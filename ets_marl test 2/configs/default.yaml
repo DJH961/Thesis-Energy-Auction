@@ -1,0 +1,114 @@
+# ============================================================
+# ETS MARL — Default Configuration
+# ============================================================
+
+# --- Simulation horizon ---
+simulation:
+  n_years: 10
+  n_episodes: 10000
+  seeds: [42, 123, 456]
+
+# --- ETS Cap and Policy ---
+ets:
+  # Cap = 66% of year-0 emissions (9.06 Mt * 0.66 = 6.00 Mt)
+  # Creates ~34% scarcity with new mix [85,70,55,35]
+  cap_year_0: 6.00
+  lrf_phase1: 0.043
+  lrf_phase2: 0.044
+  lrf_phase_switch: 5
+
+  msr:
+    enabled: true
+    tnac_upper: 2.40        # ~40% of cap
+    tnac_lower: 0.90        # ~15% of cap
+    withhold_rate: 0.24
+    release_amount: 0.05
+
+  banking: false
+  reserve_price: 40.0       # minimum auction clearing price (€/t)
+
+# --- Companies ---
+companies:
+  n_agents: 4
+  output_twh: 10.0
+
+  initial_mix:
+    - [0.85, 0.15]          # A1: heavy fossil
+    - [0.70, 0.30]          # A2: mostly fossil
+    - [0.55, 0.45]          # A3: mixed
+    - [0.35, 0.65]          # A4: mostly green
+
+  reward_weights:
+    - [0.80, 0.20]          # A1: cost-driven
+    - [0.65, 0.35]          # A2
+    - [0.35, 0.65]          # A3
+    - [0.20, 0.80]          # A4: green-driven
+
+# --- Emissions ---
+emissions:
+  ef_gas_cc: 0.37           # tCO2/MWh
+
+# --- Green Investment ---
+investment:
+  max_delta_green_pp: 0.03
+  delay_years: 2
+  switching_cost_a: 50.0
+  switching_cost_b: 10.0
+  diminishing_beta: 0.5      # delta_eff = delta * fossil^beta (diminishing returns)
+
+# --- Risk Factor ---
+# p_fail = p_min + (p_max - p_min) * fossil_frac^alpha
+# With experience discount after consecutive successes
+risk:
+  p_fail_min: 0.08              # floor: even green companies have some risk
+  p_fail_max: 0.65              # 100% fossil → 65% failure rate
+  p_fail_alpha: 0.7             # concave curve (rises fast then flattens)
+  experience_discount: 0.10     # -10pp after consecutive successes
+  experience_threshold: 2       # need 2 consecutive successes for discount
+
+# --- Auction ---
+auction:
+  lot_size: 0.001
+  price_max: 150.0          # max bid price €/t (absolute)
+  price_min: 20.0           # min bid price €/t (absolute)
+  quantity_max: 5.0
+
+# --- Secondary Market ---
+trading:
+  enabled: true
+  price_markup_range: [-0.05, 0.05]
+  transaction_cost: 0.5
+
+# --- Penalty ---
+penalty:
+  rate: 100.0
+  makeup_next_year: false   # no banking, no makeup
+
+# --- Price ---
+price:
+  initial_expected: 65.0
+  price_floor: 45.5
+  ar1_persistence: 0.85
+
+# --- DDPG ---
+ddpg:
+  lr_actor: 0.0001
+  lr_critic: 0.001          # was 0.00001 — too slow for new reward scale
+  gamma: 0.99
+  tau: 0.01
+  batch_size: 128           # larger batch for 5-dim action space
+  replay_buffer_size: 100000
+  hidden_size: 128          # larger network for 5 actions + 11 obs
+  ou_theta: 0.15
+  ou_mu: 0.0
+  ou_sigma: 0.10            # fraction of action range per dimension
+  grad_clip: 1.0
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_episodes: 8000
+
+# --- Logging ---
+logging:
+  log_interval: 10
+  save_interval: 500
+  results_dir: "results/"
