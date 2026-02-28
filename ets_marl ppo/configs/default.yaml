@@ -1,0 +1,99 @@
+# ============================================================
+# ETS MARL — Configuration v3
+# 5 agents, PPO, two-phase decisions, ~20% scarcity
+# ============================================================
+
+simulation:
+  n_years: 10
+  n_episodes: 10000
+  seeds: [42, 123, 456]
+
+ets:
+  # 5 agents × 10 TWh, fossil [0.85..0.25], ef=0.37
+  # Total emissions = sum(10*f*0.37 for f in [0.85,0.70,0.55,0.40,0.25]) = 10.175 Mt
+  # Cap ~80% → 20% scarcity
+  cap_year_0: 8.14
+  lrf_phase1: 0.043
+  lrf_phase2: 0.044
+  lrf_phase_switch: 5
+
+  msr:
+    enabled: true
+    tnac_upper: 3.26          # ~40% of cap
+    tnac_lower: 1.22          # ~15% of cap
+    withhold_rate: 0.24
+    release_amount: 0.08
+
+  banking: false
+  reserve_price: 40.0
+
+companies:
+  n_agents: 5
+  output_twh: 10.0
+
+  initial_mix:
+    - [0.85, 0.15]          # A1: heavy fossil
+    - [0.70, 0.30]          # A2: mostly fossil
+    - [0.55, 0.45]          # A3: balanced
+    - [0.40, 0.60]          # A4: mostly green
+    - [0.25, 0.75]          # A5: heavy green
+
+  reward_weights:
+    - [0.80, 0.20]          # A1: cost-driven
+    - [0.65, 0.35]          # A2
+    - [0.50, 0.50]          # A3: balanced
+    - [0.35, 0.65]          # A4
+    - [0.20, 0.80]          # A5: green-driven
+
+emissions:
+  ef_gas_cc: 0.37
+
+investment:
+  max_delta_green_pp: 0.03
+  delay_years: 2
+  switching_cost_a: 50.0
+  switching_cost_b: 10.0
+  diminishing_beta: 0.5
+
+risk:
+  p_fail_min: 0.08
+  p_fail_max: 0.65
+  p_fail_alpha: 0.7
+  experience_discount: 0.10
+  experience_threshold: 2
+
+auction:
+  price_max: 150.0
+  price_min: 20.0
+  quantity_max: 5.0
+
+trading:
+  enabled: true
+  transaction_cost: 0.5
+
+penalty:
+  rate: 100.0
+
+price:
+  initial_expected: 55.0
+  price_floor: 42.0
+  ar1_persistence: 0.85
+
+# --- PPO ---
+ppo:
+  hidden_size: 128
+  lr: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  n_epochs: 4                # PPO epochs per update
+  mini_batch_size: 64
+  normalize_advantages: true
+
+logging:
+  log_interval: 10
+  save_interval: 500
+  results_dir: "results/"
