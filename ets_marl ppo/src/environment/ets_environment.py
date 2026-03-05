@@ -1,29 +1,32 @@
 """
 ets_environment.py
 ==================
-Two-phase EU ETS environment for multi-agent RL.
+Two-phase EU ETS environment for multi-agent RL with technology-specific
+energy mix, real-data-grounded investment costs, and construction queues.
 
 Each year is split into two decision phases:
-  Phase 1 (Auction):
-    - Agents observe market state (12 dim)
-    - Decide: [bid_price, quantity, delta_green]
+  Phase 1 (Auction + Investment):
+    - Agents observe market state (18 dim)
+    - Decide: [bid_price, quantity, invest_frac, tech_choice_logit0..2]
     - Auction clears, investments are planned
-    - Returns enriched observation (15 dim) with auction results
+    - Returns enriched observation (21 dim) with auction results
 
   Phase 2 (Secondary Market):
-    - Agents observe auction results (15 dim)
+    - Agents observe auction results (21 dim)
     - Decide: [secondary_price, secondary_quantity]
     - Secondary market clears, compliance is checked
     - Returns reward and next year's Phase 1 observation
 
-This two-phase structure ensures agents make secondary market
-decisions AFTER seeing their auction allocation, enabling
-informed arbitrage strategies.
+Action space (Phase 1): 6D continuous
+  [bid_price, quantity, invest_frac, tech_logit_onshore, tech_logit_offshore, tech_logit_solar]
+  tech_choice is derived by argmax of the 3 logits (discrete from continuous)
+
+Action space (Phase 2): 2D continuous
+  [price_multiplier, quantity]
 """
 
 import numpy as np
 import gymnasium as gym
-from gymnasium import spaces
 from typing import List, Optional
 
 from src.auction.market_clearing_ets import market_clearing_ets, build_bids
@@ -51,7 +54,7 @@ class ETSEnvironment(gym.Env):
         self.companies: List[Company] = [
             Company(
                 agent_id=i, config=config,
-                initial_fossil_frac=initial_mixes[i][0], rng=self.rng,
+                initial_mix=initial_mixes[i], rng=self.rng,
             )
             for i in range(self.n_agents)
         ]
@@ -63,19 +66,20 @@ class ETSEnvironment(gym.Env):
         self._price_history: List[float] = []
         self.last_secondary_price = config["price"]["initial_expected"]
         self._last_gaps = np.zeros(self.n_agents)
-        self.holdings = np.zeros(self.n_agents)   # banked allowances carried across years
+        self.holdings = np.zeros(self.n_agents)
         self.episode_done = False
 
         # Secondary market profit tracking (EMA per agent)
-        self._secondary_profit_ema = np.zeros(self.n_agents)  # €/Mt
-        self._ema_alpha = 0.1  # smoothing factor
+        self._secondary_profit_ema = np.zeros(self.n_agents)
+        self._ema_alpha = 0.1
 
         # Auction results (stored between phase 1 and phase 2)
         self._phase1_allocations = None
         self._phase1_payments = None
         self._phase1_clearing_price = 0.0
-        self._phase1_switching_costs = None
-        self._phase1_obs = None  # phase 1 observations for logging
+        self._phase1_invest_costs = None
+        self._phase1_obs = None
+        self._phase1_log = None
 
         # Logging
         self.episode_log: List[dict] = []
@@ -99,15 +103,11 @@ class ETSEnvironment(gym.Env):
         self.holdings = np.zeros(self.n_agents)
         self.episode_log = []
 
-        # Don't reset EMA — it carries profit signal across episodes
-        # (this is intentional: the agent should learn from past episodes
-        # that secondary market is profitable)
-
         self.cap_schedule.reset()
 
         initial_mixes = self.config["companies"]["initial_mix"]
         for i, company in enumerate(self.companies):
-            company.reset(initial_fossil_frac=initial_mixes[i][0])
+            company.reset(initial_mix=initial_mixes[i])
             company.rng = self.rng
 
         obs_phase1 = self._get_obs_phase1()
@@ -123,15 +123,13 @@ class ETSEnvironment(gym.Env):
 
         Parameters
         ----------
-        auction_actions : np.ndarray, shape (N_agents, 3)
-            [bid_price, quantity, delta_green] per agent.
+        auction_actions : np.ndarray, shape (N_agents, 6)
+            [bid_price, quantity, invest_frac, tech_logit0, tech_logit1, tech_logit2]
 
         Returns
         -------
-        obs_phase2 : np.ndarray, shape (N_agents, 15)
-            Enriched observation including auction results.
+        obs_phase2 : np.ndarray, shape (N_agents, 21)
         year_info : dict
-            Auction results for logging.
         """
         assert not self.episode_done, "Episode done. Call reset()."
 
@@ -144,7 +142,6 @@ class ETSEnvironment(gym.Env):
             company.reset_budget()
 
         # 2. Compute TNAC and auction volume
-        # TNAC = total banked allowances in circulation (not surrendered yet)
         cap_t = self.cap_schedule.get_cap(year)
         tnac = float(self.holdings.sum())
         auction_volume = self.cap_schedule.get_auction_volume(year, tnac)
@@ -173,19 +170,23 @@ class ETSEnvironment(gym.Env):
         log["auction_stats"] = auction_stats
 
         # 4. Green investments
-        switching_costs = np.zeros(self.n_agents)
+        invest_costs = np.zeros(self.n_agents)
         for i, company in enumerate(self.companies):
-            switching_costs[i] = company.plan_investment(auction_actions[i, 2])
+            invest_frac = float(auction_actions[i, 2])
+            # Derive discrete tech choice from logits (argmax of 3 values)
+            tech_logits = auction_actions[i, 3:6]
+            tech_choice = int(np.argmax(tech_logits))  # 0=onshore, 1=offshore, 2=solar
+            invest_costs[i] = company.plan_investment(tech_choice, invest_frac, year)
 
         # Store for phase 2
         self._phase1_allocations = allocations
         self._phase1_payments = payments
-        self._phase1_switching_costs = switching_costs
+        self._phase1_invest_costs = invest_costs
         self._phase1_log = log
 
         # 5. Build phase 2 observations
         emissions = np.array([c.compute_emissions() for c in self.companies])
-        obs_phase1 = self._get_obs_phase1()  # current state
+        obs_phase1 = self._get_obs_phase1()
 
         obs_phase2 = np.stack([
             self.companies[i].get_observation_phase2(
@@ -212,21 +213,14 @@ class ETSEnvironment(gym.Env):
         ----------
         secondary_actions : np.ndarray, shape (N_agents, 2)
             [price_multiplier, quantity] per agent.
-            price_multiplier in [0.5, 2.0] × clearing_price
-            quantity: positive=buy, negative=sell
 
         Returns
         -------
-        obs_next : np.ndarray, shape (N_agents, 12)
-            Phase 1 observation for next year.
-        rewards : np.ndarray, shape (N_agents,)
-        terminated : bool
-        truncated : bool
-        info : dict
+        obs_next, rewards, terminated, truncated, info
         """
         allocations = self._phase1_allocations
         payments = self._phase1_payments
-        switching_costs = self._phase1_switching_costs
+        invest_costs = self._phase1_invest_costs
         clearing_price = self._phase1_clearing_price
         log = self._phase1_log
 
@@ -249,23 +243,22 @@ class ETSEnvironment(gym.Env):
 
         # Update secondary profit EMA
         for i in range(self.n_agents):
-            if trade_qtys[i] < -1e-6:  # sold something
-                profit_per_mt = -trade_costs[i] / abs(trade_qtys[i])  # revenue per Mt
-                margin = profit_per_mt - clearing_price  # profit above auction price
+            if trade_qtys[i] < -1e-6:
+                profit_per_mt = -trade_costs[i] / abs(trade_qtys[i])
+                margin = profit_per_mt - clearing_price
                 self._secondary_profit_ema[i] = (
                     self._ema_alpha * margin +
                     (1 - self._ema_alpha) * self._secondary_profit_ema[i]
                 )
-            # Buyers: update with negative signal (buying is a cost)
             elif trade_qtys[i] > 1e-6:
                 cost_per_mt = trade_costs[i] / trade_qtys[i]
-                margin = clearing_price - cost_per_mt  # savings vs penalty
+                margin = clearing_price - cost_per_mt
                 self._secondary_profit_ema[i] = (
                     self._ema_alpha * margin +
                     (1 - self._ema_alpha) * self._secondary_profit_ema[i]
                 )
 
-        # Holdings after secondary market (banked from last year + new allocation + trades)
+        # Holdings after secondary market
         holdings = self.holdings + allocations + trade_qtys
 
         emissions = np.array([c.compute_emissions() for c in self.companies])
@@ -275,13 +268,16 @@ class ETSEnvironment(gym.Env):
         for i, company in enumerate(self.companies):
             penalties[i] = company.settle_compliance(allowances_held=holdings[i])
 
-        # Banking: surplus allowances carry forward to next year
+        # Banking: surplus carry forward
         for i in range(self.n_agents):
             self.holdings[i] = max(0.0, holdings[i] - emissions[i])
         self._last_gaps = self.holdings.copy()
 
-        # 7. Rewards
-        rewards = self._compute_rewards(payments, trade_costs, penalties, switching_costs)
+        # 7. Rewards (new endogenous reward function)
+        rewards = self._compute_rewards(
+            payments, trade_costs, penalties, invest_costs,
+            emissions, clearing_price
+        )
 
         # 8. Log
         log.update({
@@ -292,20 +288,24 @@ class ETSEnvironment(gym.Env):
             "trade_qtys": trade_qtys.tolist(),
             "secondary_clearing": secondary_clearing,
             "penalties": penalties.tolist(),
-            "switching_costs": switching_costs.tolist(),
+            "invest_costs": invest_costs.tolist(),
             "rewards": rewards.tolist(),
             "green_fracs": [c.green_frac for c in self.companies],
-            "holdings": holdings.tolist(),
+            "tech_mixes": [c.mix.tolist() for c in self.companies],
+            "holdings": self.holdings.tolist(),
         })
         self.episode_log.append(log)
 
-        # 9. Advance year + AR(1) price
+        # 9. Advance year + AR(1) price with stochastic shock
         self._price_history.append(clearing_price)
         rho = self.config["price"].get("ar1_persistence", 0.85)
-        price_floor = self.config["price"].get("price_floor", 42.0)
+        price_floor = self.config["price"].get("price_floor", 50.0)
+        vol_std = self.config["price"].get("volatility_std", 0.15)
+
         if clearing_price > 0:
+            shock = self.rng.normal(0, vol_std) * clearing_price
             self.expected_price = max(
-                rho * clearing_price + (1.0 - rho) * price_floor,
+                rho * clearing_price + (1.0 - rho) * price_floor + shock,
                 price_floor,
             )
 
@@ -321,9 +321,9 @@ class ETSEnvironment(gym.Env):
     # ------------------------------------------------------------------
 
     def step(self, actions: np.ndarray):
-        """Single-call step for backward compat. actions shape (N, 5)."""
-        obs2, _ = self.step_auction(actions[:, :3])
-        return self.step_secondary(actions[:, 3:])
+        """Single-call step for backward compat. actions shape (N, 8)."""
+        obs2, _ = self.step_auction(actions[:, :6])
+        return self.step_secondary(actions[:, 6:])
 
     # ------------------------------------------------------------------
     # Secondary market — double auction
@@ -403,35 +403,60 @@ class ETSEnvironment(gym.Env):
         return trade_costs, trade_qtys, sec_clearing
 
     # ------------------------------------------------------------------
-    # Reward
+    # Reward (new endogenous function per action plan §6)
     # ------------------------------------------------------------------
 
-    def _compute_rewards(self, payments, trade_costs, penalties, switching_costs):
+    def _compute_rewards(self, payments, trade_costs, penalties,
+                         invest_costs, emissions, clearing_price):
+        """
+        R_i = -(α × TotalCost_i + β × EmissionsIntensity_i + γ × Penalty_i)
+
+        TotalCost includes: auction payments, secondary market costs,
+        investment costs, operational costs (all in M€).
+
+        EmissionsIntensity = total_emissions / output_MWh (normalized).
+
+        Penalty is large for non-compliance.
+        """
         rewards = np.zeros(self.n_agents)
+        non_compliance_mult = self.config["penalty"].get("non_compliance_multiplier", 3.0)
+
         for i, company in enumerate(self.companies):
             auction_cost = float(payments[i])
-            secondary_cost = float(trade_costs[i])  # negative = profit
+            secondary_cost = float(trade_costs[i])
             penalty_cost = float(penalties[i])
-            invest_cost = float(switching_costs[i])
+            investment_cost = float(invest_costs[i])
+            operational_cost = company.compute_operational_cost()
 
             secondary_cost = max(secondary_cost, -auction_cost)
 
-            # Record actual carbon spending for budget tracking (no negative spending)
-            company.record_spending(auction_cost + max(0.0, secondary_cost))
+            # Record spending for budget tracking
+            company.record_spending(auction_cost + max(0.0, secondary_cost) + investment_cost)
             budget_penalty = company.compute_budget_penalty()
 
-            total_cost = auction_cost + secondary_cost + penalty_cost + invest_cost + budget_penalty
-            cost_norm = total_cost / 300.0
+            # Total cost in M€
+            total_cost = (auction_cost + secondary_cost + investment_cost
+                         + operational_cost + budget_penalty)
 
-            green_component = company.fossil_frac
+            # Normalize cost (typical range: 0-2000 M€ per year for 10 TWh company)
+            cost_norm = total_cost / 1000.0
 
+            # Emissions intensity: tCO2/MWh normalized (max ~0.82 for pure coal)
+            emissions_intensity = company.weighted_emission_factor / 0.82
+
+            # Penalty component (scaled harshly)
+            penalty_norm = penalty_cost * non_compliance_mult / 1000.0
+
+            # Green improvement bonus (small, for learning signal)
             green_delta = company.green_frac - company.prev_green_frac
-            green_bonus = company.w_green * max(0.0, green_delta) * 10.0
+            green_bonus = max(0.0, green_delta) * 2.0
 
             rewards[i] = -(
                 company.w_cost * cost_norm
-                + company.w_green * green_component
+                + company.w_green * emissions_intensity
+                + penalty_norm
             ) + green_bonus
+
         return rewards
 
     # ------------------------------------------------------------------
@@ -439,7 +464,7 @@ class ETSEnvironment(gym.Env):
     # ------------------------------------------------------------------
 
     def _get_obs_phase1(self) -> np.ndarray:
-        """Phase 1 observations (12 dim) for all agents."""
+        """Phase 1 observations (18 dim) for all agents."""
         cap_t = self.cap_schedule.get_cap(self.current_year)
         obs = np.stack([
             c.get_observation_phase1(

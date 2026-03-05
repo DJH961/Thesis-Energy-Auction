@@ -1,6 +1,7 @@
 # ============================================================
-# ETS MARL — Configuration v3
-# 5 agents, PPO, two-phase decisions, ~20% scarcity
+# ETS MARL — Configuration v4
+# Technology-specific mix, real CapEx, construction queues
+# 4 agents × 10 TWh, PPO, two-phase decisions
 # ============================================================
 
 simulation:
@@ -8,52 +9,89 @@ simulation:
   n_episodes: 10000
   seeds: [42, 123, 456]
 
+# ----------------------------------------------------------
+# Technology parameters (5 technologies)
+# Sources: IRENA 2024, IPCC AR5, IEA WEO 2024
+# ----------------------------------------------------------
+technologies:
+  # Order: coal, gas, onshore_wind, offshore_wind, solar
+  names: ["coal", "gas", "onshore_wind", "offshore_wind", "solar"]
+
+  # Median lifecycle emission factors (tCO2/MWh)
+  # Coal=0.820, Gas CCGT=0.490, Onshore=0.011, Offshore=0.012, Solar=0.048
+  emission_factors: [0.820, 0.490, 0.011, 0.012, 0.048]
+
+  # CapEx (€/kW) — midpoint of ranges from IRENA 2024
+  capex: [3000, 1150, 1350, 3250, 750]
+
+  # Capacity factors
+  capacity_factors: [0.65, 0.60, 0.35, 0.47, 0.17]
+
+  # Deployment delays (model timesteps = years)
+  deploy_delays: [0, 0, 5, 8, 2]   # coal/gas = legacy only (no new build)
+
+  # Operational costs excl. ETS (€/MWh) — fuel + O&M combined
+  # Coal=72, Gas=55, Onshore=17, Offshore=47, Solar=10
+  operational_costs: [72.0, 55.0, 17.0, 47.0, 10.0]
+
+  # Decommissioning costs (€/kW) — incurred when retiring fossil
+  decommission_costs: [200, 100, 0, 0, 0]
+
+  # Which technologies are "green" (renewable)
+  is_green: [false, false, true, true, true]
+
+  # Which technologies can be newly built (greening-only)
+  is_buildable: [false, false, true, true, true]
+
+# ----------------------------------------------------------
+# ETS parameters
+# ----------------------------------------------------------
 ets:
-  # 5 agents × 10 TWh, fossil [0.85..0.25], ef=0.37
-  # Total emissions = sum(10*f*0.37 for f in [0.85,0.70,0.55,0.40,0.25]) = 10.175 Mt
-  # Cap ~80% → 20% scarcity
-  cap_year_0: 8.14
-  lrf_phase1: 0.043
-  lrf_phase2: 0.044
-  lrf_phase_switch: 5
+  # 4 agents × 10 TWh
+  # Initial emissions ~ A1:5.33Mt, A2:3.55Mt, A3:1.86Mt, A4:0.66Mt → total ~11.4 Mt
+  # Cap at ~80% → ~9.1 Mt
+  cap_year_0: 9.10
+  lrf_phase1: 0.043        # 2024-2027 (Fit for 55)
+  lrf_phase2: 0.044        # 2028+ (Fit for 55)
+  lrf_phase_switch: 4      # switch at year 4
 
   msr:
     enabled: true
-    tnac_upper: 3.26          # ~40% of cap
-    tnac_lower: 1.22          # ~15% of cap
+    tnac_upper: 3.64        # ~40% of cap
+    tnac_lower: 1.37        # ~15% of cap
     withhold_rate: 0.24
     release_amount: 0.08
 
   banking: true
   reserve_price: 40.0
 
+# ----------------------------------------------------------
+# Companies (4 agents, archetypes from action plan §8)
+# ----------------------------------------------------------
 companies:
-  n_agents: 5
+  n_agents: 4
   output_twh: 10.0
 
+  # Technology mix vectors: [coal, gas, onshore_wind, offshore_wind, solar]
+  # Must sum to 1.0 per agent
   initial_mix:
-    - [0.85, 0.15]          # A1: heavy fossil
-    - [0.70, 0.30]          # A2: mostly fossil
-    - [0.55, 0.45]          # A3: balanced
-    - [0.40, 0.60]          # A4: mostly green
-    - [0.25, 0.75]          # A5: heavy green
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A1: Legacy coal-heavy (20% green)
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A2: Gas-dominant (40% green)
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A3: Mixed transitioner (70% green)
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A4: Near-green leader (90% green)
 
+  # Reward weights: [alpha (cost), beta (emissions intensity)]
   reward_weights:
-    - [0.80, 0.20]          # A1: cost-driven
-    - [0.65, 0.35]          # A2
-    - [0.50, 0.50]          # A3: balanced
-    - [0.35, 0.65]          # A4
-    - [0.20, 0.80]          # A5: green-driven
-
-emissions:
-  ef_gas_cc: 0.37
+    - [0.90, 0.10]   # A1: primarily cost-minimizing
+    - [0.75, 0.25]   # A2: moderately cost-focused
+    - [0.50, 0.50]   # A3: balanced
+    - [0.25, 0.75]   # A4: primarily green-focused
 
 investment:
-  max_delta_green_pp: 0.03
-  delay_years: 2
-  switching_cost_a: 50.0
-  switching_cost_b: 10.0
-  diminishing_beta: 0.5
+  # Max fraction of output that can be shifted per year per technology
+  max_invest_frac: 0.05
+  # Convexity penalty for large single-year investments
+  convexity_alpha: 0.10
 
 risk:
   p_fail_min: 0.08
@@ -63,7 +101,7 @@ risk:
   experience_threshold: 2
 
 auction:
-  price_max: 200.0    # equals penalty rate — rational agents never bid above this
+  price_max: 200.0
   price_min: 20.0
   quantity_max: 5.0
 
@@ -73,18 +111,19 @@ trading:
 
 budget:
   # Annual carbon budget per agent (M€).
-  # Calibrated as: emissions_t0 * budget_price * multiplier
-  # A1 (3.14 Mt * 70€ * 1.2) ≈ 264, A5 (0.93 Mt * 70€ * 1.2) ≈ 78
-  annual_budgets: [264.0, 218.0, 171.0, 125.0, 78.0]
-  overspend_penalty_coef: 2.0   # quadratic penalty weight — tune this
+  # Calibrated from initial emissions × ~€80/t × 1.5 multiplier for investment headroom
+  annual_budgets: [640.0, 426.0, 223.0, 79.0]
+  overspend_penalty_coef: 2.0
 
 penalty:
   rate: 100.0
+  non_compliance_multiplier: 3.0
 
 price:
-  initial_expected: 55.0
-  price_floor: 42.0
+  initial_expected: 80.0     # €80/t — current EU ETS market level
+  price_floor: 50.0          # reflects MSR + reserve price support
   ar1_persistence: 0.85
+  volatility_std: 0.15       # stochastic shock ~ N(0, 0.15)
 
 # --- PPO ---
 ppo:
@@ -93,14 +132,14 @@ ppo:
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
-  entropy_coef: 0.05        # raised from 0.01 — stronger push to stay exploratory
+  entropy_coef: 0.05
   value_coef: 0.5
   max_grad_norm: 0.5
-  n_epochs: 4                # PPO epochs per update
+  n_epochs: 4
   mini_batch_size: 64
   normalize_advantages: true
-  log_std_min: -2.0          # std never below ~0.14 — keeps some spread
-  log_std_max: 1.0           # std never above ~2.7
+  log_std_min: -2.0
+  log_std_max: 1.0
 
 logging:
   log_interval: 10

@@ -2,9 +2,9 @@
 actor_critic.py
 ===============
 PPO networks for two-phase ETS decisions:
-  - AuctionPolicy:    obs_phase1(12) → 3 actions [bid_price, qty, delta_green]
-  - SecondaryPolicy:  obs_phase2(15) → 2 actions [sec_price_mult, sec_qty]
-  - ValueNetwork:     obs_phase2(15) → scalar V(s)
+  - AuctionPolicy:    obs_phase1(18) → 6 actions [bid_price, qty, invest_frac, tech_logits×3]
+  - SecondaryPolicy:  obs_phase2(21) → 2 actions [sec_price_mult, sec_qty]
+  - ValueNetwork:     obs_phase2(21) → scalar V(s)
 
 All policies output Gaussian distributions (mean + learnable log_std).
 Actions are squashed through tanh and rescaled to physical bounds.
@@ -17,7 +17,7 @@ from torch.distributions import Normal
 
 
 class AuctionPolicy(nn.Module):
-    """Phase 1: obs(13) → Gaussian over 3 auction actions."""
+    """Phase 1: obs(18) → Gaussian over 6 auction actions."""
 
     def __init__(self, obs_dim, action_dim, hidden_size, action_low, action_high,
                  log_std_min=-2.0, log_std_max=1.0):
@@ -76,7 +76,7 @@ class AuctionPolicy(nn.Module):
 
 
 class SecondaryPolicy(nn.Module):
-    """Phase 2: obs_enriched(16) → Gaussian over 2 secondary actions."""
+    """Phase 2: obs_enriched(21) → Gaussian over 2 secondary actions."""
 
     def __init__(self, obs_dim, action_dim, hidden_size, action_low, action_high,
                  log_std_min=-2.0, log_std_max=1.0):
@@ -133,7 +133,7 @@ class SecondaryPolicy(nn.Module):
 
 
 class ValueNetwork(nn.Module):
-    """V(s) for PPO. Takes enriched obs(15) = full state."""
+    """V(s) for PPO. Takes enriched obs(21) = full state."""
 
     def __init__(self, obs_dim, hidden_size):
         super().__init__()

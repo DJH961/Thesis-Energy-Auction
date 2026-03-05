@@ -2,8 +2,8 @@
 ppo_agent.py
 ============
 PPO agent with two-phase decision making for EU ETS:
-  Phase 1 (Auction):   obs(12) → [bid_price, qty, delta_green]
-  Phase 2 (Secondary): obs(15) → [sec_price_mult, sec_qty]
+  Phase 1 (Auction):   obs(18) → [bid_price, qty, invest_frac, tech_logits×3]
+  Phase 2 (Secondary): obs(21) → [sec_price_mult, sec_qty]
 
 On-policy: collects full episode rollout, then updates via
 clipped surrogate objective with GAE advantage estimation.

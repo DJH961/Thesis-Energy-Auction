@@ -4,8 +4,8 @@ train.py
 Two-phase training loop for ETS MARL with PPO agents.
 
 Each year:
-  1. Phase 1: agents see market obs(12) → choose [bid, qty, invest]
-  2. Auction clears → agents see enriched obs(15)
+  1. Phase 1: agents see market obs(18) → choose [bid, qty, invest_frac, tech_logits×3]
+  2. Auction clears → agents see enriched obs(21)
   3. Phase 2: agents see auction results → choose [sec_price, sec_qty]
   4. Secondary market, compliance, rewards
 
@@ -32,16 +32,19 @@ def load_config(path: str) -> dict:
 
 def build_agents(env: ETSEnvironment, config: dict, seed: int):
     """Instantiate one PPO agent per company."""
-    obs1_dim = env.companies[0].obs_dim_phase1  # 12
-    obs2_dim = env.companies[0].obs_dim_phase2  # 15
+    obs1_dim = env.companies[0].obs_dim_phase1  # 18
+    obs2_dim = env.companies[0].obs_dim_phase2  # 21
 
     aq = config["auction"]
     inv = config["investment"]
 
-    # Phase 1: [bid_price, qty, delta_green]
-    auction_low = np.array([aq["price_min"], 0.0, 0.0], dtype=np.float32)
-    auction_high = np.array([aq["price_max"], aq["quantity_max"],
-                             inv["max_delta_green_pp"]], dtype=np.float32)
+    # Phase 1: [bid_price, qty, invest_frac, tech_logit0, tech_logit1, tech_logit2]
+    auction_low = np.array([
+        aq["price_min"], 0.0, 0.0, -1.0, -1.0, -1.0
+    ], dtype=np.float32)
+    auction_high = np.array([
+        aq["price_max"], aq["quantity_max"], inv["max_invest_frac"], 1.0, 1.0, 1.0
+    ], dtype=np.float32)
 
     # Phase 2: [sec_price_multiplier, sec_qty]
     secondary_low = np.array([0.5, -aq["quantity_max"]], dtype=np.float32)
@@ -71,6 +74,7 @@ def train_one_seed(config: dict, seed: int):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} agents, PPO, two-phase")
+    print(f"Technology-specific mix | Real CapEx | Construction queues")
     print(f"{'='*60}")
 
     env = ETSEnvironment(config, seed=seed)
@@ -98,7 +102,7 @@ def train_one_seed(config: dict, seed: int):
     for i in range(n_agents):
         yr_fields += [f"alloc_A{i+1}", f"emissions_A{i+1}", f"trade_qty_A{i+1}",
                       f"trade_cost_A{i+1}", f"green_frac_A{i+1}", f"penalty_A{i+1}",
-                      f"reward_A{i+1}", f"holdings_A{i+1}"]
+                      f"reward_A{i+1}", f"holdings_A{i+1}", f"invest_cost_A{i+1}"]
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -112,8 +116,8 @@ def train_one_seed(config: dict, seed: int):
         total_rewards = np.zeros(n_agents)
 
         for year in range(n_years):
-            # === PHASE 1: Auction ===
-            auction_actions = np.zeros((n_agents, 3), dtype=np.float32)
+            # === PHASE 1: Auction + Investment ===
+            auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
             auction_raws = []
             auction_logps = []
 
@@ -164,7 +168,8 @@ def train_one_seed(config: dict, seed: int):
                 for key, log_key in [("alloc", "allocations"), ("emissions", "emissions"),
                                      ("trade_qty", "trade_qtys"), ("trade_cost", "trade_costs"),
                                      ("green_frac", "green_fracs"), ("penalty", "penalties"),
-                                     ("reward", "rewards"), ("holdings", "holdings")]:
+                                     ("reward", "rewards"), ("holdings", "holdings"),
+                                     ("invest_cost", "invest_costs")]:
                     vals = yl.get(log_key, [0]*n_agents)
                     yr_row[f"{key}_A{i+1}"] = vals[i] if i < len(vals) else 0
             yr_writer.writerow(yr_row)
@@ -176,7 +181,7 @@ def train_one_seed(config: dict, seed: int):
         # === PPO Update (end of episode) ===
         latest_losses = []
         for i in range(n_agents):
-            loss = agents[i].update(last_value=0.0)  # terminal → V=0
+            loss = agents[i].update(last_value=0.0)
             latest_losses.append(loss)
 
         # --- Episode-level logging ---
@@ -216,10 +221,11 @@ def train_one_seed(config: dict, seed: int):
 
         # Console
         if episode % log_interval == 0:
-            r_str = " ".join([f"A{i+1}:{total_rewards[i]:6.2f}" for i in range(n_agents)])
-            sec_str = f"sec_vol={total_sec_vol:.3f}"
+            r_str = " ".join([f"A{i+1}:{total_rewards[i]:7.2f}" for i in range(n_agents)])
+            g_str = " ".join([f"{last_log.get('green_fracs', [0]*n_agents)[i]*100:.0f}%"
+                             for i in range(n_agents)])
             print(f"Ep {episode:5d} | price={last_log.get('clearing_price', 0):6.1f} | "
-                  f"{sec_str} | {r_str}")
+                  f"green=[{g_str}] | {r_str}")
 
         # Checkpointing
         if episode % save_interval == 0:
