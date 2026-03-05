@@ -24,7 +24,7 @@ ets:
     withhold_rate: 0.24
     release_amount: 0.08
 
-  banking: false
+  banking: true
   reserve_price: 40.0
 
 companies:
@@ -63,13 +63,20 @@ risk:
   experience_threshold: 2
 
 auction:
-  price_max: 150.0
+  price_max: 200.0    # equals penalty rate — rational agents never bid above this
   price_min: 20.0
   quantity_max: 5.0
 
 trading:
   enabled: true
   transaction_cost: 0.5
+
+budget:
+  # Annual carbon budget per agent (M€).
+  # Calibrated as: emissions_t0 * budget_price * multiplier
+  # A1 (3.14 Mt * 70€ * 1.2) ≈ 264, A5 (0.93 Mt * 70€ * 1.2) ≈ 78
+  annual_budgets: [264.0, 218.0, 171.0, 125.0, 78.0]
+  overspend_penalty_coef: 2.0   # quadratic penalty weight — tune this
 
 penalty:
   rate: 100.0
@@ -86,12 +93,14 @@ ppo:
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
-  entropy_coef: 0.01
+  entropy_coef: 0.05        # raised from 0.01 — stronger push to stay exploratory
   value_coef: 0.5
   max_grad_norm: 0.5
   n_epochs: 4                # PPO epochs per update
   mini_batch_size: 64
   normalize_advantages: true
+  log_std_min: -2.0          # std never below ~0.14 — keeps some spread
+  log_std_max: 1.0           # std never above ~2.7
 
 logging:
   log_interval: 10

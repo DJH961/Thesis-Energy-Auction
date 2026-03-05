@@ -72,6 +72,8 @@ class PPOAgent:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         hidden = ppo["hidden_size"]
+        log_std_min = ppo.get("log_std_min", -2.0)
+        log_std_max = ppo.get("log_std_max", 1.0)
 
         auction_dim = len(auction_action_low)
         secondary_dim = len(secondary_action_low)
@@ -82,11 +84,13 @@ class PPOAgent:
         s_high = torch.FloatTensor(secondary_action_high).to(self.device)
 
         self.auction_policy = AuctionPolicy(
-            obs_dim_phase1, auction_dim, hidden, a_low, a_high
+            obs_dim_phase1, auction_dim, hidden, a_low, a_high,
+            log_std_min=log_std_min, log_std_max=log_std_max,
         ).to(self.device)
 
         self.secondary_policy = SecondaryPolicy(
-            obs_dim_phase2, secondary_dim, hidden, s_low, s_high
+            obs_dim_phase2, secondary_dim, hidden, s_low, s_high,
+            log_std_min=log_std_min, log_std_max=log_std_max,
         ).to(self.device)
 
         self.value_net = ValueNetwork(obs_dim_phase2, hidden).to(self.device)

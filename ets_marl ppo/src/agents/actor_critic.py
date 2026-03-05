@@ -17,14 +17,17 @@ from torch.distributions import Normal
 
 
 class AuctionPolicy(nn.Module):
-    """Phase 1: obs(12) → Gaussian over 3 auction actions."""
+    """Phase 1: obs(13) → Gaussian over 3 auction actions."""
 
-    def __init__(self, obs_dim, action_dim, hidden_size, action_low, action_high):
+    def __init__(self, obs_dim, action_dim, hidden_size, action_low, action_high,
+                 log_std_min=-2.0, log_std_max=1.0):
         super().__init__()
         self.fc1 = nn.Linear(obs_dim, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
         self.mean_head = nn.Linear(hidden_size, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
 
         self.register_buffer("action_scale", (action_high - action_low) / 2.0)
         self.register_buffer("action_bias", (action_high + action_low) / 2.0)
@@ -34,7 +37,8 @@ class AuctionPolicy(nn.Module):
         x = F.relu(self.fc1(obs))
         x = F.relu(self.fc2(x))
         mean = self.mean_head(x)
-        std = self.log_std.exp().expand_as(mean)
+        log_std_clamped = torch.clamp(self.log_std, self.log_std_min, self.log_std_max)
+        std = log_std_clamped.exp().expand_as(mean)
         return Normal(mean, std)
 
     def act(self, obs, deterministic=False):
@@ -72,14 +76,17 @@ class AuctionPolicy(nn.Module):
 
 
 class SecondaryPolicy(nn.Module):
-    """Phase 2: obs_enriched(15) → Gaussian over 2 secondary actions."""
+    """Phase 2: obs_enriched(16) → Gaussian over 2 secondary actions."""
 
-    def __init__(self, obs_dim, action_dim, hidden_size, action_low, action_high):
+    def __init__(self, obs_dim, action_dim, hidden_size, action_low, action_high,
+                 log_std_min=-2.0, log_std_max=1.0):
         super().__init__()
         self.fc1 = nn.Linear(obs_dim, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
         self.mean_head = nn.Linear(hidden_size, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
 
         self.register_buffer("action_scale", (action_high - action_low) / 2.0)
         self.register_buffer("action_bias", (action_high + action_low) / 2.0)
@@ -89,7 +96,8 @@ class SecondaryPolicy(nn.Module):
         x = F.relu(self.fc1(obs))
         x = F.relu(self.fc2(x))
         mean = self.mean_head(x)
-        std = self.log_std.exp().expand_as(mean)
+        log_std_clamped = torch.clamp(self.log_std, self.log_std_min, self.log_std_max)
+        std = log_std_clamped.exp().expand_as(mean)
         return Normal(mean, std)
 
     def act(self, obs, deterministic=False):
