@@ -1,11 +1,14 @@
 # ============================================================
-# ETS MARL — Configuration v4
-# Technology-specific mix, real CapEx, construction queues
-# 4 agents × 10 TWh, PPO, two-phase decisions
+# ETS MARL — Configuration v4.1
+# P1–P4 Roadmap improvements applied:
+#   P1: bid_penalty_alpha, reserve_price already set, n_years↑
+#   P2: gae_lambda↑, entropy decay schedule
+#   P3: reward normalization, green penalty floor, reward clipping
+#   P4: green investment reward shaping with decay
 # ============================================================
 
 simulation:
-  n_years: 10
+  n_years: 12         # increased: solar (2yr) and onshore (5yr) payoffs fit within episode
   n_episodes: 10000
   seeds: [42, 123, 456]
 
@@ -63,7 +66,7 @@ ets:
     release_amount: 0.08
 
   banking: true
-  reserve_price: 40.0
+  reserve_price: 40.0      # realistic floor (P1: prevents zero-price collapse)
 
 # ----------------------------------------------------------
 # Companies (4 agents, archetypes from action plan §8)
@@ -104,6 +107,10 @@ auction:
   price_max: 200.0
   price_min: 20.0
   quantity_max: 5.0
+  # P1: Quadratic bid cost penalty — makes overbidding costly, incentivises truthful bidding.
+  # At bid=200: penalty = 0.002 × 200² = 80 M€ (absorbed into total_cost → /1000 in reward).
+  # At bid=80: penalty = 0.002 × 80² = 12.8 M€. Difference ≈ 67 M€/yr → meaningful signal.
+  bid_penalty_alpha: 0.002
 
 trading:
   enabled: true
@@ -125,14 +132,46 @@ price:
   ar1_persistence: 0.85
   volatility_std: 0.15       # stochastic shock ~ N(0, 0.15)
 
+# ----------------------------------------------------------
+# Reward shaping (P3 + P4)
+# ----------------------------------------------------------
+reward:
+  # P3: Per-agent running reward normalisation
+  # reward_norm = (r - mu_i) / (sigma_i + eps), updated with EMA(alpha=0.01)
+  normalizer_alpha: 0.01
+  clip_min: -10.0            # safety clip after normalisation
+  clip_max: 2.0
+
+  # P3: Green penalty floor — each agent is not penalised for emissions below
+  # their initial (irreducible) fossil fraction. Prevents A4 from being punished
+  # for the 10% gas it structurally cannot eliminate immediately.
+  # Values = initial fossil fractions: [A1=0.80, A2=0.60, A3=0.30, A4=0.10]
+  green_floor_fossil: [0.80, 0.60, 0.30, 0.10]
+
+  # P4: Green investment reward shaping
+  # Progress bonus: shaping += beta * delta_green_actual
+  shaping_beta: 10.0
+  # Queue progress: shaping += gamma * n_projects * 0.1
+  shaping_gamma: 1.0
+  # Fossil lock-in penalty per year if fossil_frac unchanged for 3+ years
+  shaping_lockin_penalty: 2.0
+  # Episode at which shaping decays to 0 (linearly from episode 0)
+  shaping_decay_episode: 3000
+  # Activate lock-in penalty only after this many episodes (avoid cold-start penalty)
+  shaping_lockin_start_episode: 200
+
 # --- PPO ---
 ppo:
   hidden_size: 128
   lr: 0.0003
   gamma: 0.99
-  gae_lambda: 0.95
+  gae_lambda: 0.97          # P2: increased from 0.95 → extends credit assignment horizon
   clip_eps: 0.2
-  entropy_coef: 0.05
+  # P2: Entropy starts high for exploration, linearly decays after episode 2000
+  entropy_coef: 0.05         # initial entropy coefficient
+  entropy_coef_final: 0.005  # final entropy after decay
+  entropy_decay_start: 2000  # episode where decay begins
+  entropy_decay_end: 4000    # episode where entropy reaches final value
   value_coef: 0.5
   max_grad_norm: 0.5
   n_epochs: 4

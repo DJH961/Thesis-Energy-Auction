@@ -7,6 +7,12 @@ PPO agent with two-phase decision making for EU ETS:
 
 On-policy: collects full episode rollout, then updates via
 clipped surrogate objective with GAE advantage estimation.
+
+Roadmap improvements:
+  P2: entropy_coef is updated externally via set_entropy_coef() (decay schedule
+      lives in train.py so the agent stays stateless w.r.t. episode count).
+  P3: RewardNormalizer tracks per-agent running mean/std with EMA.
+      normalize_reward() normalises and clips before storing in buffer.
 """
 
 import numpy as np
@@ -17,6 +23,49 @@ from typing import Optional
 
 from src.agents.actor_critic import AuctionPolicy, SecondaryPolicy, ValueNetwork
 
+
+# ---------------------------------------------------------------------------
+# P3: Per-agent running reward normaliser
+# ---------------------------------------------------------------------------
+
+class RewardNormalizer:
+    """
+    Online running mean/std normaliser using exponential moving average.
+
+    reward_norm = (reward - mu) / (std + eps)
+
+    Parameters
+    ----------
+    alpha : float
+        EMA decay rate. alpha=0.01 ≈ window of 100 samples.
+    eps : float
+        Numerical stability floor for std.
+    """
+
+    def __init__(self, alpha: float = 0.01, eps: float = 1e-8):
+        self.alpha = alpha
+        self.eps = eps
+        self.mu = 0.0
+        self.var = 1.0     # initialise to 1 so first normalised value ≈ raw reward
+
+    def update_and_normalize(self, reward: float) -> float:
+        """Update running stats and return normalised reward (NOT clipped)."""
+        # EMA mean
+        self.mu = (1.0 - self.alpha) * self.mu + self.alpha * reward
+        # EMA variance (using current reward before updating mean for stability)
+        self.var = (1.0 - self.alpha) * self.var + self.alpha * (reward - self.mu) ** 2
+        std = max(self.var ** 0.5, self.eps)
+        return (reward - self.mu) / std
+
+    def reset(self):
+        """Optionally reset stats (not called by default — stats persist across episodes)."""
+        self.mu = 0.0
+        self.var = 1.0
+
+
+# ---------------------------------------------------------------------------
+# Rollout buffer
+# ---------------------------------------------------------------------------
 
 class RolloutBuffer:
     """Stores one episode of transitions for on-policy update."""
@@ -50,6 +99,10 @@ class RolloutBuffer:
         return len(self.rewards)
 
 
+# ---------------------------------------------------------------------------
+# PPO Agent
+# ---------------------------------------------------------------------------
+
 class PPOAgent:
 
     def __init__(self, agent_id, obs_dim_phase1, obs_dim_phase2,
@@ -63,7 +116,7 @@ class PPOAgent:
         self.gamma = ppo["gamma"]
         self.gae_lambda = ppo["gae_lambda"]
         self.clip_eps = ppo["clip_eps"]
-        self.entropy_coef = ppo["entropy_coef"]
+        self.entropy_coef = ppo["entropy_coef"]  # P2: updated per-episode by train.py
         self.value_coef = ppo["value_coef"]
         self.max_grad_norm = ppo["max_grad_norm"]
         self.n_epochs = ppo["n_epochs"]
@@ -106,12 +159,39 @@ class PPOAgent:
         self.actor_loss_history = []
         self.critic_loss_history = []
 
+        # P3: per-agent reward normaliser
+        reward_cfg = config.get("reward", {})
+        norm_alpha = reward_cfg.get("normalizer_alpha", 0.01)
+        self._reward_normalizer = RewardNormalizer(alpha=norm_alpha)
+        self._reward_clip_min = reward_cfg.get("clip_min", -10.0)
+        self._reward_clip_max = reward_cfg.get("clip_max", 2.0)
+
+    # ------------------------------------------------------------------
+    # P2: Entropy coefficient update (called by train.py)
+    # ------------------------------------------------------------------
+
+    def set_entropy_coef(self, coef: float):
+        """Update entropy coefficient for this training step (P2 decay schedule)."""
+        self.entropy_coef = float(coef)
+
+    # ------------------------------------------------------------------
+    # P3: Reward normalisation
+    # ------------------------------------------------------------------
+
+    def normalize_reward(self, reward: float) -> float:
+        """
+        Normalise reward with per-agent running stats, then clip.
+        Called by the training loop before storing transitions.
+        """
+        r_norm = self._reward_normalizer.update_and_normalize(reward)
+        return float(np.clip(r_norm, self._reward_clip_min, self._reward_clip_max))
+
     # ------------------------------------------------------------------
     # Action selection
     # ------------------------------------------------------------------
 
     def select_auction_action(self, obs1: np.ndarray, deterministic=False):
-        """Phase 1: obs(12) → (action[3], raw[3], logp[1])."""
+        """Phase 1: obs(18) → (action[6], raw[6], logp[1])."""
         obs_t = torch.FloatTensor(obs1).unsqueeze(0).to(self.device)
         with torch.no_grad():
             action, raw, log_prob = self.auction_policy.act(obs_t, deterministic)
@@ -120,7 +200,7 @@ class PPOAgent:
                 log_prob.cpu().numpy().squeeze(0))
 
     def select_secondary_action(self, obs2: np.ndarray, deterministic=False):
-        """Phase 2: obs(15) → (action[2], raw[2], logp[1])."""
+        """Phase 2: obs(21) → (action[2], raw[2], logp[1])."""
         obs_t = torch.FloatTensor(obs2).unsqueeze(0).to(self.device)
         with torch.no_grad():
             action, raw, log_prob = self.secondary_policy.act(obs_t, deterministic)
@@ -161,7 +241,7 @@ class PPOAgent:
         dones = np.array(self.buffer.dones, dtype=np.float32)
         values = np.array(self.buffer.values, dtype=np.float32)
 
-        # GAE
+        # GAE (P2: gae_lambda = 0.97 in config for longer credit assignment)
         T = len(rewards)
         advantages = np.zeros(T, dtype=np.float32)
         gae = 0.0
@@ -206,6 +286,7 @@ class PPOAgent:
                 v_pred = self.value_net(obs2[mb])
                 value_loss = nn.MSELoss()(v_pred, ret_t[mb])
 
+                # P2: entropy_coef updated externally via set_entropy_coef()
                 entropy = (auc_ent + sec_ent).mean()
 
                 loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy

@@ -10,6 +10,12 @@ Each year:
   4. Secondary market, compliance, rewards
 
 PPO update happens at the end of each episode (on-policy).
+
+Roadmap improvements wired here:
+  P2: Entropy decay schedule — entropy_coef linearly decays from initial to final
+      between decay_start and decay_end episodes.
+  P3: Reward normalisation — per-agent RewardNormalizer called before buffer storage.
+  P4: Shaping weight decay — communicated to environment via env.set_episode().
 """
 
 import argparse
@@ -67,6 +73,24 @@ def build_agents(env: ETSEnvironment, config: dict, seed: int):
     return agents
 
 
+def _get_entropy_coef(episode: int, ppo_cfg: dict) -> float:
+    """
+    P2: Linearly decay entropy_coef from initial to final between
+    decay_start and decay_end episodes.
+    """
+    coef_init = ppo_cfg.get("entropy_coef", 0.05)
+    coef_final = ppo_cfg.get("entropy_coef_final", 0.005)
+    decay_start = ppo_cfg.get("entropy_decay_start", 2000)
+    decay_end = ppo_cfg.get("entropy_decay_end", 4000)
+
+    if episode <= decay_start:
+        return coef_init
+    if episode >= decay_end:
+        return coef_final
+    frac = (episode - decay_start) / max(decay_end - decay_start, 1)
+    return coef_init + frac * (coef_final - coef_init)
+
+
 def train_one_seed(config: dict, seed: int):
     n_agents = config["companies"]["n_agents"]
     n_episodes = config["simulation"]["n_episodes"]
@@ -75,10 +99,13 @@ def train_one_seed(config: dict, seed: int):
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} agents, PPO, two-phase")
     print(f"Technology-specific mix | Real CapEx | Construction queues")
+    print(f"P1-P4 roadmap improvements active")
     print(f"{'='*60}")
 
     env = ETSEnvironment(config, seed=seed)
     agents = build_agents(env, config, seed)
+
+    ppo_cfg = config["ppo"]
 
     # --- CSV loggers ---
     results_dir = config["logging"]["results_dir"]
@@ -86,10 +113,11 @@ def train_one_seed(config: dict, seed: int):
 
     # Episode-level
     ep_path = os.path.join(results_dir, f"training_log_s{seed}.csv")
-    ep_fields = ["episode", "clearing_price_last", "cap_last"]
+    ep_fields = ["episode", "clearing_price_last", "cap_last", "entropy_coef", "shaping_weight"]
     for i in range(n_agents):
         ep_fields += [f"reward_A{i+1}", f"green_frac_A{i+1}",
-                      f"penalty_A{i+1}", f"actor_loss_A{i+1}", f"critic_loss_A{i+1}"]
+                      f"penalty_A{i+1}", f"actor_loss_A{i+1}", f"critic_loss_A{i+1}",
+                      f"bid_price_A{i+1}"]
     ep_fields += ["secondary_volume", "secondary_avg_price"]
     ep_csv = open(ep_path, "w", newline="")
     ep_writer = csv.DictWriter(ep_csv, fieldnames=ep_fields)
@@ -102,7 +130,8 @@ def train_one_seed(config: dict, seed: int):
     for i in range(n_agents):
         yr_fields += [f"alloc_A{i+1}", f"emissions_A{i+1}", f"trade_qty_A{i+1}",
                       f"trade_cost_A{i+1}", f"green_frac_A{i+1}", f"penalty_A{i+1}",
-                      f"reward_A{i+1}", f"holdings_A{i+1}", f"invest_cost_A{i+1}"]
+                      f"reward_A{i+1}", f"holdings_A{i+1}", f"invest_cost_A{i+1}",
+                      f"bid_price_A{i+1}"]
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -112,6 +141,14 @@ def train_one_seed(config: dict, seed: int):
     best_total_reward = -np.inf
 
     for episode in range(n_episodes):
+        # P2: Update entropy coefficients for all agents
+        entropy_coef = _get_entropy_coef(episode, ppo_cfg)
+        for agent in agents:
+            agent.set_entropy_coef(entropy_coef)
+
+        # P4: Communicate episode to environment for shaping weight + lock-in activation
+        env.set_episode(episode)
+
         obs1, _ = env.reset(seed=seed + episode * 1000)
         total_rewards = np.zeros(n_agents)
 
@@ -143,20 +180,26 @@ def train_one_seed(config: dict, seed: int):
             obs1_next, rewards, terminated, truncated, info = env.step_secondary(
                 secondary_actions)
 
-            # Store transitions for each agent
+            # P3: Normalise rewards per-agent before storing in buffer
+            normalised_rewards = np.array([
+                agents[i].normalize_reward(rewards[i]) for i in range(n_agents)
+            ], dtype=np.float32)
+
+            # Store transitions with normalised rewards
             for i in range(n_agents):
                 value = agents[i].estimate_value(obs2[i])
                 agents[i].store_transition(
                     obs1=obs1[i], obs2=obs2[i],
                     auc_raw=auction_raws[i], sec_raw=secondary_raws[i],
                     auc_lp=auction_logps[i], sec_lp=secondary_logps[i],
-                    reward=rewards[i], done=terminated, value=value,
+                    reward=normalised_rewards[i], done=terminated, value=value,
                 )
 
-            total_rewards += rewards
+            total_rewards += rewards  # log RAW rewards for diagnostics
 
             # --- Year-level logging ---
             yl = info.get("year_log", {})
+            bid_prices_this_year = yl.get("bid_prices", [0] * n_agents)
             yr_row = {
                 "episode": episode, "year": year,
                 "cap": yl.get("cap", 0), "auction_volume": yl.get("auction_volume", 0),
@@ -172,6 +215,9 @@ def train_one_seed(config: dict, seed: int):
                                      ("invest_cost", "invest_costs")]:
                     vals = yl.get(log_key, [0]*n_agents)
                     yr_row[f"{key}_A{i+1}"] = vals[i] if i < len(vals) else 0
+                yr_row[f"bid_price_A{i+1}"] = (
+                    bid_prices_this_year[i] if i < len(bid_prices_this_year) else 0
+                )
             yr_writer.writerow(yr_row)
 
             obs1 = obs1_next
@@ -197,10 +243,22 @@ def train_one_seed(config: dict, seed: int):
         )
         avg_sec_price = total_sec_value / max(total_sec_vol, 1e-6) / 2
 
+        # Average bid price per agent across the episode
+        avg_bid_per_agent = []
+        for i in range(n_agents):
+            bids_this_ep = [
+                yl["bid_prices"][i]
+                for yl in env.episode_log
+                if "bid_prices" in yl and i < len(yl["bid_prices"])
+            ]
+            avg_bid_per_agent.append(np.mean(bids_this_ep) if bids_this_ep else 0.0)
+
         ep_row = {
             "episode": episode,
             "clearing_price_last": last_log.get("clearing_price", 0),
             "cap_last": last_log.get("cap", 0),
+            "entropy_coef": round(entropy_coef, 5),
+            "shaping_weight": round(env.shaping_weight, 4),
             "secondary_volume": round(total_sec_vol, 4),
             "secondary_avg_price": round(avg_sec_price, 2),
         }
@@ -210,6 +268,7 @@ def train_one_seed(config: dict, seed: int):
                 last_log.get("green_fracs", [0]*n_agents)[i], 4)
             ep_row[f"penalty_A{i+1}"] = round(
                 sum(yl.get("penalties", [0]*n_agents)[i] for yl in env.episode_log), 6)
+            ep_row[f"bid_price_A{i+1}"] = round(avg_bid_per_agent[i], 2)
             if latest_losses[i]:
                 ep_row[f"actor_loss_A{i+1}"] = round(latest_losses[i]["actor_loss"], 6)
                 ep_row[f"critic_loss_A{i+1}"] = round(latest_losses[i]["critic_loss"], 6)
@@ -219,13 +278,15 @@ def train_one_seed(config: dict, seed: int):
 
         ep_writer.writerow(ep_row)
 
-        # Console
+        # Console — include bid prices so we can monitor P1 fix
         if episode % log_interval == 0:
             r_str = " ".join([f"A{i+1}:{total_rewards[i]:7.2f}" for i in range(n_agents)])
             g_str = " ".join([f"{last_log.get('green_fracs', [0]*n_agents)[i]*100:.0f}%"
                              for i in range(n_agents)])
-            print(f"Ep {episode:5d} | price={last_log.get('clearing_price', 0):6.1f} | "
-                  f"green=[{g_str}] | {r_str}")
+            b_str = " ".join([f"A{i+1}:{avg_bid_per_agent[i]:.0f}" for i in range(n_agents)])
+            price = last_log.get("clearing_price", 0)
+            print(f"Ep {episode:5d} | price={price:6.1f} | bids=[{b_str}] | "
+                  f"green=[{g_str}] | {r_str} | ent={entropy_coef:.4f}")
 
         # Checkpointing
         if episode % save_interval == 0:

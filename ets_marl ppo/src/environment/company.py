@@ -338,28 +338,33 @@ class Company:
     def get_observation_phase1(self, year, cap_t, last_clearing_price,
                                expected_price, auction_gap=0.0,
                                last_secondary_price=0.0,
-                               secondary_profit_signal=0.0):
+                               secondary_profit_signal=0.0,
+                               price_ma3=None):
         """
         Phase 1 observation (pre-auction): 18 dimensions.
 
         [0]  time (normalized)
         [1]  cap (normalized)
-        [2]  last auction price (normalized)
-        [3]  expected price (normalized)
+        [2]  3-year moving average of clearing price (normalized) — P1 fix:
+             was last_clearing_price (always 200 in degenerate case, uninformative).
+             MA3 still provides a signal even when individual prices are noisy.
+        [3]  expected price from AR(1) model (normalized)
         [4-8]  technology mix vector (5D)
         [9]  emissions (normalized)
         [10] estimated need with risk buffer
         [11] p_fail
         [12] investment experience
-        [13] auction gap
+        [13] auction gap (banked allowances)
         [14-16] construction queue (onshore, offshore, solar)
         [17] weighted emission factor (normalized)
         """
+        # P1: use 3-year moving average price if available; fall back to last price
+        price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
         return np.array([
             year / 10.0,                          # [0]
             cap_t / 10.0,                         # [1]
-            last_clearing_price / 200.0,          # [2]
+            price_signal / 200.0,                 # [2] P1: MA3 price (more stable signal)
             expected_price / 200.0,               # [3]
             self.mix[0],                          # [4] coal frac
             self.mix[1],                          # [5] gas frac

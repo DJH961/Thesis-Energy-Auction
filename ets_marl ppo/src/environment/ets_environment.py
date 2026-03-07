@@ -23,6 +23,12 @@ Action space (Phase 1): 6D continuous
 
 Action space (Phase 2): 2D continuous
   [price_multiplier, quantity]
+
+Roadmap improvements (P1–P4):
+  P1: Quadratic bid cost penalty (bid_penalty_alpha), 3-year price MA in obs
+  P2: gae_lambda/entropy handled in ppo_agent + train; n_years = 12
+  P3: Green penalty floor per agent; per-agent reward normalisation in PPOAgent
+  P4: Green investment reward shaping with episode-level decay weight
 """
 
 import numpy as np
@@ -61,6 +67,7 @@ class ETSEnvironment(gym.Env):
 
         # Episode state
         self.current_year = 0
+        self.current_episode = 0          # updated by training loop via set_episode()
         self.last_clearing_price = config["price"]["initial_expected"]
         self.expected_price = config["price"]["initial_expected"]
         self._price_history: List[float] = []
@@ -68,6 +75,9 @@ class ETSEnvironment(gym.Env):
         self._last_gaps = np.zeros(self.n_agents)
         self.holdings = np.zeros(self.n_agents)
         self.episode_done = False
+
+        # P4: shaping weight — decays from 1.0 to 0.0 over training (set by train.py)
+        self.shaping_weight = 1.0
 
         # Secondary market profit tracking (EMA per agent)
         self._secondary_profit_ema = np.zeros(self.n_agents)
@@ -80,9 +90,25 @@ class ETSEnvironment(gym.Env):
         self._phase1_invest_costs = None
         self._phase1_obs = None
         self._phase1_log = None
+        self._phase1_bid_prices = None    # P1: store bid prices for bid cost penalty
+
+        # P4: Per-agent fossil fraction history within the episode (last 3 years)
+        # Used for the fossil lock-in penalty (3 consecutive years of no greening).
+        self._fossil_frac_history: List[List[float]] = [[] for _ in range(self.n_agents)]
 
         # Logging
         self.episode_log: List[dict] = []
+
+    # ------------------------------------------------------------------
+    # Training loop interface
+    # ------------------------------------------------------------------
+
+    def set_episode(self, episode: int):
+        """Called by training loop to communicate current episode for shaping decay."""
+        self.current_episode = episode
+        reward_cfg = self.config.get("reward", {})
+        decay_ep = reward_cfg.get("shaping_decay_episode", 3000)
+        self.shaping_weight = max(0.0, 1.0 - episode / decay_ep)
 
     # ------------------------------------------------------------------
     # Reset
@@ -102,6 +128,7 @@ class ETSEnvironment(gym.Env):
         self._last_gaps = np.zeros(self.n_agents)
         self.holdings = np.zeros(self.n_agents)
         self.episode_log = []
+        self._fossil_frac_history = [[] for _ in range(self.n_agents)]
 
         self.cap_schedule.reset()
 
@@ -157,6 +184,9 @@ class ETSEnvironment(gym.Env):
             self.config["auction"]["price_min"],
             self.config["auction"]["price_max"],
         )
+        # P1: store bid prices for bid cost penalty in _compute_rewards
+        self._phase1_bid_prices = bid_actions[:, 0].copy()
+
         bids = build_bids(bid_actions)
 
         clearing_price, allocations, payments, auction_stats = market_clearing_ets(
@@ -273,7 +303,13 @@ class ETSEnvironment(gym.Env):
             self.holdings[i] = max(0.0, holdings[i] - emissions[i])
         self._last_gaps = self.holdings.copy()
 
-        # 7. Rewards (new endogenous reward function)
+        # P4: Update fossil fraction history (for lock-in penalty)
+        for i, company in enumerate(self.companies):
+            self._fossil_frac_history[i].append(company.fossil_frac)
+            if len(self._fossil_frac_history[i]) > 3:
+                self._fossil_frac_history[i].pop(0)
+
+        # 7. Rewards (raw — normalisation happens in PPOAgent)
         rewards = self._compute_rewards(
             payments, trade_costs, penalties, invest_costs,
             emissions, clearing_price
@@ -293,6 +329,8 @@ class ETSEnvironment(gym.Env):
             "green_fracs": [c.green_frac for c in self.companies],
             "tech_mixes": [c.mix.tolist() for c in self.companies],
             "holdings": self.holdings.tolist(),
+            # P1 diagnostic: log bid prices so we can check distribution
+            "bid_prices": self._phase1_bid_prices.tolist() if self._phase1_bid_prices is not None else [],
         })
         self.episode_log.append(log)
 
@@ -403,23 +441,41 @@ class ETSEnvironment(gym.Env):
         return trade_costs, trade_qtys, sec_clearing
 
     # ------------------------------------------------------------------
-    # Reward (new endogenous function per action plan §6)
+    # Reward function (P1 + P3 + P4 improvements)
     # ------------------------------------------------------------------
 
     def _compute_rewards(self, payments, trade_costs, penalties,
                          invest_costs, emissions, clearing_price):
         """
         R_i = -(α × TotalCost_i + β × EmissionsIntensity_i + γ × Penalty_i)
+              + Shaping_i
 
         TotalCost includes: auction payments, secondary market costs,
         investment costs, operational costs (all in M€).
 
-        EmissionsIntensity = total_emissions / output_MWh (normalized).
+        P1: quadratic bid cost penalty discourages ceiling-bidding.
+        P3: emissions intensity capped at initial fossil floor so agents are
+            not punished for structurally irreducible fossil fractions.
+        P4: green shaping bonuses (progress + queue + lock-in penalty).
 
-        Penalty is large for non-compliance.
+        Note: per-agent running normalisation is applied in PPOAgent.normalize_reward()
+        AFTER this function returns raw rewards.
         """
         rewards = np.zeros(self.n_agents)
         non_compliance_mult = self.config["penalty"].get("non_compliance_multiplier", 3.0)
+        reward_cfg = self.config.get("reward", {})
+
+        # P1: bid cost penalty coefficient
+        alpha_bid = self.config["auction"].get("bid_penalty_alpha", 0.002)
+
+        # P3: green penalty floor per agent (initial fossil fractions)
+        green_floor_fossil = reward_cfg.get("green_floor_fossil", [0.0] * self.n_agents)
+
+        # P4: shaping parameters
+        beta_shaping = reward_cfg.get("shaping_beta", 10.0)
+        gamma_queue = reward_cfg.get("shaping_gamma", 1.0)
+        lockin_penalty = reward_cfg.get("shaping_lockin_penalty", 2.0)
+        lockin_start = reward_cfg.get("shaping_lockin_start_episode", 200)
 
         for i, company in enumerate(self.companies):
             auction_cost = float(payments[i])
@@ -430,32 +486,65 @@ class ETSEnvironment(gym.Env):
 
             secondary_cost = max(secondary_cost, -auction_cost)
 
-            # Record spending for budget tracking
+            # P1: Quadratic bid cost penalty — makes overbidding costly.
+            # bid_penalty in M€: alpha × bid_price² (α=0.002, bid=200 → 80 M€).
+            # Normalised by the same /1000 factor as total_cost below.
+            bid_price_i = float(self._phase1_bid_prices[i]) if self._phase1_bid_prices is not None else 0.0
+            bid_penalty = alpha_bid * bid_price_i ** 2  # M€
+
+            # Record spending (auction + secondary + investment, not bid penalty
+            # since it is a training signal, not a real cash outflow)
             company.record_spending(auction_cost + max(0.0, secondary_cost) + investment_cost)
             budget_penalty = company.compute_budget_penalty()
 
             # Total cost in M€
             total_cost = (auction_cost + secondary_cost + investment_cost
-                         + operational_cost + budget_penalty)
+                         + operational_cost + budget_penalty + bid_penalty)
 
-            # Normalize cost (typical range: 0-2000 M€ per year for 10 TWh company)
+            # Normalize cost (typical range: 0-2000 M€/year for 10 TWh company)
             cost_norm = total_cost / 1000.0
 
-            # Emissions intensity: tCO2/MWh normalized (max ~0.82 for pure coal)
-            emissions_intensity = company.weighted_emission_factor / 0.82
+            # P3: Emissions intensity capped so agents are not penalised for
+            # their structurally irreducible fossil fraction.
+            # Initial floor = initial fossil fraction per agent.
+            fossil_floor_i = green_floor_fossil[i] if i < len(green_floor_fossil) else 0.0
+            # Compute the emission factor at the initial fossil floor
+            # (weighted EF that would correspond to max-penalisable fossil level)
+            initial_ef_at_floor = fossil_floor_i * max(company.emission_factors[~company.is_green])
+            # Actual emissions intensity, clipped so nothing below the floor contributes
+            # (i.e., A4 gets zero green penalty if its fossil_frac ≤ floor)
+            penalisable_ef = max(0.0, company.weighted_emission_factor - initial_ef_at_floor)
+            emissions_intensity = penalisable_ef / 0.82  # normalised to [0,1] scale
 
-            # Penalty component (scaled harshly)
+            # Penalty component (compliance non-compliance, scaled harshly)
             penalty_norm = penalty_cost * non_compliance_mult / 1000.0
 
-            # Green improvement bonus (small, for learning signal)
-            green_delta = company.green_frac - company.prev_green_frac
-            green_bonus = max(0.0, green_delta) * 2.0
+            # P4: Green investment shaping rewards
+            # a) Progress bonus: immediate reward for any green fraction increase
+            green_delta = max(0.0, company.green_frac - company.prev_green_frac)
+            shaping = beta_shaping * green_delta * self.shaping_weight
+
+            # b) Queue progress reward: small bonus per project under construction
+            n_queue_active = sum(
+                1 for item in company._construction_queue
+                if item.get("frac_delta", 0) > 0
+            )
+            shaping += gamma_queue * n_queue_active * 0.1 * self.shaping_weight
+
+            # c) Fossil lock-in penalty: activated after warm-up period.
+            # If fossil_frac unchanged for 3 consecutive years, penalise stagnation.
+            if self.current_episode >= lockin_start and self.shaping_weight > 0:
+                hist = self._fossil_frac_history[i]
+                if len(hist) >= 3:
+                    unchanged = all(abs(f - hist[-1]) < 1e-4 for f in hist[-2:])
+                    if unchanged:
+                        shaping -= lockin_penalty * self.shaping_weight
 
             rewards[i] = -(
                 company.w_cost * cost_norm
                 + company.w_green * emissions_intensity
                 + penalty_norm
-            ) + green_bonus
+            ) + shaping
 
         return rewards
 
@@ -463,9 +552,21 @@ class ETSEnvironment(gym.Env):
     # Observations
     # ------------------------------------------------------------------
 
+    def _compute_price_ma3(self) -> float:
+        """
+        P1: 3-year moving average of clearing price.
+        Falls back to last_clearing_price when history is short.
+        Provides a more stable price signal than a single noisy observation.
+        """
+        if not self._price_history:
+            return self.last_clearing_price
+        window = self._price_history[-3:]
+        return float(np.mean(window))
+
     def _get_obs_phase1(self) -> np.ndarray:
         """Phase 1 observations (18 dim) for all agents."""
         cap_t = self.cap_schedule.get_cap(self.current_year)
+        price_ma3 = self._compute_price_ma3()  # P1: 3-year MA price
         obs = np.stack([
             c.get_observation_phase1(
                 year=self.current_year,
@@ -475,6 +576,7 @@ class ETSEnvironment(gym.Env):
                 auction_gap=self._last_gaps[i],
                 last_secondary_price=self.last_secondary_price,
                 secondary_profit_signal=self._secondary_profit_ema[i],
+                price_ma3=price_ma3,    # P1: replaces last_clearing_price in obs[2]
             )
             for i, c in enumerate(self.companies)
         ])
