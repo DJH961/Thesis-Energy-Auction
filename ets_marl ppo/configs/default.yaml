@@ -81,6 +81,9 @@ auction:
 trading:
   enabled: true
   transaction_cost: 0.5
+  spread_tolerance: 0.07      # P8: ±7% of clearing_price — allows trades within this spread
+  banking_holding_cost: 0.01  # P8: €/t/year cost on excess banked allowances
+  excess_bank_ratio: 1.5      # P8: bank above this × annual_need incurs holding cost
 
 budget:
   annual_budgets: [640.0, 426.0, 223.0, 79.0]
@@ -103,7 +106,7 @@ reward:
   # P3: Per-agent running reward normalisation (EMA alpha=0.01)
   normalizer_alpha: 0.01
   clip_min: -10.0
-  clip_max: 2.0
+  clip_max: 5.0    # relaxed from 2.0 — allow good trading years to stand out
   # P3: Green penalty floor = initial fossil fractions [A1..A4]
   green_floor_fossil: [0.80, 0.60, 0.30, 0.10]
   # P4: Shaping
@@ -154,6 +157,47 @@ ppo:
   normalize_advantages: true
   log_std_min: -2.0
   log_std_max: 1.0
+
+# ----------------------------------------------------------
+# P5: Demand & Emission Uncertainty
+# ----------------------------------------------------------
+uncertainty:
+  enabled: true
+  sigma_demand: 0.07        # annual emission shock std (~7% variation, EU power sector data)
+  corr_rho: 0.40            # cross-agent correlation (0=independent, 1=fully correlated)
+
+# ----------------------------------------------------------
+# P6: Construction Delay Jitter & Capacity Uncertainty
+# ----------------------------------------------------------
+construction_jitter:
+  enabled: true
+  # Poisson means for each tech [coal, gas, onshore_wind, offshore_wind, solar]
+  # Replaces fixed deploy_delays; col/gas kept for completeness (not buildable)
+  poisson_lambdas: [1.0, 1.0, 2.0, 3.0, 1.5]
+  p_cancel: 0.03            # annual cancellation probability per queued project
+  recovery_rate: 0.40       # fraction of already-spent capex recovered on cancellation
+  # CF noise std per tech (0 for dispatchable): [coal, gas, onshore, offshore, solar]
+  cf_sigma: [0.0, 0.0, 0.08, 0.08, 0.05]
+
+# ----------------------------------------------------------
+# P7: Warm-Start Pipeline
+# ----------------------------------------------------------
+warm_start:
+  enabled: true
+  # Seed price history with this many synthetic prices before RL episode starts
+  n_burnin_prices: 2
+  # Seed initial bank as a uniform random multiple of annual_need
+  bank_seed_min: 0.5
+  bank_seed_max: 2.0
+  # Mean number of in-flight projects per green tech at reset (Poisson)
+  queue_mu_onshore: 1.5
+  queue_mu_offshore: 0.5
+  queue_mu_solar: 2.0
+
+# ----------------------------------------------------------
+# P8: Secondary Market Depth
+# ----------------------------------------------------------
+# (updates to existing 'trading' section below)
 
 logging:
   log_interval: 10

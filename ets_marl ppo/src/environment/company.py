@@ -14,6 +14,15 @@ Key features:
   - Operational costs differ by technology (fuel + O&M)
   - Decommissioning costs when retiring fossil capacity
   - Risk model for investment failure
+
+Roadmap improvements (P6):
+  - Delay jitter: construction delays drawn from Poisson(λ_tech) instead of fixed
+  - Cancellation risk: projects can be cancelled mid-queue (CapEx partially recovered)
+  - CF noise: capacity factor noise affects realized emissions each year
+
+Roadmap improvements (P8):
+  - Phase 1 observation includes secondary market price and volume signals
+  - Phase 2 observation includes emission shock for Phase 2 decisions
 """
 
 import numpy as np
@@ -23,6 +32,7 @@ from typing import List, Dict, Optional
 N_TECHS = 5
 TECH_NAMES = ["coal", "gas", "onshore_wind", "offshore_wind", "solar"]
 TECH_IDX = {name: i for i, name in enumerate(TECH_NAMES)}
+BUILDABLE_INDICES = [2, 3, 4]  # onshore_wind, offshore_wind, solar
 
 
 class Company:
@@ -46,7 +56,7 @@ class Company:
         self.emission_factors = np.array(tech_cfg["emission_factors"], dtype=np.float64)  # tCO2/MWh
         self.capex = np.array(tech_cfg["capex"], dtype=np.float64)  # €/kW
         self.capacity_factors = np.array(tech_cfg["capacity_factors"], dtype=np.float64)
-        self.deploy_delays = np.array(tech_cfg["deploy_delays"], dtype=np.int32)  # years
+        self.deploy_delays = np.array(tech_cfg["deploy_delays"], dtype=np.int32)  # years (base)
         self.operational_costs = np.array(tech_cfg["operational_costs"], dtype=np.float64)  # €/MWh
         self.decommission_costs = np.array(tech_cfg["decommission_costs"], dtype=np.float64)  # €/kW
         self.is_green = np.array(tech_cfg["is_green"], dtype=bool)
@@ -76,15 +86,28 @@ class Company:
         self.overspend_coef = budget_cfg.get("overspend_penalty_coef", 2.0)
         self.budget_spent_this_year = 0.0
 
+        # P6: Construction jitter config
+        jitter_cfg = config.get("construction_jitter", {})
+        self._jitter_enabled = jitter_cfg.get("enabled", False)
+        poisson_lambdas = jitter_cfg.get("poisson_lambdas", [1.0, 1.0, 2.0, 3.0, 1.5])
+        self._jitter_lambdas = np.array(poisson_lambdas, dtype=np.float64)
+        self._p_cancel = jitter_cfg.get("p_cancel", 0.03)
+        self._recovery_rate = jitter_cfg.get("recovery_rate", 0.40)
+        cf_sigma = jitter_cfg.get("cf_sigma", [0.0, 0.0, 0.08, 0.08, 0.05])
+        self._cf_sigma = np.array(cf_sigma, dtype=np.float64)
+
         # State: technology mix vector [coal, gas, onshore, offshore, solar]
         self.mix = np.array(initial_mix, dtype=np.float64)
         assert abs(self.mix.sum() - 1.0) < 1e-6, f"Mix must sum to 1.0, got {self.mix.sum()}"
         self.prev_green_frac = self.green_frac
 
-        # Construction queue: list of {tech_idx, frac_delta, completion_year, success}
+        # Construction queue: list of {tech_idx, frac_delta, completion_year, success, capex_spent}
         self._construction_queue: List[Dict] = []
         self._consecutive_successes = 0
         self.year_cost = 0.0
+
+        # P6: track capex spent per queued project (for partial recovery on cancellation)
+        # Stored inside each queue item as "capex_spent"
 
     # ------------------------------------------------------------------
     # Properties
@@ -108,9 +131,48 @@ class Company:
     # ------------------------------------------------------------------
 
     def compute_emissions(self) -> float:
-        """Annual emissions in Mt CO2."""
-        # output_mwh × Σ(mix_T × EF_T) → MWh × tCO2/MWh = tCO2 → /1e6 = Mt
+        """Annual emissions in Mt CO2 (deterministic from current mix)."""
         return self.output_mwh * self.weighted_emission_factor / 1e6
+
+    def compute_emissions_with_cf_noise(self, cf_noise: np.ndarray) -> float:
+        """
+        P6: Annual emissions with capacity factor noise applied to green technologies.
+
+        When green CF is lower than expected, fossil backup fills the gap → more emissions.
+        When green CF is higher, fossil is displaced → fewer emissions.
+
+        cf_noise : array of shape (5,)
+            Per-technology CF noise factor. Non-zero only for green techs.
+            η ~ N(0, σ_cf) per tech; green output scales by (1 + η_t).
+
+        Returns emissions in Mt CO2. Does NOT modify mix permanently.
+        """
+        if cf_noise is None or np.all(cf_noise == 0):
+            return self.compute_emissions()
+
+        # Apply CF noise to green tech fractions
+        realized_mix = self.mix.copy()
+        for t in range(N_TECHS):
+            if self.is_green[t]:
+                realized_mix[t] = self.mix[t] * max(0.0, 1.0 + cf_noise[t])
+
+        # Fossil fills deficit (or is displaced by green surplus)
+        green_realized = realized_mix[self.is_green].sum()
+        fossil_target = max(0.0, 1.0 - green_realized)
+        fossil_actual = realized_mix[~self.is_green].sum()
+        if fossil_actual > 1e-10:
+            realized_mix[~self.is_green] *= fossil_target / fossil_actual
+        else:
+            # No fossil; cap green at 1.0
+            if green_realized > 1.0:
+                realized_mix[self.is_green] /= green_realized
+
+        realized_mix = np.clip(realized_mix, 0.0, 1.0)
+        s = realized_mix.sum()
+        if s > 1e-6:
+            realized_mix /= s
+
+        return float(self.output_mwh * np.dot(realized_mix, self.emission_factors) / 1e6)
 
     def compute_risk_factor(self) -> float:
         return self._compute_p_fail()
@@ -124,15 +186,11 @@ class Company:
 
     def compute_operational_cost(self) -> float:
         """Annual operational cost in M€ (fuel + O&M, excl. ETS)."""
-        # output_mwh × Σ(mix_T × opex_T) → MWh × €/MWh = € → /1e6 = M€
         return self.output_mwh * float(np.dot(self.mix, self.operational_costs)) / 1e6
 
     def compute_ets_fuel_cost(self, ets_price: float) -> float:
         """Annual ETS cost in M€ based on current mix and carbon price."""
-        # emissions_Mt × price_€/t × 1e6 → M€... actually:
-        # emissions in Mt = millions of tonnes, price in €/t
-        # cost = Mt × 1e6 t/Mt × €/t = M€ × 1e0... let's be explicit:
-        return self.compute_emissions() * ets_price  # Mt × €/t = M€ (since Mt=1e6t, €/t, result is M€)
+        return self.compute_emissions() * ets_price
 
     # ------------------------------------------------------------------
     # Investment (greening-only)
@@ -199,11 +257,9 @@ class Company:
         total_cost : float
             Investment + decommissioning cost in M€ (paid upfront).
         """
-        # Map buildable choice to actual tech index
-        buildable_indices = [2, 3, 4]  # onshore_wind, offshore_wind, solar
-        if tech_choice < 0 or tech_choice >= len(buildable_indices):
+        if tech_choice < 0 or tech_choice >= len(BUILDABLE_INDICES):
             tech_choice = 0
-        tech_idx = buildable_indices[int(tech_choice)]
+        tech_idx = BUILDABLE_INDICES[int(tech_choice)]
 
         frac = float(np.clip(invest_frac, 0.0, self.max_invest_frac))
         if frac < 1e-6:
@@ -220,7 +276,6 @@ class Company:
         # Decommission cost: retire highest-emission fossil first
         decom_cost = 0.0
         frac_to_retire = frac
-        # Retire coal first, then gas
         for fossil_idx in [0, 1]:  # coal, gas
             if frac_to_retire <= 0:
                 break
@@ -241,16 +296,48 @@ class Company:
         else:
             self._consecutive_successes = 0
 
-        # Add to construction queue
-        delay = self.deploy_delays[tech_idx]
+        # P6: Delay jitter — draw from Poisson(λ_tech) instead of fixed delay
+        if self._jitter_enabled:
+            lam = float(self._jitter_lambdas[tech_idx])
+            delay = int(self.rng.poisson(lam))
+            delay = min(delay, int(lam) + 3)  # cap at λ + 3
+        else:
+            delay = int(self.deploy_delays[tech_idx])
+
         self._construction_queue.append({
             "tech_idx": tech_idx,
             "frac_delta": frac if success else 0.0,
             "completion_year": current_year + delay,
             "success": success,
+            "capex_spent": total_cost,
         })
 
         return total_cost
+
+    def cancel_queued_projects(self, rng) -> float:
+        """
+        P6: Probabilistic cancellation of in-flight projects.
+
+        Each queued project faces p_cancel chance of cancellation each year.
+        On cancellation, a fraction (recovery_rate) of capex already spent is
+        returned (negative cost = recovered funds).
+
+        Returns recovered_funds in M€ (positive value = money returned).
+        """
+        if not self._jitter_enabled or self._p_cancel <= 0:
+            return 0.0
+
+        remaining = []
+        recovered = 0.0
+        for item in self._construction_queue:
+            if rng.random() < self._p_cancel:
+                # Project cancelled; partial capex recovery
+                recovered += item.get("capex_spent", 0.0) * self._recovery_rate
+                # frac_delta lost
+            else:
+                remaining.append(item)
+        self._construction_queue = remaining
+        return recovered
 
     def apply_matured_investments(self, current_year: int):
         """Apply completed construction projects. Retire fossil to make room."""
@@ -333,8 +420,13 @@ class Company:
         shortfall = max(0.0, self.compute_emissions() - allowances_held)
         return shortfall * self.penalty_rate
 
+    def settle_compliance_realized(self, allowances_held: float, realized_emissions: float) -> float:
+        """P5: Settle compliance against realized (shocked) emissions."""
+        shortfall = max(0.0, realized_emissions - allowances_held)
+        return shortfall * self.penalty_rate
+
     # ------------------------------------------------------------------
-    # Observation — Phase 1: 18D, Phase 2: 21D
+    # Observations — Phase 1: 20D base (+6 opponent) | Phase 2: +4
     # ------------------------------------------------------------------
 
     def get_observation_phase1(self, year, cap_t, last_clearing_price,
@@ -342,11 +434,12 @@ class Company:
                                last_secondary_price=0.0,
                                secondary_profit_signal=0.0,
                                price_ma3=None,
-                               opponent_obs=None):
+                               opponent_obs=None,
+                               last_secondary_volume=0.0):
         """
-        Phase 1 observation (pre-auction): 18D base + 2*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 20D base + 2*(N-1) opponent dims.
 
-        Base 18 dims:
+        Base 20 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
@@ -359,9 +452,11 @@ class Company:
         [13] auction gap (banked allowances)
         [14-16] construction queue (onshore, offshore, solar)
         [17] weighted emission factor (normalized)
+        [18] last secondary market price (normalized)  -- P8
+        [19] last secondary market volume (normalized) -- P8
 
         Opponent dims (if opponent_modeling enabled):
-        [18, 19, 20, 21, 22, 23] = (bid_j/200, green_j) for each other agent j
+        [20..25] = (bid_j/200, green_j) for each other agent j
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
@@ -384,34 +479,45 @@ class Company:
             queue[1],                             # [15] offshore under construction
             queue[2],                             # [16] solar under construction
             self.weighted_emission_factor,        # [17] avg EF
+            last_secondary_price / 200.0,         # [18] P8: secondary price signal
+            last_secondary_volume / 10.0,         # [19] P8: secondary volume signal
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
         return base
 
     def get_observation_phase2(self, obs_phase1, allocation,
-                                clearing_price, emissions, banked=0.0):
+                                clearing_price, emissions, banked=0.0,
+                                emission_shock=0.0):
         """
-        Phase 2 observation (post-auction): 21 dimensions.
-        Appends auction results to phase 1 obs.
+        Phase 2 observation (post-auction): 24D (with 4-agent opponent modeling).
+        Appends auction results + P5 emission shock to phase 1 obs.
+
+        Extra dims:
+        [base+0] allocation / 5
+        [base+1] clearing_price / 200
+        [base+2] (banked + allocation - emissions) / 5
+        [base+3] emission_shock (realized deviation from base need)  -- P5
         """
         extra = np.array([
-            allocation / 5.0,                              # [18]
-            clearing_price / 200.0,                        # [19]
-            (banked + allocation - emissions) / 5.0,       # [20]
+            allocation / 5.0,                              # [base+0]
+            clearing_price / 200.0,                        # [base+1]
+            (banked + allocation - emissions) / 5.0,       # [base+2]
+            float(emission_shock),                         # [base+3] P5
         ], dtype=np.float32)
         return np.concatenate([obs_phase1, extra])
 
     @property
     def obs_dim_phase1(self) -> int:
-        """18 base dims + 2*(N-1) opponent dims when opponent modeling is enabled."""
+        """20 base dims + 2*(N-1) opponent dims when opponent modeling is enabled."""
         if self._opponent_modeling and self._n_agents > 1:
-            return 18 + 2 * (self._n_agents - 1)
-        return 18
+            return 20 + 2 * (self._n_agents - 1)
+        return 20
 
     @property
     def obs_dim_phase2(self) -> int:
-        return self.obs_dim_phase1 + 3
+        """obs_dim_phase1 + 4 (allocation, price, gap, emission_shock)."""
+        return self.obs_dim_phase1 + 4
 
     # ------------------------------------------------------------------
     # Reset

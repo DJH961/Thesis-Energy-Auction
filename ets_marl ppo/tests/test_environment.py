@@ -279,7 +279,8 @@ def test_year_log_keys():
     for key in ["year", "cap", "tnac", "auction_volume", "clearing_price",
                 "allocations", "penalties", "rewards", "green_fracs",
                 "tech_mixes", "holdings", "invest_costs",
-                "bank_start", "shortfalls", "delta_greens", "queue_sizes", "bid_prices"]:
+                "bank_start", "shortfalls", "delta_greens", "queue_sizes", "bid_prices",
+                "emission_shocks", "cf_shocks", "cancellations"]:  # P5/P6
         assert key in log, f"Missing key in year_log: {key}"
 
 
@@ -310,3 +311,96 @@ def test_investment_costs_realistic():
     cost = c.compute_investment_cost(tech_idx=2, frac_delta=0.03)  # onshore wind
     assert cost > 50, f"Investment cost ({cost:.1f} M€) is too low — should be >50 M€"
     assert cost < 500, f"Investment cost ({cost:.1f} M€) seems too high"
+
+
+# ---------------------------------------------------------------------------
+# Test 13: P5 — Emission shocks produce variance across episodes
+# ---------------------------------------------------------------------------
+
+def test_p5_emission_variance():
+    """With uncertainty enabled, realized emissions should vary across episodes."""
+    env = load_env()
+    emissions_ep = []
+    for ep in range(20):
+        env.reset(seed=ep * 999)
+        n_agents = env.n_agents
+        auction_actions = np.random.uniform(
+            [20.0, 0.0, 0.0, -1.0, -1.0, -1.0],
+            [200.0, 5.0, 0.0, 1.0, 1.0, 1.0],
+            size=(n_agents, 6)
+        ).astype(np.float32)
+        _, log = env.step_auction(auction_actions)
+        emissions_ep.append(log["emission_shocks"][0])
+
+    std = np.std(emissions_ep)
+    assert std > 1e-6, "Emission shocks show no variance — P5 uncertainty may not be active"
+
+
+# ---------------------------------------------------------------------------
+# Test 14: P6 — CF noise method is numerically stable
+# ---------------------------------------------------------------------------
+
+def test_p6_cf_noise_stability():
+    """compute_emissions_with_cf_noise should return positive finite result."""
+    env = load_env()
+    env.reset()
+    import numpy as np
+    cf_noise = np.array([0.0, 0.0, -0.15, 0.10, -0.05])
+    for company in env.companies:
+        e_base = company.compute_emissions()
+        e_noisy = company.compute_emissions_with_cf_noise(cf_noise)
+        assert e_noisy > 0, f"CF-noisy emissions non-positive: {e_noisy}"
+        assert np.isfinite(e_noisy), f"CF-noisy emissions non-finite: {e_noisy}"
+        # Lower green CF → more fossil → more emissions (or equal for 100% green)
+        # Just check it's in a reasonable range
+        assert e_noisy < e_base * 3.0, "CF noise causing implausible emission spike"
+
+
+# ---------------------------------------------------------------------------
+# Test 15: P7 — Warm-start seeds non-zero bank
+# ---------------------------------------------------------------------------
+
+def test_p7_warm_start_bank():
+    """After reset with warm_start enabled, all agents should have bank > 0."""
+    env = load_env()
+    env.reset(seed=42)
+    for i, h in enumerate(env.holdings):
+        assert h > 0, f"Agent {i+1} has zero bank after warm-start reset: holdings={h}"
+
+
+# ---------------------------------------------------------------------------
+# Test 16: P7 — Warm-start seeds price history
+# ---------------------------------------------------------------------------
+
+def test_p7_price_history_seeded():
+    """After reset with warm_start, price history should be non-empty."""
+    env = load_env()
+    env.reset(seed=42)
+    assert len(env._price_history) > 0, "Price history empty after warm-start reset"
+
+
+# ---------------------------------------------------------------------------
+# Test 17: P8 — obs dims updated correctly (20 base, +2*(N-1) opp)
+# ---------------------------------------------------------------------------
+
+def test_p8_obs_dims():
+    """Phase 1 obs should be 26D (20 base + 6 opponent) with 4-agent opponent modeling."""
+    env = load_env()
+    obs, _ = env.reset()
+    n_agents = env.config["companies"]["n_agents"]
+    opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
+    expected_p1 = 20 + (2 * (n_agents - 1) if opp_enabled else 0)
+    expected_p2 = expected_p1 + 4
+    assert obs.shape == (n_agents, expected_p1), (
+        f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
+    )
+
+    auction_actions = np.random.uniform(
+        [20.0, 0.0, 0.0, -1.0, -1.0, -1.0],
+        [200.0, 5.0, 0.05, 1.0, 1.0, 1.0],
+        size=(n_agents, 6)
+    ).astype(np.float32)
+    obs2, _ = env.step_auction(auction_actions)
+    assert obs2.shape == (n_agents, expected_p2), (
+        f"Phase 2 obs: expected ({n_agents}, {expected_p2}), got {obs2.shape}"
+    )

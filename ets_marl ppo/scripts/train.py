@@ -152,7 +152,7 @@ def train_one_seed(config: dict, seed: int):
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} agents, PPO, two-phase")
     print(f"Technology-specific mix | Real CapEx | Construction queues")
-    print(f"P1-P4 roadmap improvements active")
+    print(f"P1-P8 roadmap improvements active")
     print(f"{'='*60}")
 
     env = ETSEnvironment(config, seed=seed)
@@ -193,7 +193,9 @@ def train_one_seed(config: dict, seed: int):
                       f"trade_qty_A{i+1}", f"trade_cost_A{i+1}", f"green_frac_A{i+1}",
                       f"delta_green_A{i+1}", f"shortfall_A{i+1}", f"penalty_A{i+1}",
                       f"reward_A{i+1}", f"holdings_A{i+1}", f"invest_cost_A{i+1}",
-                      f"bid_price_A{i+1}", f"queue_size_A{i+1}"]
+                      f"bid_price_A{i+1}", f"queue_size_A{i+1}",
+                      f"emission_shock_A{i+1}", f"cf_shock_A{i+1}",  # P5/P6
+                      f"cancellation_A{i+1}"]                         # P6
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -284,6 +286,9 @@ def train_one_seed(config: dict, seed: int):
                 yr_row[f"invest_cost_A{i+1}"] = _get("invest_costs")
                 yr_row[f"bid_price_A{i+1}"] = _get("bid_prices")
                 yr_row[f"queue_size_A{i+1}"] = _get("queue_sizes")
+                yr_row[f"emission_shock_A{i+1}"] = _get("emission_shocks")   # P5
+                yr_row[f"cf_shock_A{i+1}"] = _get("cf_shocks")               # P6
+                yr_row[f"cancellation_A{i+1}"] = _get("cancellations")       # P6
             yr_writer.writerow(yr_row)
 
             obs1 = obs1_next
