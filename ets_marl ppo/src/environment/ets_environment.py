@@ -664,6 +664,8 @@ class ETSEnvironment(gym.Env):
         P3: emissions intensity capped at initial fossil floor.
         P4: green shaping bonuses (progress + queue + lock-in).
         P8: banking holding cost on excess allowances.
+        Fix 2: trading profit shaping bonus for net secondary-market revenue.
+        Fix 3: positive bank-value signal (complementary to P8's excess-bank penalty).
 
         Note: per-agent running normalisation applied in PPOAgent.normalize_reward()
         AFTER this function returns raw rewards.
@@ -679,6 +681,8 @@ class ETSEnvironment(gym.Env):
         gamma_queue = reward_cfg.get("shaping_gamma", 1.0)
         lockin_penalty = reward_cfg.get("shaping_lockin_penalty", 2.0)
         lockin_start = reward_cfg.get("shaping_lockin_start_episode", 200)
+        trading_bonus_weight = reward_cfg.get("shaping_trading_weight", 0.5)  # Fix 2
+        bank_weight = reward_cfg.get("shaping_bank_weight", 0.1)              # Fix 3
 
         # P8: banking holding cost parameters
         holding_cost_rate = trading_cfg.get("banking_holding_cost", 0.0)
@@ -686,7 +690,8 @@ class ETSEnvironment(gym.Env):
 
         for i, company in enumerate(self.companies):
             auction_cost = float(payments[i])
-            secondary_cost = float(trade_costs[i])
+            raw_secondary = float(trade_costs[i])      # Fix 2: capture before cap
+            secondary_cost = raw_secondary
             penalty_cost = float(penalties[i])
             investment_cost = float(invest_costs[i])
             operational_cost = company.compute_operational_cost()
@@ -729,6 +734,14 @@ class ETSEnvironment(gym.Env):
                     unchanged = all(abs(f - hist[-1]) < 1e-4 for f in hist[-2:])
                     if unchanged:
                         shaping -= lockin_penalty * self.shaping_weight
+
+            # Fix 2: reward net revenue from secondary market (sellers who trade profitably)
+            trading_profit = max(0.0, -raw_secondary)  # positive when agent nets revenue
+            shaping += trading_bonus_weight * (trading_profit / 1000.0) * self.shaping_weight
+
+            # Fix 3: small positive signal for holding a healthy allowance bank
+            bank_value = self.holdings[i] * clearing_price / 1e6  # M€ equivalent
+            shaping += bank_weight * (bank_value / 1000.0) * self.shaping_weight
 
             rewards[i] = -(
                 company.w_cost * cost_norm

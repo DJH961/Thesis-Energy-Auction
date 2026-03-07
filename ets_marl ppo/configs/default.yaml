@@ -115,6 +115,10 @@ reward:
   shaping_lockin_penalty: 2.0
   shaping_decay_episode: 3000
   shaping_lockin_start_episode: 200
+  # Fix 2: bonus for net secondary-market revenue (scale with cost_norm ÷1000)
+  shaping_trading_weight: 0.5
+  # Fix 3: small positive signal for banking allowances (complements P8 holding cost)
+  shaping_bank_weight: 0.1
 
 # ----------------------------------------------------------
 # Opponent modeling (Option C)
