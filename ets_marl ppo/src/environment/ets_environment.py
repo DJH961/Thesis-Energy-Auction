@@ -6,13 +6,13 @@ energy mix, real-data-grounded investment costs, and construction queues.
 
 Each year is split into two decision phases:
   Phase 1 (Auction + Investment):
-    - Agents observe market state (18 dim)
+    - Agents observe market state (18+2*(N-1) dim with opponent modeling)
     - Decide: [bid_price, quantity, invest_frac, tech_choice_logit0..2]
     - Auction clears, investments are planned
-    - Returns enriched observation (21 dim) with auction results
+    - Returns enriched observation (phase1_dim+3) with auction results
 
   Phase 2 (Secondary Market):
-    - Agents observe auction results (21 dim)
+    - Agents observe auction results (phase1_dim+3 dim)
     - Decide: [secondary_price, secondary_quantity]
     - Secondary market clears, compliance is checked
     - Returns reward and next year's Phase 1 observation
@@ -24,11 +24,14 @@ Action space (Phase 1): 6D continuous
 Action space (Phase 2): 2D continuous
   [price_multiplier, quantity]
 
-Roadmap improvements (P1–P4):
-  P1: Quadratic bid cost penalty (bid_penalty_alpha), 3-year price MA in obs
+Roadmap improvements (P1-P4):
+  P1: 3-year price MA in obs; reserve_price floor
   P2: gae_lambda/entropy handled in ppo_agent + train; n_years = 12
   P3: Green penalty floor per agent; per-agent reward normalisation in PPOAgent
   P4: Green investment reward shaping with episode-level decay weight
+  Opponent modeling (Option C): Phase 1 obs augmented with last-episode
+    (bid/200, green_frac) for each other agent (+6 dims for 4 agents).
+  Agent cycling (Option A): handled in train.py.
 """
 
 import numpy as np
@@ -96,6 +99,17 @@ class ETSEnvironment(gym.Env):
         # Used for the fossil lock-in penalty (3 consecutive years of no greening).
         self._fossil_frac_history: List[List[float]] = [[] for _ in range(self.n_agents)]
 
+        # Opponent modeling (Option C): store last episode's avg bid and green_frac
+        # per agent; used to augment Phase 1 observations.
+        opp_enabled = config.get("opponent_modeling", {}).get("enabled", False)
+        self._opponent_modeling = opp_enabled
+        self._last_episode_bids = np.zeros(self.n_agents)
+        self._last_episode_greens = np.array([
+            c.green_frac for c in self.companies
+        ])
+        self._current_episode_bid_sum = np.zeros(self.n_agents)
+        self._current_episode_bid_count = np.zeros(self.n_agents, dtype=int)
+
         # Logging
         self.episode_log: List[dict] = []
 
@@ -118,6 +132,18 @@ class ETSEnvironment(gym.Env):
         if seed is not None:
             self._seed = seed
             self.rng = np.random.default_rng(seed)
+
+        # Opponent modeling: finalise last episode's data before resetting companies
+        if self._opponent_modeling and self._current_episode_bid_count.sum() > 0:
+            mask = self._current_episode_bid_count > 0
+            self._last_episode_bids = np.where(
+                mask,
+                self._current_episode_bid_sum / np.maximum(self._current_episode_bid_count, 1),
+                self._last_episode_bids,
+            )
+            self._last_episode_greens = np.array([c.green_frac for c in self.companies])
+        self._current_episode_bid_sum = np.zeros(self.n_agents)
+        self._current_episode_bid_count = np.zeros(self.n_agents, dtype=int)
 
         self.current_year = 0
         self.episode_done = False
@@ -163,6 +189,10 @@ class ETSEnvironment(gym.Env):
         year = self.current_year
         log = {"year": year}
 
+        # Capture holdings at start of year for diagnostics (before allocations)
+        bank_start = self.holdings.copy()
+        log["bank_start"] = bank_start.tolist()
+
         # 1. Apply matured investments + reset annual budget
         for company in self.companies:
             company.apply_matured_investments(year)
@@ -184,8 +214,11 @@ class ETSEnvironment(gym.Env):
             self.config["auction"]["price_min"],
             self.config["auction"]["price_max"],
         )
-        # P1: store bid prices for bid cost penalty in _compute_rewards
+        # Store bid prices for diagnostics and opponent modeling
         self._phase1_bid_prices = bid_actions[:, 0].copy()
+        if self._opponent_modeling:
+            self._current_episode_bid_sum += self._phase1_bid_prices
+            self._current_episode_bid_count += 1
 
         bids = build_bids(bid_actions)
 
@@ -315,6 +348,12 @@ class ETSEnvironment(gym.Env):
             emissions, clearing_price
         )
 
+        # Compute per-agent shortfall for diagnostics
+        shortfalls = np.array([
+            max(0.0, emissions[i] - max(0.0, self.holdings[i] + allocations[i] + trade_qtys[i]))
+            for i in range(self.n_agents)
+        ])
+
         # 8. Log
         log.update({
             "allocations": allocations.tolist(),
@@ -329,8 +368,10 @@ class ETSEnvironment(gym.Env):
             "green_fracs": [c.green_frac for c in self.companies],
             "tech_mixes": [c.mix.tolist() for c in self.companies],
             "holdings": self.holdings.tolist(),
-            # P1 diagnostic: log bid prices so we can check distribution
+            "shortfalls": shortfalls.tolist(),
             "bid_prices": self._phase1_bid_prices.tolist() if self._phase1_bid_prices is not None else [],
+            "delta_greens": [c.green_frac - c.prev_green_frac for c in self.companies],
+            "queue_sizes": [len(c._construction_queue) for c in self.companies],
         })
         self.episode_log.append(log)
 
@@ -441,19 +482,18 @@ class ETSEnvironment(gym.Env):
         return trade_costs, trade_qtys, sec_clearing
 
     # ------------------------------------------------------------------
-    # Reward function (P1 + P3 + P4 improvements)
+    # Reward function (P3 + P4 improvements)
     # ------------------------------------------------------------------
 
     def _compute_rewards(self, payments, trade_costs, penalties,
                          invest_costs, emissions, clearing_price):
         """
-        R_i = -(α × TotalCost_i + β × EmissionsIntensity_i + γ × Penalty_i)
+        R_i = -(alpha x TotalCost_i + beta x EmissionsIntensity_i + gamma x Penalty_i)
               + Shaping_i
 
         TotalCost includes: auction payments, secondary market costs,
         investment costs, operational costs (all in M€).
 
-        P1: quadratic bid cost penalty discourages ceiling-bidding.
         P3: emissions intensity capped at initial fossil floor so agents are
             not punished for structurally irreducible fossil fractions.
         P4: green shaping bonuses (progress + queue + lock-in penalty).
@@ -464,9 +504,6 @@ class ETSEnvironment(gym.Env):
         rewards = np.zeros(self.n_agents)
         non_compliance_mult = self.config["penalty"].get("non_compliance_multiplier", 3.0)
         reward_cfg = self.config.get("reward", {})
-
-        # P1: bid cost penalty coefficient
-        alpha_bid = self.config["auction"].get("bid_penalty_alpha", 0.002)
 
         # P3: green penalty floor per agent (initial fossil fractions)
         green_floor_fossil = reward_cfg.get("green_floor_fossil", [0.0] * self.n_agents)
@@ -486,20 +523,13 @@ class ETSEnvironment(gym.Env):
 
             secondary_cost = max(secondary_cost, -auction_cost)
 
-            # P1: Quadratic bid cost penalty — makes overbidding costly.
-            # bid_penalty in M€: alpha × bid_price² (α=0.002, bid=200 → 80 M€).
-            # Normalised by the same /1000 factor as total_cost below.
-            bid_price_i = float(self._phase1_bid_prices[i]) if self._phase1_bid_prices is not None else 0.0
-            bid_penalty = alpha_bid * bid_price_i ** 2  # M€
-
-            # Record spending (auction + secondary + investment, not bid penalty
-            # since it is a training signal, not a real cash outflow)
+            # Record spending (auction + secondary + investment)
             company.record_spending(auction_cost + max(0.0, secondary_cost) + investment_cost)
             budget_penalty = company.compute_budget_penalty()
 
             # Total cost in M€
             total_cost = (auction_cost + secondary_cost + investment_cost
-                         + operational_cost + budget_penalty + bid_penalty)
+                         + operational_cost + budget_penalty)
 
             # Normalize cost (typical range: 0-2000 M€/year for 10 TWh company)
             cost_norm = total_cost / 1000.0
@@ -564,11 +594,26 @@ class ETSEnvironment(gym.Env):
         return float(np.mean(window))
 
     def _get_obs_phase1(self) -> np.ndarray:
-        """Phase 1 observations (18 dim) for all agents."""
+        """Phase 1 observations for all agents.
+        Base: 18D. With opponent modeling: 18 + 2*(N-1) dims.
+        """
         cap_t = self.cap_schedule.get_cap(self.current_year)
         price_ma3 = self._compute_price_ma3()  # P1: 3-year MA price
-        obs = np.stack([
-            c.get_observation_phase1(
+
+        obs_list = []
+        for i, c in enumerate(self.companies):
+            # Build per-agent opponent obs: (bid_j/200, green_j) for all j != i
+            if self._opponent_modeling and self.n_agents > 1:
+                opp_parts = []
+                for j in range(self.n_agents):
+                    if j != i:
+                        opp_parts.append(float(self._last_episode_bids[j]) / 200.0)
+                        opp_parts.append(float(self._last_episode_greens[j]))
+                opponent_obs = np.array(opp_parts, dtype=np.float32)
+            else:
+                opponent_obs = None
+
+            obs_i = c.get_observation_phase1(
                 year=self.current_year,
                 cap_t=cap_t,
                 last_clearing_price=self.last_clearing_price,
@@ -576,8 +621,9 @@ class ETSEnvironment(gym.Env):
                 auction_gap=self._last_gaps[i],
                 last_secondary_price=self.last_secondary_price,
                 secondary_profit_signal=self._secondary_profit_ema[i],
-                price_ma3=price_ma3,    # P1: replaces last_clearing_price in obs[2]
+                price_ma3=price_ma3,
+                opponent_obs=opponent_obs,
             )
-            for i, c in enumerate(self.companies)
-        ])
-        return obs
+            obs_list.append(obs_i)
+
+        return np.stack(obs_list)

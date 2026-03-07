@@ -32,7 +32,8 @@ def test_reset_obs_shape():
     env = load_env()
     obs, info = env.reset()
     n_agents = env.config["companies"]["n_agents"]
-    assert obs.shape == (n_agents, 18), f"Expected ({n_agents}, 18), got {obs.shape}"
+    obs1_dim = env.companies[0].obs_dim_phase1
+    assert obs.shape == (n_agents, obs1_dim), f"Expected ({n_agents}, {obs1_dim}), got {obs.shape}"
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +53,8 @@ def test_two_phase_step_runs():
     ).astype(np.float32)
 
     obs2, log = env.step_auction(auction_actions)
-    assert obs2.shape == (n_agents, 21), f"Expected ({n_agents}, 21), got {obs2.shape}"
+    obs2_dim = env.companies[0].obs_dim_phase2
+    assert obs2.shape == (n_agents, obs2_dim), f"Expected ({n_agents}, {obs2_dim}), got {obs2.shape}"
 
     # Phase 2: [sec_price_mult, sec_qty]
     secondary_actions = np.random.uniform(
@@ -60,7 +62,7 @@ def test_two_phase_step_runs():
     ).astype(np.float32)
 
     obs1_next, rewards, terminated, truncated, info = env.step_secondary(secondary_actions)
-    assert obs1_next.shape == (n_agents, 18)
+    assert obs1_next.shape == (n_agents, env.companies[0].obs_dim_phase1)
     assert len(rewards) == n_agents
 
 
@@ -276,7 +278,8 @@ def test_year_log_keys():
 
     for key in ["year", "cap", "tnac", "auction_volume", "clearing_price",
                 "allocations", "penalties", "rewards", "green_fracs",
-                "tech_mixes", "holdings", "invest_costs"]:
+                "tech_mixes", "holdings", "invest_costs",
+                "bank_start", "shortfalls", "delta_greens", "queue_sizes", "bid_prices"]:
         assert key in log, f"Missing key in year_log: {key}"
 
 

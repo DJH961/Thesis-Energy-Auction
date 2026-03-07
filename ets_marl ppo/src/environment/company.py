@@ -30,6 +30,8 @@ class Company:
     def __init__(self, agent_id: int, config: dict, initial_mix: List[float], rng):
         self.agent_id = agent_id
         self.rng = rng
+        self._n_agents = config["companies"]["n_agents"]
+        self._opponent_modeling = config.get("opponent_modeling", {}).get("enabled", False)
 
         co_cfg = config["companies"]
         tech_cfg = config["technologies"]
@@ -339,15 +341,15 @@ class Company:
                                expected_price, auction_gap=0.0,
                                last_secondary_price=0.0,
                                secondary_profit_signal=0.0,
-                               price_ma3=None):
+                               price_ma3=None,
+                               opponent_obs=None):
         """
-        Phase 1 observation (pre-auction): 18 dimensions.
+        Phase 1 observation (pre-auction): 18D base + 2*(N-1) opponent dims.
 
+        Base 18 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
-        [2]  3-year moving average of clearing price (normalized) — P1 fix:
-             was last_clearing_price (always 200 in degenerate case, uninformative).
-             MA3 still provides a signal even when individual prices are noisy.
+        [2]  3-year moving average of clearing price (normalized)
         [3]  expected price from AR(1) model (normalized)
         [4-8]  technology mix vector (5D)
         [9]  emissions (normalized)
@@ -357,14 +359,16 @@ class Company:
         [13] auction gap (banked allowances)
         [14-16] construction queue (onshore, offshore, solar)
         [17] weighted emission factor (normalized)
+
+        Opponent dims (if opponent_modeling enabled):
+        [18, 19, 20, 21, 22, 23] = (bid_j/200, green_j) for each other agent j
         """
-        # P1: use 3-year moving average price if available; fall back to last price
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
-        return np.array([
+        base = np.array([
             year / 10.0,                          # [0]
             cap_t / 10.0,                         # [1]
-            price_signal / 200.0,                 # [2] P1: MA3 price (more stable signal)
+            price_signal / 200.0,                 # [2]
             expected_price / 200.0,               # [3]
             self.mix[0],                          # [4] coal frac
             self.mix[1],                          # [5] gas frac
@@ -379,8 +383,11 @@ class Company:
             queue[0],                             # [14] onshore under construction
             queue[1],                             # [15] offshore under construction
             queue[2],                             # [16] solar under construction
-            self.weighted_emission_factor,        # [17] avg EF (already 0-1 range roughly)
+            self.weighted_emission_factor,        # [17] avg EF
         ], dtype=np.float32)
+        if opponent_obs is not None and len(opponent_obs) > 0:
+            return np.concatenate([base, opponent_obs])
+        return base
 
     def get_observation_phase2(self, obs_phase1, allocation,
                                 clearing_price, emissions, banked=0.0):
@@ -397,11 +404,14 @@ class Company:
 
     @property
     def obs_dim_phase1(self) -> int:
+        """18 base dims + 2*(N-1) opponent dims when opponent modeling is enabled."""
+        if self._opponent_modeling and self._n_agents > 1:
+            return 18 + 2 * (self._n_agents - 1)
         return 18
 
     @property
     def obs_dim_phase2(self) -> int:
-        return 21
+        return self.obs_dim_phase1 + 3
 
     # ------------------------------------------------------------------
     # Reset

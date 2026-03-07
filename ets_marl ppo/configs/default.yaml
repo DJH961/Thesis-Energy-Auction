@@ -1,14 +1,10 @@
 # ============================================================
-# ETS MARL — Configuration v4.1
-# P1–P4 Roadmap improvements applied:
-#   P1: bid_penalty_alpha, reserve_price already set, n_years↑
-#   P2: gae_lambda↑, entropy decay schedule
-#   P3: reward normalization, green penalty floor, reward clipping
-#   P4: green investment reward shaping with decay
+# ETS MARL — Configuration v4.2
+# P1-P4 roadmap applied; agent cycling + opponent modeling added
 # ============================================================
 
 simulation:
-  n_years: 12         # increased: solar (2yr) and onshore (5yr) payoffs fit within episode
+  n_years: 12         # solar (2yr) and onshore (5yr) payoffs fit within episode
   n_episodes: 10000
   seeds: [42, 123, 456]
 
@@ -17,83 +13,54 @@ simulation:
 # Sources: IRENA 2024, IPCC AR5, IEA WEO 2024
 # ----------------------------------------------------------
 technologies:
-  # Order: coal, gas, onshore_wind, offshore_wind, solar
   names: ["coal", "gas", "onshore_wind", "offshore_wind", "solar"]
-
-  # Median lifecycle emission factors (tCO2/MWh)
-  # Coal=0.820, Gas CCGT=0.490, Onshore=0.011, Offshore=0.012, Solar=0.048
-  emission_factors: [0.820, 0.490, 0.011, 0.012, 0.048]
-
-  # CapEx (€/kW) — midpoint of ranges from IRENA 2024
-  capex: [3000, 1150, 1350, 3250, 750]
-
-  # Capacity factors
+  emission_factors: [0.820, 0.490, 0.011, 0.012, 0.048]  # tCO2/MWh
+  capex: [3000, 1150, 1350, 3250, 750]                   # EUR/kW (IRENA 2024)
   capacity_factors: [0.65, 0.60, 0.35, 0.47, 0.17]
-
-  # Deployment delays (model timesteps = years)
-  deploy_delays: [0, 0, 5, 8, 2]   # coal/gas = legacy only (no new build)
-
-  # Operational costs excl. ETS (€/MWh) — fuel + O&M combined
-  # Coal=72, Gas=55, Onshore=17, Offshore=47, Solar=10
-  operational_costs: [72.0, 55.0, 17.0, 47.0, 10.0]
-
-  # Decommissioning costs (€/kW) — incurred when retiring fossil
-  decommission_costs: [200, 100, 0, 0, 0]
-
-  # Which technologies are "green" (renewable)
+  deploy_delays: [0, 0, 5, 8, 2]                          # years; coal/gas legacy-only
+  operational_costs: [72.0, 55.0, 17.0, 47.0, 10.0]      # EUR/MWh fuel+O&M
+  decommission_costs: [200, 100, 0, 0, 0]                 # EUR/kW
   is_green: [false, false, true, true, true]
-
-  # Which technologies can be newly built (greening-only)
   is_buildable: [false, false, true, true, true]
 
 # ----------------------------------------------------------
 # ETS parameters
 # ----------------------------------------------------------
 ets:
-  # 4 agents × 10 TWh
-  # Initial emissions ~ A1:5.33Mt, A2:3.55Mt, A3:1.86Mt, A4:0.66Mt → total ~11.4 Mt
-  # Cap at ~80% → ~9.1 Mt
   cap_year_0: 9.10
-  lrf_phase1: 0.043        # 2024-2027 (Fit for 55)
-  lrf_phase2: 0.044        # 2028+ (Fit for 55)
-  lrf_phase_switch: 4      # switch at year 4
+  lrf_phase1: 0.043
+  lrf_phase2: 0.044
+  lrf_phase_switch: 4
 
   msr:
     enabled: true
-    tnac_upper: 3.64        # ~40% of cap
-    tnac_lower: 1.37        # ~15% of cap
+    tnac_upper: 3.64
+    tnac_lower: 1.37
     withhold_rate: 0.24
     release_amount: 0.08
 
   banking: true
-  reserve_price: 40.0      # realistic floor (P1: prevents zero-price collapse)
+  reserve_price: 40.0   # realistic floor; prevents zero-price collapse
 
 # ----------------------------------------------------------
-# Companies (4 agents, archetypes from action plan §8)
+# Companies (4 agents)
 # ----------------------------------------------------------
 companies:
   n_agents: 4
   output_twh: 10.0
-
-  # Technology mix vectors: [coal, gas, onshore_wind, offshore_wind, solar]
-  # Must sum to 1.0 per agent
   initial_mix:
-    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A1: Legacy coal-heavy (20% green)
-    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A2: Gas-dominant (40% green)
-    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A3: Mixed transitioner (70% green)
-    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A4: Near-green leader (90% green)
-
-  # Reward weights: [alpha (cost), beta (emissions intensity)]
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A1: coal-heavy (20% green)
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A2: gas-dominant (40% green)
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A3: mixed transitioner (70% green)
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A4: near-green leader (90% green)
   reward_weights:
-    - [0.90, 0.10]   # A1: primarily cost-minimizing
-    - [0.75, 0.25]   # A2: moderately cost-focused
+    - [0.90, 0.10]   # A1: cost-minimizing
+    - [0.75, 0.25]   # A2: moderate cost
     - [0.50, 0.50]   # A3: balanced
-    - [0.25, 0.75]   # A4: primarily green-focused
+    - [0.25, 0.75]   # A4: green-focused
 
 investment:
-  # Max fraction of output that can be shifted per year per technology
   max_invest_frac: 0.05
-  # Convexity penalty for large single-year investments
   convexity_alpha: 0.10
 
 risk:
@@ -107,18 +74,15 @@ auction:
   price_max: 200.0
   price_min: 20.0
   quantity_max: 5.0
-  # P1: Quadratic bid cost penalty — makes overbidding costly, incentivises truthful bidding.
-  # At bid=200: penalty = 0.002 × 200² = 80 M€ (absorbed into total_cost → /1000 in reward).
-  # At bid=80: penalty = 0.002 × 80² = 12.8 M€. Difference ≈ 67 M€/yr → meaningful signal.
-  bid_penalty_alpha: 0.002
+  # NOTE: bid_penalty_alpha removed — the bid cost penalty created unrealistic
+  # incentives that distorted equilibrium bidding. Price discovery is now handled
+  # by reserve_price and MA3 observation signal alone.
 
 trading:
   enabled: true
   transaction_cost: 0.5
 
 budget:
-  # Annual carbon budget per agent (M€).
-  # Calibrated from initial emissions × ~€80/t × 1.5 multiplier for investment headroom
   annual_budgets: [640.0, 426.0, 223.0, 79.0]
   overspend_penalty_coef: 2.0
 
@@ -127,51 +91,62 @@ penalty:
   non_compliance_multiplier: 3.0
 
 price:
-  initial_expected: 80.0     # €80/t — current EU ETS market level
-  price_floor: 50.0          # reflects MSR + reserve price support
+  initial_expected: 80.0
+  price_floor: 50.0
   ar1_persistence: 0.85
-  volatility_std: 0.15       # stochastic shock ~ N(0, 0.15)
+  volatility_std: 0.15
 
 # ----------------------------------------------------------
 # Reward shaping (P3 + P4)
 # ----------------------------------------------------------
 reward:
-  # P3: Per-agent running reward normalisation
-  # reward_norm = (r - mu_i) / (sigma_i + eps), updated with EMA(alpha=0.01)
+  # P3: Per-agent running reward normalisation (EMA alpha=0.01)
   normalizer_alpha: 0.01
-  clip_min: -10.0            # safety clip after normalisation
+  clip_min: -10.0
   clip_max: 2.0
-
-  # P3: Green penalty floor — each agent is not penalised for emissions below
-  # their initial (irreducible) fossil fraction. Prevents A4 from being punished
-  # for the 10% gas it structurally cannot eliminate immediately.
-  # Values = initial fossil fractions: [A1=0.80, A2=0.60, A3=0.30, A4=0.10]
+  # P3: Green penalty floor = initial fossil fractions [A1..A4]
   green_floor_fossil: [0.80, 0.60, 0.30, 0.10]
-
-  # P4: Green investment reward shaping
-  # Progress bonus: shaping += beta * delta_green_actual
+  # P4: Shaping
   shaping_beta: 10.0
-  # Queue progress: shaping += gamma * n_projects * 0.1
   shaping_gamma: 1.0
-  # Fossil lock-in penalty per year if fossil_frac unchanged for 3+ years
   shaping_lockin_penalty: 2.0
-  # Episode at which shaping decays to 0 (linearly from episode 0)
   shaping_decay_episode: 3000
-  # Activate lock-in penalty only after this many episodes (avoid cold-start penalty)
   shaping_lockin_start_episode: 200
+
+# ----------------------------------------------------------
+# Opponent modeling (Option C)
+# Each agent's Phase-1 obs is augmented with last-episode
+# (bid/200, green_frac) pairs for every other agent.
+# For 4 agents: +6 dimensions → obs_dim_phase1 = 24, phase2 = 27.
+# ----------------------------------------------------------
+opponent_modeling:
+  enabled: true
+
+# ----------------------------------------------------------
+# Agent cycling (Option A)
+# Only one agent updates its weights per episode, cycling round-robin.
+# Non-active agents still collect experience.
+#   soft: false  → hard freeze (buffer discarded for non-active)
+#   soft: true   → non-active update with soft_lr_scale × base_lr
+# ----------------------------------------------------------
+agent_cycling:
+  enabled: true
+  soft: false
+  soft_lr_scale: 0.1
 
 # --- PPO ---
 ppo:
   hidden_size: 128
   lr: 0.0003
   gamma: 0.99
-  gae_lambda: 0.97          # P2: increased from 0.95 → extends credit assignment horizon
+  gae_lambda: 0.97        # P2: extended credit assignment
   clip_eps: 0.2
-  # P2: Entropy starts high for exploration, linearly decays after episode 2000
-  entropy_coef: 0.05         # initial entropy coefficient
-  entropy_coef_final: 0.005  # final entropy after decay
-  entropy_decay_start: 2000  # episode where decay begins
-  entropy_decay_end: 4000    # episode where entropy reaches final value
+  # P2: Entropy decay — condition-based (replaces episode counter trigger):
+  # decay begins only after (1) price_std<40 over last 100 eps AND
+  # (2) no agent green fraction decreased in last 50 consecutive episodes.
+  entropy_coef: 0.05
+  entropy_coef_final: 0.005
+  entropy_decay_window: 2000  # episodes of decay after condition is met
   value_coef: 0.5
   max_grad_norm: 0.5
   n_epochs: 4
