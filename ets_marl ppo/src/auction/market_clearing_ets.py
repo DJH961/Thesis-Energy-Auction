@@ -19,7 +19,6 @@ EU ETS reference:
     EU Auctioning Regulation (Commission Regulation 1031/2010).
 """
 
-import warnings
 
 import numpy as np
 
@@ -126,16 +125,6 @@ def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0
     # --- Auction statistics ---
     total_allocated = allocations.sum()
     cover_ratio = total_demand / q_cap if q_cap > 0 else 0.0
-
-    if q_cap > 0 and total_allocated < 0.5 * q_cap:
-        warnings.warn(
-            f"[market_clearing_ets] Under-allocation: {total_allocated:.2f} Mt allocated "
-            f"of {q_cap:.2f} Mt cap ({100*total_allocated/q_cap:.0f}%). "
-            f"total bid quantity ({total_demand:.2f} Mt) is below available supply. "
-            "Agents are not bidding enough volume.",
-            UserWarning,
-            stacklevel=2,
-        )
 
     stats = {
         "clearing_price": clearing_price,

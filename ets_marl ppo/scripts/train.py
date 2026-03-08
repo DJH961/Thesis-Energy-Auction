@@ -362,6 +362,8 @@ def train_one_seed(config: dict, seed: int):
     env = ETSEnvironment(config, seed=seed)
     agents = build_agents(env, config, seed)
 
+    ppo_cfg = config["ppo"]
+
     pretrain_cfg = config.get("pretrain", {})
     bc_ran = False
     if pretrain_cfg.get("enabled", False):
@@ -381,7 +383,6 @@ def train_one_seed(config: dict, seed: int):
     if critic_warmup_eps > 0:
         print(f"Critic-warmup: actor gradients frozen for first {critic_warmup_eps} episodes.")
 
-    ppo_cfg = config["ppo"]
     cycling_cfg = config.get("agent_cycling", {})
     cycling_enabled = cycling_cfg.get("enabled", False)
     cycling_soft = cycling_cfg.get("soft", False)
