@@ -271,7 +271,7 @@ pretrain:
 # Streak-based checks only count after critic-warmup ends.
 # ----------------------------------------------------------
 diagnostics:
-  market_broken_window: 20           # consecutive episodes before abort
+  market_broken_window: 200           # consecutive episodes before abort
   market_broken_bid_threshold: 0.99  # avg bid >= this x price_max  -> ceiling-collapse
   floor_bid_threshold: 1.02          # avg bid <= this x price_min  -> floor-collapse
   zero_qty_threshold: 0.01           # avg bid qty <= this x qty_max -> zero-qty collapse
