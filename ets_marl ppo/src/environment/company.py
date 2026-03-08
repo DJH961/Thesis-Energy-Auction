@@ -532,10 +532,10 @@ class Company:
 
     def get_observation_phase2(self, obs_phase1, allocation,
                                 clearing_price, emissions, banked=0.0,
-                                emission_shock=0.0):
+                                emission_shock=0.0, payment=0.0):
         """
-        Phase 2 observation (post-auction): 25D (with 4-agent opponent modeling).
-        Appends auction results + P5 emission shock to phase 1 obs.
+        Phase 2 observation (post-auction): obs_phase1 + 5 extra dims.
+        Appends auction results + P5 emission shock + auction_savings signal.
 
         Extra dims:
         [base+0] allocation / 5
@@ -543,12 +543,16 @@ class Company:
         [base+2] net compliance position: (banked + allocation - emissions - carry_forward) / 5
                  <0 means the agent is still short after using all holdings
         [base+3] emission_shock (realized deviation from base need)  -- P5
+        [base+4] auction_savings: (allocation × 100 - payment) / 1000
+                 penalty-value avoided minus cost paid; encodes deal quality
         """
+        auction_savings = (allocation * 100.0 - payment) / 1000.0
         extra = np.array([
             allocation / 5.0,                                                       # [base+0]
             clearing_price / self._price_norm,                                      # [base+1]
             (banked + allocation - emissions - self._carry_forward) / 5.0,          # [base+2]
             float(emission_shock),                                                  # [base+3] P5
+            float(auction_savings),                                                 # [base+4]
         ], dtype=np.float32)
         return np.concatenate([obs_phase1, extra])
 
@@ -562,8 +566,8 @@ class Company:
 
     @property
     def obs_dim_phase2(self) -> int:
-        """obs_dim_phase1 + 4 (allocation, price, net_compliance_pos, emission_shock)."""
-        return self.obs_dim_phase1 + 4
+        """obs_dim_phase1 + 5 (allocation, price, net_compliance_pos, emission_shock, auction_savings)."""
+        return self.obs_dim_phase1 + 5
 
     # ------------------------------------------------------------------
     # Reset

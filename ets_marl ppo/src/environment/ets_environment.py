@@ -135,6 +135,15 @@ class ETSEnvironment(gym.Env):
         # Price normalization constant
         self._price_norm = config["auction"]["price_max"]
 
+        # Sanity check: agents must not be able to produce bids below the reserve
+        _price_min = config["auction"]["price_min"]
+        _reserve = config["ets"].get("reserve_price", 0.0)
+        assert _price_min >= _reserve, (
+            f"Config error: auction.price_min ({_price_min}) < ets.reserve_price ({_reserve}). "
+            "Agents can produce valid-looking bids that the auction silently rejects, "
+            "leaving most of the cap unallocated. Set auction.price_min = reserve_price."
+        )
+
         # Logging
         self.episode_log: List[dict] = []
 
@@ -452,6 +461,7 @@ class ETSEnvironment(gym.Env):
                 emissions=realized_emissions[i],
                 banked=self.holdings[i],
                 emission_shock=float(epsilons[i]),   # P5: shock in obs
+                payment=float(payments[i]),           # for auction_savings dim
             )
             for i in range(self.n_agents)
         ])

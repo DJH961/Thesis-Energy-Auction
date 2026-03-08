@@ -91,7 +91,7 @@ risk:
 
 auction:
   price_max: 500.0     # raised: allows bids above penalty ceiling (300 €/t)
-  price_min: 20.0
+  price_min: 40.0      # = reserve_price: prevents bids that are silently rejected
   quantity_max: 5.0
   # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
   # [0.3, 2.0] centres the action around covering full need (1.0), avoids zero-qty collapse.
@@ -248,3 +248,15 @@ logging:
   log_interval: 10
   save_interval: 500
   results_dir: "results/"
+
+# ----------------------------------------------------------
+# Behavioral cloning warm-start (heuristic pre-training)
+# Run before PPO to initialise the auction policy with a
+# simple rule-based policy: bid at 1.1× MA3 price, bid
+# estimated need, invest 2% if green_frac < 0.8, solar.
+# ----------------------------------------------------------
+pretrain:
+  enabled: true
+  episodes: 300        # episodes to collect heuristic data
+  epochs: 10           # BC MSE training epochs (both auction + secondary policies)
+  lr: 0.001            # separate learning rate for BC phase

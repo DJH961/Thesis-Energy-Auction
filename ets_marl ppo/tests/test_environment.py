@@ -391,7 +391,7 @@ def test_p8_obs_dims():
     n_agents = env.config["companies"]["n_agents"]
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
     expected_p1 = 21 + (2 * (n_agents - 1) if opp_enabled else 0)
-    expected_p2 = expected_p1 + 4
+    expected_p2 = expected_p1 + 5  # +5: alloc, price, compliance_pos, shock, auction_savings
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
     )

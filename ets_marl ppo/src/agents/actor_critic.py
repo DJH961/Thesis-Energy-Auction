@@ -2,12 +2,15 @@
 actor_critic.py
 ===============
 PPO networks for two-phase ETS decisions:
-  - AuctionPolicy:    obs_phase1(18) → 6 actions [bid_price, qty, invest_frac, tech_logits×3]
-  - SecondaryPolicy:  obs_phase2(21) → 2 actions [sec_price_mult, sec_qty]
-  - ValueNetwork:     obs_phase2(21) → scalar V(s)
+  - AuctionPolicy:    obs_phase1 → 6 actions [bid_price, qty, invest_frac, tech_logits×3]
+  - SecondaryPolicy:  obs_phase2 → 2 actions [sec_price_mult, sec_qty]
+  - ValueNetwork:     obs_phase2 → scalar V(s)
 
 All policies output Gaussian distributions (mean + learnable log_std).
 Actions are squashed through tanh and rescaled to physical bounds.
+
+AuctionPolicy uses conditioned action heads: qty_mean is computed from
+[hidden, price_mean.detach()] to encode the price→quantity dependency.
 """
 
 import torch
@@ -17,14 +20,31 @@ from torch.distributions import Normal
 
 
 class AuctionPolicy(nn.Module):
-    """Phase 1: obs(18) → Gaussian over 6 auction actions."""
+    """
+    Phase 1: obs → Gaussian over 6 auction actions.
+
+    Conditioned heads architecture:
+      price_head(hidden)                      → price_mean  (1D)
+      qty_head(cat[hidden, price_mean.detach()]) → qty_mean (1D)
+      rest_head(hidden)                       → [invest_frac, logit0, logit1, logit2] (4D)
+    mean = cat[price_mean, qty_mean, rest_mean]  (6D)
+
+    This encodes the structural dependency: bid quantity should adapt to bid price.
+    The .detach() prevents gradients flowing back through price when training qty.
+    """
 
     def __init__(self, obs_dim, action_dim, hidden_size, action_low, action_high,
                  log_std_min=-2.0, log_std_max=1.0):
         super().__init__()
         self.fc1 = nn.Linear(obs_dim, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.mean_head = nn.Linear(hidden_size, action_dim)
+
+        # Conditioned heads: price first, then qty conditioned on price
+        self.price_head = nn.Linear(hidden_size, 1)
+        self.qty_head = nn.Linear(hidden_size + 1, 1)   # +1 for price_mean signal
+        # Remaining actions (invest_frac, 3 tech logits) stay independent
+        self.rest_head = nn.Linear(hidden_size, action_dim - 2)
+
         self.log_std = nn.Parameter(torch.zeros(action_dim))
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
@@ -33,10 +53,17 @@ class AuctionPolicy(nn.Module):
         self.register_buffer("action_bias", (action_high + action_low) / 2.0)
         self._init_weights()
 
+    def _compute_mean(self, hidden):
+        """Compute full action mean with price→qty conditioning."""
+        price_mean = self.price_head(hidden)                                    # (B, 1)
+        qty_mean = self.qty_head(torch.cat([hidden, price_mean.detach()], dim=-1))  # (B, 1)
+        rest_mean = self.rest_head(hidden)                                      # (B, 4)
+        return torch.cat([price_mean, qty_mean, rest_mean], dim=-1)             # (B, 6)
+
     def forward(self, obs):
         x = F.relu(self.fc1(obs))
         x = F.relu(self.fc2(x))
-        mean = self.mean_head(x)
+        mean = self._compute_mean(x)
         log_std_clamped = torch.clamp(self.log_std, self.log_std_min, self.log_std_max)
         std = log_std_clamped.exp().expand_as(mean)
         return Normal(mean, std)
@@ -71,8 +98,9 @@ class AuctionPolicy(nn.Module):
         for layer in [self.fc1, self.fc2]:
             nn.init.orthogonal_(layer.weight, gain=2**0.5)
             nn.init.zeros_(layer.bias)
-        nn.init.orthogonal_(self.mean_head.weight, gain=0.01)
-        nn.init.zeros_(self.mean_head.bias)
+        for head in [self.price_head, self.qty_head, self.rest_head]:
+            nn.init.orthogonal_(head.weight, gain=0.01)
+            nn.init.zeros_(head.bias)
 
 
 class SecondaryPolicy(nn.Module):

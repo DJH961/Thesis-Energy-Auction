@@ -28,6 +28,9 @@ import os
 import sys
 import yaml
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 # Ensure UTF-8 output on Windows (box-drawing characters in console)
 # hasattr guard: Jupyter notebooks use OutStream which has no .buffer attribute
@@ -38,6 +41,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.environment.ets_environment import ETSEnvironment
 from src.agents.ppo_agent import PPOAgent
+import src.agents.heuristic_policy as heuristic_policy
 
 
 def load_config(path: str) -> dict:
@@ -82,6 +86,162 @@ def build_agents(env: ETSEnvironment, config: dict, seed: int):
         )
         agents.append(agent)
     return agents
+
+
+# ---------------------------------------------------------------------------
+# Behavioral cloning warm-start (heuristic pre-training)
+# ---------------------------------------------------------------------------
+
+def _to_pretanh(physical_action: np.ndarray, policy, device) -> np.ndarray:
+    """
+    Convert a physical action to pre-tanh (raw) space for MSE supervision.
+
+    raw = atanh( clamp( (action - bias) / scale, -1+ε, 1-ε ) )
+    """
+    scale = policy.action_scale  # registered buffer on device
+    bias = policy.action_bias
+    h_t = torch.FloatTensor(physical_action).to(device)
+    normalized = torch.clamp((h_t - bias) / (scale + 1e-8), -1.0 + 1e-6, 1.0 - 1e-6)
+    return torch.atanh(normalized).cpu().numpy()
+
+
+def _run_bc_epoch(policy, obs_arr, tgt_arr, bc_opt, batch_size: int) -> float:
+    """One epoch of mini-batch MSE on the policy mean head. Returns mean loss."""
+    perm = torch.randperm(len(obs_arr), device=obs_arr.device)
+    total_loss = 0.0
+    n_batches = 0
+    for start in range(0, len(obs_arr), batch_size):
+        mb = perm[start:start + batch_size]
+        dist = policy.forward(obs_arr[mb])
+        loss = nn.MSELoss()(dist.mean, tgt_arr[mb])
+        bc_opt.zero_grad()
+        loss.backward()
+        bc_opt.step()
+        total_loss += loss.item()
+        n_batches += 1
+    return total_loss / max(n_batches, 1)
+
+
+def pretrain_behavioral_cloning(agents, env, config: dict,
+                                 pretrain_cfg: dict, seed: int):
+    """
+    Behavioural cloning warm-start for both AuctionPolicy and SecondaryPolicy.
+
+    Collection phase
+    ----------------
+    Run `pretrain.episodes` full episodes using the heuristic policy from
+    heuristic_policy.py for BOTH phases.  At each year-step store:
+      - (obs_phase1_i, auction_raw_i)    for AuctionPolicy BC
+      - (obs_phase2_i, secondary_raw_i)  for SecondaryPolicy BC
+
+    Training phase
+    --------------
+    For each agent, run `pretrain.epochs` epochs of mini-batch MSE loss on
+    the respective policy mean heads using dedicated BC optimisers.  The
+    PPO optimiser and value network are untouched.
+
+    After this function returns, the main PPO loop resumes with the
+    pretrained weights as its starting point.
+    """
+    n_agents = config["companies"]["n_agents"]
+    n_years = config["simulation"]["n_years"]
+    n_episodes = pretrain_cfg.get("episodes", 300)
+    n_epochs = pretrain_cfg.get("epochs", 10)
+    bc_lr = pretrain_cfg.get("lr", 0.001)
+    batch_size = 64
+
+    print(f"\n{'─'*60}")
+    print(f"Behavioral cloning pre-training")
+    print(f"  Episodes: {n_episodes}  |  Epochs: {n_epochs}  |  LR: {bc_lr}")
+    print(f"  Policies: AuctionPolicy + SecondaryPolicy")
+    print(f"{'─'*60}")
+
+    # per-agent dataset: list of (obs1, auc_raw) and (obs2, sec_raw)
+    auc_data = [[] for _ in range(n_agents)]
+    sec_data = [[] for _ in range(n_agents)]
+
+    # ----------------------------------------------------------------
+    # Collection phase
+    # ----------------------------------------------------------------
+    for ep in range(n_episodes):
+        obs1, _ = env.reset(seed=seed + ep * 997)
+
+        for _year in range(n_years):
+            price_ma3 = env._compute_price_ma3()
+            current_year = env.current_year
+
+            auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+            for i in range(n_agents):
+                company = env.companies[i]
+                h_auc = heuristic_policy.auction_action(
+                    company, price_ma3, current_year, n_years, config)
+                auction_actions[i] = h_auc
+
+                auc_raw = _to_pretanh(h_auc, agents[i].auction_policy,
+                                      agents[i].device)
+                auc_data[i].append((obs1[i].copy(), auc_raw))
+
+            obs2, _ = env.step_auction(auction_actions)
+
+            # Secondary heuristic uses env state set by step_auction
+            secondary_actions = np.zeros((n_agents, 2), dtype=np.float32)
+            for i in range(n_agents):
+                company = env.companies[i]
+                h_sec = heuristic_policy.secondary_action(
+                    company,
+                    bank=float(env.holdings[i]),
+                    allocation=float(env._phase1_allocations[i]),
+                    clearing_price=env._phase1_clearing_price,
+                    config=config,
+                )
+                secondary_actions[i] = h_sec
+
+                sec_raw = _to_pretanh(h_sec, agents[i].secondary_policy,
+                                      agents[i].device)
+                sec_data[i].append((obs2[i].copy(), sec_raw))
+
+            obs1_next, _, terminated, _, _ = env.step_secondary(secondary_actions)
+            obs1 = obs1_next
+            if terminated:
+                break
+
+    # ----------------------------------------------------------------
+    # Training phase — AuctionPolicy then SecondaryPolicy, per agent
+    # ----------------------------------------------------------------
+    for agent_idx in range(n_agents):
+        agent = agents[agent_idx]
+        dev = agent.device
+
+        # --- AuctionPolicy ---
+        a_data = auc_data[agent_idx]
+        if a_data:
+            obs_a = torch.FloatTensor(np.array([d[0] for d in a_data])).to(dev)
+            tgt_a = torch.FloatTensor(np.array([d[1] for d in a_data])).to(dev)
+            bc_opt_a = optim.Adam(agent.auction_policy.parameters(), lr=bc_lr)
+
+            for epoch in range(n_epochs):
+                loss_a = _run_bc_epoch(agent.auction_policy, obs_a, tgt_a,
+                                       bc_opt_a, batch_size)
+                if epoch == 0 or epoch == n_epochs - 1:
+                    print(f"  A{agent_idx+1} [auction]    "
+                          f"epoch {epoch+1:2d}/{n_epochs}  loss={loss_a:.4f}")
+
+        # --- SecondaryPolicy ---
+        s_data = sec_data[agent_idx]
+        if s_data:
+            obs_s = torch.FloatTensor(np.array([d[0] for d in s_data])).to(dev)
+            tgt_s = torch.FloatTensor(np.array([d[1] for d in s_data])).to(dev)
+            bc_opt_s = optim.Adam(agent.secondary_policy.parameters(), lr=bc_lr)
+
+            for epoch in range(n_epochs):
+                loss_s = _run_bc_epoch(agent.secondary_policy, obs_s, tgt_s,
+                                       bc_opt_s, batch_size)
+                if epoch == 0 or epoch == n_epochs - 1:
+                    print(f"  A{agent_idx+1} [secondary]  "
+                          f"epoch {epoch+1:2d}/{n_epochs}  loss={loss_s:.4f}")
+
+    print(f"{'─'*60}")
+    print("Behavioral cloning pre-training complete.\n")
 
 
 class EntropyConditionTracker:
@@ -201,6 +361,10 @@ def train_one_seed(config: dict, seed: int):
 
     env = ETSEnvironment(config, seed=seed)
     agents = build_agents(env, config, seed)
+
+    pretrain_cfg = config.get("pretrain", {})
+    if pretrain_cfg.get("enabled", False):
+        pretrain_behavioral_cloning(agents, env, config, pretrain_cfg, seed)
 
     ppo_cfg = config["ppo"]
     cycling_cfg = config.get("agent_cycling", {})
