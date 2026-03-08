@@ -14,6 +14,8 @@ Key features:
   - Operational costs differ by technology (fuel + O&M)
   - Decommissioning costs when retiring fossil capacity
   - Risk model for investment failure
+  - MAC fuel-switching: temporary coal→gas dispatch switching at marginal cost
+  - Carry-forward obligations: non-compliance shortfall carries to next year
 
 Roadmap improvements (P6):
   - Delay jitter: construction delays drawn from Poisson(λ_tech) instead of fixed
@@ -106,6 +108,19 @@ class Company:
         self._consecutive_successes = 0
         self.year_cost = 0.0
 
+        # Carry-forward non-compliance obligation (Mt)
+        self._carry_forward = 0.0
+        self._carry_forward_enabled = config.get("penalty", {}).get("carry_forward", False)
+
+        # MAC fuel-switching config
+        mac_cfg = config.get("mac", {})
+        self._mac_enabled = mac_cfg.get("enabled", False)
+        self._mac_cost = mac_cfg.get("coal_to_gas_cost", 65.0)
+        self._mac_max_switch = mac_cfg.get("max_switch_frac", 0.20)
+
+        # Price normalization constant (matches auction price_max)
+        self._price_norm = config["auction"]["price_max"]
+
         # P6: track capex spent per queued project (for partial recovery on cancellation)
         # Stored inside each queue item as "capex_spent"
 
@@ -173,6 +188,27 @@ class Company:
             realized_mix /= s
 
         return float(self.output_mwh * np.dot(realized_mix, self.emission_factors) / 1e6)
+
+    def apply_mac_switching(self, carbon_price: float) -> tuple:
+        """
+        MAC fuel-switching: temporarily switch coal dispatch to gas when
+        carbon price exceeds the marginal abatement cost.
+
+        Returns (emissions_reduction_Mt, cost_M€).
+        Does NOT modify the permanent capacity mix.
+        """
+        if not self._mac_enabled or carbon_price <= self._mac_cost:
+            return 0.0, 0.0
+
+        switchable = min(self.mix[0], self._mac_max_switch)
+        if switchable < 1e-6:
+            return 0.0, 0.0
+
+        ef_reduction = self.emission_factors[0] - self.emission_factors[1]  # tCO2/MWh
+        switched_mwh = switchable * self.output_mwh
+        emissions_reduction = switched_mwh * ef_reduction / 1e6  # Mt
+        cost = emissions_reduction * self._mac_cost  # M€
+        return emissions_reduction, cost
 
     def compute_risk_factor(self) -> float:
         return self._compute_p_fail()
@@ -421,8 +457,14 @@ class Company:
         return shortfall * self.penalty_rate
 
     def settle_compliance_realized(self, allowances_held: float, realized_emissions: float) -> float:
-        """P5: Settle compliance against realized (shocked) emissions."""
-        shortfall = max(0.0, realized_emissions - allowances_held)
+        """
+        Settle compliance against realized (shocked) emissions.
+        With carry_forward enabled, shortfall is added to next year's obligation.
+        """
+        total_need = realized_emissions + self._carry_forward
+        shortfall = max(0.0, total_need - allowances_held)
+        if self._carry_forward_enabled:
+            self._carry_forward = shortfall
         return shortfall * self.penalty_rate
 
     # ------------------------------------------------------------------
@@ -460,11 +502,12 @@ class Company:
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
+        pn = self._price_norm  # normalization constant (= price_max)
         base = np.array([
-            year / 10.0,                          # [0]
-            cap_t / 10.0,                         # [1]
-            price_signal / 200.0,                 # [2]
-            expected_price / 200.0,               # [3]
+            year / 12.0,                          # [0] normalized by n_years
+            cap_t / 30.0,                         # [1] normalized for 8-agent cap
+            price_signal / pn,                    # [2]
+            expected_price / pn,                  # [3]
             self.mix[0],                          # [4] coal frac
             self.mix[1],                          # [5] gas frac
             self.mix[2],                          # [6] onshore frac
@@ -479,7 +522,7 @@ class Company:
             queue[1],                             # [15] offshore under construction
             queue[2],                             # [16] solar under construction
             self.weighted_emission_factor,        # [17] avg EF
-            last_secondary_price / 200.0,         # [18] P8: secondary price signal
+            last_secondary_price / pn,            # [18] P8: secondary price signal
             last_secondary_volume / 10.0,         # [19] P8: secondary volume signal
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
@@ -501,7 +544,7 @@ class Company:
         """
         extra = np.array([
             allocation / 5.0,                              # [base+0]
-            clearing_price / 200.0,                        # [base+1]
+            clearing_price / self._price_norm,             # [base+1]
             (banked + allocation - emissions) / 5.0,       # [base+2]
             float(emission_shock),                         # [base+3] P5
         ], dtype=np.float32)
@@ -530,3 +573,4 @@ class Company:
         self._consecutive_successes = 0
         self.year_cost = 0.0
         self.budget_spent_this_year = 0.0
+        self._carry_forward = 0.0

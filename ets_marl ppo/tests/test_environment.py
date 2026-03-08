@@ -289,13 +289,13 @@ def test_year_log_keys():
 # ---------------------------------------------------------------------------
 
 def test_emissions_decrease_with_green():
-    """A4 (90% green) should have much lower emissions than A1 (20% green)."""
+    """Greenest agent should have much lower emissions than coal-heavy agent."""
     env = load_env()
     env.reset()
-    e1 = env.companies[0].compute_emissions()
-    e4 = env.companies[3].compute_emissions()
-    assert e4 < e1, f"A4 emissions ({e4}) should be < A1 emissions ({e1})"
-    assert e4 < 0.5 * e1, f"A4 should have significantly lower emissions than A1"
+    e1 = env.companies[0].compute_emissions()  # coal-heavy
+    e_green = env.companies[-1].compute_emissions()  # near-green leader (last agent)
+    assert e_green < e1, f"Green emissions ({e_green}) should be < coal emissions ({e1})"
+    assert e_green < 0.5 * e1, f"Green agent should have significantly lower emissions"
 
 
 # ---------------------------------------------------------------------------

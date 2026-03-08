@@ -123,6 +123,13 @@ class ETSEnvironment(gym.Env):
         self._current_episode_bid_sum = np.zeros(self.n_agents)
         self._current_episode_bid_count = np.zeros(self.n_agents, dtype=int)
 
+        # MAC fuel-switching tracking
+        self._mac_reductions = np.zeros(self.n_agents)
+        self._mac_costs = np.zeros(self.n_agents)
+
+        # Price normalization constant
+        self._price_norm = config["auction"]["price_max"]
+
         # Logging
         self.episode_log: List[dict] = []
 
@@ -380,7 +387,18 @@ class ETSEnvironment(gym.Env):
         log["clearing_price"] = clearing_price
         log["auction_stats"] = auction_stats
 
-        # 8. Green investments
+        # 8. MAC fuel-switching (based on auction clearing price)
+        mac_reductions = np.zeros(self.n_agents)
+        mac_costs = np.zeros(self.n_agents)
+        for i, company in enumerate(self.companies):
+            reduction, cost = company.apply_mac_switching(clearing_price)
+            mac_reductions[i] = reduction
+            mac_costs[i] = cost
+        self._current_emissions = np.maximum(self._current_emissions - mac_reductions, 0.0)
+        self._mac_reductions = mac_reductions
+        self._mac_costs = mac_costs
+
+        # 9. Green investments
         invest_costs = np.zeros(self.n_agents)
         for i, company in enumerate(self.companies):
             invest_frac = float(auction_actions[i, 2])
@@ -394,9 +412,10 @@ class ETSEnvironment(gym.Env):
         self._phase1_allocations = allocations
         self._phase1_payments = payments
         self._phase1_invest_costs = invest_costs
+        self._phase1_mac_costs = mac_costs
         self._phase1_log = log
 
-        # 9. Build phase 2 observations
+        # 10. Build phase 2 observations
         obs_phase1 = self._get_obs_phase1()
 
         obs_phase2 = np.stack([
@@ -415,6 +434,8 @@ class ETSEnvironment(gym.Env):
         log["emission_shocks"] = epsilons.tolist()
         log["cf_shocks"] = cf_shock_agg.tolist()
         log["cancellations"] = cancellations.tolist()
+        log["mac_reductions"] = mac_reductions.tolist()
+        log["mac_costs"] = mac_costs.tolist()
 
         return obs_phase2, log
 
@@ -438,6 +459,7 @@ class ETSEnvironment(gym.Env):
         allocations = self._phase1_allocations
         payments = self._phase1_payments
         invest_costs = self._phase1_invest_costs
+        mac_costs = self._phase1_mac_costs
         clearing_price = self._phase1_clearing_price
         log = self._phase1_log
 
@@ -483,7 +505,9 @@ class ETSEnvironment(gym.Env):
         # Use P5-shocked realized emissions for compliance
         realized_emissions = self._current_emissions
 
-        # 6. Compliance (against realized emissions)
+        # 6. Compliance (against realized emissions + carry-forward obligations)
+        # Capture old carry-forward before it gets updated
+        old_carry_forward = np.array([c._carry_forward for c in self.companies])
         penalties = np.zeros(self.n_agents)
         for i, company in enumerate(self.companies):
             penalties[i] = company.settle_compliance_realized(
@@ -491,9 +515,10 @@ class ETSEnvironment(gym.Env):
                 realized_emissions=realized_emissions[i],
             )
 
-        # Banking: surplus carry forward (against realized emissions)
+        # Banking: surplus after surrendering for emissions + old carry-forward
         for i in range(self.n_agents):
-            self.holdings[i] = max(0.0, holdings[i] - realized_emissions[i])
+            total_obligation = realized_emissions[i] + old_carry_forward[i]
+            self.holdings[i] = max(0.0, holdings[i] - total_obligation)
         self._last_gaps = self.holdings.copy()
 
         # P4: Update fossil fraction history (for lock-in penalty)
@@ -505,7 +530,7 @@ class ETSEnvironment(gym.Env):
         # 7. Rewards (raw — normalisation happens in PPOAgent)
         rewards = self._compute_rewards(
             payments, trade_costs, penalties, invest_costs,
-            realized_emissions, clearing_price
+            realized_emissions, clearing_price, mac_costs
         )
 
         # Compute per-agent shortfall for diagnostics (realized emissions vs held)
@@ -536,6 +561,8 @@ class ETSEnvironment(gym.Env):
             "delta_greens": [c.green_frac - c.prev_green_frac for c in self.companies],
             "queue_sizes": [len(c._construction_queue) for c in self.companies],
             "holding_costs": self._last_holding_costs.tolist(),  # P8
+            "mac_reductions": self._mac_reductions.tolist(),
+            "mac_costs": self._mac_costs.tolist(),
         })
         self.episode_log.append(log)
 
@@ -660,24 +687,26 @@ class ETSEnvironment(gym.Env):
     # ------------------------------------------------------------------
 
     def _compute_rewards(self, payments, trade_costs, penalties,
-                         invest_costs, emissions, clearing_price):
+                         invest_costs, emissions, clearing_price,
+                         mac_costs=None):
         """
-        R_i = -(alpha × TotalCost_i + beta × EmissionsIntensity_i + gamma × Penalty_i)
+        R_i = Revenue_i - (alpha × TotalCost_i + beta × EmissionsIntensity_i + Penalty_i)
               + Shaping_i
 
+        Revenue: electricity revenue (margin-based, from electricity config).
+        Costs: auction + secondary + investment + operational + MAC + budget + holding.
         P3: emissions intensity capped at initial fossil floor.
         P4: green shaping bonuses (progress + queue + lock-in).
         P8: banking holding cost on excess allowances.
-        Fix 2: trading profit shaping bonus for net secondary-market revenue.
-        Fix 3: positive bank-value signal (complementary to P8's excess-bank penalty).
 
         Note: per-agent running normalisation applied in PPOAgent.normalize_reward()
         AFTER this function returns raw rewards.
         """
         rewards = np.zeros(self.n_agents)
-        non_compliance_mult = self.config["penalty"].get("non_compliance_multiplier", 3.0)
+        non_compliance_mult = self.config["penalty"].get("non_compliance_multiplier", 1.0)
         reward_cfg = self.config.get("reward", {})
         trading_cfg = self.config.get("trading", {})
+        elec_cfg = self.config.get("electricity", {})
 
         green_floor_fossil = reward_cfg.get("green_floor_fossil", [0.0] * self.n_agents)
 
@@ -685,36 +714,58 @@ class ETSEnvironment(gym.Env):
         gamma_queue = reward_cfg.get("shaping_gamma", 1.0)
         lockin_penalty = reward_cfg.get("shaping_lockin_penalty", 2.0)
         lockin_start = reward_cfg.get("shaping_lockin_start_episode", 200)
-        trading_bonus_weight = reward_cfg.get("shaping_trading_weight", 0.5)  # Fix 2
-        bank_weight = reward_cfg.get("shaping_bank_weight", 0.1)              # Fix 3
+        trading_bonus_weight = reward_cfg.get("shaping_trading_weight", 0.5)
+        bank_weight = reward_cfg.get("shaping_bank_weight", 0.1)
 
         # P8: banking holding cost parameters
         holding_cost_rate = trading_cfg.get("banking_holding_cost", 0.0)
         excess_bank_ratio = trading_cfg.get("excess_bank_ratio", 1.5)
 
+        # Electricity revenue parameters
+        elec_enabled = elec_cfg.get("enabled", False)
+        base_elec_price = elec_cfg.get("base_price", 50.0)
+        carbon_passthrough = elec_cfg.get("carbon_passthrough", 0.80)
+
+        # System average emission factor (for electricity price)
+        if elec_enabled:
+            system_avg_ef = float(np.mean([c.weighted_emission_factor for c in self.companies]))
+            elec_price = base_elec_price + carbon_passthrough * clearing_price * system_avg_ef
+
+        if mac_costs is None:
+            mac_costs = np.zeros(self.n_agents)
+
         for i, company in enumerate(self.companies):
             auction_cost = float(payments[i])
-            raw_secondary = float(trade_costs[i])      # Fix 2: capture before cap
+            raw_secondary = float(trade_costs[i])
             secondary_cost = raw_secondary
             penalty_cost = float(penalties[i])
             investment_cost = float(invest_costs[i])
             operational_cost = company.compute_operational_cost()
+            mac_cost_i = float(mac_costs[i])
 
             secondary_cost = max(secondary_cost, -auction_cost)
 
-            company.record_spending(auction_cost + max(0.0, secondary_cost) + investment_cost)
+            company.record_spending(auction_cost + max(0.0, secondary_cost)
+                                    + investment_cost + mac_cost_i)
             budget_penalty = company.compute_budget_penalty()
 
             # P8: Banking holding cost on excess bank above threshold
-            annual_need = float(emissions[i])  # Mt (using realized emissions as proxy)
+            annual_need = float(emissions[i])
             excess_bank = max(0.0, self.holdings[i] - excess_bank_ratio * max(annual_need, 1e-6))
-            holding_cost = excess_bank * holding_cost_rate  # €/t/year × Mt → M€
+            holding_cost = excess_bank * holding_cost_rate
             self._last_holding_costs[i] = holding_cost
 
             total_cost = (auction_cost + secondary_cost + investment_cost
-                         + operational_cost + budget_penalty + holding_cost)
+                         + operational_cost + budget_penalty + holding_cost
+                         + mac_cost_i)
 
-            cost_norm = total_cost / 1000.0
+            # Electricity revenue (same market price for all, green generators profit more)
+            revenue = 0.0
+            if elec_enabled:
+                revenue = company.output_mwh * elec_price / 1e6  # M€
+
+            net_cost = total_cost - revenue
+            cost_norm = net_cost / 1000.0
 
             fossil_floor_i = green_floor_fossil[i] if i < len(green_floor_fossil) else 0.0
             initial_ef_at_floor = fossil_floor_i * max(company.emission_factors[~company.is_green])
@@ -740,12 +791,12 @@ class ETSEnvironment(gym.Env):
                     if unchanged:
                         shaping -= lockin_penalty * self.shaping_weight
 
-            # Fix 2: reward net revenue from secondary market (sellers who trade profitably)
-            trading_profit = max(0.0, -raw_secondary)  # positive when agent nets revenue
+            # Reward net revenue from secondary market (sellers who trade profitably)
+            trading_profit = max(0.0, -raw_secondary)
             shaping += trading_bonus_weight * (trading_profit / 1000.0) * self.shaping_weight
 
-            # Fix 3: small positive signal for holding a healthy allowance bank
-            bank_value = self.holdings[i] * clearing_price / 1e6  # M€ equivalent
+            # Small positive signal for holding a healthy allowance bank
+            bank_value = self.holdings[i] * clearing_price / 1e6
             shaping += bank_weight * (bank_value / 1000.0) * self.shaping_weight
 
             rewards[i] = -(
@@ -780,7 +831,7 @@ class ETSEnvironment(gym.Env):
                 opp_parts = []
                 for j in range(self.n_agents):
                     if j != i:
-                        opp_parts.append(float(self._last_episode_bids[j]) / 200.0)
+                        opp_parts.append(float(self._last_episode_bids[j]) / self._price_norm)
                         opp_parts.append(float(self._last_episode_greens[j]))
                 opponent_obs = np.array(opp_parts, dtype=np.float32)
             else:

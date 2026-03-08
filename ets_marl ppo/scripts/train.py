@@ -23,10 +23,16 @@ Roadmap improvements wired here:
 
 import argparse
 import csv
+import io
 import os
 import sys
 import yaml
 import numpy as np
+
+# Ensure UTF-8 output on Windows (box-drawing characters in console)
+# hasattr guard: Jupyter notebooks use OutStream which has no .buffer attribute
+if sys.stdout.encoding != "utf-8" and hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -151,33 +157,27 @@ def _print_training_legend():
     print("TRAINING CONSOLE — COLUMN GUIDE")
     print(leg)
     print("Market header  (printed every log_interval episodes)")
-    print("  price X→Y (peak Z) : ETS clearing price yr-0 → yr-9 and peak this episode  (€/t)")
-    print("  cap                : Cap (Mt allowances) in the final year")
-    print("  TNAC               : Total allowances in circulation, final year  (drives MSR)")
-    print("  sec_price          : Secondary market clearing price, final year  (€/t)")
-    print("  sec_vol            : Total secondary market volume across all 10 years  (Mt)")
-    print("  sec_match          : Fraction of years with at least one secondary trade")
-    print("  entropy            : PPO entropy coefficient — governs exploration  (P2)")
-    print("  shaping            : Green-investment shaping weight — decays over training  (P4)")
-    print("  [ENT-DECAY]        : Entropy decay triggered  (P2 price+green conditions met)")
-    print("  [cyc=Ax]           : Which agent updated this episode  (agent cycling enabled)")
+    print("  price X→Y (peak Z) : ETS clearing price yr-0 → yr-N and peak  (€/t)")
+    print("  cap                : Cap (Mt) in the final year")
+    print("  TNAC               : Total allowances in circulation, final year")
+    print("  sec_price/vol/match: Secondary market stats")
+    print("  entropy/shaping    : PPO entropy coef & green-shaping weight")
+    print("  [ENT-DECAY]        : Entropy decay triggered")
+    print("  [cyc=Ax]           : Active agent (soft cycling)")
     print()
-    print("Per-agent columns  (one row per agent per logged episode)")
-    print("  Green(0→9)  : Green electricity fraction at year 0 → year 9 of the episode")
-    print("  ΔGreen      : Net green fraction change across the episode  (percentage points)")
-    print("  AvgEmiss    : Mean realized emissions across 10 years  (Mt; includes P5 shocks)")
-    print("  SfYrs       : Years with a compliance shortfall  (x / 10 years)")
-    print("  AvgBid€     : Mean auction bid price across all 10 years  (€/t)")
-    print("  TotRew      : Total raw reward summed across 10 years")
-    print("  TotShort    : Total compliance shortfall summed across 10 years  (Mt)")
-    print("  TotPenalty  : Total non-compliance penalty across 10 years  (M€)")
-    print("  ActLoss     : PPO actor-network loss from the last policy update")
-    print("  CriLoss     : PPO critic-network loss from the last policy update")
-    print("  AvgShock    : P5 — mean |emission-demand shock| across 10 years  (%)")
-    print("  MaxShock    : P5 — largest single demand shock this episode  (%)")
-    print("  AvgCFnoise  : P6 — mean |capacity-factor noise| across green techs  (%)")
-    print("  Cancels     : P6 — construction-project cancellations this episode  (count)")
-    print("  HoldCost    : P8 — excess-banking holding cost summed over 10 years  (M€)")
+    print("Per-agent columns")
+    print("  Green(0→N)  : Green fraction trajectory")
+    print("  ΔGreen      : Net green change (pp)")
+    print("  AvgEmiss    : Mean emissions (Mt)")
+    print("  AvgAlloc    : Mean allocation (Mt)")
+    print("  SfYrs       : Shortfall years")
+    print("  AvgBid€     : Mean bid price (€/t)")
+    print("  TotRew      : Total raw reward")
+    print("  TotShort    : Total shortfall (Mt)")
+    print("  TotPenalty  : Total penalty (M€)")
+    print("  ActLoss     : Actor loss")
+    print("  CriLoss     : Critic loss")
+    print("  MAC_Mt      : MAC fuel-switching reduction (Mt)")
     print(leg)
 
 
@@ -188,8 +188,8 @@ def train_one_seed(config: dict, seed: int):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} agents, PPO, two-phase")
-    print(f"Technology-specific mix | Real CapEx | Construction queues")
-    print(f"P1-P8 roadmap improvements active")
+    print(f"v5.0: MAC switching | Electricity revenue | Carry-forward")
+    print(f"P1-P8 + structural improvements active")
     print(f"{'='*60}")
     _print_training_legend()
 
@@ -219,10 +219,11 @@ def train_one_seed(config: dict, seed: int):
                       f"actor_loss_A{i+1}", f"critic_loss_A{i+1}", f"bid_price_A{i+1}"]
     ep_fields += ["secondary_volume", "secondary_avg_price", "secondary_match_rate"]
     ep_fields += ["price_start", "price_peak", "price_std"]  # episode price trajectory
-    for i in range(n_agents):  # P5/P6/P8 episode aggregates
-        ep_fields += [f"mean_shock_A{i+1}", f"max_shock_A{i+1}",
+    for i in range(n_agents):  # allocation + P5/P6/P8/MAC episode aggregates
+        ep_fields += [f"mean_alloc_A{i+1}",
+                      f"mean_shock_A{i+1}", f"max_shock_A{i+1}",
                       f"mean_cf_shock_A{i+1}", f"total_cancels_A{i+1}",
-                      f"total_holding_cost_A{i+1}"]
+                      f"total_holding_cost_A{i+1}", f"total_mac_reduction_A{i+1}"]
     ep_csv = open(ep_path, "w", newline="")
     ep_writer = csv.DictWriter(ep_csv, fieldnames=ep_fields)
     ep_writer.writeheader()
@@ -240,7 +241,8 @@ def train_one_seed(config: dict, seed: int):
                       f"emission_shock_A{i+1}", f"cf_shock_A{i+1}",  # P5/P6
                       f"cancellation_A{i+1}", f"holding_cost_A{i+1}",  # P6/P8
                       f"auction_cost_A{i+1}", f"secondary_net_A{i+1}",  # cost breakdown
-                      f"compliance_surplus_A{i+1}", f"bank_end_A{i+1}"]  # compliance
+                      f"compliance_surplus_A{i+1}", f"bank_end_A{i+1}",  # compliance
+                      f"mac_reduction_A{i+1}", f"mac_cost_A{i+1}"]  # MAC
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -349,6 +351,8 @@ def train_one_seed(config: dict, seed: int):
                 yr_row[f"compliance_surplus_A{i+1}"] = round(
                     _bstart + _alloc + _tqty - _emiss, 4)  # pre-compliance surplus
                 yr_row[f"bank_end_A{i+1}"]          = round(_holdings, 4)  # post-compliance
+                yr_row[f"mac_reduction_A{i+1}"]     = _get("mac_reductions")
+                yr_row[f"mac_cost_A{i+1}"]          = _get("mac_costs")
             yr_writer.writerow(yr_row)
 
             obs1 = obs1_next
@@ -458,6 +462,10 @@ def train_one_seed(config: dict, seed: int):
             sum(yl.get("holding_costs", [0.0]*n_agents)[i] for yl in env.episode_log)
             for i in range(n_agents)
         ]
+        ep_total_mac_reduction = [                                     # total MAC abatement (Mt)
+            sum(yl.get("mac_reductions", [0.0]*n_agents)[i] for yl in env.episode_log)
+            for i in range(n_agents)
+        ]
 
         # Episode trajectory stats (across all years) — used in console only
         first_log   = env.episode_log[0] if env.episode_log else {}
@@ -475,6 +483,10 @@ def train_one_seed(config: dict, seed: int):
         ]
         ep_mean_emiss = [
             np.mean([yl.get("emissions", [0.0]*n_agents)[i] for yl in env.episode_log])
+            for i in range(n_agents)
+        ]
+        ep_mean_alloc = [
+            np.mean([yl.get("allocations", [0.0]*n_agents)[i] for yl in env.episode_log])
             for i in range(n_agents)
         ]
         ep_shortfall_years = [                       # count of years where agent had shortfall
@@ -509,11 +521,13 @@ def train_one_seed(config: dict, seed: int):
             ep_row[f"shortfall_A{i+1}"] = round(ep_total_shortfalls[i], 6)
             ep_row[f"queue_size_A{i+1}"] = round(ep_avg_queue[i], 2)
             ep_row[f"bid_price_A{i+1}"] = round(avg_bid_per_agent[i], 2)
+            ep_row[f"mean_alloc_A{i+1}"]          = round(ep_mean_alloc[i], 4)
             ep_row[f"mean_shock_A{i+1}"]         = round(ep_mean_shock[i], 5)
             ep_row[f"max_shock_A{i+1}"]          = round(ep_max_shock[i], 5)
             ep_row[f"mean_cf_shock_A{i+1}"]      = round(ep_mean_cf_shock[i], 5)
             ep_row[f"total_cancels_A{i+1}"]      = ep_total_cancels[i]
             ep_row[f"total_holding_cost_A{i+1}"] = round(ep_total_holding_cost[i], 4)
+            ep_row[f"total_mac_reduction_A{i+1}"] = round(ep_total_mac_reduction[i], 4)
             if latest_losses[i]:
                 ep_row[f"actor_loss_A{i+1}"] = round(latest_losses[i]["actor_loss"], 6)
                 ep_row[f"critic_loss_A{i+1}"] = round(latest_losses[i]["critic_loss"], 6)
@@ -532,35 +546,33 @@ def train_one_seed(config: dict, seed: int):
             cyc_str   = f" [cyc=A{active_agent_idx+1}]" if cycling_enabled else ""
             decay_str = " [ENT-DECAY]" if entropy_tracker.decay_triggered else ""
 
-            sep = "─" * 165
+            sep = "─" * 160
             print(sep)
-            # Market context — price as trajectory across the episode, not just last year
             print(f"Ep {episode:5d} │ price {price_start:.0f}→{price_final:.0f} (peak {price_peak:.0f})"
                   f"  cap={cap:5.0f}  TNAC={tnac:5.0f} │ "
-                  f"sec_price={sec_p:5.1f}  sec_vol={total_sec_vol:6.1f}  sec_match={sec_match_rate*100:.0f}% │ "
-                  f"entropy={entropy_coef:.4f}  shaping={env.shaping_weight:.3f}"
+                  f"sec={sec_p:5.1f}€ vol={total_sec_vol:5.1f} match={sec_match_rate*100:.0f}% │ "
+                  f"ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"
                   f"{decay_str}{cyc_str}")
-            # Header: episode trajectory columns | episode aggregate columns | P5/P6/P8 inline
-            print(f"  {'':4}  {'Green(0→9)':>10} {'ΔGreen':>7} {'AvgEmiss':>9} "
-                  f"{'SfYrs':>6} {'AvgBid€':>8} "
-                  f"│ {'TotRew':>8} {'TotShort':>9} {'TotPenalty':>11} {'ActLoss':>8} {'CriLoss':>8} "
-                  f"│ {'AvgShock':>9} {'MaxShock':>9} {'AvgCFnoise':>11} {'Cancels':>8} {'HoldCost':>9}")
+            # Compact header for 8 agents
+            print(f"  {'':4}  {'Grn':>9} {'ΔG':>6} {'Emiss':>6} {'Alloc':>6} "
+                  f"{'Sf':>5} {'Bid€':>6} "
+                  f"│ {'Rew':>7} {'Short':>6} {'Pen':>7} {'ALoss':>7} {'CLoss':>7} "
+                  f"│ {'MAC_Mt':>7}")
             for i in range(n_agents):
                 act_mark  = "*" if (cycling_enabled and i == active_agent_idx) else " "
-                grn_str   = f"{ep_green_start[i]*100:.0f}%→{ep_green_end[i]*100:.0f}%"
-                dgrn_str  = f"{(ep_green_end[i]-ep_green_start[i])*100:+.1f}pp"
+                grn_str   = f"{ep_green_start[i]*100:.0f}→{ep_green_end[i]*100:.0f}%"
+                dgrn_str  = f"{(ep_green_end[i]-ep_green_start[i])*100:+.1f}"
                 sf_str    = f"{ep_shortfall_years[i]}/{n_years_ep}"
                 loss_i    = latest_losses[i]
                 al_str    = f"{loss_i['actor_loss']:.4f}"  if loss_i else "   n/a"
                 cl_str    = f"{loss_i['critic_loss']:.4f}" if loss_i else "   n/a"
                 print(
                     f"  A{i+1}{act_mark}: "
-                    f"{grn_str:>10} {dgrn_str:>7} {ep_mean_emiss[i]:9.2f} "
-                    f"{sf_str:>6} {avg_bid_per_agent[i]:8.1f} "
-                    f"│ {total_rewards[i]:8.2f} {ep_total_shortfalls[i]:9.2f} "
-                    f"{ep_total_penalties[i]:11.1f} {al_str:>8} {cl_str:>8} "
-                    f"│ {ep_mean_shock[i]*100:8.2f}% {ep_max_shock[i]*100:+8.2f}% "
-                    f"{ep_mean_cf_shock[i]*100:10.2f}% {ep_total_cancels[i]:8d} {ep_total_holding_cost[i]:9.2f}"
+                    f"{grn_str:>9} {dgrn_str:>6} {ep_mean_emiss[i]:6.2f} {ep_mean_alloc[i]:6.2f} "
+                    f"{sf_str:>5} {avg_bid_per_agent[i]:6.0f} "
+                    f"│ {total_rewards[i]:7.1f} {ep_total_shortfalls[i]:6.2f} "
+                    f"{ep_total_penalties[i]:7.0f} {al_str:>7} {cl_str:>7} "
+                    f"│ {ep_total_mac_reduction[i]:7.3f}"
                 )
             print(sep)
 
