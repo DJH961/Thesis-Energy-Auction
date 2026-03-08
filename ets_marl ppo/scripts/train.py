@@ -363,8 +363,23 @@ def train_one_seed(config: dict, seed: int):
     agents = build_agents(env, config, seed)
 
     pretrain_cfg = config.get("pretrain", {})
+    bc_ran = False
     if pretrain_cfg.get("enabled", False):
         pretrain_behavioral_cloning(agents, env, config, pretrain_cfg, seed)
+        bc_ran = True
+
+    # Snapshot BC-trained weights as frozen KL anchors (only when BC was run)
+    kl_beta_init = ppo_cfg.get("kl_anchor_beta", 0.0)
+    if bc_ran and kl_beta_init > 0.0:
+        for agent in agents:
+            agent.set_bc_anchor()
+        print(f"KL anchor: frozen BC policies captured for all {n_agents} agents "
+              f"(β₀={kl_beta_init}, decay={ppo_cfg.get('kl_anchor_decay_episodes', 2000)} eps).")
+
+    critic_warmup_eps = ppo_cfg.get("critic_warmup_episodes", 0)
+    kl_decay_eps     = ppo_cfg.get("kl_anchor_decay_episodes", 2000)
+    if critic_warmup_eps > 0:
+        print(f"Critic-warmup: actor gradients frozen for first {critic_warmup_eps} episodes.")
 
     ppo_cfg = config["ppo"]
     cycling_cfg = config.get("agent_cycling", {})
@@ -424,6 +439,15 @@ def train_one_seed(config: dict, seed: int):
     for episode in range(n_episodes):
         # Agent cycling: which agent updates this episode
         active_agent_idx = episode % n_agents if cycling_enabled else None
+
+        # Critic-warmup: disable actor gradients for the first N episodes
+        actor_update = (episode >= critic_warmup_eps)
+
+        # KL anchor beta: linear decay from beta_init to 0 over kl_decay_eps
+        if kl_beta_init > 0.0:
+            kl_beta_now = kl_beta_init * max(0.0, 1.0 - episode / max(kl_decay_eps, 1))
+            for agent in agents:
+                agent.set_kl_beta(kl_beta_now)
 
         # P4: Communicate episode to environment for shaping weight + lock-in activation
         env.set_episode(episode)
@@ -543,13 +567,13 @@ def train_one_seed(config: dict, seed: int):
             if cycling_enabled:
                 if i == active_agent_idx:
                     # Active agent: full update
-                    loss = agents[i].update(last_value=0.0)
+                    loss = agents[i].update(last_value=0.0, actor_update=actor_update)
                 elif cycling_soft:
                     # Soft cycling: update with reduced lr
                     orig_lr = agents[i].optimizer.param_groups[0]["lr"]
                     for pg in agents[i].optimizer.param_groups:
                         pg["lr"] = orig_lr * cycling_lr_scale
-                    loss = agents[i].update(last_value=0.0)
+                    loss = agents[i].update(last_value=0.0, actor_update=actor_update)
                     for pg in agents[i].optimizer.param_groups:
                         pg["lr"] = orig_lr
                 else:
@@ -557,7 +581,7 @@ def train_one_seed(config: dict, seed: int):
                     agents[i].buffer.clear()
                     loss = None
             else:
-                loss = agents[i].update(last_value=0.0)
+                loss = agents[i].update(last_value=0.0, actor_update=actor_update)
             latest_losses.append(loss)
 
         # --- Episode-level logging ---
@@ -753,8 +777,9 @@ def train_one_seed(config: dict, seed: int):
             tnac   = last_log.get("tnac", 0)
             sec_p  = last_log.get("secondary_clearing", 0)
 
-            cyc_str   = f" [cyc=A{active_agent_idx+1}]" if cycling_enabled else ""
-            decay_str = " [ENT-DECAY]" if entropy_tracker.decay_triggered else ""
+            cyc_str    = f" [cyc=A{active_agent_idx+1}]" if cycling_enabled else ""
+            decay_str  = " [ENT-DECAY]" if entropy_tracker.decay_triggered else ""
+            warmup_str = f" [WARMUP {episode+1}/{critic_warmup_eps}]" if not actor_update else ""
 
             # Compact warning summary — only non-zero counters
             _warn_labels = {
@@ -775,7 +800,7 @@ def train_one_seed(config: dict, seed: int):
                   f"  cap={cap:5.0f}  TNAC={tnac:5.0f} │ "
                   f"sec={sec_p:5.1f}€ vol={total_sec_vol:5.1f} match={sec_match_rate*100:.0f}% │ "
                   f"ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"
-                  f"{decay_str}{cyc_str}{warn_str}")
+                  f"{decay_str}{cyc_str}{warmup_str}{warn_str}")
             # Compact header covering all 8 action dimensions
             print(f"  {'':4}  {'Grn':>9} {'ΔG':>6} {'Emiss':>6} {'Alloc':>6} "
                   f"{'Sf':>5} {'Bid€':>6} {'BidMt':>6} {'InvFr':>5} "

@@ -209,6 +209,9 @@ ppo:
   normalize_advantages: true
   log_std_min: -2.0
   log_std_max: 1.0
+  critic_warmup_episodes: 200    # episodes to train critic only (no actor gradients) after BC
+  kl_anchor_beta: 0.5            # initial weight of KL penalty against frozen BC policy
+  kl_anchor_decay_episodes: 2000 # episodes over which beta decays linearly to 0
 
 # ----------------------------------------------------------
 # P5: Demand & Emission Uncertainty

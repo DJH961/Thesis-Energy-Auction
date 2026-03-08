@@ -15,10 +15,12 @@ Roadmap improvements:
       normalize_reward() normalises and clips before storing in buffer.
 """
 
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.distributions import kl_divergence
 from typing import Optional
 
 from src.agents.actor_critic import AuctionPolicy, SecondaryPolicy, ValueNetwork
@@ -166,6 +168,11 @@ class PPOAgent:
         self._reward_clip_min = reward_cfg.get("clip_min", -10.0)
         self._reward_clip_max = reward_cfg.get("clip_max", 2.0)
 
+        # KL anchor: frozen snapshot of BC-trained policy (set after BC pretraining)
+        self._bc_auction_policy = None
+        self._bc_secondary_policy = None
+        self.kl_beta = 0.0
+
     # ------------------------------------------------------------------
     # P2: Entropy coefficient update (called by train.py)
     # ------------------------------------------------------------------
@@ -173,6 +180,24 @@ class PPOAgent:
     def set_entropy_coef(self, coef: float):
         """Update entropy coefficient for this training step (P2 decay schedule)."""
         self.entropy_coef = float(coef)
+
+    def set_kl_beta(self, beta: float):
+        """Update KL anchor penalty weight (decayed by train.py)."""
+        self.kl_beta = float(beta)
+
+    def set_bc_anchor(self):
+        """
+        Snapshot current auction and secondary policy weights as a frozen
+        BC anchor.  Called by train.py immediately after BC pretraining.
+        The anchor networks receive no gradient updates.
+        """
+        self._bc_auction_policy = copy.deepcopy(self.auction_policy).eval()
+        for p in self._bc_auction_policy.parameters():
+            p.requires_grad_(False)
+
+        self._bc_secondary_policy = copy.deepcopy(self.secondary_policy).eval()
+        for p in self._bc_secondary_policy.parameters():
+            p.requires_grad_(False)
 
     # ------------------------------------------------------------------
     # P3: Reward normalisation
@@ -227,7 +252,18 @@ class PPOAgent:
     # PPO Update (end of episode)
     # ------------------------------------------------------------------
 
-    def update(self, last_value: float = 0.0) -> Optional[dict]:
+    def update(self, last_value: float = 0.0, actor_update: bool = True) -> Optional[dict]:
+        """
+        PPO update for one episode rollout.
+
+        Parameters
+        ----------
+        last_value : float
+            Bootstrap value for the last step (0 if terminal).
+        actor_update : bool
+            When False (critic-warmup phase) only the value network is trained;
+            actor gradients are not computed or applied.
+        """
         if len(self.buffer) < 2:
             return None
 
@@ -271,25 +307,45 @@ class PPOAgent:
                 end = min(start + self.mini_batch_size, T)
                 mb = idx[start:end]
 
-                # Re-evaluate
-                auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
-                sec_lp_new, sec_ent = self.secondary_policy.evaluate(obs2[mb], sec_raw[mb])
-
-                new_lp = auc_lp_new + sec_lp_new
-                old_lp = old_auc_lp[mb] + old_sec_lp[mb]
-
-                ratio = torch.exp(new_lp - old_lp)
-                surr1 = ratio * adv_t[mb]
-                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
-                policy_loss = -torch.min(surr1, surr2).mean()
-
                 v_pred = self.value_net(obs2[mb])
                 value_loss = nn.MSELoss()(v_pred, ret_t[mb])
 
-                # P2: entropy_coef updated externally via set_entropy_coef()
-                entropy = (auc_ent + sec_ent).mean()
+                if actor_update:
+                    # Re-evaluate current policy
+                    auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
+                    sec_lp_new, sec_ent = self.secondary_policy.evaluate(obs2[mb], sec_raw[mb])
 
-                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+                    new_lp = auc_lp_new + sec_lp_new
+                    old_lp = old_auc_lp[mb] + old_sec_lp[mb]
+
+                    ratio = torch.exp(new_lp - old_lp)
+                    surr1 = ratio * adv_t[mb]
+                    surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
+                    policy_loss = -torch.min(surr1, surr2).mean()
+
+                    # P2: entropy_coef updated externally via set_entropy_coef()
+                    entropy = (auc_ent + sec_ent).mean()
+
+                    # KL anchor penalty against frozen BC policy
+                    kl_pen = torch.tensor(0.0, device=self.device)
+                    if self._bc_auction_policy is not None and self.kl_beta > 0.0:
+                        curr_auc_dist = self.auction_policy.forward(obs1[mb])
+                        curr_sec_dist = self.secondary_policy.forward(obs2[mb])
+                        with torch.no_grad():
+                            bc_auc_dist = self._bc_auction_policy.forward(obs1[mb])
+                            bc_sec_dist = self._bc_secondary_policy.forward(obs2[mb])
+                        kl_auc = kl_divergence(curr_auc_dist, bc_auc_dist).mean()
+                        kl_sec = kl_divergence(curr_sec_dist, bc_sec_dist).mean()
+                        kl_pen = self.kl_beta * (kl_auc + kl_sec) * 0.5
+
+                    loss = (policy_loss
+                            + self.value_coef * value_loss
+                            - self.entropy_coef * entropy
+                            + kl_pen)
+                else:
+                    # Critic-warmup: train value network only
+                    policy_loss = torch.tensor(0.0, device=self.device)
+                    loss = self.value_coef * value_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
