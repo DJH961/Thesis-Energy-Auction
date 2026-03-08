@@ -51,6 +51,7 @@ ets:
 
   banking: true
   reserve_price: 40.0    # realistic floor; prevents zero-price collapse
+  unsold_to_msr: true    # feed unsold auction allowances into MSR reserve (else discarded)
 
 # ----------------------------------------------------------
 # Companies (8 agents — 2× each of 4 archetypes)

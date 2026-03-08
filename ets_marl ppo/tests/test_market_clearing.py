@@ -11,6 +11,8 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import warnings
+
 import numpy as np
 import pytest
 from src.auction.market_clearing_ets import market_clearing_ets, build_bids
@@ -85,7 +87,9 @@ def test_uniform_price_payment():
 def test_reserve_price():
     """Bids below reserve price should be ignored."""
     bids = make_bids([(80, 1.0), (30, 1.0), (20, 1.0)])
-    _, alloc, _, stats = market_clearing_ets(bids, q_cap=3.0, reserve_price=50.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # expected under-allocation
+        _, alloc, _, stats = market_clearing_ets(bids, q_cap=3.0, reserve_price=50.0)
 
     # Only A0 (price=80) is above reserve
     assert alloc[0] == pytest.approx(1.0)

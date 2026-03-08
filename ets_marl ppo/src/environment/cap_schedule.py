@@ -42,6 +42,10 @@ class CapSchedule:
         # Internal MSR reserve (starts empty)
         self._msr_reserve = 0.0
 
+        # Separate accounting for unsold allowances absorbed into MSR
+        # (distinct from normal TNAC-triggered withholding)
+        self._unsold_absorbed = 0.0
+
         # History for logging
         self.cap_history = []
         self.volume_history = []
@@ -93,6 +97,17 @@ class CapSchedule:
         """Return current MSR reserve level (Mt)."""
         return self._msr_reserve
 
+    def absorb_unsold(self, amount: float):
+        """
+        Absorb unsold auction allowances into the MSR reserve.
+
+        This is tracked separately from normal TNAC-triggered withholding
+        so the two sources can be distinguished in accounting.
+        """
+        amount = max(0.0, amount)
+        self._msr_reserve += amount
+        self._unsold_absorbed += amount
+
     # ------------------------------------------------------------------
     # Internal MSR logic
     # ------------------------------------------------------------------
@@ -129,5 +144,6 @@ class CapSchedule:
     def reset(self):
         """Reset schedule to initial state (call at episode start)."""
         self._msr_reserve = 0.0
+        self._unsold_absorbed = 0.0
         self.cap_history = []
         self.volume_history = []

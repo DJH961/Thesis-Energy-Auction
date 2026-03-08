@@ -131,8 +131,8 @@ def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0
         warnings.warn(
             f"[market_clearing_ets] Under-allocation: {total_allocated:.2f} Mt allocated "
             f"of {q_cap:.2f} Mt cap ({100*total_allocated/q_cap:.0f}%). "
-            "This usually means most bids are below reserve_price. "
-            "Check that auction.price_min >= ets.reserve_price in config.",
+            f"total bid quantity ({total_demand:.2f} Mt) is below available supply. "
+            "Agents are not bidding enough volume.",
             UserWarning,
             stacklevel=2,
         )

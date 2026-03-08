@@ -756,13 +756,26 @@ def train_one_seed(config: dict, seed: int):
             cyc_str   = f" [cyc=A{active_agent_idx+1}]" if cycling_enabled else ""
             decay_str = " [ENT-DECAY]" if entropy_tracker.decay_triggered else ""
 
+            # Compact warning summary — only non-zero counters
+            _warn_labels = {
+                "under_alloc": "under", "price_floor": "floor", "price_ceiling": "ceil",
+                "auction_failed": "fail", "cover_below_one": "cov<1", "zero_invest": "0inv",
+                "chronic_short": "chron", "bid_cluster": "bclust", "bank_hoard": "hoard",
+                "sec_one_sided": "1side", "sec_zero_vol": "0vol",
+            }
+            _warn_parts = [
+                f"{_warn_labels.get(k, k)}={v}"
+                for k, v in env._warnings.items() if v > 0
+            ]
+            warn_str = "  │ warn: " + " ".join(_warn_parts) if _warn_parts else ""
+
             sep = "─" * 152
             print(sep)
             print(f"Ep {episode:5d} │ price {price_start:.0f}→{price_final:.0f} (peak {price_peak:.0f})"
                   f"  cap={cap:5.0f}  TNAC={tnac:5.0f} │ "
                   f"sec={sec_p:5.1f}€ vol={total_sec_vol:5.1f} match={sec_match_rate*100:.0f}% │ "
                   f"ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"
-                  f"{decay_str}{cyc_str}")
+                  f"{decay_str}{cyc_str}{warn_str}")
             # Compact header covering all 8 action dimensions
             print(f"  {'':4}  {'Grn':>9} {'ΔG':>6} {'Emiss':>6} {'Alloc':>6} "
                   f"{'Sf':>5} {'Bid€':>6} {'BidMt':>6} {'InvFr':>5} "
