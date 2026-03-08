@@ -93,6 +93,10 @@ auction:
   price_max: 500.0     # raised: allows bids above penalty ceiling (300 €/t)
   price_min: 20.0
   quantity_max: 5.0
+  # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
+  # [0.3, 2.0] centres the action around covering full need (1.0), avoids zero-qty collapse.
+  qty_mult_low: 0.3
+  qty_mult_high: 2.0
 
 trading:
   enabled: true
@@ -155,8 +159,10 @@ electricity:
 # ----------------------------------------------------------
 reward:
   normalizer_alpha: 0.01
-  clip_min: -10.0
-  clip_max: 5.0
+  # Widened clip range so large carry-forward penalties are not truncated.
+  # Agents need to distinguish a 1 Mt shortfall from a 10 Mt one after normalization.
+  clip_min: -30.0
+  clip_max: 20.0
   # P3: Green penalty floor = initial fossil fractions [A1..A8]
   green_floor_fossil: [0.80, 0.80, 0.60, 0.60, 0.30, 0.30, 0.10, 0.10]
   # P4: Shaping

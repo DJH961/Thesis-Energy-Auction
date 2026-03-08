@@ -524,6 +524,7 @@ class Company:
             self.weighted_emission_factor,        # [17] avg EF
             last_secondary_price / pn,            # [18] P8: secondary price signal
             last_secondary_volume / 10.0,         # [19] P8: secondary volume signal
+            self._carry_forward / 5.0,            # [20] carry-forward obligation (Mt)
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -533,33 +534,35 @@ class Company:
                                 clearing_price, emissions, banked=0.0,
                                 emission_shock=0.0):
         """
-        Phase 2 observation (post-auction): 24D (with 4-agent opponent modeling).
+        Phase 2 observation (post-auction): 25D (with 4-agent opponent modeling).
         Appends auction results + P5 emission shock to phase 1 obs.
 
         Extra dims:
         [base+0] allocation / 5
-        [base+1] clearing_price / 200
-        [base+2] (banked + allocation - emissions) / 5
+        [base+1] clearing_price / price_max
+        [base+2] net compliance position: (banked + allocation - emissions - carry_forward) / 5
+                 <0 means the agent is still short after using all holdings
         [base+3] emission_shock (realized deviation from base need)  -- P5
         """
         extra = np.array([
-            allocation / 5.0,                              # [base+0]
-            clearing_price / self._price_norm,             # [base+1]
-            (banked + allocation - emissions) / 5.0,       # [base+2]
-            float(emission_shock),                         # [base+3] P5
+            allocation / 5.0,                                                       # [base+0]
+            clearing_price / self._price_norm,                                      # [base+1]
+            (banked + allocation - emissions - self._carry_forward) / 5.0,          # [base+2]
+            float(emission_shock),                                                  # [base+3] P5
         ], dtype=np.float32)
         return np.concatenate([obs_phase1, extra])
 
     @property
     def obs_dim_phase1(self) -> int:
-        """20 base dims + 2*(N-1) opponent dims when opponent modeling is enabled."""
+        """21 base dims + 2*(N-1) opponent dims when opponent modeling is enabled.
+        Base dims include carry-forward obligation at index [20]."""
         if self._opponent_modeling and self._n_agents > 1:
-            return 20 + 2 * (self._n_agents - 1)
-        return 20
+            return 21 + 2 * (self._n_agents - 1)
+        return 21
 
     @property
     def obs_dim_phase2(self) -> int:
-        """obs_dim_phase1 + 4 (allocation, price, gap, emission_shock)."""
+        """obs_dim_phase1 + 4 (allocation, price, net_compliance_pos, emission_shock)."""
         return self.obs_dim_phase1 + 4
 
     # ------------------------------------------------------------------

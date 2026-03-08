@@ -53,12 +53,14 @@ def build_agents(env: ETSEnvironment, config: dict, seed: int):
     aq = config["auction"]
     inv = config["investment"]
 
-    # Phase 1: [bid_price, qty, invest_frac, tech_logit0, tech_logit1, tech_logit2]
+    # Phase 1: [bid_price, qty_multiplier, invest_frac, tech_logit0, tech_logit1, tech_logit2]
+    # qty_multiplier is a coverage ratio on estimated need — the policy learns HOW MUCH
+    # of its compliance need to cover at auction rather than an arbitrary absolute volume.
     auction_low = np.array([
-        aq["price_min"], 0.0, 0.0, -1.0, -1.0, -1.0
+        aq["price_min"], aq.get("qty_mult_low", 0.3), 0.0, -1.0, -1.0, -1.0
     ], dtype=np.float32)
     auction_high = np.array([
-        aq["price_max"], aq["quantity_max"], inv["max_invest_frac"], 1.0, 1.0, 1.0
+        aq["price_max"], aq.get("qty_mult_high", 2.0), inv["max_invest_frac"], 1.0, 1.0, 1.0
     ], dtype=np.float32)
 
     # Phase 2: [sec_price_multiplier, sec_qty]
@@ -172,12 +174,16 @@ def _print_training_legend():
     print("  AvgAlloc    : Mean allocation (Mt)")
     print("  SfYrs       : Shortfall years")
     print("  AvgBid€     : Mean bid price (€/t)")
+    print("  BidMt       : Mean bid volume (Mt) — after coverage-multiplier expansion")
+    print("  InvFr       : Mean invest_frac action (how aggressively agent invests)")
     print("  TotRew      : Total raw reward")
     print("  TotShort    : Total shortfall (Mt)")
-    print("  TotPenalty  : Total penalty (M€)")
+    print("  TotPenalty  : Total penalty (M\u20ac)")
     print("  ActLoss     : Actor loss")
     print("  CriLoss     : Critic loss")
     print("  MAC_Mt      : MAC fuel-switching reduction (Mt)")
+    print("  SecMl       : Mean secondary price multiplier (action[0]; 0.5=discount 2.0=premium)")
+    print("  SqAct       : Mean secondary qty action (+buy intent / -sell intent, Mt)")
     print(leg)
 
 
@@ -420,6 +426,46 @@ def train_one_seed(config: dict, seed: int):
             ]
             avg_bid_per_agent.append(np.mean(bids_this_ep) if bids_this_ep else 0.0)
 
+        # Average bid quantity (Mt) per agent — Phase 1 action[1] after multiplier expansion
+        avg_bid_qty_per_agent = []
+        for i in range(n_agents):
+            qtys_this_ep = [
+                yl["bid_quantities"][i]
+                for yl in env.episode_log
+                if "bid_quantities" in yl and i < len(yl["bid_quantities"])
+            ]
+            avg_bid_qty_per_agent.append(np.mean(qtys_this_ep) if qtys_this_ep else 0.0)
+
+        # Average invest_frac action per agent — Phase 1 action[2]
+        avg_invest_frac_per_agent = []
+        for i in range(n_agents):
+            frac_this_ep = [
+                yl["invest_fracs"][i]
+                for yl in env.episode_log
+                if "invest_fracs" in yl and i < len(yl["invest_fracs"])
+            ]
+            avg_invest_frac_per_agent.append(np.mean(frac_this_ep) if frac_this_ep else 0.0)
+
+        # Average secondary price multiplier per agent — Phase 2 action[0]
+        avg_sec_mult_per_agent = []
+        for i in range(n_agents):
+            mults_this_ep = [
+                yl["sec_price_mults"][i]
+                for yl in env.episode_log
+                if "sec_price_mults" in yl and i < len(yl["sec_price_mults"])
+            ]
+            avg_sec_mult_per_agent.append(np.mean(mults_this_ep) if mults_this_ep else 1.0)
+
+        # Average secondary qty action per agent — Phase 2 action[1] (+ve=buy -ve=sell)
+        avg_sec_qty_per_agent = []
+        for i in range(n_agents):
+            sqt_this_ep = [
+                yl["sec_qty_actions"][i]
+                for yl in env.episode_log
+                if "sec_qty_actions" in yl and i < len(yl["sec_qty_actions"])
+            ]
+            avg_sec_qty_per_agent.append(np.mean(sqt_this_ep) if sqt_this_ep else 0.0)
+
         # Per-agent episode aggregates
         ep_total_shortfalls = [
             sum(yl.get("shortfalls", [0]*n_agents)[i] for yl in env.episode_log)
@@ -546,18 +592,18 @@ def train_one_seed(config: dict, seed: int):
             cyc_str   = f" [cyc=A{active_agent_idx+1}]" if cycling_enabled else ""
             decay_str = " [ENT-DECAY]" if entropy_tracker.decay_triggered else ""
 
-            sep = "─" * 160
+            sep = "─" * 152
             print(sep)
             print(f"Ep {episode:5d} │ price {price_start:.0f}→{price_final:.0f} (peak {price_peak:.0f})"
                   f"  cap={cap:5.0f}  TNAC={tnac:5.0f} │ "
                   f"sec={sec_p:5.1f}€ vol={total_sec_vol:5.1f} match={sec_match_rate*100:.0f}% │ "
                   f"ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"
                   f"{decay_str}{cyc_str}")
-            # Compact header for 8 agents
+            # Compact header covering all 8 action dimensions
             print(f"  {'':4}  {'Grn':>9} {'ΔG':>6} {'Emiss':>6} {'Alloc':>6} "
-                  f"{'Sf':>5} {'Bid€':>6} "
+                  f"{'Sf':>5} {'Bid€':>6} {'BidMt':>6} {'InvFr':>5} "
                   f"│ {'Rew':>7} {'Short':>6} {'Pen':>7} {'ALoss':>7} {'CLoss':>7} "
-                  f"│ {'MAC_Mt':>7}")
+                  f"│ {'MAC_Mt':>7} │ {'SecMl':>5} {'SqAct':>6}")
             for i in range(n_agents):
                 act_mark  = "*" if (cycling_enabled and i == active_agent_idx) else " "
                 grn_str   = f"{ep_green_start[i]*100:.0f}→{ep_green_end[i]*100:.0f}%"
@@ -569,10 +615,10 @@ def train_one_seed(config: dict, seed: int):
                 print(
                     f"  A{i+1}{act_mark}: "
                     f"{grn_str:>9} {dgrn_str:>6} {ep_mean_emiss[i]:6.2f} {ep_mean_alloc[i]:6.2f} "
-                    f"{sf_str:>5} {avg_bid_per_agent[i]:6.0f} "
+                    f"{sf_str:>5} {avg_bid_per_agent[i]:6.0f} {avg_bid_qty_per_agent[i]:6.2f} {avg_invest_frac_per_agent[i]:5.3f} "
                     f"│ {total_rewards[i]:7.1f} {ep_total_shortfalls[i]:6.2f} "
                     f"{ep_total_penalties[i]:7.0f} {al_str:>7} {cl_str:>7} "
-                    f"│ {ep_total_mac_reduction[i]:7.3f}"
+                    f"│ {ep_total_mac_reduction[i]:7.3f} │ {avg_sec_mult_per_agent[i]:5.2f} {avg_sec_qty_per_agent[i]:6.2f}"
                 )
             print(sep)
 

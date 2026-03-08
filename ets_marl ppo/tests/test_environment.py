@@ -384,20 +384,22 @@ def test_p7_price_history_seeded():
 # ---------------------------------------------------------------------------
 
 def test_p8_obs_dims():
-    """Phase 1 obs should be 26D (20 base + 6 opponent) with 4-agent opponent modeling."""
+    """Phase 1 obs should be 21D base (+ 2*(N-1) opponent dims) with opponent modeling.
+    21 = 20 original dims + carry-forward obligation at [20]."""
     env = load_env()
     obs, _ = env.reset()
     n_agents = env.config["companies"]["n_agents"]
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
-    expected_p1 = 20 + (2 * (n_agents - 1) if opp_enabled else 0)
+    expected_p1 = 21 + (2 * (n_agents - 1) if opp_enabled else 0)
     expected_p2 = expected_p1 + 4
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
     )
 
+    # Auction actions: action[1] is now a COVERAGE MULTIPLIER on estimated need
     auction_actions = np.random.uniform(
-        [20.0, 0.0, 0.0, -1.0, -1.0, -1.0],
-        [200.0, 5.0, 0.05, 1.0, 1.0, 1.0],
+        [20.0, 0.3, 0.0, -1.0, -1.0, -1.0],
+        [200.0, 2.0, 0.05, 1.0, 1.0, 1.0],
         size=(n_agents, 6)
     ).astype(np.float32)
     obs2, _ = env.step_auction(auction_actions)

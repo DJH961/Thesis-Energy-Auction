@@ -97,6 +97,7 @@ class ETSEnvironment(gym.Env):
         self._phase1_obs = None
         self._phase1_log = None
         self._phase1_bid_prices = None
+        self._phase1_bid_quantities = None  # actual Mt quantities after multiplier expansion
 
         # P4: Per-agent fossil fraction history within the episode (last 3 years)
         self._fossil_frac_history: List[List[float]] = [[] for _ in range(self.n_agents)]
@@ -112,6 +113,10 @@ class ETSEnvironment(gym.Env):
 
         # P8: per-agent holding costs from last _compute_rewards call (M€)
         self._last_holding_costs = np.zeros(self.n_agents)
+
+        # Unsold allowance rollover: volume offered at auction but not allocated
+        # carries forward to the next year's auction supply.
+        self._unsold_rollover = 0.0
 
         # Opponent modeling (Option C)
         opp_enabled = config.get("opponent_modeling", {}).get("enabled", False)
@@ -182,6 +187,7 @@ class ETSEnvironment(gym.Env):
         self._p6_cancellations = np.zeros(self.n_agents, dtype=int)
 
         self.cap_schedule.reset()
+        self._unsold_rollover = 0.0
 
         initial_mixes = self.config["companies"]["initial_mix"]
         for i, company in enumerate(self.companies):
@@ -320,10 +326,13 @@ class ETSEnvironment(gym.Env):
         # 3. Compute TNAC and auction volume
         cap_t = self.cap_schedule.get_cap(year)
         tnac = float(self.holdings.sum())
-        auction_volume = self.cap_schedule.get_auction_volume(year, tnac)
+        base_auction_volume = self.cap_schedule.get_auction_volume(year, tnac)
+        # Redistribute unsold allowances: roll over from previous year's unsold supply
+        auction_volume = base_auction_volume + self._unsold_rollover
         log["cap"] = cap_t
         log["tnac"] = tnac
         log["auction_volume"] = auction_volume
+        log["unsold_rollover_in"] = round(self._unsold_rollover, 4)
         log["msr_reserve"] = self.cap_schedule.msr_reserve()
 
         # 4. P5: Generate correlated emission shocks
@@ -371,7 +380,19 @@ class ETSEnvironment(gym.Env):
             self.config["auction"]["price_min"],
             self.config["auction"]["price_max"],
         )
+        # Quantity reparameterization: action[1] is a coverage MULTIPLIER on estimated need.
+        # actual_qty = multiplier × (compute_estimate_need + carry_forward)
+        # This keeps the strategic decision centred on compliance coverage ratio rather
+        # than an absolute volume, avoiding the zero-quantity collapse.
+        qty_mult_low = self.config["auction"].get("qty_mult_low", 0.3)
+        qty_mult_high = self.config["auction"].get("qty_mult_high", 2.0)
+        for i, company in enumerate(self.companies):
+            multiplier = float(np.clip(auction_actions[i, 1], qty_mult_low, qty_mult_high))
+            base_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
+            bid_actions[i, 1] = multiplier * base_need
+
         self._phase1_bid_prices = bid_actions[:, 0].copy()
+        self._phase1_bid_quantities = bid_actions[:, 1].copy()  # Mt after multiplier expansion
         if self._opponent_modeling:
             self._current_episode_bid_sum += self._phase1_bid_prices
             self._current_episode_bid_count += 1
@@ -382,6 +403,9 @@ class ETSEnvironment(gym.Env):
             q_cap=auction_volume,
             reserve_price=self.config["ets"].get("reserve_price", 0.0),
         )
+        # Update unsold rollover with this year's unallocated supply
+        self._unsold_rollover = max(0.0, auction_volume - float(allocations.sum()))
+        log["unsold_rollover_out"] = round(self._unsold_rollover, 4)
         self.last_clearing_price = clearing_price
         self._phase1_clearing_price = clearing_price
         log["clearing_price"] = clearing_price
@@ -400,8 +424,10 @@ class ETSEnvironment(gym.Env):
 
         # 9. Green investments
         invest_costs = np.zeros(self.n_agents)
+        invest_fracs = np.zeros(self.n_agents)  # raw action values for logging
         for i, company in enumerate(self.companies):
             invest_frac = float(auction_actions[i, 2])
+            invest_fracs[i] = invest_frac
             tech_logits = auction_actions[i, 3:6]
             tech_choice = int(np.argmax(tech_logits))
             invest_costs[i] = company.plan_investment(tech_choice, invest_frac, year)
@@ -436,6 +462,8 @@ class ETSEnvironment(gym.Env):
         log["cancellations"] = cancellations.tolist()
         log["mac_reductions"] = mac_reductions.tolist()
         log["mac_costs"] = mac_costs.tolist()
+        log["bid_quantities"] = self._phase1_bid_quantities.tolist()  # Mt per agent
+        log["invest_fracs"] = invest_fracs.tolist()                   # raw action[2] per agent
 
         return obs_phase2, log
 
@@ -533,11 +561,11 @@ class ETSEnvironment(gym.Env):
             realized_emissions, clearing_price, mac_costs
         )
 
-        # Compute per-agent shortfall for diagnostics (realized emissions vs held)
+        # Compute per-agent shortfall for diagnostics.
+        # Total obligation = realized emissions + carry-forward from prior years.
+        # Uses local `holdings` (pre-compliance: prev_bank + alloc + secondary).
         shortfalls = np.array([
-            max(0.0, realized_emissions[i] - max(
-                0.0, self.holdings[i] + allocations[i] + trade_qtys[i]
-            ))
+            max(0.0, realized_emissions[i] + old_carry_forward[i] - holdings[i])
             for i in range(self.n_agents)
         ])
 
@@ -563,6 +591,8 @@ class ETSEnvironment(gym.Env):
             "holding_costs": self._last_holding_costs.tolist(),  # P8
             "mac_reductions": self._mac_reductions.tolist(),
             "mac_costs": self._mac_costs.tolist(),
+            "sec_price_mults": secondary_actions[:, 0].tolist(),  # Phase 2 action[0] (raw)
+            "sec_qty_actions": secondary_actions[:, 1].tolist(),  # Phase 2 action[1] (raw)
         })
         self.episode_log.append(log)
 
