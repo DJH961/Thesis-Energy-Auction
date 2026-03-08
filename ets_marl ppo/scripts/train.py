@@ -144,6 +144,43 @@ class EntropyConditionTracker:
         return self._decay_start_episode is not None
 
 
+def _print_training_legend():
+    """Print field guide once at the start of each training run."""
+    leg = "─" * 82
+    print(f"\n{leg}")
+    print("TRAINING CONSOLE — COLUMN GUIDE")
+    print(leg)
+    print("Market header  (printed every log_interval episodes)")
+    print("  price X→Y (peak Z) : ETS clearing price yr-0 → yr-9 and peak this episode  (€/t)")
+    print("  cap                : Cap (Mt allowances) in the final year")
+    print("  TNAC               : Total allowances in circulation, final year  (drives MSR)")
+    print("  sec_price          : Secondary market clearing price, final year  (€/t)")
+    print("  sec_vol            : Total secondary market volume across all 10 years  (Mt)")
+    print("  sec_match          : Fraction of years with at least one secondary trade")
+    print("  entropy            : PPO entropy coefficient — governs exploration  (P2)")
+    print("  shaping            : Green-investment shaping weight — decays over training  (P4)")
+    print("  [ENT-DECAY]        : Entropy decay triggered  (P2 price+green conditions met)")
+    print("  [cyc=Ax]           : Which agent updated this episode  (agent cycling enabled)")
+    print()
+    print("Per-agent columns  (one row per agent per logged episode)")
+    print("  Green(0→9)  : Green electricity fraction at year 0 → year 9 of the episode")
+    print("  ΔGreen      : Net green fraction change across the episode  (percentage points)")
+    print("  AvgEmiss    : Mean realized emissions across 10 years  (Mt; includes P5 shocks)")
+    print("  SfYrs       : Years with a compliance shortfall  (x / 10 years)")
+    print("  AvgBid€     : Mean auction bid price across all 10 years  (€/t)")
+    print("  TotRew      : Total raw reward summed across 10 years")
+    print("  TotShort    : Total compliance shortfall summed across 10 years  (Mt)")
+    print("  TotPenalty  : Total non-compliance penalty across 10 years  (M€)")
+    print("  ActLoss     : PPO actor-network loss from the last policy update")
+    print("  CriLoss     : PPO critic-network loss from the last policy update")
+    print("  AvgShock    : P5 — mean |emission-demand shock| across 10 years  (%)")
+    print("  MaxShock    : P5 — largest single demand shock this episode  (%)")
+    print("  AvgCFnoise  : P6 — mean |capacity-factor noise| across green techs  (%)")
+    print("  Cancels     : P6 — construction-project cancellations this episode  (count)")
+    print("  HoldCost    : P8 — excess-banking holding cost summed over 10 years  (M€)")
+    print(leg)
+
+
 def train_one_seed(config: dict, seed: int):
     n_agents = config["companies"]["n_agents"]
     n_episodes = config["simulation"]["n_episodes"]
@@ -154,6 +191,7 @@ def train_one_seed(config: dict, seed: int):
     print(f"Technology-specific mix | Real CapEx | Construction queues")
     print(f"P1-P8 roadmap improvements active")
     print(f"{'='*60}")
+    _print_training_legend()
 
     env = ETSEnvironment(config, seed=seed)
     agents = build_agents(env, config, seed)
@@ -494,43 +532,35 @@ def train_one_seed(config: dict, seed: int):
             cyc_str   = f" [cyc=A{active_agent_idx+1}]" if cycling_enabled else ""
             decay_str = " [ENT-DECAY]" if entropy_tracker.decay_triggered else ""
 
-            sep = "─" * 108
+            sep = "─" * 165
             print(sep)
             # Market context — price as trajectory across the episode, not just last year
-            print(f"Ep {episode:5d} │ price {price_start:.0f}→{price_final:.0f} (pk {price_peak:.0f}) "
-                  f" cap={cap:5.0f}  TNAC={tnac:5.0f} │ "
-                  f"sec_p={sec_p:5.1f}  vol={total_sec_vol:6.1f}  match={sec_match_rate*100:.0f}% │ "
-                  f"ent={entropy_coef:.4f}  shw={env.shaping_weight:.3f}"
+            print(f"Ep {episode:5d} │ price {price_start:.0f}→{price_final:.0f} (peak {price_peak:.0f})"
+                  f"  cap={cap:5.0f}  TNAC={tnac:5.0f} │ "
+                  f"sec_price={sec_p:5.1f}  sec_vol={total_sec_vol:6.1f}  sec_match={sec_match_rate*100:.0f}% │ "
+                  f"entropy={entropy_coef:.4f}  shaping={env.shaping_weight:.3f}"
                   f"{decay_str}{cyc_str}")
-            # Header: episode trajectory columns | episode aggregate columns
-            print(f"  {'':4}  {'Grn0→F':>8} {'ΔGrn':>6} {'EmMean':>7} "
-                  f"{'SfYrs':>6} {'BidAvg':>7}  "
-                  f"│ {'EpRew':>7} {'EpShort':>8} {'EpPen':>9} {'aLoss':>7} {'cLoss':>7}")
+            # Header: episode trajectory columns | episode aggregate columns | P5/P6/P8 inline
+            print(f"  {'':4}  {'Green(0→9)':>10} {'ΔGreen':>7} {'AvgEmiss':>9} "
+                  f"{'SfYrs':>6} {'AvgBid€':>8} "
+                  f"│ {'TotRew':>8} {'TotShort':>9} {'TotPenalty':>11} {'ActLoss':>8} {'CriLoss':>8} "
+                  f"│ {'AvgShock':>9} {'MaxShock':>9} {'AvgCFnoise':>11} {'Cancels':>8} {'HoldCost':>9}")
             for i in range(n_agents):
                 act_mark  = "*" if (cycling_enabled and i == active_agent_idx) else " "
                 grn_str   = f"{ep_green_start[i]*100:.0f}%→{ep_green_end[i]*100:.0f}%"
                 dgrn_str  = f"{(ep_green_end[i]-ep_green_start[i])*100:+.1f}pp"
                 sf_str    = f"{ep_shortfall_years[i]}/{n_years_ep}"
                 loss_i    = latest_losses[i]
-                al_str    = f"{loss_i['actor_loss']:.4f}"  if loss_i else "  n/a "
-                cl_str    = f"{loss_i['critic_loss']:.4f}" if loss_i else "  n/a "
+                al_str    = f"{loss_i['actor_loss']:.4f}"  if loss_i else "   n/a"
+                cl_str    = f"{loss_i['critic_loss']:.4f}" if loss_i else "   n/a"
                 print(
                     f"  A{i+1}{act_mark}: "
-                    f"{grn_str:>8} {dgrn_str:>6} {ep_mean_emiss[i]:7.2f} "
-                    f"{sf_str:>6} {avg_bid_per_agent[i]:7.1f}  "
-                    f"│ {total_rewards[i]:7.2f} {ep_total_shortfalls[i]:8.2f} "
-                    f"{ep_total_penalties[i]:9.1f} {al_str:>7} {cl_str:>7}"
-                )
-
-            # P5/P6/P8 stochastic deviations row (episode aggregates only — last year is noise)
-            print(f"  {'':4}  {'meanShk%':>8} {'maxShk%':>8} {'CFnoise%':>9} "
-                  f"{'Cancels':>8} {'HoldCost':>9}")
-            for i in range(n_agents):
-                print(
-                    f"  A{i+1}    "
-                    f"{ep_mean_shock[i]*100:7.2f}%  {ep_max_shock[i]*100:+7.2f}%  "
-                    f"{ep_mean_cf_shock[i]*100:8.2f}%  "
-                    f"{ep_total_cancels[i]:8d}  {ep_total_holding_cost[i]:9.2f}"
+                    f"{grn_str:>10} {dgrn_str:>7} {ep_mean_emiss[i]:9.2f} "
+                    f"{sf_str:>6} {avg_bid_per_agent[i]:8.1f} "
+                    f"│ {total_rewards[i]:8.2f} {ep_total_shortfalls[i]:9.2f} "
+                    f"{ep_total_penalties[i]:11.1f} {al_str:>8} {cl_str:>8} "
+                    f"│ {ep_mean_shock[i]*100:8.2f}% {ep_max_shock[i]*100:+8.2f}% "
+                    f"{ep_mean_cf_shock[i]*100:10.2f}% {ep_total_cancels[i]:8d} {ep_total_holding_cost[i]:9.2f}"
                 )
             print(sep)
 
