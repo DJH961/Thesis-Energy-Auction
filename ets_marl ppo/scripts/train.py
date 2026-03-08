@@ -436,6 +436,19 @@ def train_one_seed(config: dict, seed: int):
     save_interval = config["logging"]["save_interval"]
     best_total_reward = -np.inf
 
+    # ── Broken-policy detection state ────────────────────────────────────────
+    _diag            = config.get("diagnostics", {})
+    _broken_window   = _diag.get("market_broken_window", 20)
+    _ceil_thresh     = _diag.get("market_broken_bid_threshold", 0.99)  # fraction of price_max
+    _floor_thresh    = _diag.get("floor_bid_threshold", 1.02)          # fraction of price_min
+    _zero_qty_thresh = _diag.get("zero_qty_threshold", 0.01)           # fraction of quantity_max
+    _price_max       = config["auction"]["price_max"]
+    _price_min       = config["auction"]["price_min"]
+    _qty_max         = config["auction"]["quantity_max"]
+    _streak_ceil  = np.zeros(n_agents, dtype=int)  # avg bid >= ceil_thresh * price_max
+    _streak_floor = np.zeros(n_agents, dtype=int)  # avg bid <= floor_thresh * price_min
+    _streak_qty   = np.zeros(n_agents, dtype=int)  # avg bid qty <= zero_qty_thresh * qty_max
+
     for episode in range(n_episodes):
         # Agent cycling: which agent updates this episode
         active_agent_idx = episode % n_agents if cycling_enabled else None
@@ -623,6 +636,49 @@ def train_one_seed(config: dict, seed: int):
                 if "bid_quantities" in yl and i < len(yl["bid_quantities"])
             ]
             avg_bid_qty_per_agent.append(np.mean(qtys_this_ep) if qtys_this_ep else 0.0)
+
+        # ── Broken-policy detection ───────────────────────────────────────────
+        # 1. NaN reward: numerical explosion → immediate halt
+        if np.isnan(total_rewards).any():
+            ep_csv.close(); yr_csv.close()
+            _nan_agents = [f"A{i+1}" for i in range(n_agents) if np.isnan(total_rewards[i])]
+            raise RuntimeError(
+                f"[BROKEN – NaN REWARD] ep {episode}: NaN reward for "
+                f"{', '.join(_nan_agents)}. Numerical instability. Aborting."
+            )
+        # 2-4. Streak-based structural collapses (only counted after actor starts updating)
+        if not actor_update:
+            _streak_ceil[:] = 0; _streak_floor[:] = 0; _streak_qty[:] = 0
+        else:
+            for _i in range(n_agents):
+                _streak_ceil[_i]  = (_streak_ceil[_i]  + 1) if avg_bid_per_agent[_i]     >= _ceil_thresh * _price_max  else 0
+                _streak_floor[_i] = (_streak_floor[_i] + 1) if avg_bid_per_agent[_i]     <= _floor_thresh * _price_min else 0
+                _streak_qty[_i]   = (_streak_qty[_i]   + 1) if avg_bid_qty_per_agent[_i] <= _zero_qty_thresh * _qty_max else 0
+
+                if _streak_ceil[_i] >= _broken_window:
+                    ep_csv.close(); yr_csv.close()
+                    raise RuntimeError(
+                        f"[BROKEN – CEILING BID] A{_i+1}: avg bid "
+                        f">={_ceil_thresh*100:.0f}% of price_max ({_price_max:.0f} €/t) for "
+                        f"{_broken_window} consecutive episodes (ep {episode}). "
+                        f"Policy collapsed to price ceiling. Aborting."
+                    )
+                if _streak_floor[_i] >= _broken_window:
+                    ep_csv.close(); yr_csv.close()
+                    raise RuntimeError(
+                        f"[BROKEN – FLOOR BID] A{_i+1}: avg bid "
+                        f"<={_floor_thresh*100:.0f}% of price_min ({_price_min:.0f} €/t) for "
+                        f"{_broken_window} consecutive episodes (ep {episode}). "
+                        f"Policy stuck at price floor. Aborting."
+                    )
+                if _streak_qty[_i] >= _broken_window:
+                    ep_csv.close(); yr_csv.close()
+                    raise RuntimeError(
+                        f"[BROKEN – ZERO QUANTITY] A{_i+1}: avg bid qty "
+                        f"<={_zero_qty_thresh*100:.0f}% of qty_max ({_qty_max:.1f} Mt) for "
+                        f"{_broken_window} consecutive episodes (ep {episode}). "
+                        f"Agent opted out of auction. Aborting."
+                    )
 
         # Average invest_frac action per agent — Phase 1 action[2]
         avg_invest_frac_per_agent = []
