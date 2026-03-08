@@ -180,6 +180,11 @@ def train_one_seed(config: dict, seed: int):
                       f"penalty_A{i+1}", f"shortfall_A{i+1}", f"queue_size_A{i+1}",
                       f"actor_loss_A{i+1}", f"critic_loss_A{i+1}", f"bid_price_A{i+1}"]
     ep_fields += ["secondary_volume", "secondary_avg_price", "secondary_match_rate"]
+    ep_fields += ["price_start", "price_peak", "price_std"]  # episode price trajectory
+    for i in range(n_agents):  # P5/P6/P8 episode aggregates
+        ep_fields += [f"mean_shock_A{i+1}", f"max_shock_A{i+1}",
+                      f"mean_cf_shock_A{i+1}", f"total_cancels_A{i+1}",
+                      f"total_holding_cost_A{i+1}"]
     ep_csv = open(ep_path, "w", newline="")
     ep_writer = csv.DictWriter(ep_csv, fieldnames=ep_fields)
     ep_writer.writeheader()
@@ -195,7 +200,9 @@ def train_one_seed(config: dict, seed: int):
                       f"reward_A{i+1}", f"holdings_A{i+1}", f"invest_cost_A{i+1}",
                       f"bid_price_A{i+1}", f"queue_size_A{i+1}",
                       f"emission_shock_A{i+1}", f"cf_shock_A{i+1}",  # P5/P6
-                      f"cancellation_A{i+1}"]                         # P6
+                      f"cancellation_A{i+1}", f"holding_cost_A{i+1}",  # P6/P8
+                      f"auction_cost_A{i+1}", f"secondary_net_A{i+1}",  # cost breakdown
+                      f"compliance_surplus_A{i+1}", f"bank_end_A{i+1}"]  # compliance
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -289,6 +296,21 @@ def train_one_seed(config: dict, seed: int):
                 yr_row[f"emission_shock_A{i+1}"] = _get("emission_shocks")   # P5
                 yr_row[f"cf_shock_A{i+1}"] = _get("cf_shocks")               # P6
                 yr_row[f"cancellation_A{i+1}"] = _get("cancellations")       # P6
+                yr_row[f"holding_cost_A{i+1}"] = _get("holding_costs")       # P8
+                # Derived cost-breakdown and compliance fields
+                _alloc    = _get("allocations")
+                _price    = yl.get("clearing_price", 0.0)
+                _payment  = _get("payments")           # actual auction payment
+                _tqty     = _get("trade_qtys")
+                _tcost    = _get("trade_costs")
+                _emiss    = _get("emissions")
+                _bstart   = _get("bank_start")
+                _holdings = _get("holdings")            # post-compliance bank
+                yr_row[f"auction_cost_A{i+1}"]      = round(_payment, 4)
+                yr_row[f"secondary_net_A{i+1}"]     = round(-_tcost, 4)  # +ve = revenue
+                yr_row[f"compliance_surplus_A{i+1}"] = round(
+                    _bstart + _alloc + _tqty - _emiss, 4)  # pre-compliance surplus
+                yr_row[f"bank_end_A{i+1}"]          = round(_holdings, 4)  # post-compliance
             yr_writer.writerow(yr_row)
 
             obs1 = obs1_next
@@ -374,6 +396,57 @@ def train_one_seed(config: dict, seed: int):
             for i in range(n_agents)
         ]
 
+        # P5/P6/P8 episode aggregates for diagnostics
+        ep_mean_shock = [                                              # mean |ε| over years
+            np.mean([abs(yl.get("emission_shocks", [0]*n_agents)[i])
+                     for yl in env.episode_log])
+            for i in range(n_agents)
+        ]
+        ep_max_shock = [                                               # worst-case ε
+            max(yl.get("emission_shocks", [0]*n_agents)[i]
+                for yl in env.episode_log)
+            for i in range(n_agents)
+        ]
+        ep_mean_cf_shock = [                                           # mean |CF noise|
+            np.mean([abs(yl.get("cf_shocks", [0]*n_agents)[i])
+                     for yl in env.episode_log])
+            for i in range(n_agents)
+        ]
+        ep_total_cancels = [                                           # total project cancellations
+            sum(int(yl.get("cancellations", [0]*n_agents)[i]) for yl in env.episode_log)
+            for i in range(n_agents)
+        ]
+        ep_total_holding_cost = [                                      # total P8 holding cost (M€)
+            sum(yl.get("holding_costs", [0.0]*n_agents)[i] for yl in env.episode_log)
+            for i in range(n_agents)
+        ]
+
+        # Episode trajectory stats (across all years) — used in console only
+        first_log   = env.episode_log[0] if env.episode_log else {}
+        n_years_ep  = len(env.episode_log)
+        prices_ep   = [yl.get("clearing_price", 0.0) for yl in env.episode_log]
+        price_start = prices_ep[0]  if prices_ep else 0.0
+        price_final = prices_ep[-1] if prices_ep else 0.0
+        price_peak  = max(prices_ep) if prices_ep else 0.0
+
+        ep_green_start = [
+            first_log.get("green_fracs", [0.0]*n_agents)[i] for i in range(n_agents)
+        ]
+        ep_green_end = [
+            last_log.get("green_fracs", [0.0]*n_agents)[i] for i in range(n_agents)
+        ]
+        ep_mean_emiss = [
+            np.mean([yl.get("emissions", [0.0]*n_agents)[i] for yl in env.episode_log])
+            for i in range(n_agents)
+        ]
+        ep_shortfall_years = [                       # count of years where agent had shortfall
+            sum(1 for yl in env.episode_log
+                if yl.get("shortfalls", [0.0]*n_agents)[i] > 1e-6)
+            for i in range(n_agents)
+        ]
+
+        price_std = float(np.std(prices_ep)) if len(prices_ep) > 1 else 0.0
+
         ep_row = {
             "episode": episode,
             "clearing_price_last": last_log.get("clearing_price", 0),
@@ -385,6 +458,9 @@ def train_one_seed(config: dict, seed: int):
             "secondary_volume": round(total_sec_vol, 4),
             "secondary_avg_price": round(avg_sec_price, 2),
             "secondary_match_rate": round(sec_match_rate, 3),
+            "price_start": round(price_start, 2),
+            "price_peak": round(price_peak, 2),
+            "price_std": round(price_std, 2),
         }
         for i in range(n_agents):
             ep_row[f"reward_A{i+1}"] = round(total_rewards[i], 4)
@@ -395,6 +471,11 @@ def train_one_seed(config: dict, seed: int):
             ep_row[f"shortfall_A{i+1}"] = round(ep_total_shortfalls[i], 6)
             ep_row[f"queue_size_A{i+1}"] = round(ep_avg_queue[i], 2)
             ep_row[f"bid_price_A{i+1}"] = round(avg_bid_per_agent[i], 2)
+            ep_row[f"mean_shock_A{i+1}"]         = round(ep_mean_shock[i], 5)
+            ep_row[f"max_shock_A{i+1}"]          = round(ep_max_shock[i], 5)
+            ep_row[f"mean_cf_shock_A{i+1}"]      = round(ep_mean_cf_shock[i], 5)
+            ep_row[f"total_cancels_A{i+1}"]      = ep_total_cancels[i]
+            ep_row[f"total_holding_cost_A{i+1}"] = round(ep_total_holding_cost[i], 4)
             if latest_losses[i]:
                 ep_row[f"actor_loss_A{i+1}"] = round(latest_losses[i]["actor_loss"], 6)
                 ep_row[f"critic_loss_A{i+1}"] = round(latest_losses[i]["critic_loss"], 6)
@@ -406,50 +487,50 @@ def train_one_seed(config: dict, seed: int):
 
         # Console diagnostics
         if episode % log_interval == 0:
-            price  = last_log.get("clearing_price", 0)
             cap    = last_log.get("cap", 0)
             tnac   = last_log.get("tnac", 0)
             sec_p  = last_log.get("secondary_clearing", 0)
 
-            # Last-year per-agent arrays (most recent state)
-            ly_bank   = last_log.get("bank_start",   [0.0] * n_agents)
-            ly_alloc  = last_log.get("allocations",  [0.0] * n_agents)
-            ly_emiss  = last_log.get("emissions",    [0.0] * n_agents)
-            ly_secnet = last_log.get("trade_qtys",   [0.0] * n_agents)
-            ly_hold   = last_log.get("holdings",     [0.0] * n_agents)
-            ly_short  = last_log.get("shortfalls",   [0.0] * n_agents)
-            ly_pen    = last_log.get("penalties",    [0.0] * n_agents)
-            ly_green  = last_log.get("green_fracs",  [0.0] * n_agents)
-            ly_dg     = last_log.get("delta_greens", [0.0] * n_agents)
-
             cyc_str   = f" [cyc=A{active_agent_idx+1}]" if cycling_enabled else ""
             decay_str = " [ENT-DECAY]" if entropy_tracker.decay_triggered else ""
 
-            sep = "─" * 112
+            sep = "─" * 108
             print(sep)
-            print(f"Ep {episode:5d} │ price={price:6.1f}  cap={cap:5.0f}  TNAC={tnac:6.0f} │ "
-                  f"sec_p={sec_p:5.1f}  sec_vol={total_sec_vol:7.1f}  match={sec_match_rate*100:.0f}% │ "
-                  f"ent={entropy_coef:.4f}  shaping={env.shaping_weight:.3f}"
+            # Market context — price as trajectory across the episode, not just last year
+            print(f"Ep {episode:5d} │ price {price_start:.0f}→{price_final:.0f} (pk {price_peak:.0f}) "
+                  f" cap={cap:5.0f}  TNAC={tnac:5.0f} │ "
+                  f"sec_p={sec_p:5.1f}  vol={total_sec_vol:6.1f}  match={sec_match_rate*100:.0f}% │ "
+                  f"ent={entropy_coef:.4f}  shw={env.shaping_weight:.3f}"
                   f"{decay_str}{cyc_str}")
-            # Header: last-year columns | episode aggregate columns
-            print(f"  {'':4}  {'BankSt':>7} {'Alloc':>7} {'Emiss':>7} {'SecNet':>7} "
-                  f"{'Hold':>7} {'Short/yr':>8} {'Pen/yr':>9} "
-                  f"{'Green':>6} {'ΔGreen':>7} {'Bid':>5}  "
+            # Header: episode trajectory columns | episode aggregate columns
+            print(f"  {'':4}  {'Grn0→F':>8} {'ΔGrn':>6} {'EmMean':>7} "
+                  f"{'SfYrs':>6} {'BidAvg':>7}  "
                   f"│ {'EpRew':>7} {'EpShort':>8} {'EpPen':>9} {'aLoss':>7} {'cLoss':>7}")
             for i in range(n_agents):
-                act_mark = "*" if (cycling_enabled and i == active_agent_idx) else " "
-                dg_str   = f"{ly_dg[i] * 100:+.1f}%"
-                loss_i   = latest_losses[i]
-                al_str   = f"{loss_i['actor_loss']:.4f}"  if loss_i else "  n/a "
-                cl_str   = f"{loss_i['critic_loss']:.4f}" if loss_i else "  n/a "
+                act_mark  = "*" if (cycling_enabled and i == active_agent_idx) else " "
+                grn_str   = f"{ep_green_start[i]*100:.0f}%→{ep_green_end[i]*100:.0f}%"
+                dgrn_str  = f"{(ep_green_end[i]-ep_green_start[i])*100:+.1f}pp"
+                sf_str    = f"{ep_shortfall_years[i]}/{n_years_ep}"
+                loss_i    = latest_losses[i]
+                al_str    = f"{loss_i['actor_loss']:.4f}"  if loss_i else "  n/a "
+                cl_str    = f"{loss_i['critic_loss']:.4f}" if loss_i else "  n/a "
                 print(
                     f"  A{i+1}{act_mark}: "
-                    f"{ly_bank[i]:7.1f} {ly_alloc[i]:7.1f} {ly_emiss[i]:7.1f} "
-                    f"{ly_secnet[i]:+7.1f} {ly_hold[i]:7.1f} "
-                    f"{ly_short[i]:8.2f} {ly_pen[i]:9.1f} "
-                    f"{ly_green[i]*100:5.1f}% {dg_str:>7} {avg_bid_per_agent[i]:5.1f}  "
+                    f"{grn_str:>8} {dgrn_str:>6} {ep_mean_emiss[i]:7.2f} "
+                    f"{sf_str:>6} {avg_bid_per_agent[i]:7.1f}  "
                     f"│ {total_rewards[i]:7.2f} {ep_total_shortfalls[i]:8.2f} "
                     f"{ep_total_penalties[i]:9.1f} {al_str:>7} {cl_str:>7}"
+                )
+
+            # P5/P6/P8 stochastic deviations row (episode aggregates only — last year is noise)
+            print(f"  {'':4}  {'meanShk%':>8} {'maxShk%':>8} {'CFnoise%':>9} "
+                  f"{'Cancels':>8} {'HoldCost':>9}")
+            for i in range(n_agents):
+                print(
+                    f"  A{i+1}    "
+                    f"{ep_mean_shock[i]*100:7.2f}%  {ep_max_shock[i]*100:+7.2f}%  "
+                    f"{ep_mean_cf_shock[i]*100:8.2f}%  "
+                    f"{ep_total_cancels[i]:8d}  {ep_total_holding_cost[i]:9.2f}"
                 )
             print(sep)
 

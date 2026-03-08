@@ -110,6 +110,9 @@ class ETSEnvironment(gym.Env):
         self._current_cf_noise = np.zeros((self.n_agents, 5))
         self._p6_cancellations = np.zeros(self.n_agents, dtype=int)
 
+        # P8: per-agent holding costs from last _compute_rewards call (M€)
+        self._last_holding_costs = np.zeros(self.n_agents)
+
         # Opponent modeling (Option C)
         opp_enabled = config.get("opponent_modeling", {}).get("enabled", False)
         self._opponent_modeling = opp_enabled
@@ -532,6 +535,7 @@ class ETSEnvironment(gym.Env):
             "bid_prices": self._phase1_bid_prices.tolist() if self._phase1_bid_prices is not None else [],
             "delta_greens": [c.green_frac - c.prev_green_frac for c in self.companies],
             "queue_sizes": [len(c._construction_queue) for c in self.companies],
+            "holding_costs": self._last_holding_costs.tolist(),  # P8
         })
         self.episode_log.append(log)
 
@@ -705,6 +709,7 @@ class ETSEnvironment(gym.Env):
             annual_need = float(emissions[i])  # Mt (using realized emissions as proxy)
             excess_bank = max(0.0, self.holdings[i] - excess_bank_ratio * max(annual_need, 1e-6))
             holding_cost = excess_bank * holding_cost_rate  # €/t/year × Mt → M€
+            self._last_holding_costs[i] = holding_cost
 
             total_cost = (auction_cost + secondary_cost + investment_cost
                          + operational_cost + budget_penalty + holding_cost)
