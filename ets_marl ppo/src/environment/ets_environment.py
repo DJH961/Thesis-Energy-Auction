@@ -534,7 +534,11 @@ class ETSEnvironment(gym.Env):
         log = self._phase1_log
 
         # 5. Secondary market
-        secondary_prices = clearing_price * np.clip(secondary_actions[:, 0], 0.5, 2.0)
+        trading_cfg = self.config.get("trading", {})
+        sec_mult_low = trading_cfg.get("sec_mult_low", 0.8)
+        sec_mult_high = trading_cfg.get("sec_mult_high", 1.3)
+        secondary_prices = clearing_price * np.clip(
+            secondary_actions[:, 0], sec_mult_low, sec_mult_high)
         secondary_qtys = np.clip(
             secondary_actions[:, 1],
             -self.config["auction"]["quantity_max"],
@@ -803,6 +807,7 @@ class ETSEnvironment(gym.Env):
         lockin_start = reward_cfg.get("shaping_lockin_start_episode", 200)
         trading_bonus_weight = reward_cfg.get("shaping_trading_weight", 0.5)
         bank_weight = reward_cfg.get("shaping_bank_weight", 0.1)
+        coverage_weight = reward_cfg.get("shaping_coverage_weight", 2.0)
 
         # P8: banking holding cost parameters
         holding_cost_rate = trading_cfg.get("banking_holding_cost", 0.0)
@@ -885,6 +890,12 @@ class ETSEnvironment(gym.Env):
             # Small positive signal for holding a healthy allowance bank
             bank_value = self.holdings[i] * clearing_price / 1e6
             shaping += bank_weight * (bank_value / 1000.0) * self.shaping_weight
+
+            # Auction coverage bonus: reward covering emissions via primary auction
+            allocation_i = float(self._phase1_allocations[i])
+            annual_emissions_i = max(float(emissions[i]), 0.01)
+            coverage_ratio = min(1.0, allocation_i / annual_emissions_i)
+            shaping += coverage_weight * coverage_ratio * self.shaping_weight
 
             rewards[i] = -(
                 company.w_cost * cost_norm

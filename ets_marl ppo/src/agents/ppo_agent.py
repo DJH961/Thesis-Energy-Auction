@@ -315,13 +315,21 @@ class PPOAgent:
                     auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
                     sec_lp_new, sec_ent = self.secondary_policy.evaluate(obs2[mb], sec_raw[mb])
 
-                    new_lp = auc_lp_new + sec_lp_new
-                    old_lp = old_auc_lp[mb] + old_sec_lp[mb]
+                    # Per-policy PPO clipping: decomposes the joint ratio so each
+                    # policy's gradient update is independently clipped.  Prevents
+                    # a profitable secondary trade from incorrectly reinforcing
+                    # bad auction bids (and vice versa).
+                    auc_ratio = torch.exp(auc_lp_new - old_auc_lp[mb])
+                    auc_surr1 = auc_ratio * adv_t[mb]
+                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
+                    auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
 
-                    ratio = torch.exp(new_lp - old_lp)
-                    surr1 = ratio * adv_t[mb]
-                    surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
-                    policy_loss = -torch.min(surr1, surr2).mean()
+                    sec_ratio = torch.exp(sec_lp_new - old_sec_lp[mb])
+                    sec_surr1 = sec_ratio * adv_t[mb]
+                    sec_surr2 = torch.clamp(sec_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
+                    sec_policy_loss = -torch.min(sec_surr1, sec_surr2).mean()
+
+                    policy_loss = auc_policy_loss + sec_policy_loss
 
                     # P2: entropy_coef updated externally via set_entropy_coef()
                     entropy = (auc_ent + sec_ent).mean()

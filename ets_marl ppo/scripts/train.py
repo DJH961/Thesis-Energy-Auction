@@ -68,8 +68,11 @@ def build_agents(env: ETSEnvironment, config: dict, seed: int):
     ], dtype=np.float32)
 
     # Phase 2: [sec_price_multiplier, sec_qty]
-    secondary_low = np.array([0.5, -aq["quantity_max"]], dtype=np.float32)
-    secondary_high = np.array([2.0, aq["quantity_max"]], dtype=np.float32)
+    trading_cfg = config.get("trading", {})
+    sec_mult_low = trading_cfg.get("sec_mult_low", 0.8)
+    sec_mult_high = trading_cfg.get("sec_mult_high", 1.3)
+    secondary_low = np.array([sec_mult_low, -aq["quantity_max"]], dtype=np.float32)
+    secondary_high = np.array([sec_mult_high, aq["quantity_max"]], dtype=np.float32)
 
     agents = []
     for i in range(config["companies"]["n_agents"]):
@@ -246,18 +249,27 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
 
 class EntropyConditionTracker:
     """
-    P2: Time-based entropy decay.
+    P2: Time-based entropy decay with auto-scaling.
 
     Entropy stays at coef_init for the first `decay_start` episodes
     (allowing BC warm-start and critic warmup to settle), then decays
     linearly from coef_init to coef_final over `decay_window` episodes.
+
+    If decay_start or decay_window are 0 in config, they auto-scale
+    to 5% and 80% of n_episodes respectively.  This ensures the
+    schedule adapts to both short Colab runs and full 15000-ep training.
     """
 
-    def __init__(self, ppo_cfg: dict, n_agents: int):
+    def __init__(self, ppo_cfg: dict, n_agents: int, n_episodes: int = 15000):
         self.coef_init = ppo_cfg.get("entropy_coef", 0.02)
         self.coef_final = ppo_cfg.get("entropy_coef_final", 0.005)
-        self.decay_window = ppo_cfg.get("entropy_decay_window", 3000)
-        self.decay_start = ppo_cfg.get("entropy_decay_start", 500)
+
+        raw_window = ppo_cfg.get("entropy_decay_window", 0)
+        raw_start = ppo_cfg.get("entropy_decay_start", 0)
+
+        # Auto-scale: 0 means "compute from n_episodes"
+        self.decay_start = raw_start if raw_start > 0 else int(0.05 * n_episodes)
+        self.decay_window = raw_window if raw_window > 0 else int(0.80 * n_episodes)
 
     def update(self, episode: int) -> float:
         """Return current entropy coefficient based on episode number."""
@@ -350,8 +362,8 @@ def train_one_seed(config: dict, seed: int):
     cycling_soft = cycling_cfg.get("soft", False)
     cycling_lr_scale = cycling_cfg.get("soft_lr_scale", 0.1)
 
-    # Condition-based entropy tracker
-    entropy_tracker = EntropyConditionTracker(ppo_cfg, n_agents)
+    # Condition-based entropy tracker (auto-scales to n_episodes)
+    entropy_tracker = EntropyConditionTracker(ppo_cfg, n_agents, n_episodes)
 
     # --- CSV loggers ---
     results_dir = config["logging"]["results_dir"]
