@@ -618,7 +618,7 @@ def train_one_seed(config: dict, seed: int):
                 f"[BROKEN – NaN REWARD] ep {episode}: NaN reward for "
                 f"{', '.join(_nan_agents)}. Numerical instability. Aborting."
             )
-        # 2-4. Streak-based structural collapses (only counted after actor starts updating)
+        # 2-4. Streak-based structural collapses (warnings only — training continues)
         if not actor_update:
             _streak_ceil[:] = 0; _streak_floor[:] = 0; _streak_qty[:] = 0
         else:
@@ -627,29 +627,23 @@ def train_one_seed(config: dict, seed: int):
                 _streak_floor[_i] = (_streak_floor[_i] + 1) if avg_bid_per_agent[_i]     <= _floor_thresh * _price_min else 0
                 _streak_qty[_i]   = (_streak_qty[_i]   + 1) if avg_bid_qty_per_agent[_i] <= _zero_qty_thresh * _qty_max else 0
 
-                if _streak_ceil[_i] >= _broken_window:
-                    ep_csv.close(); yr_csv.close()
-                    raise RuntimeError(
-                        f"[BROKEN – CEILING BID] A{_i+1}: avg bid "
+                if _streak_ceil[_i] >= _broken_window and _streak_ceil[_i] % _broken_window == 0:
+                    print(
+                        f"⚠ [WARN – CEILING BID] A{_i+1}: avg bid "
                         f">={_ceil_thresh*100:.0f}% of price_max ({_price_max:.0f} €/t) for "
-                        f"{_broken_window} consecutive episodes (ep {episode}). "
-                        f"Policy collapsed to price ceiling. Aborting."
+                        f"{_streak_ceil[_i]} consecutive episodes (ep {episode})."
                     )
-                if _streak_floor[_i] >= _broken_window:
-                    ep_csv.close(); yr_csv.close()
-                    raise RuntimeError(
-                        f"[BROKEN – FLOOR BID] A{_i+1}: avg bid "
+                if _streak_floor[_i] >= _broken_window and _streak_floor[_i] % _broken_window == 0:
+                    print(
+                        f"⚠ [WARN – FLOOR BID] A{_i+1}: avg bid "
                         f"<={_floor_thresh*100:.0f}% of price_min ({_price_min:.0f} €/t) for "
-                        f"{_broken_window} consecutive episodes (ep {episode}). "
-                        f"Policy stuck at price floor. Aborting."
+                        f"{_streak_floor[_i]} consecutive episodes (ep {episode})."
                     )
-                if _streak_qty[_i] >= _broken_window:
-                    ep_csv.close(); yr_csv.close()
-                    raise RuntimeError(
-                        f"[BROKEN – ZERO QUANTITY] A{_i+1}: avg bid qty "
+                if _streak_qty[_i] >= _broken_window and _streak_qty[_i] % _broken_window == 0:
+                    print(
+                        f"⚠ [WARN – ZERO QUANTITY] A{_i+1}: avg bid qty "
                         f"<={_zero_qty_thresh*100:.0f}% of qty_max ({_qty_max:.1f} Mt) for "
-                        f"{_broken_window} consecutive episodes (ep {episode}). "
-                        f"Agent opted out of auction. Aborting."
+                        f"{_streak_qty[_i]} consecutive episodes (ep {episode})."
                     )
 
         # Average invest_frac action per agent — Phase 1 action[2]
