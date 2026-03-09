@@ -1,0 +1,12 @@
+# ============================================================
+# Scenario: 2024-style — EUA price ~65 €/t
+# Inherits all defaults, overrides price section only
+# ============================================================
+
+price:
+  initial_expected: 65.0
+  ar1_persistence: 0.85
+
+simulation:
+  n_episodes: 1000
+  seeds: [42, 123, 456]
