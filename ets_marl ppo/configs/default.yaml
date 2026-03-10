@@ -218,6 +218,8 @@ ppo:
   normalize_advantages: true
   log_std_min: -2.0
   log_std_max: 0.0           # caps std at e^0=1.0 (was e^1=2.72)
+  centralized_critic: true   # MAPPO: critic sees global state (all agents' obs2 concatenated)
+  critic_hidden_size: 256    # critic network width (can differ from actor hidden_size)
   critic_warmup_episodes: 200    # episodes to train critic only (no actor gradients) after BC
   kl_anchor_beta: 0.5            # initial weight of KL penalty against frozen BC policy
   kl_anchor_decay_episodes: 2000 # episodes over which beta decays linearly to 0

@@ -53,6 +53,11 @@ def build_agents(env: ETSEnvironment, config: dict, seed: int):
     """Instantiate one PPO agent per company."""
     obs1_dim = env.companies[0].obs_dim_phase1  # 18
     obs2_dim = env.companies[0].obs_dim_phase2  # 21
+    n_agents = config["companies"]["n_agents"]
+
+    # MAPPO: global state = concatenation of all agents' phase2 obs
+    centralized = config["ppo"].get("centralized_critic", False)
+    global_state_dim = n_agents * obs2_dim if centralized else 0
 
     aq = config["auction"]
     inv = config["investment"]
@@ -75,7 +80,7 @@ def build_agents(env: ETSEnvironment, config: dict, seed: int):
     secondary_high = np.array([sec_mult_high, aq["quantity_max"]], dtype=np.float32)
 
     agents = []
-    for i in range(config["companies"]["n_agents"]):
+    for i in range(n_agents):
         agent = PPOAgent(
             agent_id=i,
             obs_dim_phase1=obs1_dim,
@@ -86,6 +91,7 @@ def build_agents(env: ETSEnvironment, config: dict, seed: int):
             secondary_action_high=secondary_high,
             config=config,
             seed=seed + i,
+            global_state_dim=global_state_dim,
         )
         agents.append(agent)
     return agents
@@ -326,8 +332,12 @@ def train_one_seed(config: dict, seed: int):
     n_episodes = config["simulation"]["n_episodes"]
     n_years = config["simulation"]["n_years"]
 
+    algo = ("MAPPO (centralized critic)"
+            if config["ppo"].get("centralized_critic", False)
+            else "IPPO (independent critic)")
+
     print(f"\n{'='*60}")
-    print(f"Training — seed {seed}, {n_agents} agents, PPO, two-phase")
+    print(f"Training — seed {seed}, {n_agents} agents, {algo}, two-phase")
     print(f"v5.0: MAC switching | Electricity revenue | Carry-forward")
     print(f"P1-P8 + structural improvements active")
     print(f"{'='*60}")
@@ -457,6 +467,10 @@ def train_one_seed(config: dict, seed: int):
 
             obs2, auction_info = env.step_auction(auction_actions)
 
+            # MAPPO: construct global state from all agents' phase2 obs
+            _centralized = config["ppo"].get("centralized_critic", False)
+            global_state = obs2.flatten() if _centralized else None
+
             # === PHASE 2: Secondary Market ===
             secondary_actions = np.zeros((n_agents, 2), dtype=np.float32)
             secondary_raws = []
@@ -478,12 +492,14 @@ def train_one_seed(config: dict, seed: int):
 
             # Store transitions with normalised rewards
             for i in range(n_agents):
-                value = agents[i].estimate_value(obs2[i])
+                value = agents[i].estimate_value(
+                    global_state if _centralized else obs2[i])
                 agents[i].store_transition(
                     obs1=obs1[i], obs2=obs2[i],
                     auc_raw=auction_raws[i], sec_raw=secondary_raws[i],
                     auc_lp=auction_logps[i], sec_lp=secondary_logps[i],
                     reward=normalised_rewards[i], done=terminated, value=value,
+                    global_state=global_state,
                 )
 
             total_rewards += rewards  # log RAW rewards for diagnostics

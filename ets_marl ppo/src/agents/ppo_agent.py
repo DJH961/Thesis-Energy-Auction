@@ -8,6 +8,11 @@ PPO agent with two-phase decision making for EU ETS:
 On-policy: collects full episode rollout, then updates via
 clipped surrogate objective with GAE advantage estimation.
 
+Supports **MAPPO** (Multi-Agent PPO) via centralized critic:
+  When `ppo.centralized_critic = true`, the value network V(s) receives the
+  global state (concatenation of all agents' phase-2 observations) instead of
+  the local observation.  Actors remain decentralized (CTDE paradigm).
+
 Roadmap improvements:
   P2: entropy_coef is updated externally via set_entropy_coef() (decay schedule
       lives in train.py so the agent stays stateless w.r.t. episode count).
@@ -78,6 +83,7 @@ class RolloutBuffer:
     def clear(self):
         self.obs1 = []
         self.obs2 = []
+        self.global_states = []  # MAPPO: centralized critic input
         self.auction_raw = []
         self.secondary_raw = []
         self.auction_logp = []
@@ -86,9 +92,12 @@ class RolloutBuffer:
         self.dones = []
         self.values = []
 
-    def push(self, obs1, obs2, auc_raw, sec_raw, auc_lp, sec_lp, reward, done, value):
+    def push(self, obs1, obs2, auc_raw, sec_raw, auc_lp, sec_lp, reward, done, value,
+             global_state=None):
         self.obs1.append(obs1)
         self.obs2.append(obs2)
+        if global_state is not None:
+            self.global_states.append(global_state)
         self.auction_raw.append(auc_raw)
         self.secondary_raw.append(sec_raw)
         self.auction_logp.append(auc_lp)
@@ -110,7 +119,7 @@ class PPOAgent:
     def __init__(self, agent_id, obs_dim_phase1, obs_dim_phase2,
                  auction_action_low, auction_action_high,
                  secondary_action_low, secondary_action_high,
-                 config, seed=None):
+                 config, seed=None, global_state_dim=0):
         self.agent_id = agent_id
         self.config = config
         ppo = config["ppo"]
@@ -148,7 +157,14 @@ class PPOAgent:
             log_std_min=log_std_min, log_std_max=log_std_max,
         ).to(self.device)
 
-        self.value_net = ValueNetwork(obs_dim_phase2, hidden).to(self.device)
+        # MAPPO: centralized critic sees global state (all agents' obs2 concatenated)
+        self.centralized_critic = ppo.get("centralized_critic", False)
+        critic_hidden = ppo.get("critic_hidden_size", hidden)
+
+        if self.centralized_critic and global_state_dim > 0:
+            self.value_net = ValueNetwork(global_state_dim, critic_hidden).to(self.device)
+        else:
+            self.value_net = ValueNetwork(obs_dim_phase2, hidden).to(self.device)
 
         all_params = (
             list(self.auction_policy.parameters()) +
@@ -233,9 +249,9 @@ class PPOAgent:
                 raw.cpu().numpy().squeeze(0),
                 log_prob.cpu().numpy().squeeze(0))
 
-    def estimate_value(self, obs2: np.ndarray) -> float:
-        """V(s) from phase 2 observation."""
-        obs_t = torch.FloatTensor(obs2).unsqueeze(0).to(self.device)
+    def estimate_value(self, obs: np.ndarray) -> float:
+        """V(s) — from local obs2 (IPPO) or global state (MAPPO)."""
+        obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
         with torch.no_grad():
             return self.value_net(obs_t).cpu().item()
 
@@ -244,9 +260,11 @@ class PPOAgent:
     # ------------------------------------------------------------------
 
     def store_transition(self, obs1, obs2, auc_raw, sec_raw,
-                         auc_lp, sec_lp, reward, done, value):
+                         auc_lp, sec_lp, reward, done, value,
+                         global_state=None):
         self.buffer.push(obs1, obs2, auc_raw, sec_raw,
-                         auc_lp, sec_lp, reward, done, value)
+                         auc_lp, sec_lp, reward, done, value,
+                         global_state=global_state)
 
     # ------------------------------------------------------------------
     # PPO Update (end of episode)
@@ -269,6 +287,14 @@ class PPOAgent:
 
         obs1 = torch.FloatTensor(np.array(self.buffer.obs1)).to(self.device)
         obs2 = torch.FloatTensor(np.array(self.buffer.obs2)).to(self.device)
+
+        # MAPPO: use global states for centralized critic if available
+        if self.centralized_critic and len(self.buffer.global_states) > 0:
+            critic_input = torch.FloatTensor(
+                np.array(self.buffer.global_states)).to(self.device)
+        else:
+            critic_input = obs2
+
         auc_raw = torch.FloatTensor(np.array(self.buffer.auction_raw)).to(self.device)
         sec_raw = torch.FloatTensor(np.array(self.buffer.secondary_raw)).to(self.device)
         old_auc_lp = torch.FloatTensor(np.array(self.buffer.auction_logp)).to(self.device)
@@ -307,7 +333,7 @@ class PPOAgent:
                 end = min(start + self.mini_batch_size, T)
                 mb = idx[start:end]
 
-                v_pred = self.value_net(obs2[mb])
+                v_pred = self.value_net(critic_input[mb])
                 value_loss = nn.MSELoss()(v_pred, ret_t[mb])
 
                 if actor_update:
