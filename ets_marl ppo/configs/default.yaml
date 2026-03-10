@@ -1,0 +1,286 @@
+# ============================================================
+# ETS MARL — Configuration v5.0
+# P1-P8 roadmap + structural improvements:
+#   - 8 agents (reduced market power)
+#   - price_max raised to 500 (above penalty ceiling)
+#   - cap_year_0 = 24 Mt (slight surplus at start)
+#   - MAC fuel-switching mechanism
+#   - Electricity revenue (margin-based reward)
+#   - Carry-forward non-compliance obligations
+#   - Re-tuned budgets, entropy, soft cycling
+# ============================================================
+
+simulation:
+  n_years: 12         # solar (2yr) and onshore (5yr) payoffs fit within episode
+  n_episodes: 15000   # increased for 8 agents + soft cycling
+  seeds: [42, 123, 456]
+
+# ----------------------------------------------------------
+# Technology parameters (5 technologies)
+# Sources: IRENA 2024, IPCC AR5, IEA WEO 2024
+# ----------------------------------------------------------
+technologies:
+  names: ["coal", "gas", "onshore_wind", "offshore_wind", "solar"]
+  emission_factors: [0.820, 0.490, 0.011, 0.012, 0.048]  # tCO2/MWh
+  capex: [3000, 1150, 1350, 3250, 750]                   # EUR/kW (IRENA 2024)
+  capacity_factors: [0.65, 0.60, 0.35, 0.47, 0.17]
+  deploy_delays: [0, 0, 3, 5, 1]                          # years; compressed so investments pay off within 12-yr episode
+  operational_costs: [72.0, 55.0, 17.0, 47.0, 10.0]      # EUR/MWh fuel+O&M
+  decommission_costs: [200, 100, 0, 0, 0]                 # EUR/kW
+  is_green: [false, false, true, true, true]
+  is_buildable: [false, false, true, true, true]
+
+# ----------------------------------------------------------
+# ETS parameters
+# Cap starts above total emissions (~22.5 Mt for 8 agents),
+# providing a slight surplus that transitions to scarcity
+# as the LRF tightens.  Cap at year 11 ≈ 15 Mt.
+# ----------------------------------------------------------
+ets:
+  cap_year_0: 24.0       # Mt — slight surplus vs 22.5 Mt initial emissions
+  lrf_phase1: 0.043
+  lrf_phase2: 0.044
+  lrf_phase_switch: 4
+
+  msr:
+    enabled: true
+    tnac_upper: 9.60     # scaled from 3.64 × (24/9.1)
+    tnac_lower: 3.60     # scaled from 1.37 × (24/9.1)
+    withhold_rate: 0.24
+    release_amount: 0.20  # scaled from 0.08
+
+  banking: true
+  reserve_price: 40.0    # realistic floor; prevents zero-price collapse
+  unsold_to_msr: true    # feed unsold auction allowances into MSR reserve (else discarded)
+
+# ----------------------------------------------------------
+# Companies (8 agents — 2× each of 4 archetypes)
+# Reduced individual market power; each agent is 10 TWh/year.
+# ----------------------------------------------------------
+companies:
+  n_agents: 8
+  output_twh: 10.0
+  initial_mix:
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A1: coal-heavy (20% green)
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A2: coal-heavy (20% green)
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A3: gas-dominant (40% green)
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A4: gas-dominant (40% green)
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A5: mixed transitioner (70% green)
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A6: mixed transitioner (70% green)
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A7: near-green leader (90% green)
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A8: near-green leader (90% green)
+  reward_weights:
+    - [0.90, 0.10]   # A1: cost-minimizing
+    - [0.90, 0.10]   # A2: cost-minimizing
+    - [0.75, 0.25]   # A3: moderate cost
+    - [0.75, 0.25]   # A4: moderate cost
+    - [0.50, 0.50]   # A5: balanced
+    - [0.50, 0.50]   # A6: balanced
+    - [0.25, 0.75]   # A7: green-focused
+    - [0.25, 0.75]   # A8: green-focused
+
+investment:
+  max_invest_frac: 0.10
+  convexity_alpha: 0.10
+
+risk:
+  p_fail_min: 0.08
+  p_fail_max: 0.65
+  p_fail_alpha: 0.7
+  experience_discount: 0.10
+  experience_threshold: 2
+
+auction:
+  price_max: 120.0     # penalty (100) + modest carry-forward premium; prevents ceiling-bid cornering
+  price_min: 40.0      # = reserve_price: prevents bids that are silently rejected
+  quantity_max: 3.0
+  # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
+  # [0.3, 1.3] centres the action around covering full need (1.0), max 130% coverage.
+  qty_mult_low: 0.3
+  qty_mult_high: 1.3
+  # California-style holding limit: no single agent can receive > 25% of auctioned volume.
+  max_agent_share: 0.25
+  # EU lot-size: bids in multiples of 500 EUAs (= 0.0005 Mt)
+  lot_size: 0.0005
+
+trading:
+  enabled: true
+  transaction_cost: 0.5
+  spread_tolerance: 0.07      # P8: ±7% of clearing_price
+  banking_holding_cost: 0.01  # P8: €/t/year cost on excess banked allowances
+  excess_bank_ratio: 1.5      # P8: bank above this × annual_need incurs holding cost
+  sec_mult_low: 0.8           # secondary price multiplier lower bound (×clearing_price)
+  sec_mult_high: 1.3          # secondary price multiplier upper bound (×clearing_price)
+
+# ----------------------------------------------------------
+# Budgets — scaled to not artificially prevent compliance.
+# Each budget ≈ 1.5× expected compliance cost at moderate
+# carbon prices (~150 €/t) + operational costs.
+# ----------------------------------------------------------
+budget:
+  annual_budgets: [1500.0, 1500.0, 1200.0, 1200.0, 800.0, 800.0, 500.0, 500.0]
+  overspend_penalty_coef: 0.5
+
+# ----------------------------------------------------------
+# Non-compliance penalty
+# carry_forward: true means shortfall is added to next year's
+# compliance obligation (real EU ETS behaviour).
+# With carry-forward, non_compliance_multiplier reduced to 1.0
+# (the carry-forward IS the additional cost).
+# ----------------------------------------------------------
+penalty:
+  rate: 100.0
+  non_compliance_multiplier: 1.5
+  carry_forward: true
+
+price:
+  initial_expected: 80.0
+  price_floor: 50.0
+  ar1_persistence: 0.85
+  volatility_std: 0.15
+
+# ----------------------------------------------------------
+# MAC: Marginal Abatement Cost — fuel-switching mechanism
+# Agents can temporarily reduce emissions by switching coal
+# dispatch to gas (short-run, doesn't change capacity mix).
+# Switching occurs automatically when carbon price > MAC cost.
+# ----------------------------------------------------------
+mac:
+  enabled: true
+  coal_to_gas_cost: 65.0     # €/tCO2 abated
+  max_switch_frac: 0.20      # max fraction of coal output switchable per year
+
+# ----------------------------------------------------------
+# Electricity revenue — transforms reward from all-negative
+# (pure cost) to a margin calculation.
+# Revenue_i = output_TWh × (base_price + passthrough × carbon_price × system_avg_EF)
+# Green generators benefit: same revenue, lower carbon costs.
+# ----------------------------------------------------------
+electricity:
+  enabled: true
+  base_price: 50.0           # €/MWh base electricity price
+  carbon_passthrough: 0.80   # fraction of carbon cost passed into electricity price
+
+# ----------------------------------------------------------
+# Reward shaping (P3 + P4)
+# ----------------------------------------------------------
+reward:
+  normalizer_alpha: 0.01
+  # Widened clip range so large carry-forward penalties are not truncated.
+  # Agents need to distinguish a 1 Mt shortfall from a 10 Mt one after normalization.
+  clip_min: -30.0
+  clip_max: 20.0
+  # P3: Green penalty floor = initial fossil fractions [A1..A8]
+  green_floor_fossil: [0.80, 0.80, 0.60, 0.60, 0.30, 0.30, 0.10, 0.10]
+  # P4: Shaping
+  shaping_beta: 10.0
+  shaping_gamma: 1.0
+  shaping_lockin_penalty: 2.0
+  shaping_decay_episode: 12000   # decay over 80% of training (15000 episodes)
+  shaping_weight_floor: 0.15     # never drop below 15% — prevents investment death
+  shaping_lockin_start_episode: 300
+  shaping_trading_weight: 0.5
+  shaping_bank_weight: 0.1
+  shaping_coverage_weight: 2.0  # bonus for covering emissions via primary auction
+
+# ----------------------------------------------------------
+# Opponent modeling (Option C)
+# With 8 agents: +14 dims → obs_dim_phase1 = 35, phase2 = 40
+# ----------------------------------------------------------
+opponent_modeling:
+  enabled: true
+
+# ----------------------------------------------------------
+# Agent cycling (Option A) — SOFT mode
+# All agents update, but non-active agents use reduced LR.
+# Prevents equilibrium shift from hard freezing.
+# ----------------------------------------------------------
+agent_cycling:
+  enabled: true
+  soft: true
+  soft_lr_scale: 0.3
+
+# --- PPO ---
+ppo:
+  hidden_size: 256           # increased for larger obs space (34/38 dims)
+  lr: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.97
+  clip_eps: 0.2
+  entropy_coef: 0.02         # low enough to preserve BC warm-start
+  entropy_coef_final: 0.005  # minimal exploration at convergence
+  entropy_decay_start: 0     # 0 = auto: 5% of n_episodes
+  entropy_decay_window: 0    # 0 = auto: 80% of n_episodes
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  n_epochs: 4
+  mini_batch_size: 6
+  normalize_advantages: true
+  log_std_min: -2.0
+  log_std_max: 0.0           # caps std at e^0=1.0 (was e^1=2.72)
+  critic_warmup_episodes: 200    # episodes to train critic only (no actor gradients) after BC
+  kl_anchor_beta: 0.5            # initial weight of KL penalty against frozen BC policy
+  kl_anchor_decay_episodes: 2000 # episodes over which beta decays linearly to 0
+
+# ----------------------------------------------------------
+# P5: Demand & Emission Uncertainty
+# ----------------------------------------------------------
+uncertainty:
+  enabled: false   # disabled: learn deterministic dynamics first, re-enable later
+  sigma_demand: 0.07
+  corr_rho: 0.40
+
+# ----------------------------------------------------------
+# P6: Construction Delay Jitter & Capacity Uncertainty
+# ----------------------------------------------------------
+construction_jitter:
+  enabled: false   # disabled: learn deterministic dynamics first, re-enable later
+  poisson_lambdas: [1.0, 1.0, 2.0, 3.0, 1.5]
+  p_cancel: 0.03
+  recovery_rate: 0.40
+  cf_sigma: [0.0, 0.0, 0.08, 0.08, 0.05]
+
+# ----------------------------------------------------------
+# P7: Warm-Start Pipeline
+# ----------------------------------------------------------
+warm_start:
+  enabled: true
+  n_burnin_prices: 2
+  bank_seed_min: 0.5
+  bank_seed_max: 2.0
+  queue_mu_onshore: 1.5
+  queue_mu_offshore: 0.5
+  queue_mu_solar: 2.0
+
+# ----------------------------------------------------------
+# P8: Secondary Market Depth
+# ----------------------------------------------------------
+# (updates to existing 'trading' section above)
+
+logging:
+  log_interval: 10
+  save_interval: 500
+  results_dir: "results/"
+
+# ----------------------------------------------------------
+# Behavioral cloning warm-start (heuristic pre-training)
+# Run before PPO to initialise the auction policy with a
+# simple rule-based policy: bid at 1.1× MA3 price, bid
+# estimated need, invest 2% if green_frac < 0.8, solar.
+# ----------------------------------------------------------
+pretrain:
+  enabled: true
+  episodes: 300        # episodes to collect heuristic data
+  epochs: 10           # BC MSE training epochs (both auction + secondary policies)
+  lr: 0.001            # separate learning rate for BC phase
+
+# ----------------------------------------------------------
+# Broken-policy detection (training safety guardrails)
+# Training aborts with a RuntimeError when any check fires.
+# Streak-based checks only count after critic-warmup ends.
+# ----------------------------------------------------------
+diagnostics:
+  market_broken_window: 200           # consecutive episodes before abort
+  market_broken_bid_threshold: 0.99  # avg bid >= this x price_max  -> ceiling-collapse
+  floor_bid_threshold: 1.02          # avg bid <= this x price_min  -> floor-collapse
+  zero_qty_threshold: 0.01           # avg bid qty <= this x qty_max -> zero-qty collapse
