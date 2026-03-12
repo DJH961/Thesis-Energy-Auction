@@ -346,6 +346,11 @@ class PPOAgent:
         sec_raw = torch.FloatTensor(np.array(self.buffer.secondary_raw)).to(self.device)
         old_auc_lp = torch.FloatTensor(np.array(self.buffer.auction_logp)).to(self.device)
         old_sec_lp = torch.FloatTensor(np.array(self.buffer.secondary_logp)).to(self.device)
+
+        rewards = np.array(self.buffer.rewards, dtype=np.float32)
+        dones = np.array(self.buffer.dones, dtype=np.float32)
+        values = np.array(self.buffer.values, dtype=np.float32)
+
         rewards = np.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
         dones = np.nan_to_num(dones, nan=1.0, posinf=1.0, neginf=1.0)
         values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
