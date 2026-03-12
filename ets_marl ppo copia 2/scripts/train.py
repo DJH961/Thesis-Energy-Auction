@@ -66,10 +66,10 @@ def build_agents(env: ETSEnvironment, config: dict, seed: int):
     # qty_multiplier is a coverage ratio on estimated need — the policy learns HOW MUCH
     # of its compliance need to cover at auction rather than an arbitrary absolute volume.
     auction_low = np.array([
-        aq["price_min"], aq.get("qty_mult_low", 0.3), 0.0, -1.0, -1.0, -1.0
+        aq.get("price_markup_low", 0.90), aq.get("qty_mult_low", 0.3), 0.0, -1.0, -1.0, -1.0
     ], dtype=np.float32)
     auction_high = np.array([
-        aq["price_max"], aq.get("qty_mult_high", 1.3), inv["max_invest_frac"], 1.0, 1.0, 1.0
+        aq.get("price_markup_high", 1.25), aq.get("qty_mult_high", 1.3), inv["max_invest_frac"], 1.0, 1.0, 1.0
     ], dtype=np.float32)
 
     # Phase 2: [sec_price_multiplier, sec_qty]

@@ -37,7 +37,7 @@ technologies:
 # as the LRF tightens.  Cap at year 11 ≈ 15 Mt.
 # ----------------------------------------------------------
 ets:
-  cap_year_0: 24.0       # Mt — slight surplus vs 22.5 Mt initial emissions
+  cap_year_0: 22.5       # Mt — slight surplus vs 22.5 Mt initial emissions
   lrf_phase1: 0.043
   lrf_phase2: 0.044
   lrf_phase_switch: 4
@@ -93,7 +93,10 @@ risk:
 auction:
   price_max: 120.0     # penalty (100) + modest carry-forward premium; prevents ceiling-bid cornering
   price_min: 40.0      # = reserve_price: prevents bids that are silently rejected
+  price_markup_low: 0.90
+  price_markup_high: 1.25
   quantity_max: 3.0
+  reserve_ratio: 0.85
   # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
   # [0.3, 1.3] centres the action around covering full need (1.0), max 130% coverage.
   qty_mult_low: 0.3
@@ -218,17 +221,17 @@ agent_cycling:
 # --- PPO ---
 ppo:
   hidden_size: 256           # increased for larger obs space (34/38 dims)
-  lr: 0.0003
+  lr: 0.0002
   gamma: 0.99
   gae_lambda: 0.97
   clip_eps: 0.2
-  entropy_coef: 0.02         # low enough to preserve BC warm-start
-  entropy_coef_final: 0.015  # keep meaningful exploration; 0.005 was too low for 6D continuous actions
-  entropy_decay_start: 0     # 0 = auto: 5% of n_episodes
+  entropy_coef: 0.03         # low enough to preserve BC warm-start
+  entropy_coef_final: 0.02  # keep meaningful exploration; 0.005 was too low for 6D continuous actions
+  entropy_decay_start: 1500     # 0 = auto: 5% of n_episodes
   entropy_decay_window: 0    # 0 = auto: 80% of n_episodes
   value_coef: 0.5
-  max_grad_norm: 0.5
-  n_epochs: 4
+  max_grad_norm: 0.3
+  n_epochs: 3
   mini_batch_size: 6
   normalize_advantages: true
   log_std_min: -1.5          # e^-1.5 ≈ 0.22; was -2.0 (e^-2 ≈ 0.14) which froze exploration too early
@@ -236,7 +239,7 @@ ppo:
   # centralized_critic: true  # MAPPO: accelerated convergence to degenerate Nash equilibrium
   centralized_critic: false   # IPPO: independent critics — better for competitive auction setting
   critic_hidden_size: 256     # critic network width (can differ from actor hidden_size)
-  critic_warmup_episodes: 200    # episodes to train critic only (no actor gradients) after BC
+  critic_warmup_episodes: 100    # episodes to train critic only (no actor gradients) after BC
   kl_anchor_beta: 0.5            # initial weight of KL penalty against frozen BC policy
   kl_anchor_decay_episodes: 5000 # episodes over which beta decays linearly to 0 (was 2000; agents need more time near heuristic before deviating)
 
@@ -314,8 +317,8 @@ diagnostics:
   # Per-agent entropy boost: when stuck at floor/ceiling for this many episodes,
   # temporarily boost entropy to force re-exploration.  In uniform-price auctions,
   # floor-bidding is suboptimal but agents can't discover this once entropy decays.
-  stuck_boost_window: 500            # episodes stuck before boost triggers
-  stuck_boost_coef: 0.025            # boosted entropy coef (above coef_init=0.02)
+  stuck_boost_window: 250            # episodes stuck before boost triggers
+  stuck_boost_coef: 0.04            # boosted entropy coef (above coef_init=0.02)
 
 # ----------------------------------------------------------
 # Epsilon-greedy exploration (physical-space)
@@ -326,6 +329,6 @@ diagnostics:
 # the full bid-price range.
 # ----------------------------------------------------------
 exploration:
-  epsilon_start: 0.15      # 15% random actions early on
-  epsilon_final: 0.02      # 2% residual exploration
-  epsilon_decay_episodes: 5000  # linear decay over first 5000 episodes
+  epsilon_start: 0.25      # 15% random actions early on
+  epsilon_final: 0.05      # 2% residual exploration
+  epsilon_decay_episodes: 7000  # linear decay over first 5000 episodes

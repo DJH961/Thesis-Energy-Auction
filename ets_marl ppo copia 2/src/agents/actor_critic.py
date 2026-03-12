@@ -62,11 +62,14 @@ class AuctionPolicy(nn.Module):
         return torch.cat([price_mean, qty_mean, rest_mean], dim=-1)             # (B, 6)
 
     def forward(self, obs):
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
         x = F.relu(self.fc1(obs))
         x = F.relu(self.fc2(x))
         mean = self._compute_mean(x)
+        mean = torch.nan_to_num(mean, nan=0.0, posinf=10.0, neginf=-10.0)
         log_std_clamped = torch.clamp(self.log_std, self.log_std_min, self.log_std_max)
         std = log_std_clamped.exp().expand_as(mean)
+        std = torch.nan_to_num(std, nan=1.0, posinf=1.0, neginf=1.0)
         return Normal(mean, std)
 
     def act(self, obs, deterministic=False):
@@ -122,11 +125,14 @@ class SecondaryPolicy(nn.Module):
         self._init_weights()
 
     def forward(self, obs):
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
         x = F.relu(self.fc1(obs))
         x = F.relu(self.fc2(x))
         mean = self.mean_head(x)
+        mean = torch.nan_to_num(mean, nan=0.0, posinf=10.0, neginf=-10.0)
         log_std_clamped = torch.clamp(self.log_std, self.log_std_min, self.log_std_max)
         std = log_std_clamped.exp().expand_as(mean)
+        std = torch.nan_to_num(std, nan=1.0, posinf=1.0, neginf=1.0)
         return Normal(mean, std)
 
     def act(self, obs, deterministic=False):

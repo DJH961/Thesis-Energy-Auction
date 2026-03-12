@@ -329,8 +329,11 @@ class PPOAgent:
         if len(self.buffer) < 2:
             return None
 
-        obs1 = torch.FloatTensor(np.array(self.buffer.obs1)).to(self.device)
-        obs2 = torch.FloatTensor(np.array(self.buffer.obs2)).to(self.device)
+        obs1_np = np.nan_to_num(np.array(self.buffer.obs1), nan=0.0, posinf=1e6, neginf=-1e6)
+        obs2_np = np.nan_to_num(np.array(self.buffer.obs2), nan=0.0, posinf=1e6, neginf=-1e6)
+
+        obs1 = torch.FloatTensor(obs1_np).to(self.device)
+        obs2 = torch.FloatTensor(obs2_np).to(self.device)
 
         # MAPPO: use global states for centralized critic if available
         if self.centralized_critic and len(self.buffer.global_states) > 0:
@@ -343,9 +346,9 @@ class PPOAgent:
         sec_raw = torch.FloatTensor(np.array(self.buffer.secondary_raw)).to(self.device)
         old_auc_lp = torch.FloatTensor(np.array(self.buffer.auction_logp)).to(self.device)
         old_sec_lp = torch.FloatTensor(np.array(self.buffer.secondary_logp)).to(self.device)
-        rewards = np.array(self.buffer.rewards, dtype=np.float32)
-        dones = np.array(self.buffer.dones, dtype=np.float32)
-        values = np.array(self.buffer.values, dtype=np.float32)
+        rewards = np.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
+        dones = np.nan_to_num(dones, nan=1.0, posinf=1.0, neginf=1.0)
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
 
         # GAE (P2: gae_lambda = 0.97 in config for longer credit assignment)
         T = len(rewards)
@@ -358,11 +361,17 @@ class PPOAgent:
             advantages[t] = gae
 
         returns = advantages + values
+        advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
+        returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+
         adv_t = torch.FloatTensor(advantages).to(self.device).unsqueeze(1)
         ret_t = torch.FloatTensor(returns).to(self.device).unsqueeze(1)
 
         if self.normalize_advantages and T > 1:
             adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+
+        adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
+        ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
 
         # PPO epochs
         total_a_loss = 0.0
@@ -389,12 +398,14 @@ class PPOAgent:
                     # policy's gradient update is independently clipped.  Prevents
                     # a profitable secondary trade from incorrectly reinforcing
                     # bad auction bids (and vice versa).
-                    auc_ratio = torch.exp(auc_lp_new - old_auc_lp[mb])
+                    auc_log_ratio = torch.clamp(auc_lp_new - old_auc_lp[mb], -10.0, 10.0)
+                    auc_ratio = torch.exp(auc_log_ratio)
                     auc_surr1 = auc_ratio * adv_t[mb]
                     auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
                     auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
 
-                    sec_ratio = torch.exp(sec_lp_new - old_sec_lp[mb])
+                    sec_log_ratio = torch.clamp(sec_lp_new - old_sec_lp[mb], -10.0, 10.0)
+                    sec_ratio = torch.exp(sec_log_ratio)
                     sec_surr1 = sec_ratio * adv_t[mb]
                     sec_surr2 = torch.clamp(sec_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
                     sec_policy_loss = -torch.min(sec_surr1, sec_surr2).mean()
@@ -425,14 +436,33 @@ class PPOAgent:
                     policy_loss = torch.tensor(0.0, device=self.device)
                     loss = self.value_coef * value_loss
 
+                if not torch.isfinite(loss):
+                    continue
+
                 self.optimizer.zero_grad()
                 loss.backward()
+
                 nn.utils.clip_grad_norm_(
                     list(self.auction_policy.parameters()) +
                     list(self.secondary_policy.parameters()) +
                     list(self.value_net.parameters()),
                     self.max_grad_norm
                 )
+
+                bad_grad = False
+                for p in (
+                    list(self.auction_policy.parameters()) +
+                    list(self.secondary_policy.parameters()) +
+                    list(self.value_net.parameters())
+                ):
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        bad_grad = True
+                        break
+
+                if bad_grad:
+                    self.optimizer.zero_grad()
+                    continue
+
                 self.optimizer.step()
 
                 total_a_loss += policy_loss.item()

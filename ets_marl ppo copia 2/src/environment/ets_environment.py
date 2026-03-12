@@ -185,6 +185,7 @@ class ETSEnvironment(gym.Env):
         self.last_clearing_price = self.config["price"]["initial_expected"]
         self.expected_price = self.config["price"]["initial_expected"]
         self.last_secondary_price = self.config["price"]["initial_expected"]
+        self._current_reference_price = self.config["price"]["initial_expected"]
         self.last_secondary_volume = 0.0
         self._price_history = []
         self._last_gaps = np.zeros(self.n_agents)
@@ -394,10 +395,24 @@ class ETSEnvironment(gym.Env):
 
         # 7. Auction
         bid_actions = auction_actions[:, :2].copy()
+
+        markup_low = self.config["auction"].get("price_markup_low", 0.90)
+        markup_high = self.config["auction"].get("price_markup_high", 1.25)
+        price_min = self.config["auction"]["price_min"]
+        price_max = self.config["auction"]["price_max"]
+
+        reference_price = max(
+            price_min,
+            0.5 * float(self.last_clearing_price) + 0.5 * float(self.expected_price)
+        )
+
+        self._current_reference_price = reference_price
+
+        bid_markup = np.clip(bid_actions[:, 0], markup_low, markup_high)
         bid_actions[:, 0] = np.clip(
-            bid_actions[:, 0],
-            self.config["auction"]["price_min"],
-            self.config["auction"]["price_max"],
+            bid_markup * reference_price,
+            price_min,
+            price_max,
         )
         # Quantity reparameterization: action[1] is a coverage MULTIPLIER on estimated need.
         # actual_qty = multiplier × (compute_estimate_need + carry_forward)
