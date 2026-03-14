@@ -37,7 +37,7 @@ technologies:
 # as the LRF tightens.  Cap at year 11 ≈ 15 Mt.
 # ----------------------------------------------------------
 ets:
-  cap_year_0: 22.5       # Mt — slight surplus vs 22.5 Mt initial emissions
+  cap_year_0: 23.5       # Mt — slight surplus vs 22.5 Mt initial emissions
   lrf_phase1: 0.043
   lrf_phase2: 0.044
   lrf_phase_switch: 4
@@ -120,8 +120,8 @@ trading:
   excess_bank_ratio: 1.5      # P8: bank above this × annual_need incurs holding cost
   sec_mult_low: 0.8           # secondary price multiplier lower bound (×clearing_price)
   sec_mult_high: 1.3          # secondary price multiplier upper bound (×clearing_price)
-  sell_coverage_floor: 1.00
-  unsafe_sell_penalty_weight: 1.0
+  sell_coverage_floor: 1.05
+  unsafe_sell_penalty_weight: 2.0
 # ----------------------------------------------------------
 # Budgets — scaled to not artificially prevent compliance.
 # Each budget ≈ 1.5× expected compliance cost at moderate
