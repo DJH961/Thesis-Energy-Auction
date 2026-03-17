@@ -945,7 +945,10 @@ class ETSEnvironment(gym.Env):
             penalisable_ef = max(0.0, company.weighted_emission_factor - initial_ef_at_floor)
             emissions_intensity = penalisable_ef / 0.82
 
-            penalty_norm = penalty_cost * non_compliance_mult / 1000.0
+            # P9: Log-compressed penalty — preserves ordering but compresses
+            # extreme values.  7132 M€ → 4.28 instead of 7.13 (linear).
+            # 100 M€ → 0.69, 10 M€ → 0.095.  Range ratio ~6:1 vs 70:1.
+            penalty_norm = float(np.log1p(penalty_cost / 100.0)) * non_compliance_mult
 
             # P4→P9: Green investment shaping with diminishing returns.
             # Bonus scales with remaining fossil fraction: coal-heavy agents

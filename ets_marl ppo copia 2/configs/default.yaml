@@ -148,7 +148,7 @@ penalty:
   rate: 100.0
   non_compliance_multiplier: 1.0   # was 1.5; reduced because carry-forward already adds future cost
   carry_forward: true
-  carry_forward_cap: 2.0           # cap CF at 2× base annual emissions; prevents death spiral
+  carry_forward_cap: 0.5           # P9: was 2.0; 0.5× prevents death spiral where CF > allocation
 
 price:
   initial_expected: 80.0
@@ -183,10 +183,11 @@ electricity:
 # ----------------------------------------------------------
 reward:
   normalizer_alpha: 0.01
-  # Widened clip range so large carry-forward penalties are not truncated.
-  # Agents need to distinguish a 1 Mt shortfall from a 10 Mt one after normalization.
-  clip_min: -30.0
-  clip_max: 20.0
+  # P9: Tightened clip range — ±5 std covers 99.9999% of Gaussian.
+  # Combined with log-compressed penalties, extreme returns are bounded.
+  # Old [-30,20] let penalty outliers corrupt critic targets.
+  clip_min: -5.0
+  clip_max: 5.0
   # P3: Green penalty floor — lowered from initial fossil fractions so the
   # w_green × emissions_intensity channel is active from the start.
   # Old values [0.80,0.80,0.60,0.60,0.30,0.30,0.10,0.10] zeroed out the

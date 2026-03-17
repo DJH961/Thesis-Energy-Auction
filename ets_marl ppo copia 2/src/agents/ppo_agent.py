@@ -37,14 +37,20 @@ from src.agents.actor_critic import AuctionPolicy, SecondaryPolicy, ValueNetwork
 
 class RewardNormalizer:
     """
-    Online running mean/std normaliser using exponential moving average.
+    Online running mean/std normaliser with adaptive warmup.
 
     reward_norm = (reward - mu) / (std + eps)
+
+    Uses an adaptive alpha schedule: alpha_eff = max(alpha, 1/(n+1)).
+    This gives alpha=1.0 on the first sample (mu = reward exactly),
+    alpha=0.1 after 10 samples, converging to the steady-state alpha
+    after ~1/alpha samples.  Eliminates the cold-start bias that causes
+    wild normalised values in early training.
 
     Parameters
     ----------
     alpha : float
-        EMA decay rate. alpha=0.01 ≈ window of 100 samples.
+        Steady-state EMA decay rate. alpha=0.01 ≈ window of 100 samples.
     eps : float
         Numerical stability floor for std.
     """
@@ -54,13 +60,18 @@ class RewardNormalizer:
         self.eps = eps
         self.mu = 0.0
         self.var = 1.0     # initialise to 1 so first normalised value ≈ raw reward
+        self._n_samples = 0
 
     def update_and_normalize(self, reward: float) -> float:
         """Update running stats and return normalised reward (NOT clipped)."""
+        # Adaptive alpha: fast warmup, stable long-term
+        self._n_samples += 1
+        effective_alpha = max(self.alpha, 1.0 / self._n_samples)
+
         # EMA mean
-        self.mu = (1.0 - self.alpha) * self.mu + self.alpha * reward
-        # EMA variance (using current reward before updating mean for stability)
-        self.var = (1.0 - self.alpha) * self.var + self.alpha * (reward - self.mu) ** 2
+        self.mu = (1.0 - effective_alpha) * self.mu + effective_alpha * reward
+        # EMA variance
+        self.var = (1.0 - effective_alpha) * self.var + effective_alpha * (reward - self.mu) ** 2
         std = max(self.var ** 0.5, self.eps)
         return (reward - self.mu) / std
 
@@ -68,6 +79,7 @@ class RewardNormalizer:
         """Optionally reset stats (not called by default — stats persist across episodes)."""
         self.mu = 0.0
         self.var = 1.0
+        self._n_samples = 0
 
 
 # ---------------------------------------------------------------------------
