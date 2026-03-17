@@ -964,11 +964,15 @@ class ETSEnvironment(gym.Env):
             shaping += gamma_queue * n_queue_active * 0.1 * self.shaping_weight
 
             if self.current_episode >= lockin_start and self.shaping_weight > 0:
-                hist = self._fossil_frac_history[i]
-                if len(hist) >= 3:
-                    unchanged = all(abs(f - hist[-1]) < 1e-4 for f in hist[-2:])
-                    if unchanged:
-                        shaping -= lockin_penalty * self.shaping_weight
+                # P10: Only penalise lock-in for agents with significant fossil share.
+                # Agents at fossil_frac < 5% have completed their transition — their
+                # unchanged fossil fraction is a success signal, not stagnation.
+                if company.fossil_frac > 0.05:
+                    hist = self._fossil_frac_history[i]
+                    if len(hist) >= 3:
+                        unchanged = all(abs(f - hist[-1]) < 1e-4 for f in hist[-2:])
+                        if unchanged:
+                            shaping -= lockin_penalty * self.shaping_weight
 
             # Reward net revenue from secondary market (sellers who trade profitably)
             trading_profit = max(0.0, -raw_secondary)
@@ -990,11 +994,16 @@ class ETSEnvironment(gym.Env):
             if raw_coverage <= 1.0:
                 coverage_score = raw_coverage
             elif raw_coverage <= 1.05:
-                # P9: tighter dead zone — drops to 0 at 105% (was 110%)
                 coverage_score = 1.0 - (raw_coverage - 1.0) * 20.0
             else:
-                # P9: steeper over-coverage penalty (was -2.0 above 110%)
-                coverage_score = -3.0 * (raw_coverage - 1.05)
+                # P10: Saturating over-coverage penalty (tanh).
+                # Linear slope was unbounded: at coverage=4x, penalty = -3.0 × 2.95
+                # = -8.85, dominating all other reward components.  Green agents who
+                # successfully decarbonise see their coverage ratio explode (low
+                # emissions, residual bank) and get crushed by the penalty.
+                # tanh(overcoverage) caps at -3.0 regardless of how high coverage goes.
+                overcoverage = raw_coverage - 1.05
+                coverage_score = -3.0 * float(np.tanh(overcoverage))
 
             shaping += coverage_weight * coverage_score * self.shaping_weight
 

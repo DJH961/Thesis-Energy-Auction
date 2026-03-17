@@ -120,9 +120,13 @@ trading:
   enabled: true
   transaction_cost: 0.5
   spread_tolerance: 0.07      # P8: ±7% of clearing_price
-  # P9: Progressive banking tax — convex in bank/need ratio.
-  # At ratio=1.5: rate ≈ 0.71 EUR/t (moderate). At ratio=3.0: rate ≈ 5.66 EUR/t (prohibitive).
-  banking_holding_cost: 2.0    # was 0.01; base rate for progressive tax (EUR/t)
+  # P10: Progressive banking tax — convex in bank/need ratio.
+  # base_rate × (ratio - 1)^exp on excess above 1× annual need.
+  # At ratio=1.5: 0.5 × 0.5^1.5 ≈ 0.18 EUR/t (mild). At ratio=3: 0.5 × 2^1.5 ≈ 1.41 EUR/t.
+  # At ratio=5: 0.5 × 4^1.5 = 4.0 EUR/t (still deters extreme hoarding).
+  # Previous 2.0 base caused 200+ M€/yr costs for high-bank agents, overwhelming
+  # the reward signal together with the coverage over-penalty (double-counting).
+  banking_holding_cost: 0.5    # was 2.0; reduced to avoid double-counting with coverage penalty
   holding_cost_exponent: 1.5   # convexity exponent: cost grows as (ratio-1)^exp
   sec_mult_low: 0.8           # secondary price multiplier lower bound (×clearing_price)
   sec_mult_high: 1.3          # secondary price multiplier upper bound (×clearing_price)
