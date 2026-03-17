@@ -404,9 +404,17 @@ class ETSEnvironment(gym.Env):
         price_min = self.config["auction"]["price_min"]
         price_max = self.config["auction"]["price_max"]
 
+        # P11: Reference price with fundamental anchor — breaks positive feedback
+        # loop where clearing→reference→bids→clearing spirals to ceiling.
+        # Blend market signal (50%) with fundamental anchor (50%) so reference
+        # stays grounded near (MAC + penalty_rate) / 2 ≈ 82.5 regardless of
+        # clearing price level.
+        clearing_ref = 0.5 * float(self.last_clearing_price) + 0.5 * float(self.expected_price)
+        fundamental_anchor = float(self.config["auction"].get("reference_anchor", 82.5))
+        anchor_blend = float(self.config["auction"].get("anchor_blend", 0.5))
         reference_price = max(
             price_min,
-            0.5 * float(self.last_clearing_price) + 0.5 * float(self.expected_price)
+            anchor_blend * clearing_ref + (1.0 - anchor_blend) * fundamental_anchor
         )
 
         self._current_reference_price = reference_price

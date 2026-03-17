@@ -145,6 +145,8 @@ class PPOAgent:
         self.n_epochs = ppo["n_epochs"]
         self.mini_batch_size = ppo["mini_batch_size"]
         self.normalize_advantages = ppo.get("normalize_advantages", True)
+        # P11: KL-based early stopping — abort PPO epochs if policy drifts too far
+        self.target_kl = ppo.get("target_kl", 0.0)  # 0 = disabled
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         hidden = ppo["hidden_size"]
@@ -395,9 +397,13 @@ class PPOAgent:
         total_v_loss = 0.0
         n_up = 0
 
-        for _ in range(self.n_epochs):
+        for _epoch in range(self.n_epochs):
             idx = np.arange(T)
             np.random.shuffle(idx)
+
+            # P11: KL tracking for early stopping
+            epoch_kl_sum = 0.0
+            epoch_kl_count = 0
 
             for start in range(0, T, self.mini_batch_size):
                 end = min(start + self.mini_batch_size, T)
@@ -415,19 +421,31 @@ class PPOAgent:
                     # policy's gradient update is independently clipped.  Prevents
                     # a profitable secondary trade from incorrectly reinforcing
                     # bad auction bids (and vice versa).
-                    auc_log_ratio = torch.clamp(auc_lp_new - old_auc_lp[mb], -10.0, 10.0)
+                    # P11: Tighter log-ratio clamp — max ratio e^2≈7.4 (was e^10≈22026).
+                    # Prevents catastrophic loss from rare high-ratio mini-batches.
+                    auc_log_ratio = torch.clamp(auc_lp_new - old_auc_lp[mb], -2.0, 2.0)
                     auc_ratio = torch.exp(auc_log_ratio)
                     auc_surr1 = auc_ratio * adv_t[mb]
                     auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
                     auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
 
-                    sec_log_ratio = torch.clamp(sec_lp_new - old_sec_lp[mb], -10.0, 10.0)
+                    sec_log_ratio = torch.clamp(sec_lp_new - old_sec_lp[mb], -2.0, 2.0)
                     sec_ratio = torch.exp(sec_log_ratio)
                     sec_surr1 = sec_ratio * adv_t[mb]
                     sec_surr2 = torch.clamp(sec_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
                     sec_policy_loss = -torch.min(sec_surr1, sec_surr2).mean()
 
                     policy_loss = auc_policy_loss + sec_policy_loss
+
+                    # P11: Approximate KL divergence for early stopping
+                    # Schulman (2020): approx_kl ≈ (ratio - 1) - log(ratio)
+                    with torch.no_grad():
+                        mb_kl = 0.5 * (
+                            ((auc_ratio - 1.0) - auc_log_ratio).mean()
+                            + ((sec_ratio - 1.0) - sec_log_ratio).mean()
+                        )
+                        epoch_kl_sum += mb_kl.item() * len(mb)
+                        epoch_kl_count += len(mb)
 
                     # P2: entropy_coef updated externally via set_entropy_coef()
                     entropy = (auc_ent + sec_ent).mean()
@@ -485,6 +503,13 @@ class PPOAgent:
                 total_a_loss += policy_loss.item()
                 total_v_loss += value_loss.item()
                 n_up += 1
+
+            # P11: KL early stopping — abort remaining epochs if policy
+            # has already drifted significantly from data-collection policy.
+            if actor_update and self.target_kl > 0 and epoch_kl_count > 0:
+                avg_kl = epoch_kl_sum / epoch_kl_count
+                if avg_kl > self.target_kl:
+                    break
 
         self.buffer.clear()
 

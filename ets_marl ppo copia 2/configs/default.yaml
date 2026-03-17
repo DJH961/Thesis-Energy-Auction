@@ -97,8 +97,15 @@ risk:
 auction:
   price_max: 120.0     # penalty (100) + modest carry-forward premium; prevents ceiling-bid cornering
   price_min: 40.0      # = reserve_price: prevents bids that are silently rejected
-  price_markup_low: 0.90
-  price_markup_high: 1.25
+  # P11: Wider markup range — breaks price ceiling trap.
+  # Old [0.90, 1.25] at reference=114.8 gave min bid=103.3 (above MAC=65).
+  # New [0.50, 1.50] at reference=98.6 (anchored) gives min bid=49.3.
+  price_markup_low: 0.50
+  price_markup_high: 1.50
+  # Fundamental anchor: (penalty_rate + MAC) / 2 = (100+65)/2 = 82.5
+  # Prevents reference price from drifting to ceiling with clearing price.
+  reference_anchor: 82.5
+  anchor_blend: 0.5          # 50% market signal + 50% fundamental anchor
   quantity_max: 3.0
   reserve_ratio: 0.85
   # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
@@ -252,6 +259,10 @@ ppo:
   centralized_critic: false   # IPPO: independent critics — better for competitive auction setting
   critic_hidden_size: 256     # critic network width (can differ from actor hidden_size)
   critic_warmup_episodes: 100    # episodes to train critic only (no actor gradients) after BC
+  # P11: KL-based early stopping — abort PPO epochs if approximate KL
+  # between updated and data-collection policy exceeds threshold.
+  # Prevents catastrophic policy drift within a single update.
+  target_kl: 0.02
   kl_anchor_beta: 0.5            # initial weight of KL penalty against frozen BC policy
   kl_anchor_decay_episodes: 5000 # episodes over which beta decays linearly to 0 (was 2000; agents need more time near heuristic before deviating)
 
