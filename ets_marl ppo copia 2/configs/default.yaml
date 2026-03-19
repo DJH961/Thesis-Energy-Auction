@@ -95,7 +95,7 @@ risk:
   experience_threshold: 2
 
 auction:
-  price_max: 120.0     # penalty (100) + modest carry-forward premium; prevents ceiling-bid cornering
+  price_max: 500.0     # penalty (100) + modest carry-forward premium; prevents ceiling-bid cornering
   price_min: 40.0      # = reserve_price: prevents bids that are silently rejected
   # P11: Wider markup range — breaks price ceiling trap.
   # Old [0.90, 1.25] at reference=114.8 gave min bid=103.3 (above MAC=65).
