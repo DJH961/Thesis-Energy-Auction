@@ -327,7 +327,7 @@ def _print_training_legend():
     print(leg)
 
 
-def train_one_seed(config: dict, seed: int):
+def train_one_seed(config: dict, seed: int, on_log=None):
     n_agents = config["companies"]["n_agents"]
     n_episodes = config["simulation"]["n_episodes"]
     n_years = config["simulation"]["n_years"]
@@ -938,6 +938,10 @@ def train_one_seed(config: dict, seed: int):
                     f"│ {ep_total_mac_reduction[i]:7.3f} │ {avg_sec_mult_per_agent[i]:5.2f} {avg_sec_qty_per_agent[i]:6.2f}"
                 )
             print(sep)
+
+            # Optional callback for live plotting (e.g. from notebook)
+            if on_log is not None:
+                on_log(episode, ep_path)
 
         # Checkpointing
         if episode % save_interval == 0:
