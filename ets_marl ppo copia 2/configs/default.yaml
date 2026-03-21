@@ -97,11 +97,13 @@ risk:
 auction:
   price_max: 500.0     # penalty (100) + modest carry-forward premium; prevents ceiling-bid cornering
   price_min: 60.0      # P13: = reserve_price; raised from 40 to keep prices above MAC floor
-  # P11: Wider markup range — breaks price ceiling trap.
-  # Old [0.90, 1.25] at reference=114.8 gave min bid=103.3 (above MAC=65).
-  # New [0.50, 1.50] at reference=98.6 (anchored) gives min bid=49.3.
-  price_markup_low: 0.50
-  price_markup_high: 1.50
+  # P14: Narrower markup range — eliminates gradient dead zone.
+  # With [0.50, 1.50] at reference~71 (floor clearing), any markup<0.842
+  # clips to price_min=60, creating a 34% dead zone with zero gradient.
+  # [0.85, 1.25]: min bid = 0.85×71 = 60.4 (just above floor), full gradient
+  # everywhere.  Max bid = 1.25×71 = 89 (reasonable for scarcity signal).
+  price_markup_low: 0.85
+  price_markup_high: 1.25
   # Fundamental anchor: (penalty_rate + MAC) / 2 = (100+65)/2 = 82.5
   # Prevents reference price from drifting to ceiling with clearing price.
   reference_anchor: 82.5
