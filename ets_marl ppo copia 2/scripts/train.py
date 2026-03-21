@@ -22,6 +22,8 @@ Roadmap improvements wired here:
 """
 
 import argparse
+import collections
+import copy
 import csv
 import io
 import os
@@ -406,6 +408,19 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         print(f"Epsilon-greedy: {eps_start:.2f} → {eps_final:.2f} "
               f"over {eps_decay_episodes} episodes (physical-space).")
 
+    # Historical Policy Pool (HPP) — anti-regression safety net
+    hpp_cfg = config.get("hpp", {})
+    hpp_enabled = hpp_cfg.get("enabled", False)
+    hpp_pool_size = hpp_cfg.get("pool_size", 10)
+    hpp_save_interval = hpp_cfg.get("save_interval", 500)
+    hpp_swap_prob = hpp_cfg.get("swap_prob", 0.20)
+    hpp_warmup = hpp_cfg.get("warmup_episodes", 1000)
+    # Per-agent FIFO pool of actor state_dicts (auction + secondary only)
+    hpp_pools = [collections.deque(maxlen=hpp_pool_size) for _ in range(n_agents)]
+    if hpp_enabled:
+        print(f"HPP: pool={hpp_pool_size}, save every {hpp_save_interval} eps, "
+              f"swap_prob={hpp_swap_prob:.0%}, warmup={hpp_warmup} eps.")
+
     # Condition-based entropy tracker (auto-scales to n_episodes)
     entropy_tracker = EntropyConditionTracker(ppo_cfg, n_agents, n_episodes)
 
@@ -510,6 +525,22 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         obs1, _ = env.reset(seed=seed + episode * 1000)
         total_rewards = np.zeros(n_agents)
+
+        # HPP: swap some agents to historical policies for this episode's rollout
+        hpp_swapped = {}  # agent_idx → saved (auc_sd, sec_sd)
+        if hpp_enabled and episode >= hpp_warmup:
+            for i in range(n_agents):
+                if hpp_pools[i] and np.random.random() < hpp_swap_prob:
+                    # Save current actor weights
+                    hpp_swapped[i] = (
+                        copy.deepcopy(agents[i].auction_policy.state_dict()),
+                        copy.deepcopy(agents[i].secondary_policy.state_dict()),
+                    )
+                    # Load random historical policy for action selection
+                    hist_auc, hist_sec = hpp_pools[i][
+                        np.random.randint(len(hpp_pools[i]))]
+                    agents[i].auction_policy.load_state_dict(hist_auc)
+                    agents[i].secondary_policy.load_state_dict(hist_sec)
 
         for year in range(effective_n_years):
             # === PHASE 1: Auction + Investment ===
@@ -617,6 +648,24 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             if terminated:
                 break
 
+        # HPP: restore current policies (swapped agents used historical for rollout only)
+        if hpp_swapped:
+            for i, (saved_auc, saved_sec) in hpp_swapped.items():
+                agents[i].auction_policy.load_state_dict(saved_auc)
+                agents[i].secondary_policy.load_state_dict(saved_sec)
+            # Swapped agents collected experience under historical policy —
+            # discard their buffers so they don't corrupt the current policy update.
+            for i in hpp_swapped:
+                agents[i].buffer.clear()
+
+        # HPP: periodically snapshot current actors into the pool
+        if hpp_enabled and episode > 0 and episode % hpp_save_interval == 0:
+            for i in range(n_agents):
+                hpp_pools[i].append((
+                    copy.deepcopy(agents[i].auction_policy.state_dict()),
+                    copy.deepcopy(agents[i].secondary_policy.state_dict()),
+                ))
+
         # === PPO Update (end of episode) ===
         # Time-based entropy decay
         entropy_coef = entropy_tracker.update(episode)
@@ -644,7 +693,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
             # 2. Sequential update in random order
             order = np.random.permutation(n_agents).tolist()
-            T = gae_data[0][2]["T"] if gae_data[0][2] is not None else 0
+            # Find T from first agent with non-empty buffer
+            T = 0
+            for _gd in gae_data:
+                if _gd[2] is not None:
+                    T = _gd[2]["T"]
+                    break
             cumulative_ratio = torch.ones(T, 1) if T > 0 else None
 
             for j in order:
@@ -679,6 +733,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         else:
             # === IPPO / cycling update (fallback) ===
             for i in range(n_agents):
+                # HPP: skip update for agents whose buffer was cleared (swapped)
+                if i in hpp_swapped:
+                    latest_losses.append(None)
+                    continue
                 if cycling_enabled:
                     if i == active_agent_idx:
                         loss = agents[i].update(last_value=0.0, actor_update=actor_update)

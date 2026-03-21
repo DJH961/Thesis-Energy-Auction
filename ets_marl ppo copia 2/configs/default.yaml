@@ -54,7 +54,7 @@ ets:
     emergency_release_amount: 0.50    # Mt released per year in emergency
 
   banking: true
-  reserve_price: 40.0    # realistic floor; prevents zero-price collapse
+  reserve_price: 60.0    # P13: raised from 40; keeps floor above MAC (65€) vicinity
   unsold_to_msr: true    # feed unsold auction allowances into MSR reserve (else discarded)
 
 # ----------------------------------------------------------
@@ -96,7 +96,7 @@ risk:
 
 auction:
   price_max: 500.0     # penalty (100) + modest carry-forward premium; prevents ceiling-bid cornering
-  price_min: 40.0      # = reserve_price: prevents bids that are silently rejected
+  price_min: 60.0      # P13: = reserve_price; raised from 40 to keep prices above MAC floor
   # P11: Wider markup range — breaks price ceiling trap.
   # Old [0.90, 1.25] at reference=114.8 gave min bid=103.3 (above MAC=65).
   # New [0.50, 1.50] at reference=98.6 (anchored) gives min bid=49.3.
@@ -190,8 +190,8 @@ electricity:
   carbon_passthrough: 0.80   # fraction of carbon cost passed into electricity price
 
 # ----------------------------------------------------------
-# Reward (P12: simplified to 4 core signals)
-# R_i = -cost_norm - emissions_intensity - penalty_norm + green_bonus
+# Reward (P13: 5 core signals)
+# R_i = -cost_norm - emissions_intensity - penalty_norm + green_bonus - coverage_penalty
 # ----------------------------------------------------------
 reward:
   normalizer_alpha: 0.01
@@ -201,6 +201,10 @@ reward:
   shaping_beta: 4.0              # green_delta bonus ~ 0.4 per 10% shift
   shaping_decay_episode: 12000   # (irrelevant when floor=1.0, kept for reference)
   shaping_weight_floor: 1.0      # constant shaping weight
+  # P13: Forward-looking coverage signal — bounded [0, 1] penalty when
+  # holdings < emissions obligation.  Bridges temporal gap between bidding
+  # and compliance.  At coverage=0.5: penalty=0.5; at coverage>=1: penalty=0.
+  coverage_weight: 1.0
 # ----------------------------------------------------------
 # Opponent modeling (Option C)
 # With 8 agents: +14 dims → obs_dim_phase1 = 35, phase2 = 40
@@ -323,6 +327,20 @@ diagnostics:
   # floor-bidding is suboptimal but agents can't discover this once entropy decays.
   stuck_boost_window: 250            # episodes stuck before boost triggers
   stuck_boost_coef: 0.04            # boosted entropy coef (above coef_init=0.02)
+
+# ----------------------------------------------------------
+# Historical Policy Pool (HPP) — anti-regression safety net
+# Maintains a pool of past actor snapshots.  During rollout,
+# some agents' actors are replaced with historical versions
+# so opponents are behaviourally diverse.  This prevents
+# synchronised collapse to a bad equilibrium.
+# ----------------------------------------------------------
+hpp:
+  enabled: true
+  pool_size: 10           # max snapshots per agent (FIFO)
+  save_interval: 500      # episodes between snapshots (first save after BC)
+  swap_prob: 0.20         # per-agent probability of using a historical policy each episode
+  warmup_episodes: 1000   # don't swap until agents have basic competence
 
 # ----------------------------------------------------------
 # Epsilon-greedy exploration (physical-space)

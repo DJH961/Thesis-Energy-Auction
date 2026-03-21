@@ -862,14 +862,15 @@ class ETSEnvironment(gym.Env):
                          mac_costs=None, precompliance_holdings=None,
                             old_carry_forward=None, blocked_sell_qty=None):
         """
-        Simplified reward (P12):
-          R_i = -cost_norm - emissions_intensity - penalty_norm + green_bonus
+        Reward (P13):
+          R_i = -cost_norm - emissions_intensity - penalty_norm + green_bonus - coverage_penalty
 
-        Four core economic signals only:
+        Five core economic signals:
           cost_norm:           total costs (auction + secondary + invest + ops + holding + MAC - revenue) / 1000
           emissions_intensity: penalisable emission factor / 0.82
-          penalty_norm:        log-compressed non-compliance penalty
+          penalty_norm:        linear non-compliance penalty (penalty / 500)
           green_bonus:         diminishing-returns bonus for green investment progress
+          coverage_penalty:    bounded [0, 1] penalty when holdings < emissions obligation
 
         Note: per-agent running normalisation applied in PPOAgent.normalize_reward()
         AFTER this function returns raw rewards.
@@ -879,6 +880,7 @@ class ETSEnvironment(gym.Env):
         reward_cfg = self.config.get("reward", {})
         trading_cfg = self.config.get("trading", {})
         elec_cfg = self.config.get("electricity", {})
+        coverage_weight = reward_cfg.get("coverage_weight", 1.0)
 
         green_floor_fossil = reward_cfg.get("green_floor_fossil", [0.0] * self.n_agents)
         beta_shaping = reward_cfg.get("shaping_beta", 10.0)
@@ -939,15 +941,26 @@ class ETSEnvironment(gym.Env):
             penalisable_ef = max(0.0, company.weighted_emission_factor - initial_ef_at_floor)
             emissions_intensity = penalisable_ef / 0.82
 
-            # Log-compressed non-compliance penalty
-            penalty_norm = float(np.log1p(penalty_cost / 100.0)) * non_compliance_mult
+            # Linear non-compliance penalty (preserves gradient for large penalties)
+            penalty_norm = (penalty_cost / 500.0) * non_compliance_mult
+
+            # Bounded coverage penalty: forward-looking signal for under-coverage
+            if precompliance_holdings is not None:
+                obligation = max(float(emissions[i]), 1e-6)
+                if old_carry_forward is not None:
+                    obligation += float(old_carry_forward[i])
+                coverage_ratio = float(precompliance_holdings[i]) / obligation
+                coverage_penalty = coverage_weight * max(0.0, 1.0 - coverage_ratio)
+            else:
+                coverage_penalty = 0.0
 
             # Green investment bonus with diminishing returns
             green_delta = max(0.0, company.green_frac - company.prev_green_frac)
             fossil_scale = max(company.fossil_frac, 0.05)
             green_bonus = beta_shaping * green_delta * fossil_scale * self.shaping_weight
 
-            rewards[i] = float(-cost_norm - emissions_intensity - penalty_norm + green_bonus)
+            rewards[i] = float(-cost_norm - emissions_intensity - penalty_norm
+                               + green_bonus - coverage_penalty)
 
         return rewards
 
