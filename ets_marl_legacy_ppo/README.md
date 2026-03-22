@@ -4,26 +4,71 @@
 
 ## What Is This?
 
-This folder contains an **earlier snapshot** of the project from when PPO was first adopted as the learning algorithm (replacing DDPG from the original prototype). It exists purely as a historical reference point.
+This is the **second version** of the carbon market simulation. It was the first version to use **PPO (Proximal Policy Optimization)** as the learning algorithm, replacing DDPG from the original prototype. It still used the simpler 4-agent, 2-technology setup but proved that PPO was the right algorithmic direction.
 
-This version only contains a **notebook** — the full codebase was not preserved separately because the changes were carried forward into the current version.
+This version served as the bridge between the original DDPG prototype and the current 8-agent HAPPO version.
 
-## Contents
+## How It Differs From the Other Versions
+
+| Feature | Legacy Test (DDPG) | This Version (Legacy PPO) | Current (HAPPO) |
+|---------|-------------------|--------------------------|-----------------|
+| Learning algorithm | DDPG | **PPO** | PPO/HAPPO |
+| Number of companies | 4 | 4 | 8 |
+| Technologies | 2 (fossil vs green) | 2 (fossil vs green) | 5 (coal, gas, onshore, offshore, solar) |
+| Heuristic baselines | No | **Yes** | Yes |
+| Cap (starting) | 14.6 Mt | 14.6 Mt | 23.5 Mt |
+
+## Project Structure
 
 ```
 ets_marl_legacy_ppo/
-└── notebooks/
-    └── ets_marl_colab_HAPPO.ipynb   # Colab notebook from this era
+│
+├── src/
+│   ├── environment/
+│   │   ├── ets_environment.py    # Simulation loop
+│   │   ├── company.py            # Company state
+│   │   └── cap_schedule.py       # Cap + MSR logic
+│   ├── agents/
+│   │   ├── ppo_agent.py          # PPO learning algorithm
+│   │   ├── actor_critic.py       # Neural networks
+│   │   ├── heuristic_policy.py   # Rule-based baseline agents
+│   │   └── noise.py              # Exploration noise
+│   ├── auction/
+│   │   └── market_clearing_ets.py
+│   └── utils/
+│       ├── logger.py
+│       └── replay_buffer.py
+│
+├── tests/                        # Unit and integration tests
+├── configs/
+│   └── default.yaml
+├── scripts/
+│   ├── train.py
+│   └── evaluate.py
+├── notebooks/
+│   ├── ets_marl_colab.ipynb       # Training notebook
+│   └── ets_marl_colab_HAPPO.ipynb # Early HAPPO experiments
+├── docs/
+│   └── design.md
+├── main.py
+├── requirements.txt
+└── pyproject.toml
 ```
 
-## How It Fits In the Timeline
+## Can I Still Run It?
 
-1. **Legacy Test** (`ets_marl_legacy_test/`) — First prototype, DDPG, 4 agents, 2 technologies
-2. **Legacy PPO** (`ets_marl_legacy_ppo/`) — **This version.** Switched to PPO, intermediate experiments
-3. **Current HAPPO** (`ets_marl_happo_current/`) — Full version with 8 agents, 5 technologies, PPO/HAPPO, all policy improvements
+Yes:
 
-## Should I Look at This?
+```bash
+pip install -r requirements.txt
+python scripts/train.py --config configs/default.yaml --seed 42
+python -m pytest tests/ -v
+```
 
-Probably not. Unless you want to compare the notebook with the current Colab notebook to see how the approach evolved, there's nothing here that isn't done better in the current version.
+However, all new development and experiments should use the [current version](../ets_marl_happo_current) instead.
 
-Go to [ets_marl_happo_current](../ets_marl_happo_current) for the real thing.
+## Why Was It Replaced?
+
+- PPO worked well, but the **4-agent / 2-technology model was still too simple** to capture realistic market dynamics
+- The current version scaled up to **8 agents and 5 technologies**, adding fuel-switching, electricity revenue, and carry-forward penalties
+- The HAPPO variant allows **heterogeneous agent updates**, which is better suited for agents with very different energy mixes
