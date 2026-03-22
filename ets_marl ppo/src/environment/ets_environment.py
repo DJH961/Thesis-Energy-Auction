@@ -851,13 +851,14 @@ class ETSEnvironment(gym.Env):
                          old_carry_forward=None):
         """
         Reward (HAPPO-compliant):
-          R_i = -cost_norm - emissions_intensity - penalty_norm + green_bonus
+          R_i = -cost_norm - emissions_intensity - penalty_norm + green_bonus + queue_bonus
 
-        Four core economic signals:
+        Five core economic signals:
           cost_norm:           total costs (auction + secondary + invest + ops + MAC - revenue) / 1000
           emissions_intensity: penalisable emission factor / 0.82
           penalty_norm:        linear non-compliance penalty (penalty / 100)
           green_bonus:         diminishing-returns bonus for green investment progress
+          queue_bonus:         reward for active construction queue items (decays with shaping_weight)
 
         Note: per-agent running normalisation applied in PPOAgent.normalize_reward()
         AFTER this function returns raw rewards.
@@ -870,6 +871,7 @@ class ETSEnvironment(gym.Env):
 
         green_floor_fossil = reward_cfg.get("green_floor_fossil", [0.0] * self.n_agents)
         beta_shaping = reward_cfg.get("shaping_beta", 10.0)
+        gamma_shaping = reward_cfg.get("shaping_gamma", 1.0)
 
         # Banking holding cost — diagnostic only, not included in reward
         holding_cost_rate = trading_cfg.get("banking_holding_cost", 0.0)
@@ -932,8 +934,12 @@ class ETSEnvironment(gym.Env):
             fossil_scale = max(company.fossil_frac, 0.05)
             green_bonus = beta_shaping * green_delta * fossil_scale * self.shaping_weight
 
+            # Queue bonus: reward for having active construction projects
+            n_active_queue = len(company._construction_queue)
+            queue_bonus = gamma_shaping * n_active_queue * 0.1 * self.shaping_weight
+
             rewards[i] = float(-cost_norm - emissions_intensity - penalty_norm
-                               + green_bonus)
+                               + green_bonus + queue_bonus)
 
         return rewards
 

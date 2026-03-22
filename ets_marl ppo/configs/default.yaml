@@ -181,11 +181,12 @@ electricity:
 # ----------------------------------------------------------
 reward:
   normalizer_alpha: 0.01
-  clip_min: -5.0
+  clip_min: -10.0
   clip_max: 5.0
   green_floor_fossil: [0.40, 0.40, 0.30, 0.30, 0.10, 0.10, 0.00, 0.00]
-  shaping_beta: 4.0              # green_delta bonus ~ 0.4 per 10% shift
-  shaping_decay_episode: 12000   # (irrelevant when floor=1.0, kept for reference)
+  shaping_beta: 7.0              # green_delta bonus — increased for stronger investment signal
+  shaping_gamma: 1.0             # queue bonus weight — rewards active construction queue items
+  shaping_decay_episode: 12000   # episodes over which shaping_weight decays to floor
   shaping_weight_floor: 0.0      # green shaping decays fully to zero
 # ----------------------------------------------------------
 # Opponent modeling (Option C)

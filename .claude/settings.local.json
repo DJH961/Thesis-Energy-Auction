@@ -4,7 +4,8 @@
       "Bash(python -c \":*)",
       "Bash(python _build_notebook.py)",
       "Bash(python -m pytest tests/test_environment.py -v --tb=short)",
-      "Bash(python -m pytest tests/ -v --tb=short)"
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(python -m pytest tests/ -x -q)"
     ]
   }
 }
