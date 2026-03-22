@@ -174,6 +174,16 @@ def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0
     cover_ratio = total_demand / q_cap if q_cap > 0 else 0.0
     unsold = max(0.0, q_cap - total_allocated)
 
+    # HHI: Herfindahl-Hirschman Index of allocation concentration
+    # HHI = sum of squared market shares (0 = perfectly spread, 10000 = monopoly)
+    if total_allocated > 1e-9:
+        shares = allocations / total_allocated
+        hhi = float(np.sum((shares * 100) ** 2))
+        max_agent_share_actual = float(np.max(shares))
+    else:
+        hhi = 0.0
+        max_agent_share_actual = 0.0
+
     stats = {
         "clearing_price": clearing_price,
         "total_demand": total_demand,
@@ -181,6 +191,8 @@ def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0
         "cover_ratio": cover_ratio,
         "auction_failed": False,
         "unsold": unsold,
+        "hhi": hhi,
+        "max_agent_share_actual": max_agent_share_actual,
     }
 
     return clearing_price, allocations, payments, stats

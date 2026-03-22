@@ -15,6 +15,13 @@ Provides one function per decision phase that mirrors the agent's action space:
 All outputs are in physical (action) space. The calling code in train.py
 inverse-maps them through atanh for MSE supervision on the policy mean heads.
 
+Agent objectives (4×2 factorial: archetype × objective)
+-------------------------------------------------------
+Even-indexed agents (0, 2, 4, 6) are *financial*: prioritize cost minimization,
+invest conservatively, and sell surplus aggressively.
+Odd-indexed agents (1, 3, 5, 7) are *green-objective*: invest more aggressively,
+bid higher to guarantee allocation, and hold surplus rather than selling.
+
 Design rationale
 ----------------
 auction_action:
@@ -23,18 +30,20 @@ auction_action:
     and capped at penalty_rate (100 €/t).  In a uniform-price auction, bidding
     near true valuation is weakly dominant — you pay the clearing price
     regardless, so bidding higher guarantees allocation without raising cost.
+    Green-objective agents bid a further 10% premium to ensure allocation
+    for their transition strategy.
   - qty_multiplier = 1.0 normally; raised to 1.3 when carry-forward > 0
     (agent must cover the rolled-over shortfall).
-  - invest_frac = 0.03 when the NPV-proxy of investing is positive over the
-    remaining episode horizon, else 0.005 (always invest a little to explore).
+  - invest_frac: financial agents use 0.03/0.005 (NPV-gated); green-objective
+    agents use 0.07/0.02 (invest aggressively regardless of short-run NPV).
   - tech: solar (fast, 2yr) near end of episode; onshore wind (higher capacity)
     in the early years.
 
 secondary_action:
   - Compute surplus = bank + allocation - need.
-  - Surplus > 10% of need  → sell half at 1.1× (take profit above clearing)
-  - Deficit                → buy shortfall at 1.3× (willing to pay premium)
-  - Near-balanced          → hold (neutral)
+  - Financial agents: sell surplus aggressively (half at 1.1×), buy shortfall.
+  - Green-objective agents: hold surplus as a buffer (only sell large excess),
+    buy shortfall more aggressively (1.3× premium, up to 1.5× shortfall).
 """
 
 import numpy as np
@@ -51,6 +60,7 @@ def auction_action(
     current_year: int,
     n_years: int,
     config: dict,
+    reserve_price: float = None,
 ) -> np.ndarray:
     """
     Heuristic Phase-1 (auction + investment) action.
@@ -76,7 +86,9 @@ def auction_action(
     """
     aq = config["auction"]
     inv = config["investment"]
-    reserve_price = config["ets"].get("reserve_price", 0.0)
+    if reserve_price is None:
+        reserve_price = config["ets"].get("reserve_price", 0.0)
+    is_green = (company.agent_id % 2) == 1  # odd indices = green-objective
 
     # --- Bid price ---
     # In a uniform-price auction, bidding near your true valuation is
@@ -86,9 +98,11 @@ def auction_action(
     # We anchor at 1.15× MA3 price, floored at reserve+5 and capped at
     # the penalty rate (not 90€ — that was too low for high-emitting agents
     # whose allowance value is ≈100 €/t).
+    # Green-objective agents add a 10% premium to ensure allocation.
     penalty_rate = config.get("penalty", {}).get("rate", 100.0)
+    price_anchor = price_ma3 * (1.25 if is_green else 1.15)
     bid_price = float(np.clip(
-        max(reserve_price + 5.0, min(penalty_rate, price_ma3 * 1.15)),
+        max(reserve_price + 5.0, min(penalty_rate, price_anchor)),
         aq["price_min"], aq["price_max"],
     ))
 
@@ -103,8 +117,9 @@ def auction_action(
     # Simple NPV proxy: compare (years_left × annual carbon saving) to invest cost.
     # annual_carbon_saving = emission reduction from shifting invest_frac_test to solar,
     #                        valued at the current MA3 carbon price.
+    # Green-objective agents invest more aggressively (higher frac, lower threshold).
     years_left = max(1, n_years - current_year)
-    frac_test = 0.03  # evaluate at 3% shift — matches candidate invest_frac
+    frac_test = 0.07 if is_green else 0.03
 
     invest_cost = company.compute_investment_cost(_TECH_SOLAR, frac_test)  # M€
 
@@ -112,10 +127,19 @@ def auction_action(
     annual_emission_reduction = frac_test * company.output_mwh * ef_saved / 1e6  # Mt
     annual_carbon_saving = annual_emission_reduction * price_ma3  # M€ (at MA3 price)
 
-    invest_frac = float(np.clip(
-        0.03 if years_left * annual_carbon_saving > invest_cost else 0.005,
-        0.0, inv["max_invest_frac"],
-    ))
+    if is_green:
+        # Green agents invest aggressively: high frac when NPV positive, still
+        # moderate when not (always push the transition).
+        invest_frac = float(np.clip(
+            0.07 if years_left * annual_carbon_saving > invest_cost * 0.5 else 0.02,
+            0.0, inv["max_invest_frac"],
+        ))
+    else:
+        # Financial agents invest conservatively: strict NPV gate.
+        invest_frac = float(np.clip(
+            0.03 if years_left * annual_carbon_saving > invest_cost else 0.005,
+            0.0, inv["max_invest_frac"],
+        ))
 
     # --- Technology choice (logits) ---
     # Solar (2yr delay) near the end when there is little time for onshore (5yr) to deliver.
@@ -158,23 +182,38 @@ def secondary_action(
     """
     aq = config["auction"]
     qty_max = aq["quantity_max"]
+    is_green = (company.agent_id % 2) == 1  # odd indices = green-objective
 
     need = max(company.compute_estimate_need() + company._carry_forward, 1e-6)
     surplus = bank + allocation - need
 
-    if surplus > need * 0.1:
-        # Oversupplied — sell half the surplus at a modest premium
-        sell_qty = min(surplus / 2.0, qty_max)
-        sec_qty = float(-sell_qty)   # negative = intent to sell
-        price_mult = 1.1
-    elif surplus < 0:
-        # Short — buy the shortfall, willing to pay a premium
-        buy_qty = min(abs(surplus), qty_max)
-        sec_qty = float(buy_qty)     # positive = intent to buy
-        price_mult = 1.3
+    if is_green:
+        # Green-objective: hold surplus as compliance buffer; only sell large excess.
+        if surplus > need * 0.3:
+            sell_qty = min(surplus / 3.0, qty_max)
+            sec_qty = float(-sell_qty)
+            price_mult = 1.2  # demand higher price if selling
+        elif surplus < 0:
+            # Buy aggressively — cover 1.5× shortfall to build buffer
+            buy_qty = min(abs(surplus) * 1.5, qty_max)
+            sec_qty = float(buy_qty)
+            price_mult = 1.3
+        else:
+            sec_qty = 0.0
+            price_mult = 1.0
     else:
-        sec_qty = 0.0
-        price_mult = 1.0
+        # Financial: sell surplus aggressively for profit, buy shortfall.
+        if surplus > need * 0.1:
+            sell_qty = min(surplus / 2.0, qty_max)
+            sec_qty = float(-sell_qty)
+            price_mult = 1.1
+        elif surplus < 0:
+            buy_qty = min(abs(surplus), qty_max)
+            sec_qty = float(buy_qty)
+            price_mult = 1.3
+        else:
+            sec_qty = 0.0
+            price_mult = 1.0
 
     sec_low = config.get("trading", {}).get("sec_mult_low", 0.8)
     sec_high = config.get("trading", {}).get("sec_mult_high", 1.3)

@@ -185,7 +185,8 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
             for i in range(n_agents):
                 company = env.companies[i]
                 h_auc = heuristic_policy.auction_action(
-                    company, price_ma3, current_year, n_years, config)
+                    company, price_ma3, current_year, n_years, config,
+                    reserve_price=env._compute_dynamic_reserve())
                 auction_actions[i] = h_auc
 
                 auc_raw = _to_raw(h_auc, agents[i].auction_policy,
@@ -515,6 +516,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         # P4: Communicate episode to environment for shaping weight + lock-in activation
         env.set_episode(episode)
+
+        # Cancel-under-subscribed schedule: enable after N episodes
+        cancel_after = config["auction"].get("cancel_under_subscribed_after", None)
+        if cancel_after is not None:
+            env.config["auction"]["cancel_under_subscribed"] = (episode >= cancel_after)
 
         # Epsilon-greedy schedule: linear decay
         if eps_start > 0.0:
@@ -1006,6 +1012,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 "auction_failed": "fail", "cover_below_one": "cov<1", "zero_invest": "0inv",
                 "chronic_short": "chron", "bid_cluster": "bclust", "bank_hoard": "hoard",
                 "sec_one_sided": "1side", "sec_zero_vol": "0vol",
+                "monopoly": "mono", "dyn_reserve_cancel": "dynRsvCancel",
             }
             _warn_parts = [
                 f"{_warn_labels.get(k, k)}={v}"

@@ -118,15 +118,13 @@ class ETSEnvironment(gym.Env):
         # carries forward to the next year's auction supply.
         self._unsold_rollover = 0.0
 
-        # Opponent modeling (Option C)
+        # Dynamic reserve tracking
+        self._last_effective_reserve = config["ets"].get("reserve_initial",
+                                                          config["ets"].get("reserve_price", 0.0))
+
+        # Opponent modeling (5D public info per opponent)
         opp_enabled = config.get("opponent_modeling", {}).get("enabled", False)
         self._opponent_modeling = opp_enabled
-        self._last_episode_bids = np.zeros(self.n_agents)
-        self._last_episode_greens = np.array([
-            c.green_frac for c in self.companies
-        ])
-        self._current_episode_bid_sum = np.zeros(self.n_agents)
-        self._current_episode_bid_count = np.zeros(self.n_agents, dtype=int)
 
         # MAC fuel-switching tracking
         self._mac_reductions = np.zeros(self.n_agents)
@@ -135,14 +133,18 @@ class ETSEnvironment(gym.Env):
         # Price normalization constant
         self._price_norm = config["auction"]["price_max"]
 
-        # Sanity check: agents must not be able to produce bids below the reserve
+        # Sanity check: in static mode, price_min must be >= reserve_price.
+        # In dynamic mode, the effective reserve is computed each year, so
+        # price_min can be below the absolute floor (agents learn to bid above).
         _price_min = config["auction"]["price_min"]
         _reserve = config["ets"].get("reserve_price", 0.0)
-        assert _price_min >= _reserve, (
-            f"Config error: auction.price_min ({_price_min}) < ets.reserve_price ({_reserve}). "
-            "Agents can produce valid-looking bids that the auction silently rejects, "
-            "leaving most of the cap unallocated. Set auction.price_min = reserve_price."
-        )
+        _reserve_mode = config["ets"].get("reserve_price_mode", "static")
+        if _reserve_mode == "static":
+            assert _price_min >= _reserve, (
+                f"Config error: auction.price_min ({_price_min}) < ets.reserve_price ({_reserve}). "
+                "Agents can produce valid-looking bids that the auction silently rejects, "
+                "leaving most of the cap unallocated. Set auction.price_min = reserve_price."
+            )
 
         # Logging
         self.episode_log: List[dict] = []
@@ -160,6 +162,35 @@ class ETSEnvironment(gym.Env):
         self.shaping_weight = max(floor, 1.0 - episode / decay_ep)
 
     # ------------------------------------------------------------------
+    # Dynamic reserve price
+    # ------------------------------------------------------------------
+
+    def _compute_dynamic_reserve(self) -> float:
+        """
+        Compute effective reserve price for this year's auction.
+
+        In 'dynamic' mode: max(absolute_floor, discount × MA3_price).
+        Falls back to reserve_initial when no MA3 history is available.
+        In 'static' mode: returns the configured reserve_price as-is.
+        """
+        ets_cfg = self.config["ets"]
+        mode = ets_cfg.get("reserve_price_mode", "static")
+        abs_floor = ets_cfg.get("reserve_price", 0.0)
+
+        if mode != "dynamic":
+            return abs_floor
+
+        discount = ets_cfg.get("reserve_discount", 0.80)
+        initial = ets_cfg.get("reserve_initial", 50.0)
+
+        ma3 = self._compute_price_ma3()
+        # If no price history yet, use reserve_initial as fallback
+        if not self._price_history:
+            return max(abs_floor, initial)
+
+        return max(abs_floor, discount * ma3)
+
+    # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
 
@@ -167,18 +198,6 @@ class ETSEnvironment(gym.Env):
         if seed is not None:
             self._seed = seed
             self.rng = np.random.default_rng(seed)
-
-        # Opponent modeling: finalise last episode's data before resetting companies
-        if self._opponent_modeling and self._current_episode_bid_count.sum() > 0:
-            mask = self._current_episode_bid_count > 0
-            self._last_episode_bids = np.where(
-                mask,
-                self._current_episode_bid_sum / np.maximum(self._current_episode_bid_count, 1),
-                self._last_episode_bids,
-            )
-            self._last_episode_greens = np.array([c.green_frac for c in self.companies])
-        self._current_episode_bid_sum = np.zeros(self.n_agents)
-        self._current_episode_bid_count = np.zeros(self.n_agents, dtype=int)
 
         self.current_year = 0
         self.episode_done = False
@@ -205,6 +224,7 @@ class ETSEnvironment(gym.Env):
             "auction_failed": 0, "cover_below_one": 0, "zero_invest": 0,
             "chronic_short": 0, "bid_cluster": 0, "bank_hoard": 0,
             "sec_one_sided": 0, "sec_zero_vol": 0,
+            "monopoly": 0, "dyn_reserve_cancel": 0,
         }
         # Per-agent consecutive-shortfall counter for chronic_short detection
         self._consecutive_shortfall = np.zeros(self.n_agents, dtype=int)
@@ -420,15 +440,19 @@ class ETSEnvironment(gym.Env):
 
         self._phase1_bid_prices = bid_actions[:, 0].copy()
         self._phase1_bid_quantities = bid_actions[:, 1].copy()  # Mt after multiplier expansion
-        if self._opponent_modeling:
-            self._current_episode_bid_sum += self._phase1_bid_prices
-            self._current_episode_bid_count += 1
+
+        # Compute effective reserve price (dynamic or static)
+        effective_reserve = self._compute_dynamic_reserve()
+        self._last_effective_reserve = effective_reserve
+
+        # Clip bids at the effective reserve (bids below are rejected anyway)
+        bid_actions[:, 0] = np.maximum(bid_actions[:, 0], effective_reserve)
 
         bids = build_bids(bid_actions)
         clearing_price, allocations, payments, auction_stats = market_clearing_ets(
             bids=bids,
             q_cap=auction_volume,
-            reserve_price=self.config["ets"].get("reserve_price", 0.0),
+            reserve_price=effective_reserve,
             max_agent_share=self.config["auction"].get("max_agent_share", 1.0),
             rng=self.rng,
             cancel_under_subscribed=self.config["auction"].get(
@@ -443,6 +467,7 @@ class ETSEnvironment(gym.Env):
         self.last_clearing_price = clearing_price
         self._phase1_clearing_price = clearing_price
         log["clearing_price"] = clearing_price
+        log["effective_reserve"] = effective_reserve
         log["auction_stats"] = auction_stats
 
         # 8. MAC fuel-switching (based on auction clearing price)
@@ -501,7 +526,7 @@ class ETSEnvironment(gym.Env):
         log["invest_fracs"] = invest_fracs.tolist()                   # raw action[2] per agent
 
         # ── Auction-phase warning counters ────────────────────────────────────
-        _reserve = self.config["ets"].get("reserve_price", 0.0)
+        _reserve = self._last_effective_reserve
         _price_max = self.config["auction"]["price_max"]
         if clearing_price <= _reserve + 1.0:
             self._warnings["price_floor"] += 1
@@ -519,6 +544,15 @@ class ETSEnvironment(gym.Env):
             self._warnings["zero_invest"] += 1
         if tnac > 2.0 * float(self._current_emissions.sum()):
             self._warnings["bank_hoard"] += 1
+        # Monopoly warning: any agent received >50% of total allocation
+        total_alloc = float(allocations.sum())
+        if total_alloc > 1e-9:
+            if float(allocations.max()) > 0.5 * total_alloc:
+                self._warnings["monopoly"] += 1
+        # Dynamic reserve cancellation: bids rejected because below effective reserve
+        n_below_reserve = int(np.sum(self._phase1_bid_prices < _reserve - 1e-6))
+        if n_below_reserve > 0:
+            self._warnings["dyn_reserve_cancel"] += 1
 
         return obs_phase2, log
 
@@ -916,10 +950,18 @@ class ETSEnvironment(gym.Env):
 
     def _get_obs_phase1(self) -> np.ndarray:
         """Phase 1 observations for all agents.
-        Base: 20D (P8: +2 secondary dims). With opponent modeling: 20 + 2*(N-1) dims.
+        Base: 22D. With opponent modeling: 22 + 5*(N-1) dims.
         """
         cap_t = self.cap_schedule.get_cap(self.current_year)
         price_ma3 = self._compute_price_ma3()
+
+        # TNAC proxy: total banked allowances / cap (market-level scarcity signal)
+        tnac = float(self.holdings.sum())
+        tnac_proxy = tnac / max(cap_t, 1e-6)
+
+        # Pre-compute 5D public info for all agents (used for opponent modeling)
+        if self._opponent_modeling and self.n_agents > 1:
+            public_infos = [c.get_public_info() for c in self.companies]
 
         obs_list = []
         for i, c in enumerate(self.companies):
@@ -927,8 +969,14 @@ class ETSEnvironment(gym.Env):
                 opp_parts = []
                 for j in range(self.n_agents):
                     if j != i:
-                        opp_parts.append(float(self._last_episode_bids[j]) / self._price_norm)
-                        opp_parts.append(float(self._last_episode_greens[j]))
+                        pi = public_infos[j]
+                        opp_parts.extend([
+                            pi["emissions"],
+                            pi["carry_forward"],
+                            pi["green_frac"],
+                            pi["fossil_frac"],
+                            pi["queue_total"],
+                        ])
                 opponent_obs = np.array(opp_parts, dtype=np.float32)
             else:
                 opponent_obs = None
@@ -943,7 +991,8 @@ class ETSEnvironment(gym.Env):
                 secondary_profit_signal=self._secondary_profit_ema[i],
                 price_ma3=price_ma3,
                 opponent_obs=opponent_obs,
-                last_secondary_volume=self.last_secondary_volume,  # P8
+                last_secondary_volume=self.last_secondary_volume,
+                tnac_proxy=tnac_proxy,
             )
             obs_list.append(obs_i)
 

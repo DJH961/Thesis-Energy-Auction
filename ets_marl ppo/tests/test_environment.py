@@ -387,13 +387,13 @@ def test_p7_price_history_seeded():
 # ---------------------------------------------------------------------------
 
 def test_p8_obs_dims():
-    """Phase 1 obs should be 21D base (+ 2*(N-1) opponent dims) with opponent modeling.
-    21 = 20 original dims + carry-forward obligation at [20]."""
+    """Phase 1 obs should be 22D base (+ 5*(N-1) opponent dims) with opponent modeling.
+    22 = 21 original dims + TNAC proxy at [21]."""
     env = load_env()
     obs, _ = env.reset()
     n_agents = env.config["companies"]["n_agents"]
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
-    expected_p1 = 21 + (2 * (n_agents - 1) if opp_enabled else 0)
+    expected_p1 = 22 + (5 * (n_agents - 1) if opp_enabled else 0)
     expected_p2 = expected_p1 + 7  # +7: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
@@ -401,7 +401,7 @@ def test_p8_obs_dims():
 
     # Auction actions: action[1] is now a COVERAGE MULTIPLIER on estimated need
     auction_actions = np.random.uniform(
-        [20.0, 0.3, 0.0, -1.0, -1.0, -1.0],
+        [5.0, 0.3, 0.0, -1.0, -1.0, -1.0],
         [200.0, 2.0, 0.05, 1.0, 1.0, 1.0],
         size=(n_agents, 6)
     ).astype(np.float32)
@@ -409,3 +409,73 @@ def test_p8_obs_dims():
     assert obs2.shape == (n_agents, expected_p2), (
         f"Phase 2 obs: expected ({n_agents}, {expected_p2}), got {obs2.shape}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 18: Dynamic reserve price tracks MA3
+# ---------------------------------------------------------------------------
+
+def test_dynamic_reserve_tracks_price():
+    """In dynamic mode, effective reserve should be max(abs_floor, discount × MA3)."""
+    env = load_env()
+    env.reset(seed=42)
+
+    # After warm-start, price history is seeded.  Run a few years to build MA3.
+    n_agents = env.n_agents
+    for _ in range(3):
+        auction_actions = np.random.uniform(
+            [50.0, 0.5, 0.0, -1.0, -1.0, -1.0],
+            [200.0, 1.5, 0.02, 1.0, 1.0, 1.0],
+            size=(n_agents, 6)
+        ).astype(np.float32)
+        obs2, log = env.step_auction(auction_actions)
+        secondary_actions = np.zeros((n_agents, 2), dtype=np.float32)
+        secondary_actions[:, 0] = 1.0
+        env.step_secondary(secondary_actions)
+
+    # Verify dynamic reserve is being computed
+    ets_cfg = env.config["ets"]
+    assert ets_cfg.get("reserve_price_mode") == "dynamic", "Expected dynamic reserve mode"
+
+    effective = env._compute_dynamic_reserve()
+    abs_floor = ets_cfg["reserve_price"]
+    discount = ets_cfg["reserve_discount"]
+    ma3 = env._compute_price_ma3()
+
+    expected = max(abs_floor, discount * ma3)
+    assert abs(effective - expected) < 1e-6, (
+        f"Dynamic reserve {effective:.2f} != expected {expected:.2f} "
+        f"(floor={abs_floor}, discount={discount}, MA3={ma3:.2f})"
+    )
+    # Reserve should be above the absolute floor
+    assert effective >= abs_floor - 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Test 19: No holding limit (max_agent_share = 1.0)
+# ---------------------------------------------------------------------------
+
+def test_no_holding_limit():
+    """With max_agent_share=1.0, a single high-bidding agent can get all supply."""
+    env = load_env()
+    env.reset(seed=42)
+    n_agents = env.n_agents
+
+    # Agent 0 bids very high, others bid at floor
+    auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+    auction_actions[:, 0] = 5.0    # all agents bid at floor
+    auction_actions[:, 1] = 1.0    # coverage multiplier
+    auction_actions[0, 0] = 400.0  # agent 0 bids very high
+
+    obs2, log = env.step_auction(auction_actions)
+
+    # With max_agent_share=1.0, agent 0 should receive a large share
+    allocs = np.array(log["auction_stats"]["clearing_price"])  # just check it didn't fail
+    assert not log["auction_stats"].get("auction_failed", False), "Auction should not fail"
+    # Agent 0's allocation should be substantial (they bid highest)
+    agent0_alloc = env._phase1_allocations[0]
+    total_alloc = float(env._phase1_allocations.sum())
+    if total_alloc > 1e-9:
+        share = agent0_alloc / total_alloc
+        # With no holding limit, the high bidder should get the majority
+        assert share > 0.3, f"Agent 0 share {share:.2f} too low with no holding limit"

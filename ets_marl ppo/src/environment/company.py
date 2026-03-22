@@ -416,6 +416,21 @@ class Company:
             self.mix /= self.mix.sum()
 
     # ------------------------------------------------------------------
+    # Public info (for opponent modeling)
+    # ------------------------------------------------------------------
+
+    def get_public_info(self) -> dict:
+        """Return publicly observable information about this company (5D)."""
+        queue_total = sum(item["frac_delta"] for item in self._construction_queue)
+        return {
+            "emissions": self.compute_emissions() / 10.0,
+            "carry_forward": self._carry_forward / 5.0,
+            "green_frac": self.green_frac,
+            "fossil_frac": self.fossil_frac,
+            "queue_total": queue_total,
+        }
+
+    # ------------------------------------------------------------------
     # Construction queue info (for observation space)
     # ------------------------------------------------------------------
 
@@ -479,7 +494,7 @@ class Company:
         return shortfall * self.penalty_rate
 
     # ------------------------------------------------------------------
-    # Observations — Phase 1: 20D base (+6 opponent) | Phase 2: +4
+    # Observations — Phase 1: 22D base (+5*(N-1) opponent) | Phase 2: +7
     # ------------------------------------------------------------------
 
     def get_observation_phase1(self, year, cap_t, last_clearing_price,
@@ -488,11 +503,12 @@ class Company:
                                secondary_profit_signal=0.0,
                                price_ma3=None,
                                opponent_obs=None,
-                               last_secondary_volume=0.0):
+                               last_secondary_volume=0.0,
+                               tnac_proxy=0.0):
         """
-        Phase 1 observation (pre-auction): 20D base + 2*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 22D base + 5*(N-1) opponent dims.
 
-        Base 20 dims:
+        Base 22 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
@@ -507,9 +523,11 @@ class Company:
         [17] weighted emission factor (normalized)
         [18] last secondary market price (normalized)  -- P8
         [19] last secondary market volume (normalized) -- P8
+        [20] carry-forward obligation (Mt)
+        [21] TNAC proxy (total banked allowances / cap, clipped to [0,3])
 
-        Opponent dims (if opponent_modeling enabled):
-        [20..25] = (bid_j/200, green_j) for each other agent j
+        Opponent dims (if opponent_modeling enabled, 5D per opponent):
+        [22..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
@@ -536,6 +554,7 @@ class Company:
             last_secondary_price / pn,            # [18] P8: secondary price signal
             last_secondary_volume / 10.0,         # [19] P8: secondary volume signal
             self._carry_forward / 5.0,            # [20] carry-forward obligation (Mt)
+            float(np.clip(tnac_proxy, 0.0, 3.0)), # [21] TNAC proxy
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -584,11 +603,11 @@ class Company:
 
     @property
     def obs_dim_phase1(self) -> int:
-        """21 base dims + 2*(N-1) opponent dims when opponent modeling is enabled.
-        Base dims include carry-forward obligation at index [20]."""
+        """22 base dims + 5*(N-1) opponent dims when opponent modeling is enabled.
+        Base dims include carry-forward at [20] and TNAC proxy at [21]."""
         if self._opponent_modeling and self._n_agents > 1:
-            return 21 + 2 * (self._n_agents - 1)
-        return 21
+            return 22 + 5 * (self._n_agents - 1)
+        return 22
 
     @property
     def obs_dim_phase2(self) -> int:

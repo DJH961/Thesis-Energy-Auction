@@ -26,7 +26,7 @@ Thesis-Energy-Auction/
 │   ├── scripts/
 │   │   ├── train.py               # Main training loop (BC warm-start + PPO)
 │   │   └── evaluate.py            # Evaluation script
-│   ├── tests/                     # 66 tests (pytest)
+│   ├── tests/                     # 68 tests (pytest)
 │   ├── notebooks/
 │   │   └── ets_marl_colab_HAPPO.ipynb  # Interactive notebook (works in VS Code + Colab)
 │   ├── requirements.txt
@@ -55,7 +55,14 @@ This branch simplifies the reward function and action space to be compatible wit
 | **Penalty norm** | `penalty_cost / 500.0` (100M EUR penalty = 0.2 signal) | `penalty_cost / 100.0` (100M EUR penalty = 1.0 signal) |
 | **KL anchor decay** | 5000 episodes | 8000 episodes (BC-taught behavior persists longer) |
 | **Phase 2 obs** | 5 extra dims (alloc, price, compliance_pos, shock, savings) | 7 extra dims (+coverage_ratio, +carry_forward_norm) |
-| **Holding limit** | `max_agent_share: 0.25` in config but unverified | Verified: correctly enforced in `market_clearing_ets.py` |
+| **Holding limit** | `max_agent_share: 0.25` in config but unverified | `max_agent_share: 1.0` — removed; agents compete freely |
+| **Reserve price** | Static `reserve_price: 60.0` = `price_min` | Dynamic: `max(5.0, 0.80 × MA3)` with initial fallback of 50.0 |
+| **price_min** | 60.0 (= reserve_price) | 5.0 (low floor; dynamic reserve provides effective floor) |
+| **Opponent modeling** | 2D per opponent (avg_bid/200, green_frac) | 5D per opponent (emissions, carry_forward, green_frac, fossil_frac, queue_total) |
+| **Phase 1 obs** | 21 base + 14 opponent = 35D | 22 base + 35 opponent = 57D (+TNAC proxy at [21]) |
+| **Phase 2 obs** | Phase 1 + 7 = 42D | Phase 1 + 7 = 64D |
+| **Auction stats** | Basic (clearing_price, demand, allocated) | +HHI, +max_agent_share_actual |
+| **Cancel under-subscribed** | Always disabled | Enabled after episode 1000 (schedule) |
 
 ### Reward Function
 
@@ -76,7 +83,7 @@ Four signals, no artificial guards:
 Each year of the simulation has two phases:
 
 **Phase 1 — Auction + Investment** (6D action):
-1. `bid_price`: How much to bid for carbon allowances (60–500 EUR/t)
+1. `bid_price`: How much to bid for carbon allowances (5–500 EUR/t, effective floor set by dynamic reserve)
 2. `qty_multiplier`: Coverage ratio of estimated compliance need to bid for (0.3–1.3x)
 3. `invest_frac`: Fraction of output to shift from fossil to renewable (0–10%)
 4. `tech_logits[3]`: Which green technology to invest in (onshore/offshore/solar)
@@ -85,14 +92,21 @@ Each year of the simulation has two phases:
 1. `price_multiplier`: Price relative to clearing price for secondary trade (0.8–1.3x)
 2. `quantity`: How much to buy (+) or sell (-) on the secondary market
 
-### Agent Archetypes (8 agents)
+### Agent Archetypes (8 agents — 4 archetypes × 2 objectives)
 
-| Agents | Archetype | Initial Green | Cost Weight | Green Weight |
-|--------|-----------|---------------|-------------|--------------|
-| A1, A2 | Coal-heavy | 20% | 0.90 | 0.10 |
-| A3, A4 | Gas-dominant | 40% | 0.75 | 0.25 |
-| A5, A6 | Mixed transitioner | 70% | 0.50 | 0.50 |
-| A7, A8 | Near-green leader | 90% | 0.25 | 0.75 |
+Each archetype pair shares the same energy mix but differs in objective:
+odd-numbered agents (A2, A4, A6, A8) are green-objective, even-numbered (A1, A3, A5, A7) are financial.
+
+| Agent | Archetype | Objective | Initial Green | Cost Weight | Green Weight |
+|-------|-----------|-----------|---------------|-------------|--------------|
+| A1 | Coal-heavy | Financial | 20% | 0.75 | 0.25 |
+| A2 | Coal-heavy | Green | 20% | 0.25 | 0.75 |
+| A3 | Gas-dominant | Financial | 40% | 0.75 | 0.25 |
+| A4 | Gas-dominant | Green | 40% | 0.25 | 0.75 |
+| A5 | Transitioner | Financial | 70% | 0.75 | 0.25 |
+| A6 | Transitioner | Green | 70% | 0.25 | 0.75 |
+| A7 | Green-leader | Financial | 90% | 0.75 | 0.25 |
+| A8 | Green-leader | Green | 90% | 0.25 | 0.75 |
 
 ### Training Pipeline
 
@@ -111,7 +125,7 @@ Each year of the simulation has two phases:
 ```bash
 cd "ets_marl ppo"
 pip install -r requirements.txt
-python -m pytest tests/ -q          # Run tests (should pass 66/66)
+python -m pytest tests/ -q          # Run tests (should pass 68/68)
 python main.py                       # Train with default config
 ```
 
@@ -128,7 +142,7 @@ cd "ets_marl ppo"
 python -m pytest tests/ -v
 ```
 
-All 66 tests should pass. Key test files:
+All 68 tests should pass. Key test files:
 - `test_environment.py` — Environment mechanics, obs dimensions, compliance
 - `test_market_clearing.py` — Auction clearing, holding limits, reserve price
 - `test_mappo.py` — MAPPO/HAPPO centralized critic, global state construction
@@ -142,16 +156,20 @@ simulation:
   n_years: 20
   n_episodes: 30000
 
-# ETS cap trajectory
+# ETS cap trajectory + dynamic reserve
 ets:
-  cap_year_0: 23.5          # Mt (slight surplus at start)
-  reserve_price: 60.0       # Auction floor price
+  cap_year_0: 23.5              # Mt (slight surplus at start)
+  reserve_price: 5.0            # Absolute floor (EUR/t)
+  reserve_price_mode: "dynamic" # max(abs_floor, discount × MA3)
+  reserve_discount: 0.80        # 80% of 3-year moving average
+  reserve_initial: 50.0         # Fallback before MA3 history exists
 
 # Auction
 auction:
-  price_min: 60.0            # Direct bid lower bound (EUR/t)
-  price_max: 500.0           # Direct bid upper bound (EUR/t)
-  max_agent_share: 0.25      # California-style holding limit
+  price_min: 5.0               # Low floor — dynamic reserve provides effective floor
+  price_max: 500.0             # Direct bid upper bound (EUR/t)
+  max_agent_share: 1.0         # No holding limit (agents compete freely)
+  cancel_under_subscribed_after: 1000  # Enable cancel-under-subscribed after ep 1000
 
 # Penalty
 penalty:
@@ -169,10 +187,11 @@ See `configs/default.yaml` for the complete configuration with inline documentat
 
 ## Observation Space
 
-**Phase 1** (21 base + 14 opponent = 35 dims with 8 agents):
-- Time, cap, price signals (MA3, expected), technology mix (5D), emissions, risk, construction queue, carry-forward, secondary market signals, opponent modeling (2 dims per opponent)
+**Phase 1** (22 base + 35 opponent = 57 dims with 8 agents):
+- Time, cap, price signals (MA3, expected), technology mix (5D), emissions, risk, construction queue, carry-forward, secondary market signals, **TNAC proxy** (total banked / cap)
+- Opponent modeling: 5D per opponent (emissions, carry_forward, green_frac, fossil_frac, queue_total)
 
-**Phase 2** (Phase 1 + 7 = 42 dims):
+**Phase 2** (Phase 1 + 7 = 64 dims):
 - Allocation, clearing price, net compliance position, emission shock, auction savings, **coverage ratio**, **carry-forward normalized**
 
 ## Validation Checklist

@@ -54,7 +54,10 @@ ets:
     emergency_release_amount: 0.50    # Mt released per year in emergency
 
   banking: true
-  reserve_price: 60.0    # P13: raised from 40; keeps floor above MAC (65€) vicinity
+  reserve_price: 5.0     # absolute floor (dynamic reserve computes effective floor each year)
+  reserve_price_mode: "dynamic"   # "static" = use reserve_price as-is; "dynamic" = max(reserve_price, discount × MA3)
+  reserve_discount: 0.80          # fraction of MA3 price used as dynamic floor
+  reserve_initial: 50.0           # fallback reserve price before MA3 history is available
   unsold_to_msr: true    # feed unsold auction allowances into MSR reserve (else discarded)
 
 # ----------------------------------------------------------
@@ -65,23 +68,23 @@ companies:
   n_agents: 8
   output_twh: 10.0
   initial_mix:
-    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A1: coal-heavy (20% green)
-    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A2: coal-heavy (20% green)
-    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A3: gas-dominant (40% green)
-    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A4: gas-dominant (40% green)
-    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A5: mixed transitioner (70% green)
-    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A6: mixed transitioner (70% green)
-    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A7: near-green leader (90% green)
-    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A8: near-green leader (90% green)
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A1: coal-heavy / financial
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A2: coal-heavy / green
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A3: gas-dominant / financial
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A4: gas-dominant / green
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A5: transitioner / financial
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A6: transitioner / green
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A7: green-leader / financial
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A8: green-leader / green
   reward_weights:
-    - [0.90, 0.10]   # A1: cost-minimizing
-    - [0.90, 0.10]   # A2: cost-minimizing
-    - [0.75, 0.25]   # A3: moderate cost
-    - [0.75, 0.25]   # A4: moderate cost
-    - [0.50, 0.50]   # A5: balanced
-    - [0.50, 0.50]   # A6: balanced
-    - [0.25, 0.75]   # A7: green-focused
-    - [0.25, 0.75]   # A8: green-focused
+    - [0.75, 0.25]   # A1: coal-heavy / financial
+    - [0.25, 0.75]   # A2: coal-heavy / green
+    - [0.75, 0.25]   # A3: gas-dominant / financial
+    - [0.25, 0.75]   # A4: gas-dominant / green
+    - [0.75, 0.25]   # A5: transitioner / financial
+    - [0.25, 0.75]   # A6: transitioner / green
+    - [0.75, 0.25]   # A7: green-leader / financial
+    - [0.25, 0.75]   # A8: green-leader / green
 
 investment:
   max_invest_frac: 0.10
@@ -96,7 +99,7 @@ risk:
 
 auction:
   price_max: 500.0     # penalty (100) + modest carry-forward premium; prevents ceiling-bid cornering
-  price_min: 60.0      # = reserve_price; agent action[0] maps directly to bid price in [price_min, price_max]
+  price_min: 5.0       # low floor — dynamic reserve provides the effective floor each year
   quantity_max: 3.0
   reserve_ratio: 0.85
   # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
@@ -104,13 +107,14 @@ auction:
   qty_mult_low: 0.3
   qty_mult_high: 1.3
   # California-style holding limit: no single agent can receive > 25% of auctioned volume.
-  max_agent_share: 0.25
+  max_agent_share: 1.0
   # Under-subscription cancellation (Article 7(6) of Reg. 1031/2010):
   # If true, auctions where total demand < supply are cancelled (zero allocations).
   # Disabled for training: early-stage agents bid too little, causing every auction
   # to cancel and producing uninformative penalty-dominated gradients.
   # Enable for evaluation or once agents have learned basic bidding.
   cancel_under_subscribed: false
+  cancel_under_subscribed_after: 1000  # enable cancel_under_subscribed after this many episodes
   # EU lot-size: bids in multiples of 500 EUAs (= 0.0005 Mt)
   lot_size: 0.0005
 
