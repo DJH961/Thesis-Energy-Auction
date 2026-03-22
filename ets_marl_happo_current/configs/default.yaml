@@ -12,7 +12,7 @@
 
 simulation:
   n_years: 20         # solar (2yr) and onshore (5yr) payoffs fit within episode
-  n_episodes: 30000   # increased for 8 agents + soft cycling
+  n_episodes: 70000   # increased for 8 agents + soft cycling
   seeds: [42, 123, 456]
 
 # ----------------------------------------------------------
