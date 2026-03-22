@@ -1,0 +1,111 @@
+# ============================================================
+# ETS MARL — Default Configuration
+# ============================================================
+
+# --- Simulation horizon ---
+simulation:
+  n_years: 10               # years per episode
+  n_episodes: 1000          # training episodes
+  seeds: [42, 123, 456]     # seeds for reproducibility runs
+
+# --- ETS Cap and Policy ---
+ets:
+  cap_year_0: 7.40         # MtCO2, scaled to 4-firm micro-ETS
+  lrf_phase1: 0.043         # Linear Reduction Factor years 1-4
+  lrf_phase2: 0.044         # Linear Reduction Factor years 5+
+  lrf_phase_switch: 5       # year at which LRF switches to phase2
+
+  # MSR (Market Stability Reserve) — scaled from EU thresholds
+  msr:
+    enabled: true
+    tnac_upper: 8.33        # Mt — above this: withhold from auction
+    tnac_lower: 4.00        # Mt — below this: release from reserve
+    withhold_rate: 0.24     # fraction of excess TNAC withheld per year
+    release_amount: 0.10    # Mt released per year when TNAC < lower
+
+  banking: false             # allowances can be carried forward
+  reserve_price: 0.0        # €/t, set >0 to add a floor price
+
+# --- Companies (4 agents) ---
+companies:
+  n_agents: 4
+  output_twh: 10.0          # TWh/year — identical for all (same size)
+
+  # Initial fossil/green split [fossil%, green%]
+  initial_mix:
+    - [0.90, 0.10]          # A1: heavy fossil
+    - [0.60, 0.40]          # A2: mixed fossil
+    - [0.40, 0.60]          # A3: mixed green
+    - [0.10, 0.90]          # A4: near-green
+
+  # Reward weights [w_cost, w_green] per agent
+  reward_weights:
+    - [0.80, 0.20]          # A1
+    - [0.65, 0.35]          # A2
+    - [0.35, 0.65]          # A3
+    - [0.20, 0.80]          # A4
+
+# --- Emissions ---
+emissions:
+  ef_gas_cc: 0.37           # tCO2/MWh — IPCC AR5 Annex III median, gas CC
+  # All fossil generation modelled as gas CC (conservative, EU-realistic)
+
+# --- Green Investment ---
+investment:
+  max_delta_green_pp: 0.03  # max green% increase per year (3 p.p.)
+  delay_years: 2            # years before investment affects green%
+  # Switching cost: cost = a * delta + b * delta^2  (M€ per p.p.)
+  switching_cost_a: 50.0    # M€/p.p.
+  switching_cost_b: 10.0    # M€/p.p.^2
+  # Failure probability: p_fail = base_fail * (1 - green%) * (1 - success_rate)
+  base_failure_prob: 0.30
+
+# --- Risk Factor (precautionary over-bidding at auction) ---
+risk:
+  # risk_factor = base_risk * (1 - green%) * (1 - success_rate)
+  base_risk: 0.50
+  initial_success_rate: 0.50   # all agents start at 50% success history
+
+# --- Auction ---
+auction:
+  lot_size: 0.001           # Mt per lot (0.001 Mt = 1000 tCO2, like EU 500-1000 t lots)
+  price_max: 0.30           # markup massimo sopra expected price (+30%)
+  price_min: -0.30          # markup minimo sotto expected price (-30%)
+  quantity_max: 5.0         # Mt — max any agent can bid in one auction
+
+# --- Secondary Market (post-auction trading) ---
+trading:
+  enabled: true
+  price_markup_range: [-0.05, 0.05]   # trade price = clearing * (1 + ε)
+  transaction_cost: 0.5               # €/t
+
+# --- Penalty ---
+penalty:
+  rate: 100.0               # €/tCO2 — EU ETS Directive Art. 16
+  makeup_next_year: true    # deficit must be covered next year
+
+# --- EUA Price Expectations ---
+price:
+  initial_expected: 65.0 # €/t — 2024-style baseline
+  price_floor: 45.5     
+  ar1_persistence: 0.85     # AR(1) coefficient for price expectation update
+
+# --- DDPG Hyperparameters ---
+ddpg:
+  lr_actor: 0.0001       
+  lr_critic: 0.00001       
+  gamma: 0.99
+  tau: 0.01
+  batch_size: 64
+  replay_buffer_size: 50000
+  hidden_size: 64
+  ou_theta: 0.15
+  ou_mu: 0.0
+  ou_sigma: 0.50         # aumentato: più esplorazione iniziale
+          # noise scale (tunable)
+
+# --- Logging ---
+logging:
+  log_interval: 10          # log every N episodes
+  save_interval: 100        # save checkpoint every N episodes
+  results_dir: "results/"
