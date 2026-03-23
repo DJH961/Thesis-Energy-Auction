@@ -494,7 +494,7 @@ class Company:
         return shortfall * self.penalty_rate
 
     # ------------------------------------------------------------------
-    # Observations — Phase 1: 22D base (+5*(N-1) opponent) | Phase 2: +7
+    # Observations — Phase 1: 23D base (+5*(N-1) opponent) | Phase 2: +7
     # ------------------------------------------------------------------
 
     def get_observation_phase1(self, year, cap_t, last_clearing_price,
@@ -504,11 +504,12 @@ class Company:
                                price_ma3=None,
                                opponent_obs=None,
                                last_secondary_volume=0.0,
-                               tnac_proxy=0.0):
+                               tnac_proxy=0.0,
+                               effective_reserve=0.0):
         """
-        Phase 1 observation (pre-auction): 22D base + 5*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 23D base + 5*(N-1) opponent dims.
 
-        Base 22 dims:
+        Base 23 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
@@ -525,9 +526,10 @@ class Company:
         [19] last secondary market volume (normalized) -- P8
         [20] carry-forward obligation (Mt)
         [21] TNAC proxy (total banked allowances / cap, clipped to [0,3])
+        [22] effective reserve price / price_max
 
         Opponent dims (if opponent_modeling enabled, 5D per opponent):
-        [22..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
+        [23..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
@@ -555,6 +557,7 @@ class Company:
             last_secondary_volume / 10.0,         # [19] P8: secondary volume signal
             self._carry_forward / 5.0,            # [20] carry-forward obligation (Mt)
             float(np.clip(tnac_proxy, 0.0, 3.0)), # [21] TNAC proxy
+            effective_reserve / pn,               # [22] effective reserve signal
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -603,11 +606,11 @@ class Company:
 
     @property
     def obs_dim_phase1(self) -> int:
-        """22 base dims + 5*(N-1) opponent dims when opponent modeling is enabled.
-        Base dims include carry-forward at [20] and TNAC proxy at [21]."""
+        """23 base dims + 5*(N-1) opponent dims when opponent modeling is enabled.
+        Base dims include carry-forward at [20], TNAC proxy at [21], and effective reserve at [22]."""
         if self._opponent_modeling and self._n_agents > 1:
-            return 22 + 5 * (self._n_agents - 1)
-        return 22
+            return 23 + 5 * (self._n_agents - 1)
+        return 23
 
     @property
     def obs_dim_phase2(self) -> int:

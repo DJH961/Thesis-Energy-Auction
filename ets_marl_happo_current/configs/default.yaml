@@ -58,6 +58,7 @@ ets:
   reserve_price_mode: "dynamic"   # "static" = use reserve_price as-is; "dynamic" = max(reserve_price, discount × MA3)
   reserve_discount: 0.80          # fraction of MA3 price used as dynamic floor
   reserve_initial: 50.0           # fallback reserve price before MA3 history is available
+  reserve_anchor: "secondary"    # "secondary" (default) or "auction" (legacy)
   unsold_to_msr: true    # feed unsold auction allowances into MSR reserve (else discarded)
 
 # ----------------------------------------------------------
@@ -124,6 +125,13 @@ trading:
   spread_tolerance: 0.07      # P8: ±7% of clearing_price
   sec_mult_low: 0.8           # secondary price multiplier lower bound (×clearing_price)
   sec_mult_high: 1.3          # secondary price multiplier upper bound (×clearing_price)
+
+secondary:
+  liquidity_pool:
+    enabled: true
+    spread: 0.05
+    penalty_anchor_weight: 0.30
+    ema_alpha: 0.30
 # ----------------------------------------------------------
 # Budgets — scaled to not artificially prevent compliance.
 # Each budget ≈ 1.5× expected compliance cost at moderate
@@ -212,9 +220,9 @@ ppo:
   gamma: 0.99
   gae_lambda: 0.97
   clip_eps: 0.2
-  entropy_coef: 0.03         # low enough to preserve BC warm-start
-  entropy_coef_final: 0.02  # keep meaningful exploration; 0.005 was too low for 6D continuous actions
-  entropy_decay_start: 1500     # 0 = auto: 5% of n_episodes
+  entropy_coef: 0.05         # reset higher to avoid early policy freezing
+  entropy_coef_final: 0.03   # keep meaningful exploration late in training
+  entropy_decay_start: 3000  # slower decay onset for fresh runs after structural changes
   entropy_decay_window: 0    # 0 = auto: 80% of n_episodes
   value_coef: 0.5
   max_grad_norm: 0.3

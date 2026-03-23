@@ -387,13 +387,13 @@ def test_p7_price_history_seeded():
 # ---------------------------------------------------------------------------
 
 def test_p8_obs_dims():
-    """Phase 1 obs should be 22D base (+ 5*(N-1) opponent dims) with opponent modeling.
-    22 = 21 original dims + TNAC proxy at [21]."""
+    """Phase 1 obs should be 23D base (+ 5*(N-1) opponent dims) with opponent modeling.
+    23 = 22 previous dims + effective_reserve at [22]."""
     env = load_env()
     obs, _ = env.reset()
     n_agents = env.config["companies"]["n_agents"]
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
-    expected_p1 = 22 + (5 * (n_agents - 1) if opp_enabled else 0)
+    expected_p1 = 23 + (5 * (n_agents - 1) if opp_enabled else 0)
     expected_p2 = expected_p1 + 7  # +7: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
@@ -416,7 +416,7 @@ def test_p8_obs_dims():
 # ---------------------------------------------------------------------------
 
 def test_dynamic_reserve_tracks_price():
-    """In dynamic mode, effective reserve should be max(abs_floor, discount × MA3)."""
+    """In dynamic mode, reserve tracks MA3 from the configured anchor (secondary by default)."""
     env = load_env()
     env.reset(seed=42)
 
@@ -433,9 +433,10 @@ def test_dynamic_reserve_tracks_price():
         secondary_actions[:, 0] = 1.0
         env.step_secondary(secondary_actions)
 
-    # Verify dynamic reserve is being computed
+    # Verify dynamic reserve is being computed from secondary anchor
     ets_cfg = env.config["ets"]
     assert ets_cfg.get("reserve_price_mode") == "dynamic", "Expected dynamic reserve mode"
+    assert ets_cfg.get("reserve_anchor", "secondary") == "secondary"
 
     effective = env._compute_dynamic_reserve()
     abs_floor = ets_cfg["reserve_price"]
@@ -449,6 +450,100 @@ def test_dynamic_reserve_tracks_price():
     )
     # Reserve should be above the absolute floor
     assert effective >= abs_floor - 1e-6
+
+
+def test_consecutive_auction_cancellations_decay_reserve():
+    """After 2+ consecutive failed auctions, effective reserve decays 20% toward floor."""
+    env = load_env()
+    env.reset(seed=42)
+
+    # Stabilize the MA anchor at a high level so decay is visible.
+    env._price_history = [100.0, 100.0, 100.0]
+    env.last_secondary_price = 100.0
+
+    baseline_reserve = env._compute_dynamic_reserve()
+    floor = env.config["ets"]["reserve_price"]
+
+    n_agents = env.n_agents
+    fail_actions = np.zeros((n_agents, 6), dtype=np.float32)
+    fail_actions[:, 0] = env.config["auction"]["price_min"]  # below dynamic reserve
+    fail_actions[:, 1] = 1.0
+
+    sec_actions = np.zeros((n_agents, 2), dtype=np.float32)
+    sec_actions[:, 0] = 1.0
+
+    _, log1 = env.step_auction(fail_actions)
+    assert log1["auction_stats"].get("auction_failed", False)
+    env.step_secondary(sec_actions)
+
+    _, log2 = env.step_auction(fail_actions)
+    assert log2["auction_stats"].get("auction_failed", False)
+    env.step_secondary(sec_actions)
+
+    decayed = env._compute_dynamic_reserve()
+    current_base = max(
+        floor,
+        env.config["ets"]["reserve_discount"] * env._compute_price_ma3(),
+    )
+    expected = floor + (current_base - floor) * 0.8
+    assert decayed == pytest.approx(expected, abs=1e-6)
+    assert decayed < current_base + 1e-9
+
+
+def test_bids_below_reserve_not_clipped_and_get_zero_allocation():
+    """Bids below effective reserve should be rejected by auction clearing, not clipped upward."""
+    env = load_env()
+    env.reset(seed=42)
+
+    n_agents = env.n_agents
+    effective_reserve = env._compute_dynamic_reserve()
+    bid_price = max(env.config["auction"]["price_min"], effective_reserve - 10.0)
+
+    auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+    auction_actions[:, 0] = bid_price
+    auction_actions[:, 1] = 1.0
+
+    _, log = env.step_auction(auction_actions)
+
+    assert np.all(env._phase1_bid_prices < effective_reserve + 1e-9), "Bid prices were silently clipped"
+    assert log["auction_stats"].get("auction_failed", False), "Auction should fail when all bids are below reserve"
+    assert np.allclose(env._phase1_allocations, 0.0), "Bids below reserve must receive zero allocation"
+
+
+def test_liquidity_pool_fills_at_reference_plus_spread():
+    """External liquidity pool should fill unmatched buy flow at reference*(1+spread)."""
+    env = load_env()
+    env.reset(seed=42)
+
+    env.config.setdefault("secondary", {}).setdefault("liquidity_pool", {})["enabled"] = True
+    env.config["secondary"]["liquidity_pool"]["spread"] = 0.05
+    env.config["secondary"]["liquidity_pool"]["penalty_anchor_weight"] = 0.30
+    env._liquidity_ref_ema = 100.0
+
+    allocations = np.zeros(env.n_agents)
+    secondary_prices = np.full(env.n_agents, 90.0)
+    secondary_qtys = np.zeros(env.n_agents)
+
+    # One buyer with no internal seller counterpart -> pool should fill.
+    secondary_prices[0] = 120.0
+    secondary_qtys[0] = 1.0
+
+    trade_costs, trade_qtys, _, total_volume, pool_info = env._settle_double_auction(
+        allocations=allocations,
+        secondary_prices=secondary_prices,
+        secondary_qtys=secondary_qtys,
+        clearing_price=100.0,
+    )
+
+    assert pool_info["enabled"] is True
+    assert pool_info["reference_price"] == pytest.approx(100.0, abs=1e-6)
+    assert pool_info["sell_price"] == pytest.approx(105.0, abs=1e-6)
+    assert trade_qtys[0] == pytest.approx(1.0, abs=1e-6)
+    assert pool_info["sell_volume"] == pytest.approx(1.0, abs=1e-6)
+    assert total_volume == pytest.approx(1.0, abs=1e-6)
+    # Buyer pays pool sell price plus transaction cost.
+    expected_cost = 1.0 * (105.0 + env.config["trading"]["transaction_cost"])
+    assert trade_costs[0] == pytest.approx(expected_cost, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------

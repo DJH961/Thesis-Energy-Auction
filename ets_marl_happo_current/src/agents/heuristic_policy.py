@@ -95,14 +95,16 @@ def auction_action(
     # (weakly) dominant: you pay the clearing price regardless, so bidding
     # higher just guarantees allocation without raising your cost.
     # True valuation = min(penalty_rate, price_max).
-    # We anchor at 1.15× MA3 price, floored at reserve+5 and capped at
-    # the penalty rate (not 90€ — that was too low for high-emitting agents
-    # whose allowance value is ≈100 €/t).
-    # Green-objective agents add a 10% premium to ensure allocation.
+    # We anchor near penalty_rate so BC warm-start seeds realistic compliance
+    # prices from the first episodes, while still reacting to MA3.
+    # Green-objective agents add a small premium to ensure allocation.
     penalty_rate = config.get("penalty", {}).get("rate", 100.0)
-    price_anchor = price_ma3 * (1.25 if is_green else 1.15)
+    ma3_anchor = price_ma3 * (1.15 if not is_green else 1.20)
+    near_penalty_anchor = 0.7 * penalty_rate + 0.3 * ma3_anchor
+    if is_green:
+        near_penalty_anchor *= 1.05
     bid_price = float(np.clip(
-        max(reserve_price + 5.0, min(penalty_rate, price_anchor)),
+        max(reserve_price + 5.0, min(penalty_rate, near_penalty_anchor)),
         aq["price_min"], aq["price_max"],
     ))
 

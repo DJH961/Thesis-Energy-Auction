@@ -118,6 +118,13 @@ class ETSEnvironment(gym.Env):
         # Dynamic reserve tracking
         self._last_effective_reserve = config["ets"].get("reserve_initial",
                                                           config["ets"].get("reserve_price", 0.0))
+        self._reserve_anchor = config["ets"].get("reserve_anchor", "secondary")
+        if self._reserve_anchor not in {"secondary", "auction"}:
+            self._reserve_anchor = "secondary"
+        self._consecutive_years_without_valid_auction_clear = 0
+
+        # Secondary liquidity pool EMA anchor state
+        self._liquidity_ref_ema = float(config["price"]["initial_expected"])
 
         # Opponent modeling (5D public info per opponent)
         opp_enabled = config.get("opponent_modeling", {}).get("enabled", False)
@@ -129,6 +136,12 @@ class ETSEnvironment(gym.Env):
 
         # Price normalization constant
         self._price_norm = config["auction"]["price_max"]
+
+        # Under-subscription cancellation is disabled during training to preserve learning signal.
+        auction_cfg = self.config.get("auction", {})
+        if auction_cfg.get("cancel_under_subscribed", False):
+            auction_cfg["cancel_under_subscribed"] = False
+        print(f"[ETSEnvironment] auction.cancel_under_subscribed={auction_cfg.get('cancel_under_subscribed', False)}")
 
         # Sanity check: in static mode, price_min must be >= reserve_price.
         # In dynamic mode, the effective reserve is computed each year, so
@@ -181,11 +194,17 @@ class ETSEnvironment(gym.Env):
         initial = ets_cfg.get("reserve_initial", 50.0)
 
         ma3 = self._compute_price_ma3()
-        # If no price history yet, use reserve_initial as fallback
         if not self._price_history:
-            return max(abs_floor, initial)
+            base_reserve = max(abs_floor, initial)
+        else:
+            base_reserve = max(abs_floor, discount * ma3)
 
-        return max(abs_floor, discount * ma3)
+        # If auctions have failed for consecutive years, decay the effective reserve
+        # by 20% per year toward the absolute floor.
+        if self._consecutive_years_without_valid_auction_clear >= 2:
+            return max(abs_floor, abs_floor + (base_reserve - abs_floor) * 0.8)
+
+        return base_reserve
 
     # ------------------------------------------------------------------
     # Reset
@@ -211,6 +230,8 @@ class ETSEnvironment(gym.Env):
         self._current_emission_shocks = np.zeros(self.n_agents)
         self._current_cf_noise = np.zeros((self.n_agents, 5))
         self._p6_cancellations = np.zeros(self.n_agents, dtype=int)
+        self._consecutive_years_without_valid_auction_clear = 0
+        self._liquidity_ref_ema = float(self.config["price"]["initial_expected"])
 
         self.cap_schedule.reset()
         self._unsold_rollover = 0.0
@@ -442,9 +463,6 @@ class ETSEnvironment(gym.Env):
         effective_reserve = self._compute_dynamic_reserve()
         self._last_effective_reserve = effective_reserve
 
-        # Clip bids at the effective reserve (bids below are rejected anyway)
-        bid_actions[:, 0] = np.maximum(bid_actions[:, 0], effective_reserve)
-
         bids = build_bids(bid_actions)
         clearing_price, allocations, payments, auction_stats = market_clearing_ets(
             bids=bids,
@@ -466,6 +484,14 @@ class ETSEnvironment(gym.Env):
         log["clearing_price"] = clearing_price
         log["effective_reserve"] = effective_reserve
         log["auction_stats"] = auction_stats
+
+        auction_succeeded = not bool(auction_stats.get("auction_failed", False))
+        if auction_succeeded:
+            self._consecutive_years_without_valid_auction_clear = 0
+            if self._reserve_anchor == "auction":
+                self._price_history.append(clearing_price)
+        else:
+            self._consecutive_years_without_valid_auction_clear += 1
 
         # 8. MAC fuel-switching (based on auction clearing price)
         mac_reductions = np.zeros(self.n_agents)
@@ -601,7 +627,7 @@ class ETSEnvironment(gym.Env):
         # Pre-trade resources for compliance tracking
         pretrade_holdings = self.holdings + allocations
 
-        trade_costs, trade_qtys, secondary_clearing, secondary_volume = \
+        trade_costs, trade_qtys, secondary_clearing, secondary_volume, liquidity_pool_info = \
             self._settle_double_auction(
                 allocations=allocations.copy(),
                 secondary_prices=secondary_prices,
@@ -718,11 +744,13 @@ class ETSEnvironment(gym.Env):
             "mac_costs": self._mac_costs.tolist(),
             "sec_price_mults": secondary_actions[:, 0].tolist(),  # Phase 2 action[0] (raw)
             "sec_qty_actions": secondary_actions[:, 1].tolist(),  # Phase 2 action[1] (raw)
+            "liquidity_pool": liquidity_pool_info,
         })
         self.episode_log.append(log)
 
         # 9. Advance year + AR(1) price
-        self._price_history.append(clearing_price)
+        if self._reserve_anchor == "secondary":
+            self._price_history.append(secondary_clearing)
         rho = self.config["price"].get("ar1_persistence", 0.85)
         price_floor = self.config["price"].get("price_floor", 50.0)
         vol_std = self.config["price"].get("volatility_std", 0.15)
@@ -766,8 +794,17 @@ class ETSEnvironment(gym.Env):
         trade_costs = np.zeros(self.n_agents)
         trade_qtys = np.zeros(self.n_agents)
 
+        liquidity_pool_info = {
+            "enabled": False,
+            "reference_price": float(clearing_price),
+            "buy_price": float(clearing_price),
+            "sell_price": float(clearing_price),
+            "buy_volume": 0.0,
+            "sell_volume": 0.0,
+        }
+
         if not cfg["enabled"]:
-            return trade_costs, trade_qtys, clearing_price, 0.0
+            return trade_costs, trade_qtys, clearing_price, 0.0, liquidity_pool_info
 
         tx_cost = cfg["transaction_cost"]
         # P8: spread tolerance as fraction of clearing price
@@ -788,54 +825,102 @@ class ETSEnvironment(gym.Env):
                 if sell_qty > 1e-6:
                     sellers.append([i, price, sell_qty])
 
-        if not buyers or not sellers:
-            return trade_costs, trade_qtys, clearing_price, 0.0
-
-        buyers.sort(key=lambda x: -x[1])
-        sellers.sort(key=lambda x: x[1])
-
-        executed_trades = []
-        b_idx, s_idx = 0, 0
-        while b_idx < len(buyers) and s_idx < len(sellers):
-            buyer_id, buyer_price, buy_qty_rem = buyers[b_idx]
-            seller_id, seller_price, sell_qty_rem = sellers[s_idx]
-
-            # P8: trade if buyer_price + spread_tol >= seller_price
-            if buyer_price + spread_tol < seller_price:
-                break
-
-            trade_price = (buyer_price + seller_price) / 2.0
-            trade_qty = min(buy_qty_rem, sell_qty_rem)
-            executed_trades.append((buyer_id, seller_id, trade_price, trade_qty))
-
-            buyers[b_idx][2] -= trade_qty
-            sellers[s_idx][2] -= trade_qty
-            if buyers[b_idx][2] < 1e-6:
-                b_idx += 1
-            if sellers[s_idx][2] < 1e-6:
-                s_idx += 1
-
-        if not executed_trades:
-            return trade_costs, trade_qtys, clearing_price, 0.0
-
         total_value = 0.0
         total_qty = 0.0
 
-        for buyer_id, seller_id, trade_price, trade_qty in executed_trades:
-            cost_buyer = trade_qty * (trade_price + tx_cost)
-            revenue_seller = trade_qty * (trade_price - tx_cost)
+        # 1) Internal matching between agents
+        if buyers and sellers:
+            buyers.sort(key=lambda x: -x[1])
+            sellers.sort(key=lambda x: x[1])
 
-            trade_costs[buyer_id] += cost_buyer
-            trade_costs[seller_id] -= revenue_seller
+            executed_trades = []
+            b_idx, s_idx = 0, 0
+            while b_idx < len(buyers) and s_idx < len(sellers):
+                buyer_id, buyer_price, buy_qty_rem = buyers[b_idx]
+                seller_id, seller_price, sell_qty_rem = sellers[s_idx]
 
-            trade_qtys[buyer_id] += trade_qty
-            trade_qtys[seller_id] -= trade_qty
+                # P8: trade if buyer_price + spread_tol >= seller_price
+                if buyer_price + spread_tol < seller_price:
+                    break
 
-            total_value += trade_price * trade_qty
-            total_qty += trade_qty
+                trade_price = (buyer_price + seller_price) / 2.0
+                trade_qty = min(buy_qty_rem, sell_qty_rem)
+                executed_trades.append((buyer_id, seller_id, trade_price, trade_qty))
+
+                buyers[b_idx][2] -= trade_qty
+                sellers[s_idx][2] -= trade_qty
+                if buyers[b_idx][2] < 1e-6:
+                    b_idx += 1
+                if sellers[s_idx][2] < 1e-6:
+                    s_idx += 1
+
+            for buyer_id, seller_id, trade_price, trade_qty in executed_trades:
+                cost_buyer = trade_qty * (trade_price + tx_cost)
+                revenue_seller = trade_qty * (trade_price - tx_cost)
+
+                trade_costs[buyer_id] += cost_buyer
+                trade_costs[seller_id] -= revenue_seller
+
+                trade_qtys[buyer_id] += trade_qty
+                trade_qtys[seller_id] -= trade_qty
+
+                total_value += trade_price * trade_qty
+                total_qty += trade_qty
+
+        # 2) External liquidity pool for unmatched flow
+        sec_cfg = self.config.get("secondary", {})
+        pool_cfg = sec_cfg.get("liquidity_pool", {})
+        pool_enabled = bool(pool_cfg.get("enabled", False))
+        if pool_enabled:
+            ema_alpha = float(pool_cfg.get("ema_alpha", 0.30))
+            penalty_weight = float(pool_cfg.get("penalty_anchor_weight", 0.30))
+            penalty_weight = float(np.clip(penalty_weight, 0.0, 1.0))
+            spread = float(pool_cfg.get("spread", 0.05))
+            spread = max(0.0, spread)
+
+            self._liquidity_ref_ema = (
+                ema_alpha * float(clearing_price) +
+                (1.0 - ema_alpha) * self._liquidity_ref_ema
+            )
+            penalty_rate = float(self.config.get("penalty", {}).get("rate", 100.0))
+            ref_price = (1.0 - penalty_weight) * self._liquidity_ref_ema + penalty_weight * penalty_rate
+            pool_buy_price = ref_price * (1.0 - spread)   # pool buys from agents
+            pool_sell_price = ref_price * (1.0 + spread)  # pool sells to agents
+
+            pool_buy_volume = 0.0
+            pool_sell_volume = 0.0
+
+            for buyer_id, buyer_price, buy_qty_rem in buyers:
+                rem = float(buy_qty_rem)
+                if rem > 1e-6 and buyer_price >= pool_sell_price:
+                    cost_buyer = rem * (pool_sell_price + tx_cost)
+                    trade_costs[buyer_id] += cost_buyer
+                    trade_qtys[buyer_id] += rem
+                    total_value += pool_sell_price * rem
+                    total_qty += rem
+                    pool_sell_volume += rem
+
+            for seller_id, seller_price, sell_qty_rem in sellers:
+                rem = float(sell_qty_rem)
+                if rem > 1e-6 and seller_price <= pool_buy_price:
+                    revenue_seller = rem * (pool_buy_price - tx_cost)
+                    trade_costs[seller_id] -= revenue_seller
+                    trade_qtys[seller_id] -= rem
+                    total_value += pool_buy_price * rem
+                    total_qty += rem
+                    pool_buy_volume += rem
+
+            liquidity_pool_info = {
+                "enabled": True,
+                "reference_price": float(ref_price),
+                "buy_price": float(pool_buy_price),
+                "sell_price": float(pool_sell_price),
+                "buy_volume": float(pool_buy_volume),
+                "sell_volume": float(pool_sell_volume),
+            }
 
         sec_clearing = total_value / total_qty if total_qty > 0 else clearing_price
-        return trade_costs, trade_qtys, sec_clearing, total_qty
+        return trade_costs, trade_qtys, sec_clearing, total_qty, liquidity_pool_info
 
     # ------------------------------------------------------------------
     # Reward function (P3 + P4 + P8 improvements)
@@ -947,13 +1032,15 @@ class ETSEnvironment(gym.Env):
     def _compute_price_ma3(self) -> float:
         """P1: 3-year moving average of clearing price."""
         if not self._price_history:
-            return self.last_clearing_price
+            if self._reserve_anchor == "auction":
+                return self.last_clearing_price
+            return self.last_secondary_price
         window = self._price_history[-3:]
         return float(np.mean(window))
 
     def _get_obs_phase1(self) -> np.ndarray:
         """Phase 1 observations for all agents.
-        Base: 22D. With opponent modeling: 22 + 5*(N-1) dims.
+        Base: 23D. With opponent modeling: 23 + 5*(N-1) dims.
         """
         cap_t = self.cap_schedule.get_cap(self.current_year)
         price_ma3 = self._compute_price_ma3()
@@ -996,6 +1083,7 @@ class ETSEnvironment(gym.Env):
                 opponent_obs=opponent_obs,
                 last_secondary_volume=self.last_secondary_volume,
                 tnac_proxy=tnac_proxy,
+                effective_reserve=self._last_effective_reserve,
             )
             obs_list.append(obs_i)
 
