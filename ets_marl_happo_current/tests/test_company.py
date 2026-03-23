@@ -345,23 +345,23 @@ def test_budget_utilization(config):
 # ---------------------------------------------------------------------------
 
 def test_obs_phase1_shape(config):
-    """Phase 1 obs should be 22D base (no opponent modeling)."""
+    """Phase 1 obs should be 23D base (no opponent modeling)."""
     c = make_company(config, agent_id=0)
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, auction_gap=1.0)
-    assert obs.shape == (22,), f"Expected 22D, got {obs.shape}"
+    assert obs.shape == (23,), f"Expected 23D, got {obs.shape}"
     assert obs.dtype == np.float32
 
 def test_obs_phase1_with_opponents(config):
-    """With opponent modeling, obs should have 22 + 5*(N-1) dims."""
+    """With opponent modeling, obs should have 23 + 5*(N-1) dims."""
     config_opp = {**config, "opponent_modeling": {"enabled": True}}
     c = make_company(config_opp, agent_id=0)
     opponent_obs = np.zeros(5 * 3, dtype=np.float32)  # 3 opponents
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, opponent_obs=opponent_obs)
-    assert obs.shape == (22 + 15,)
+    assert obs.shape == (23 + 15,)
 
 def test_obs_phase2_extends_phase1(config):
     """Phase 2 obs = phase1 + 7 extra dims."""
@@ -371,9 +371,9 @@ def test_obs_phase2_extends_phase1(config):
     obs2 = c.get_observation_phase2(
         obs_phase1=obs1, allocation=2.0, clearing_price=80.0,
         emissions=3.0, banked=1.0, emission_shock=0.05, payment=160.0)
-    assert obs2.shape == (22 + 7,)
-    # First 22 dims should match phase1
-    np.testing.assert_array_equal(obs2[:22], obs1)
+    assert obs2.shape == (23 + 7,)
+    # First 23 dims should match phase1
+    np.testing.assert_array_equal(obs2[:23], obs1)
 
 def test_obs_values_finite(config):
     """All observation values should be finite."""
