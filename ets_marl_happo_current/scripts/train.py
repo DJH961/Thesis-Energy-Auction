@@ -25,9 +25,11 @@ import argparse
 import collections
 import copy
 import csv
+import datetime
 import io
 import os
 import sys
+import time
 import yaml
 import numpy as np
 import torch
@@ -327,7 +329,13 @@ def _print_training_legend():
     print("  MAC_Mt      : MAC fuel-switching reduction (Mt)")
     print("  SecMl       : Mean secondary price multiplier (action[0]; 0.5=discount 2.0=premium)")
     print("  SqAct       : Mean secondary qty action (+buy intent / -sell intent, Mt)")
+    print("  elapsed/ETA : Wall-clock elapsed time and estimated remaining time")
     print(leg)
+
+
+def _format_hms(seconds: float) -> str:
+    """Format seconds as HH:MM:SS."""
+    return str(datetime.timedelta(seconds=max(0, int(round(float(seconds))))))
 
 
 def train_one_seed(config: dict, seed: int, on_log=None):
@@ -470,7 +478,23 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     log_interval = config["logging"]["log_interval"]
     save_interval = config["logging"]["save_interval"]
+    # Flush logs every N episodes to reduce data loss if training aborts early.
+    csv_flush_interval = int(
+        config["logging"].get("csv_flush_interval", 1000)
+    )
+    csv_flush_interval = max(1, csv_flush_interval)
     best_total_reward = -np.inf
+
+    train_t0 = time.time()
+    recent_ep_durations = collections.deque(maxlen=200)
+
+    def _flush_csv_logs(current_episode: int, force: bool = False) -> None:
+        if force or ((current_episode + 1) % csv_flush_interval == 0):
+            ep_csv.flush()
+            yr_csv.flush()
+            # fsync keeps data safer on abrupt termination.
+            os.fsync(ep_csv.fileno())
+            os.fsync(yr_csv.fileno())
 
     # ── Broken-policy detection state ────────────────────────────────────────
     _diag            = config.get("diagnostics", {})
@@ -492,6 +516,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     _stuck_boost_coef   = _diag.get("stuck_boost_coef", 0.025)
 
     for episode in range(n_episodes):
+        episode_t0 = time.time()
         # Agent cycling: which agent updates this episode
         active_agent_idx = episode % n_agents if cycling_enabled else None
 
@@ -802,6 +827,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         # ── Broken-policy detection ───────────────────────────────────────────
         # 1. NaN reward: numerical explosion → immediate halt
         if np.isnan(total_rewards).any():
+            _flush_csv_logs(episode, force=True)
             ep_csv.close(); yr_csv.close()
             _nan_agents = [f"A{i+1}" for i in range(n_agents) if np.isnan(total_rewards[i])]
             raise RuntimeError(
@@ -990,11 +1016,19 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         ep_writer.writerow(ep_row)
 
+        # Track runtime and flush logs periodically for crash resilience.
+        recent_ep_durations.append(time.time() - episode_t0)
+        _flush_csv_logs(episode)
+
         # Console diagnostics
         if episode % log_interval == 0:
             cap    = last_log.get("cap", 0)
             tnac   = last_log.get("tnac", 0)
             sec_p  = last_log.get("secondary_clearing", 0)
+            elapsed_s = time.time() - train_t0
+            avg_ep_s = float(np.mean(recent_ep_durations)) if recent_ep_durations else 0.0
+            episodes_left = max(0, n_episodes - (episode + 1))
+            eta_s = avg_ep_s * episodes_left
 
             cyc_str    = f" [cyc=A{active_agent_idx+1}]" if cycling_enabled else ""
             decay_str  = " [ENT-DECAY]" if entropy_tracker.decay_triggered else ""
@@ -1016,6 +1050,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
             sep = "─" * 152
             print(sep)
+            print(f"Time elapsed: {_format_hms(elapsed_s)} | ETA: {_format_hms(eta_s)} | speed={avg_ep_s:.2f}s/ep")
             print(f"Ep {episode:5d} │ price {price_start:.0f}→{price_final:.0f} (peak {price_peak:.0f})"
                   f"  cap={cap:5.0f}  TNAC={tnac:5.0f} │ "
                   f"sec={sec_p:5.1f}€ vol={total_sec_vol:5.1f} match={sec_match_rate*100:.0f}% │ "
@@ -1055,6 +1090,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             os.makedirs(ckpt_dir, exist_ok=True)
             for i, agent in enumerate(agents):
                 agent.save(os.path.join(ckpt_dir, f"agent_{i}_ep{episode}.pt"))
+            _flush_csv_logs(episode, force=True)
 
         ep_total = total_rewards.sum()
         if ep_total > best_total_reward:

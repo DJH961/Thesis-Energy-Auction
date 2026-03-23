@@ -281,6 +281,7 @@ warm_start:
 logging:
   log_interval: 10
   save_interval: 500
+  csv_flush_interval: 1000  # flush CSV buffers every N episodes (crash resilience)
   results_dir: "results/"
 
 # ----------------------------------------------------------
