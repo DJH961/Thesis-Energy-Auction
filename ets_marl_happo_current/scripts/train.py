@@ -444,7 +444,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         ep_fields += [f"mean_alloc_A{i+1}",
                       f"mean_shock_A{i+1}", f"max_shock_A{i+1}",
                       f"mean_cf_shock_A{i+1}", f"total_cancels_A{i+1}",
-                      f"total_holding_cost_A{i+1}", f"total_mac_reduction_A{i+1}"]
+                      f"total_mac_reduction_A{i+1}"]
     ep_csv = open(ep_path, "w", newline="")
     ep_writer = csv.DictWriter(ep_csv, fieldnames=ep_fields)
     ep_writer.writeheader()
@@ -460,7 +460,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"reward_A{i+1}", f"holdings_A{i+1}", f"invest_cost_A{i+1}",
                       f"bid_price_A{i+1}", f"queue_size_A{i+1}",
                       f"emission_shock_A{i+1}", f"cf_shock_A{i+1}",  # P5/P6
-                      f"cancellation_A{i+1}", f"holding_cost_A{i+1}",  # P6/P8
+                      f"cancellation_A{i+1}",  # P6
                       f"auction_cost_A{i+1}", f"secondary_net_A{i+1}",  # cost breakdown
                       f"compliance_surplus_A{i+1}", f"bank_end_A{i+1}",  # compliance
                       f"mac_reduction_A{i+1}", f"mac_cost_A{i+1}"]  # MAC
@@ -631,7 +631,6 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 yr_row[f"emission_shock_A{i+1}"] = _get("emission_shocks")   # P5
                 yr_row[f"cf_shock_A{i+1}"] = _get("cf_shocks")               # P6
                 yr_row[f"cancellation_A{i+1}"] = _get("cancellations")       # P6
-                yr_row[f"holding_cost_A{i+1}"] = _get("holding_costs")       # P8
                 # Derived cost-breakdown and compliance fields
                 _alloc    = _get("allocations")
                 _price    = yl.get("clearing_price", 0.0)
@@ -916,10 +915,6 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             sum(int(yl.get("cancellations", [0]*n_agents)[i]) for yl in env.episode_log)
             for i in range(n_agents)
         ]
-        ep_total_holding_cost = [                                      # total P8 holding cost (M€)
-            sum(yl.get("holding_costs", [0.0]*n_agents)[i] for yl in env.episode_log)
-            for i in range(n_agents)
-        ]
         ep_total_mac_reduction = [                                     # total MAC abatement (Mt)
             sum(yl.get("mac_reductions", [0.0]*n_agents)[i] for yl in env.episode_log)
             for i in range(n_agents)
@@ -985,7 +980,6 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             ep_row[f"max_shock_A{i+1}"]          = round(ep_max_shock[i], 5)
             ep_row[f"mean_cf_shock_A{i+1}"]      = round(ep_mean_cf_shock[i], 5)
             ep_row[f"total_cancels_A{i+1}"]      = ep_total_cancels[i]
-            ep_row[f"total_holding_cost_A{i+1}"] = round(ep_total_holding_cost[i], 4)
             ep_row[f"total_mac_reduction_A{i+1}"] = round(ep_total_mac_reduction[i], 4)
             if latest_losses[i]:
                 ep_row[f"actor_loss_A{i+1}"] = round(latest_losses[i]["actor_loss"], 6)

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \":*)",
+      "Bash(python3 -c \"import json; json.load\\(open\\(''ets_marl_happo_current/notebooks/ets_marl_colab.ipynb'', encoding=''utf-8''\\)\\); print\\(''Valid JSON''\\)\")"
+    ]
+  }
+}

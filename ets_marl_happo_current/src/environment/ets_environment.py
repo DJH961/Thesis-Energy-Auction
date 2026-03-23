@@ -111,9 +111,6 @@ class ETSEnvironment(gym.Env):
         self._current_cf_noise = np.zeros((self.n_agents, 5))
         self._p6_cancellations = np.zeros(self.n_agents, dtype=int)
 
-        # P8: per-agent holding costs from last _compute_rewards call (M€)
-        self._last_holding_costs = np.zeros(self.n_agents)
-
         # Unsold allowance rollover: volume offered at auction but not allocated
         # carries forward to the next year's auction supply.
         self._unsold_rollover = 0.0
@@ -717,7 +714,6 @@ class ETSEnvironment(gym.Env):
             "bid_prices": self._phase1_bid_prices.tolist() if self._phase1_bid_prices is not None else [],
             "delta_greens": [c.green_frac - c.prev_green_frac for c in self.companies],
             "queue_sizes": [len(c._construction_queue) for c in self.companies],
-            "holding_costs": self._last_holding_costs.tolist(),  # P8
             "mac_reductions": self._mac_reductions.tolist(),
             "mac_costs": self._mac_costs.tolist(),
             "sec_price_mults": secondary_actions[:, 0].tolist(),  # Phase 2 action[0] (raw)
@@ -874,9 +870,6 @@ class ETSEnvironment(gym.Env):
         gamma_shaping = reward_cfg.get("shaping_gamma", 1.0)
         price_anchor_delta = reward_cfg.get("price_anchor_delta", 0.5)
 
-        # Banking holding cost — diagnostic only, not included in reward
-        holding_cost_rate = trading_cfg.get("banking_holding_cost", 0.0)
-
         # Electricity revenue parameters
         elec_enabled = elec_cfg.get("enabled", False)
         base_elec_price = elec_cfg.get("base_price", 50.0)
@@ -900,16 +893,6 @@ class ETSEnvironment(gym.Env):
             company.record_spending(auction_cost + max(0.0, secondary_cost)
                                     + investment_cost + mac_cost_i)
             budget_penalty = company.compute_budget_penalty()
-
-            # Banking holding cost — diagnostic only (not in reward)
-            annual_need = max(float(emissions[i]), 1e-6)
-            bank_ratio = self.holdings[i] / annual_need
-            if holding_cost_rate > 0.0 and bank_ratio > 1.0:
-                excess = self.holdings[i] - annual_need
-                holding_cost = excess * holding_cost_rate
-            else:
-                holding_cost = 0.0
-            self._last_holding_costs[i] = holding_cost
 
             total_cost = (auction_cost + secondary_cost + investment_cost
                          + operational_cost + budget_penalty + mac_cost_i)

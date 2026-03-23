@@ -122,7 +122,6 @@ trading:
   enabled: true
   transaction_cost: 0.5
   spread_tolerance: 0.07      # P8: ±7% of clearing_price
-  banking_holding_cost: 0.0    # disabled: no artificial holding cost in reward
   sec_mult_low: 0.8           # secondary price multiplier lower bound (×clearing_price)
   sec_mult_high: 1.3          # secondary price multiplier upper bound (×clearing_price)
 # ----------------------------------------------------------
@@ -248,7 +247,7 @@ curriculum:
 # P5: Demand & Emission Uncertainty
 # ----------------------------------------------------------
 uncertainty:
-  enabled: false   # disabled: learn deterministic dynamics first, re-enable later
+  enabled: true
   sigma_demand: 0.07
   corr_rho: 0.40
 
@@ -256,7 +255,7 @@ uncertainty:
 # P6: Construction Delay Jitter & Capacity Uncertainty
 # ----------------------------------------------------------
 construction_jitter:
-  enabled: false   # disabled: learn deterministic dynamics first, re-enable later
+  enabled: true
   poisson_lambdas: [1.0, 1.0, 2.0, 3.0, 1.5]
   p_cancel: 0.03
   recovery_rate: 0.40
