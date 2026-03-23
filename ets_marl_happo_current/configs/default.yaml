@@ -188,6 +188,7 @@ reward:
   shaping_gamma: 1.0             # queue bonus weight — rewards active construction queue items
   shaping_decay_episode: 12000   # episodes over which shaping_weight decays to floor
   shaping_weight_floor: 0.0      # green shaping decays fully to zero
+  price_anchor_delta: 0.5        # price-proximity bonus weight (Gaussian around expected_price, decays with shaping_weight)
 # ----------------------------------------------------------
 # Opponent modeling (Option C)
 # With 8 agents: +14 dims → obs_dim_phase1 = 35, phase2 = 42
@@ -334,6 +335,14 @@ hpp:
 # the full bid-price range.
 # ----------------------------------------------------------
 exploration:
-  epsilon_start: 0.25      # 15% random actions early on
-  epsilon_final: 0.05      # 2% residual exploration
-  epsilon_decay_episodes: 7000  # linear decay over first 5000 episodes
+  epsilon_start: 0.25      # 25% random actions early on
+  epsilon_final: 0.05      # 5% residual exploration
+  epsilon_decay_episodes: 7000  # linear decay over first 7000 episodes
+  # Action anchors: realistic initial policy targets in physical space.
+  # These set the initial policy mean (via head bias init) so agents start
+  # near historically plausible actions.  Epsilon exploration also samples
+  # from Gaussians around these values instead of uniform.
+  # Auction: [bid_price, qty_mult, invest_frac, logit_onshore, logit_offshore, logit_solar]
+  auction_anchors: [80.0, 1.0, 0.03, 0.3, -0.5, 0.5]
+  # Secondary: [sec_price_multiplier, sec_qty]
+  secondary_anchors: [1.05, 0.0]

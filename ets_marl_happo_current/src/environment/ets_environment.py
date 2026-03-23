@@ -872,6 +872,7 @@ class ETSEnvironment(gym.Env):
         green_floor_fossil = reward_cfg.get("green_floor_fossil", [0.0] * self.n_agents)
         beta_shaping = reward_cfg.get("shaping_beta", 10.0)
         gamma_shaping = reward_cfg.get("shaping_gamma", 1.0)
+        price_anchor_delta = reward_cfg.get("price_anchor_delta", 0.5)
 
         # Banking holding cost — diagnostic only, not included in reward
         holding_cost_rate = trading_cfg.get("banking_holding_cost", 0.0)
@@ -938,8 +939,21 @@ class ETSEnvironment(gym.Env):
             n_active_queue = len(company._construction_queue)
             queue_bonus = gamma_shaping * n_active_queue * 0.1 * self.shaping_weight
 
+            # Price-anchor bonus: encourage bidding near expected price (decays with shaping_weight).
+            # Uses a Gaussian-shaped bonus: max at expected_price, falls off with distance.
+            # Normalised so the bonus ∈ [0, price_anchor_delta] when shaping_weight=1.
+            price_anchor_bonus = 0.0
+            if price_anchor_delta > 0.0 and self.shaping_weight > 0.0:
+                bid_price_i = float(self._phase1_bid_prices[i])
+                ref_price = max(self.expected_price, 10.0)  # AR(1) expected price
+                price_dev = (bid_price_i - ref_price) / ref_price  # fractional deviation
+                # Gaussian kernel: exp(-dev²/2σ²) with σ=0.5 (±50% gets ~60% of max bonus)
+                price_anchor_bonus = (price_anchor_delta
+                                      * np.exp(-0.5 * (price_dev / 0.5) ** 2)
+                                      * self.shaping_weight)
+
             rewards[i] = float(-cost_norm - emissions_intensity - penalty_norm
-                               + green_bonus + queue_bonus)
+                               + green_bonus + queue_bonus + price_anchor_bonus)
 
         return rewards
 

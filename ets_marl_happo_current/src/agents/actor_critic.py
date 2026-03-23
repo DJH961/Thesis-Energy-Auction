@@ -35,7 +35,7 @@ class AuctionPolicy(nn.Module):
     """
 
     def __init__(self, obs_dim, action_dim, hidden_size, action_low, action_high,
-                 log_std_min=-2.0, log_std_max=1.0):
+                 log_std_min=-2.0, log_std_max=1.0, action_anchors=None):
         super().__init__()
         self.fc1 = nn.Linear(obs_dim, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
@@ -52,6 +52,9 @@ class AuctionPolicy(nn.Module):
 
         self.register_buffer("action_scale", (action_high - action_low) / 2.0)
         self.register_buffer("action_bias", (action_high + action_low) / 2.0)
+        # action_anchors: physical-space targets for initial policy mean.
+        # [bid_price, qty_mult, invest_frac, logit_onshore, logit_offshore, logit_solar]
+        self._action_anchors = action_anchors  # None = use midpoint (legacy behavior)
         self._init_weights()
 
     def _compute_mean(self, hidden):
@@ -105,13 +108,24 @@ class AuctionPolicy(nn.Module):
         for head in [self.price_head, self.qty_head, self.rest_head]:
             nn.init.orthogonal_(head.weight, gain=0.01)
             nn.init.zeros_(head.bias)
+        # Anchor head biases so initial policy output ≈ action_anchors in physical space.
+        # With small weights (gain=0.01) the hidden→mean contribution is ~0,
+        # so bias dominates the initial output.  raw = (anchor - bias) / scale.
+        if self._action_anchors is not None:
+            with torch.no_grad():
+                anchors = torch.FloatTensor(self._action_anchors)
+                raw_anchors = (anchors - self.action_bias.cpu()) / (self.action_scale.cpu() + 1e-8)
+                raw_anchors = torch.clamp(raw_anchors, -0.95, 0.95)  # stay within usable range
+                self.price_head.bias.fill_(raw_anchors[0].item())
+                self.qty_head.bias.fill_(raw_anchors[1].item())
+                self.rest_head.bias.copy_(raw_anchors[2:])
 
 
 class SecondaryPolicy(nn.Module):
     """Phase 2: obs_enriched(21) → Gaussian over 2 secondary actions."""
 
     def __init__(self, obs_dim, action_dim, hidden_size, action_low, action_high,
-                 log_std_min=-2.0, log_std_max=1.0):
+                 log_std_min=-2.0, log_std_max=1.0, action_anchors=None):
         super().__init__()
         self.fc1 = nn.Linear(obs_dim, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
@@ -122,6 +136,9 @@ class SecondaryPolicy(nn.Module):
 
         self.register_buffer("action_scale", (action_high - action_low) / 2.0)
         self.register_buffer("action_bias", (action_high + action_low) / 2.0)
+        # action_anchors: physical-space targets for initial policy mean.
+        # [sec_price_multiplier, sec_qty]
+        self._action_anchors = action_anchors
         self._init_weights()
 
     def forward(self, obs):
@@ -162,6 +179,12 @@ class SecondaryPolicy(nn.Module):
             nn.init.zeros_(layer.bias)
         nn.init.orthogonal_(self.mean_head.weight, gain=0.01)
         nn.init.zeros_(self.mean_head.bias)
+        if self._action_anchors is not None:
+            with torch.no_grad():
+                anchors = torch.FloatTensor(self._action_anchors)
+                raw_anchors = (anchors - self.action_bias.cpu()) / (self.action_scale.cpu() + 1e-8)
+                raw_anchors = torch.clamp(raw_anchors, -0.95, 0.95)
+                self.mean_head.bias.copy_(raw_anchors)
 
 
 class ValueNetwork(nn.Module):
