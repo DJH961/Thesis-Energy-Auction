@@ -277,8 +277,8 @@ class PPOAgent:
                 # This gives exploration a sensible starting distribution that
                 # reflects how real companies would initially behave.
                 rand_action = torch.zeros_like(action)
-                price_max = high[0, 0].item()
-                price_min = low[0, 0].item()
+                price_max = high[0].item()
+                price_min = low[0].item()
 
                 # [0] bid_price: Gaussian around expected_price (obs[3] × price_max)
                 expected_price = float(obs1[3]) * price_max
@@ -289,12 +289,12 @@ class PPOAgent:
                 # [1] qty_multiplier: Gaussian around 1.0 (cover full need)
                 rand_action[0, 1] = np.clip(
                     np.random.normal(1.0, 0.15),
-                    low[0, 1].item(), high[0, 1].item())
+                    low[1].item(), high[1].item())
 
                 # [2] invest_frac: Gaussian around 0.03 (moderate investment)
                 rand_action[0, 2] = np.clip(
                     np.random.normal(0.03, 0.02),
-                    low[0, 2].item(), high[0, 2].item())
+                    low[2].item(), high[2].item())
 
                 # [3-5] tech logits: slight solar/onshore preference, moderate spread
                 # onshore=0.3, offshore=-0.5, solar=0.5 (reflects cost/speed reality)
@@ -336,13 +336,13 @@ class PPOAgent:
                 # [0] sec_price_mult: Gaussian around 1.05 (trade near clearing price)
                 rand_action[0, 0] = np.clip(
                     np.random.normal(1.05, 0.10),
-                    low[0, 0].item(), high[0, 0].item())
+                    low[0].item(), high[0].item())
 
                 # [1] sec_qty: Gaussian around 0 with moderate spread.
                 # Positive = buy, negative = sell; neutral center lets both be explored.
                 rand_action[0, 1] = np.clip(
                     np.random.normal(0.0, 1.0),
-                    low[0, 1].item(), high[0, 1].item())
+                    low[1].item(), high[1].item())
 
                 rand_raw = torch.clamp(
                     (rand_action - self.secondary_policy.action_bias) /

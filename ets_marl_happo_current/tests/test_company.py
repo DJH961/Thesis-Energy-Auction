@@ -1,0 +1,416 @@
+"""
+test_company.py
+===============
+Unit tests for Company class — core business logic that drives the simulation.
+
+Covers:
+  - Emissions computation (deterministic and with CF noise)
+  - MAC fuel-switching logic
+  - Investment queue lifecycle (plan → mature, with risk)
+  - Compliance and carry-forward obligations
+  - Budget enforcement
+  - Observation generation (phase 1 and phase 2)
+  - Properties (green_frac, fossil_frac, weighted_emission_factor)
+"""
+
+import sys
+import os
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from src.environment.company import Company, N_TECHS, BUILDABLE_INDICES
+
+
+# ---------------------------------------------------------------------------
+# Shared fixture: minimal config for Company instantiation
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def config():
+    """Minimal config dict for Company."""
+    return {
+        "companies": {
+            "n_agents": 4,
+            "output_twh": 10.0,
+            "initial_mix": [
+                [0.40, 0.40, 0.10, 0.05, 0.05],
+                [0.15, 0.45, 0.20, 0.10, 0.10],
+                [0.05, 0.25, 0.35, 0.20, 0.15],
+                [0.00, 0.10, 0.30, 0.35, 0.25],
+            ],
+            "reward_weights": [[0.75, 0.25]] * 4,
+        },
+        "technologies": {
+            "names": ["coal", "gas", "onshore_wind", "offshore_wind", "solar"],
+            "emission_factors": [0.820, 0.490, 0.011, 0.012, 0.048],
+            "capex": [3000, 1150, 1350, 3250, 750],
+            "capacity_factors": [0.65, 0.60, 0.35, 0.47, 0.17],
+            "deploy_delays": [0, 0, 3, 5, 1],
+            "operational_costs": [72.0, 55.0, 17.0, 47.0, 10.0],
+            "decommission_costs": [200, 100, 0, 0, 0],
+            "is_green": [False, False, True, True, True],
+            "is_buildable": [False, False, True, True, True],
+        },
+        "investment": {"max_invest_frac": 0.10, "convexity_alpha": 0.10},
+        "risk": {
+            "p_fail_min": 0.08, "p_fail_max": 0.65,
+            "p_fail_alpha": 0.7, "experience_discount": 0.10,
+            "experience_threshold": 2,
+        },
+        "penalty": {
+            "rate": 100.0, "carry_forward": True,
+            "carry_forward_cap": 0.5,
+        },
+        "auction": {"price_max": 500.0, "price_min": 5.0, "quantity_max": 3.0},
+        "budget": {
+            "annual_budgets": [1500.0, 1200.0, 800.0, 500.0],
+            "overspend_penalty_coef": 0.5,
+        },
+        "mac": {"enabled": True, "coal_to_gas_cost": 65.0, "max_switch_frac": 0.20},
+        "opponent_modeling": {"enabled": False},
+        "construction_jitter": {"enabled": False},
+    }
+
+
+def make_company(config, agent_id=0, seed=42):
+    rng = np.random.default_rng(seed)
+    mix = config["companies"]["initial_mix"][agent_id]
+    return Company(agent_id=agent_id, config=config, initial_mix=mix, rng=rng)
+
+
+# ---------------------------------------------------------------------------
+# Properties
+# ---------------------------------------------------------------------------
+
+def test_mix_sums_to_one(config):
+    c = make_company(config, agent_id=0)
+    assert abs(c.mix.sum() - 1.0) < 1e-6
+
+def test_green_frac(config):
+    c = make_company(config, agent_id=0)
+    # Agent 0 mix: [0.40, 0.40, 0.10, 0.05, 0.05], green = 0.10+0.05+0.05 = 0.20
+    assert abs(c.green_frac - 0.20) < 1e-6
+
+def test_fossil_frac(config):
+    c = make_company(config, agent_id=0)
+    assert abs(c.fossil_frac - 0.80) < 1e-6
+
+def test_green_plus_fossil_is_one(config):
+    for i in range(4):
+        c = make_company(config, agent_id=i)
+        assert abs(c.green_frac + c.fossil_frac - 1.0) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Emissions
+# ---------------------------------------------------------------------------
+
+def test_emissions_deterministic(config):
+    """Emissions = output_MWh * weighted_EF / 1e6 (Mt)."""
+    c = make_company(config, agent_id=0)
+    ef = np.dot(c.mix, c.emission_factors)
+    expected = c.output_mwh * ef / 1e6
+    assert abs(c.compute_emissions() - expected) < 1e-8
+
+def test_emissions_positive(config):
+    for i in range(4):
+        c = make_company(config, agent_id=i)
+        assert c.compute_emissions() > 0
+
+def test_emissions_with_zero_cf_noise(config):
+    """Zero CF noise → same as deterministic."""
+    c = make_company(config, agent_id=0)
+    noise = np.zeros(N_TECHS)
+    assert abs(c.compute_emissions_with_cf_noise(noise) - c.compute_emissions()) < 1e-8
+
+def test_emissions_with_positive_cf_noise_reduces(config):
+    """Positive green CF noise → more green output → less fossil → lower emissions."""
+    c = make_company(config, agent_id=0)
+    noise = np.array([0.0, 0.0, 0.15, 0.15, 0.15])  # green techs produce more
+    e_noisy = c.compute_emissions_with_cf_noise(noise)
+    e_base = c.compute_emissions()
+    assert e_noisy < e_base, f"Expected lower emissions with positive CF noise: {e_noisy} vs {e_base}"
+
+def test_emissions_with_negative_cf_noise_increases(config):
+    """Negative green CF noise → less green output → more fossil → higher emissions."""
+    c = make_company(config, agent_id=0)
+    noise = np.array([0.0, 0.0, -0.15, -0.15, -0.15])  # green techs produce less
+    e_noisy = c.compute_emissions_with_cf_noise(noise)
+    e_base = c.compute_emissions()
+    assert e_noisy > e_base, f"Expected higher emissions with negative CF noise: {e_noisy} vs {e_base}"
+
+def test_greener_company_emits_less(config):
+    """Agent with more green capacity should emit less."""
+    c_dirty = make_company(config, agent_id=0)   # 80% fossil
+    c_clean = make_company(config, agent_id=3)    # 10% fossil
+    assert c_dirty.compute_emissions() > c_clean.compute_emissions()
+
+
+# ---------------------------------------------------------------------------
+# MAC fuel-switching
+# ---------------------------------------------------------------------------
+
+def test_mac_no_switch_below_cost(config):
+    """No switching when carbon price < MAC cost."""
+    c = make_company(config, agent_id=0)
+    reduction, cost = c.apply_mac_switching(carbon_price=50.0)  # below 65
+    assert reduction == 0.0
+    assert cost == 0.0
+
+def test_mac_switch_above_cost(config):
+    """Switching occurs when carbon price > MAC cost."""
+    c = make_company(config, agent_id=0)
+    reduction, cost = c.apply_mac_switching(carbon_price=100.0)  # above 65
+    assert reduction > 0
+    assert cost > 0
+
+def test_mac_reduction_bounded(config):
+    """Reduction cannot exceed max_switch_frac of coal capacity."""
+    c = make_company(config, agent_id=0)
+    reduction, cost = c.apply_mac_switching(carbon_price=200.0)
+    # max switchable = min(coal_frac=0.40, max_switch=0.20) = 0.20
+    max_switched_mwh = 0.20 * c.output_mwh
+    max_ef_reduction = c.emission_factors[0] - c.emission_factors[1]
+    max_reduction = max_switched_mwh * max_ef_reduction / 1e6
+    assert abs(reduction - max_reduction) < 1e-6
+
+def test_mac_no_coal_no_switch(config):
+    """No switching possible when agent has no coal."""
+    c = make_company(config, agent_id=3)  # 0% coal
+    reduction, cost = c.apply_mac_switching(carbon_price=200.0)
+    assert reduction == 0.0
+    assert cost == 0.0
+
+def test_mac_does_not_modify_mix(config):
+    """MAC switching is temporary — should not change the permanent mix."""
+    c = make_company(config, agent_id=0)
+    mix_before = c.mix.copy()
+    c.apply_mac_switching(carbon_price=100.0)
+    np.testing.assert_array_equal(c.mix, mix_before)
+
+
+# ---------------------------------------------------------------------------
+# Investment queue lifecycle
+# ---------------------------------------------------------------------------
+
+def test_plan_investment_adds_to_queue(config):
+    c = make_company(config, agent_id=0)
+    cost = c.plan_investment(tech_choice=2, invest_frac=0.05, current_year=0)  # solar
+    assert len(c._construction_queue) == 1
+    assert cost > 0
+
+def test_plan_investment_zero_frac_no_queue(config):
+    c = make_company(config, agent_id=0)
+    cost = c.plan_investment(tech_choice=0, invest_frac=0.0, current_year=0)
+    assert len(c._construction_queue) == 0
+    assert cost == 0.0
+
+def test_plan_investment_capped_at_fossil_frac(config):
+    """Cannot invest more than remaining fossil fraction."""
+    c = make_company(config, agent_id=3)  # only 10% fossil
+    c.plan_investment(tech_choice=2, invest_frac=0.10, current_year=0)
+    # Should be clipped to fossil_frac = 0.10
+    item = c._construction_queue[0]
+    assert item["frac_delta"] <= c.fossil_frac + 1e-6
+
+def test_matured_investment_changes_mix(config):
+    """Solar investment (1-year delay) should mature and update mix."""
+    c = make_company(config, agent_id=0, seed=1)
+    initial_green = c.green_frac
+    # Force success by seeding — try multiple seeds to find one that succeeds
+    for seed in range(100):
+        c = make_company(config, agent_id=0, seed=seed)
+        c.plan_investment(tech_choice=2, invest_frac=0.05, current_year=0)
+        if c._construction_queue[0]["success"]:
+            break
+    assert c._construction_queue[0]["success"], "Could not find successful seed"
+    # Solar has deploy_delay=1, so completes at year 1
+    c.apply_matured_investments(current_year=1)
+    assert c.green_frac > initial_green, "Green frac should increase after matured investment"
+    assert abs(c.mix.sum() - 1.0) < 1e-6, "Mix should still sum to 1.0"
+
+def test_failed_investment_no_mix_change(config):
+    """Failed investment adds zero frac_delta — mix unchanged after maturity."""
+    c = make_company(config, agent_id=0, seed=42)
+    # Force failure by finding a seed that fails
+    for seed in range(100):
+        c = make_company(config, agent_id=0, seed=seed)
+        c.plan_investment(tech_choice=2, invest_frac=0.05, current_year=0)
+        if not c._construction_queue[0]["success"]:
+            break
+    if not c._construction_queue[0]["success"]:
+        mix_before = c.mix.copy()
+        c.apply_matured_investments(current_year=1)
+        np.testing.assert_array_almost_equal(c.mix, mix_before, decimal=6)
+
+
+# ---------------------------------------------------------------------------
+# Compliance and carry-forward
+# ---------------------------------------------------------------------------
+
+def test_compliance_no_shortfall(config):
+    """Enough allowances → zero penalty."""
+    c = make_company(config, agent_id=0)
+    emissions = c.compute_emissions()
+    penalty = c.settle_compliance(allowances_held=emissions + 1.0)
+    assert penalty == 0.0
+
+def test_compliance_shortfall_penalty(config):
+    """Shortfall × penalty_rate = penalty."""
+    c = make_company(config, agent_id=0)
+    emissions = c.compute_emissions()
+    shortfall = 0.5  # Mt
+    penalty = c.settle_compliance(allowances_held=emissions - shortfall)
+    assert abs(penalty - shortfall * 100.0) < 1e-6
+
+def test_carry_forward_accumulates(config):
+    """Realized shortfall carries forward to next year."""
+    c = make_company(config, agent_id=0)
+    emissions = 3.0
+    allowances = 2.0  # shortfall = 1.0
+    c.settle_compliance_realized(allowances_held=allowances, realized_emissions=emissions)
+    assert c._carry_forward > 0, "Carry-forward should accumulate on shortfall"
+
+def test_carry_forward_capped(config):
+    """Carry-forward is capped at carry_forward_cap × base_emissions."""
+    c = make_company(config, agent_id=0)
+    # Create a huge shortfall
+    c.settle_compliance_realized(allowances_held=0.0, realized_emissions=100.0)
+    base_need = c.compute_estimate_need()
+    cap = config["penalty"]["carry_forward_cap"] * base_need
+    assert c._carry_forward <= cap + 1e-6, (
+        f"Carry-forward {c._carry_forward} exceeds cap {cap}")
+
+def test_carry_forward_adds_to_next_obligation(config):
+    """Carry-forward increases next year's compliance obligation."""
+    c = make_company(config, agent_id=0)
+    # Year 1: shortfall
+    c.settle_compliance_realized(allowances_held=1.0, realized_emissions=3.0)
+    cf = c._carry_forward
+    assert cf > 0
+    # Year 2: total_need = emissions + carry_forward
+    # If we have enough for emissions but not carry-forward, we still get penalty
+    emissions_y2 = c.compute_emissions()
+    penalty = c.settle_compliance_realized(
+        allowances_held=emissions_y2,  # covers emissions but not carry-forward
+        realized_emissions=emissions_y2)
+    assert penalty > 0, "Carry-forward should cause additional penalty"
+
+def test_no_carry_forward_when_disabled(config):
+    """With carry_forward disabled, shortfall does not persist."""
+    config_no_cf = {**config, "penalty": {**config["penalty"], "carry_forward": False}}
+    c = make_company(config_no_cf, agent_id=0)
+    c.settle_compliance_realized(allowances_held=0.0, realized_emissions=5.0)
+    assert c._carry_forward == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Budget enforcement
+# ---------------------------------------------------------------------------
+
+def test_budget_no_penalty_within_budget(config):
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.record_spending(500.0)  # well within 1500 budget
+    assert c.compute_budget_penalty() == 0.0
+
+def test_budget_penalty_on_overspend(config):
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.record_spending(2000.0)  # 500 over 1500 budget
+    penalty = c.compute_budget_penalty()
+    assert penalty > 0, "Should penalize overspending"
+
+def test_budget_penalty_quadratic(config):
+    """Penalty = coef × (overspend/budget)² × budget."""
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.record_spending(2000.0)
+    overspend = 500.0
+    ratio = overspend / 1500.0
+    expected = 0.5 * (ratio ** 2) * 1500.0
+    assert abs(c.compute_budget_penalty() - expected) < 1e-6
+
+def test_budget_utilization(config):
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.record_spending(750.0)
+    assert abs(c.get_budget_utilization() - 0.5) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Observations
+# ---------------------------------------------------------------------------
+
+def test_obs_phase1_shape(config):
+    """Phase 1 obs should be 22D base (no opponent modeling)."""
+    c = make_company(config, agent_id=0)
+    obs = c.get_observation_phase1(
+        year=0, cap_t=24.0, last_clearing_price=80.0,
+        expected_price=80.0, auction_gap=1.0)
+    assert obs.shape == (22,), f"Expected 22D, got {obs.shape}"
+    assert obs.dtype == np.float32
+
+def test_obs_phase1_with_opponents(config):
+    """With opponent modeling, obs should have 22 + 5*(N-1) dims."""
+    config_opp = {**config, "opponent_modeling": {"enabled": True}}
+    c = make_company(config_opp, agent_id=0)
+    opponent_obs = np.zeros(5 * 3, dtype=np.float32)  # 3 opponents
+    obs = c.get_observation_phase1(
+        year=0, cap_t=24.0, last_clearing_price=80.0,
+        expected_price=80.0, opponent_obs=opponent_obs)
+    assert obs.shape == (22 + 15,)
+
+def test_obs_phase2_extends_phase1(config):
+    """Phase 2 obs = phase1 + 7 extra dims."""
+    c = make_company(config, agent_id=0)
+    obs1 = c.get_observation_phase1(
+        year=0, cap_t=24.0, last_clearing_price=80.0, expected_price=80.0)
+    obs2 = c.get_observation_phase2(
+        obs_phase1=obs1, allocation=2.0, clearing_price=80.0,
+        emissions=3.0, banked=1.0, emission_shock=0.05, payment=160.0)
+    assert obs2.shape == (22 + 7,)
+    # First 22 dims should match phase1
+    np.testing.assert_array_equal(obs2[:22], obs1)
+
+def test_obs_values_finite(config):
+    """All observation values should be finite."""
+    c = make_company(config, agent_id=0)
+    obs1 = c.get_observation_phase1(
+        year=5, cap_t=20.0, last_clearing_price=60.0,
+        expected_price=70.0, auction_gap=2.0)
+    assert np.all(np.isfinite(obs1))
+    obs2 = c.get_observation_phase2(
+        obs_phase1=obs1, allocation=1.5, clearing_price=60.0,
+        emissions=3.0, banked=0.5)
+    assert np.all(np.isfinite(obs2))
+
+def test_obs_price_normalization(config):
+    """Prices in obs should be normalized by price_max."""
+    c = make_company(config, agent_id=0)
+    price_max = config["auction"]["price_max"]  # 500
+    clearing = 100.0
+    expected = 200.0
+    obs = c.get_observation_phase1(
+        year=0, cap_t=24.0, last_clearing_price=clearing,
+        expected_price=expected, price_ma3=clearing)
+    assert abs(obs[2] - clearing / price_max) < 1e-6, "obs[2] should be MA3/price_max"
+    assert abs(obs[3] - expected / price_max) < 1e-6, "obs[3] should be expected/price_max"
+
+
+# ---------------------------------------------------------------------------
+# Public info (opponent modeling)
+# ---------------------------------------------------------------------------
+
+def test_public_info_keys(config):
+    c = make_company(config, agent_id=0)
+    info = c.get_public_info()
+    assert set(info.keys()) == {"emissions", "carry_forward", "green_frac", "fossil_frac", "queue_total"}
+
+def test_queue_capacity_shape(config):
+    c = make_company(config, agent_id=0)
+    qc = c.get_queue_capacity()
+    assert qc.shape == (3,)  # onshore, offshore, solar
+    assert np.all(qc >= 0)

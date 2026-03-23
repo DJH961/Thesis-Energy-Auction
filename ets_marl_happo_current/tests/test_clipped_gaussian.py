@@ -183,7 +183,13 @@ def test_to_raw_invertibility(auction_policy):
 # ---------------------------------------------------------------------------
 
 def test_epsilon_greedy_auction(sample_config):
-    """With epsilon=1.0, select_auction_action produces diverse physical actions."""
+    """With epsilon=1.0, select_auction_action produces anchored-Gaussian actions.
+
+    Epsilon exploration now samples from Gaussians centered on realistic anchors
+    (e.g. bid_price around expected_price from obs[3]) rather than uniform.
+    The test verifies: (a) actions stay within bounds, (b) there is meaningful
+    variance, and (c) the mean is near the anchor rather than the midpoint.
+    """
     from src.agents.ppo_agent import PPOAgent
 
     agent = PPOAgent(
@@ -195,17 +201,26 @@ def test_epsilon_greedy_auction(sample_config):
         config=sample_config, seed=42,
     )
 
+    # Use a controlled obs where obs[3] (expected_price / price_max) = 0.65
+    # → expected_price = 0.65 × 120 = 78 €/t
     obs = np.random.randn(21).astype(np.float32)
+    obs[3] = 0.65
     bid_prices = []
-    for _ in range(100):
+    for _ in range(200):
         action, raw, lp = agent.select_auction_action(obs, epsilon=1.0)
         bid_prices.append(action[0])
 
     bid_prices = np.array(bid_prices)
-    # With epsilon=1.0 (all random), bids should span [40, 120] range
-    assert bid_prices.min() < 55.0, f"Min bid too high: {bid_prices.min():.1f}"
-    assert bid_prices.max() > 105.0, f"Max bid too low: {bid_prices.max():.1f}"
-    assert bid_prices.std() > 15.0, f"Bid std too low: {bid_prices.std():.1f}"
+    price_max = 120.0
+    expected_price = obs[3] * price_max  # 78.0
+    # (a) All within bounds
+    assert bid_prices.min() >= 40.0 - 0.01, f"Bid below floor: {bid_prices.min():.1f}"
+    assert bid_prices.max() <= 120.0 + 0.01, f"Bid above ceiling: {bid_prices.max():.1f}"
+    # (b) Meaningful variance (not collapsed)
+    assert bid_prices.std() > 5.0, f"Bid std too low: {bid_prices.std():.1f}"
+    # (c) Mean is near expected_price anchor, not the midpoint (80)
+    assert abs(bid_prices.mean() - expected_price) < 25.0, (
+        f"Mean bid {bid_prices.mean():.1f} too far from anchor {expected_price:.1f}")
 
 
 # ---------------------------------------------------------------------------
