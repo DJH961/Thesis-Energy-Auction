@@ -123,7 +123,7 @@ class ETSEnvironment(gym.Env):
             self._reserve_anchor = "secondary"
         self._consecutive_years_without_valid_auction_clear = 0
 
-        # Secondary liquidity pool EMA anchor state
+        # Secondary liquidity pool EMA anchor state (only used when pool enabled)
         self._liquidity_ref_ema = float(config["price"]["initial_expected"])
 
         # Opponent modeling (5D public info per opponent)
@@ -137,10 +137,8 @@ class ETSEnvironment(gym.Env):
         # Price normalization constant
         self._price_norm = config["auction"]["price_max"]
 
-        # Under-subscription cancellation is disabled during training to preserve learning signal.
+        # Log cancel_under_subscribed state (permanently false in this config)
         auction_cfg = self.config.get("auction", {})
-        if auction_cfg.get("cancel_under_subscribed", False):
-            auction_cfg["cancel_under_subscribed"] = False
         print(f"[ETSEnvironment] auction.cancel_under_subscribed={auction_cfg.get('cancel_under_subscribed', False)}")
 
         # Sanity check: in static mode, price_min must be >= reserve_price.

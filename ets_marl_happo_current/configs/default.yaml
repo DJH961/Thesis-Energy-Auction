@@ -109,13 +109,11 @@ auction:
   qty_mult_high: 1.3
   # California-style holding limit: no single agent can receive > 25% of auctioned volume.
   max_agent_share: 1.0
-  # Under-subscription cancellation (Article 7(6) of Reg. 1031/2010):
-  # If true, auctions where total demand < supply are cancelled (zero allocations).
-  # Disabled for training: early-stage agents bid too little, causing every auction
-  # to cancel and producing uninformative penalty-dominated gradients.
-  # Enable for evaluation or once agents have learned basic bidding.
+  # cancel_under_subscribed: false — in the annual-auction abstraction, binary
+  # cancellation is unrealistically severe (real ETS rolls cancelled volume to
+  # next-day auction). Under-subscription handled by unsold→MSR tightening
+  # future supply and graded shortfall penalties.
   cancel_under_subscribed: false
-  cancel_under_subscribed_after: 1000  # enable cancel_under_subscribed after this many episodes
   # EU lot-size: bids in multiples of 500 EUAs (= 0.0005 Mt)
   lot_size: 0.0005
 
@@ -128,10 +126,10 @@ trading:
 
 secondary:
   liquidity_pool:
-    enabled: true
-    spread: 0.05
-    penalty_anchor_weight: 0.30
-    ema_alpha: 0.30
+    # Liquidity pool disabled — financial intermediaries excluded to isolate
+    # compliance-driven inter-agent trading.  Secondary market operates purely
+    # agent-to-agent.  See thesis §X for justification.
+    enabled: false
 # ----------------------------------------------------------
 # Budgets — scaled to not artificially prevent compliance.
 # Each budget ≈ 1.5× expected compliance cost at moderate

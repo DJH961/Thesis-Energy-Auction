@@ -341,7 +341,7 @@ def _print_training_legend():
     print("                 agents bid near minimum. Often pairs with lowAlloc.")
     print("  priceCeil=N  : Clearing price ≥90% of price_max. Agents overbidding — unlikely to")
     print("                 be optimal in uniform-price auction. May indicate reward miscalibration.")
-    print("  auctFail=N   : Auction cancelled (cancel_under_subscribed=true). Zero allocations.")
+    print("  auctFail=N   : Auction cancelled (cancel_under_subscribed=true, currently disabled).")
     print("  lowDemand=N  : Total demand < 70% of supply. Agents under-bidding on quantity.")
     print("                 Early exploration noise; persistent = weak quantity signal.")
     print("  noInvest=N   : All agents chose invest_frac ≈ 0 — nobody investing in green.")
@@ -353,9 +353,11 @@ def _print_training_legend():
     print("  overBank=N   : TNAC > 2× total emissions — massive over-banking. Stockpiling")
     print("                 allowances suppresses price signals and delays scarcity.")
     print("  1sideSec=N   : All agents buying OR all selling on secondary market.")
-    print("                 No natural counterparty; liquidity pool absorbs the imbalance.")
+    print("                 No natural counterparty exists — expected in thin compliance markets.")
+    print("                 Informational, not pathological (pool disabled, pure agent-to-agent).")
     print("  noTrade=N    : Secondary market volume ≈ 0. No trading this year-step.")
-    print("                 Common early; should decrease as agents discover secondary market.")
+    print("                 Expected in compliance-only market without liquidity pool.")
+    print("                 Signals thin market, not a bug. Watch for trends, not individual counts.")
     print("  cornering=N  : An agent's alloc share > 2× its emissions share AND > 30% of total,")
     print("                 with meaningful auction volume (>30% of cap). Market concentration risk.")
     print("  rsvReject=N  : Rejected bid volume > 25% of total bid volume (bids below dynamic")
@@ -574,11 +576,6 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         # P4: Communicate episode to environment for shaping weight + lock-in activation
         env.set_episode(episode)
-
-        # Cancel-under-subscribed schedule: enable after N episodes
-        cancel_after = config["auction"].get("cancel_under_subscribed_after", None)
-        if cancel_after is not None:
-            env.config["auction"]["cancel_under_subscribed"] = (episode >= cancel_after)
 
         # Epsilon-greedy schedule: linear decay
         if eps_start > 0.0:
