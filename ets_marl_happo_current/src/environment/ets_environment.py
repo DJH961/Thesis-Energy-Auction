@@ -257,6 +257,19 @@ class ETSEnvironment(gym.Env):
         if ws_cfg.get("enabled", False):
             self._apply_warm_start(ws_cfg)
 
+        # Scarcity check: warn if cap trajectory doesn't tighten enough over the episode
+        cap_year_0 = self.cap_schedule.get_cap(0)
+        cap_year_n = self.cap_schedule.get_cap(self.n_years - 1)
+        if cap_year_0 - cap_year_n < 0.30 * cap_year_0:
+            import warnings
+            warnings.warn(
+                f"[ETSEnvironment] Weak scarcity: cap drops only "
+                f"{(cap_year_0 - cap_year_n) / cap_year_0 * 100:.1f}% over {self.n_years} years "
+                f"(year-0={cap_year_0:.2f} Mt, year-{self.n_years-1}={cap_year_n:.2f} Mt). "
+                f"Consider increasing n_years or LRF for meaningful price signals.",
+                stacklevel=2,
+            )
+
         obs_phase1 = self._get_obs_phase1()
         return obs_phase1, {}
 
@@ -1022,6 +1035,34 @@ class ETSEnvironment(gym.Env):
 
             rewards[i] = float(-cost_norm - emissions_intensity - penalty_norm
                                + green_bonus + queue_bonus + price_anchor_bonus)
+
+        # Terminal value bonuses (final year only)
+        is_final_year = self.current_year >= self.n_years - 1
+        terminal_bank = reward_cfg.get("terminal_bank_value", False)
+        terminal_queue = reward_cfg.get("terminal_queue_value", False)
+
+        if is_final_year and (terminal_bank or terminal_queue):
+            gamma_discount = self.config["ppo"].get("gamma", 0.99)
+            terminal_payoff_years = reward_cfg.get("terminal_payoff_years", 5)
+
+            for i, company in enumerate(self.companies):
+                # Terminal bank value: banked allowances × clearing price
+                if terminal_bank:
+                    bank_value = self.holdings[i] * clearing_price / 1000.0
+                    rewards[i] += bank_value
+
+                # Terminal queue value: NPV of future carbon savings from in-construction projects
+                if terminal_queue:
+                    queue_value = 0.0
+                    for item in company._construction_queue:
+                        delta_ef = company.weighted_emission_factor - company.emission_factors[item["tech_idx"]]
+                        annual_saving = (max(0.0, delta_ef)
+                                         * item["frac_delta"]
+                                         * company.output_mwh / 1e6
+                                         * clearing_price)
+                        discount = gamma_discount ** max(0, item["completion_year"] - self.current_year)
+                        queue_value += annual_saving * terminal_payoff_years * discount
+                    rewards[i] += queue_value / 1000.0
 
         return rewards
 

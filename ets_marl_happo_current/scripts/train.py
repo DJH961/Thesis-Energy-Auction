@@ -330,6 +330,46 @@ def _print_training_legend():
     print("  SecMl       : Mean secondary price multiplier (action[0]; 0.5=discount 2.0=premium)")
     print("  SqAct       : Mean secondary qty action (+buy intent / -sell intent, Mt)")
     print("  elapsed/ETA : Wall-clock elapsed time and estimated remaining time")
+    print()
+    print("Inline warnings  (appear as │ warn: key=N at end of market header line)")
+    print("  These count how many year-steps within the episode triggered each condition.")
+    print("  Low counts (1-2) are normal early in training. Persistent high counts signal problems.")
+    print()
+    print("  under=N     : Auction under-allocation — total allocated < 50% of auction volume.")
+    print("                Agents bid too low or too little. Common early; should fade by ep ~2000.")
+    print("  floor=N     : Clearing price hit the reserve price floor. Market is not competitive —")
+    print("                agents bid near minimum. Often pairs with 'under'. Watch for persistence.")
+    print("  ceil=N      : Clearing price hit ≥90% of price_max. Agents overbidding — unlikely to")
+    print("                be optimal in a uniform-price auction. May indicate reward miscalibration.")
+    print("  fail=N      : Auction failed entirely (e.g., cancelled due to under-subscription when")
+    print("                cancel_under_subscribed=true). Zero allowances distributed that year.")
+    print("  cov<1=N     : Total demand < supply — not enough bids to buy the full cap. Agents are")
+    print("                under-bidding on quantity. Often a sign of exploration in early training.")
+    print("  0inv=N      : All agents chose invest_frac ≈ 0 this year — nobody investing in green.")
+    print("                Occasional is fine; persistent means investment signal may be too weak.")
+    print("  chron=N     : An agent had shortfall (non-compliance) 3+ consecutive years, then reset.")
+    print("                Indicates an agent stuck in a debt spiral. Carry-forward cap should help.")
+    print("  bclust=N    : Bid prices very close together (std < €5). Low differentiation — agents")
+    print("                may have converged to identical strategies. Not always bad if prices work.")
+    print("  hoard=N     : TNAC > 2× total emissions — massive over-banking. Agents stockpiling")
+    print("                allowances instead of using them. Can suppress price signals.")
+    print("  1side=N     : All agents tried to buy OR all tried to sell on secondary market —")
+    print("                no natural counterparty. Liquidity pool absorbs the imbalance.")
+    print("  0vol=N      : Secondary market volume ≈ 0. No trading happened. Common early on;")
+    print("                should decrease as agents learn to use the secondary market.")
+    print("  mono=N      : One agent received >50% of total auction allocation. Market concentration")
+    print("                risk — that agent may be cornering the market.")
+    print("  dynRsvCancel=N : Some bids fell below the dynamic reserve price and were rejected.")
+    print("                Normal if reserve is rising; problematic if agents can't adapt.")
+    print()
+    print("Streak warnings  (printed as separate ⚠ lines between log intervals)")
+    print("  ⚠ CEILING BID  : Agent's avg bid ≥99% of price_max for 200+ consecutive episodes.")
+    print("  ⚠ FLOOR BID    : Agent's avg bid ≤102% of price_min for 200+ consecutive episodes.")
+    print("  ⚠ ZERO QUANTITY : Agent's avg bid qty ≤1% of qty_max for 200+ consecutive episodes.")
+    print("  🔄 ENTROPY BOOST: Agent stuck at floor/ceiling → entropy temporarily boosted to")
+    print("                    force re-exploration. Resets once agent moves away from extreme.")
+    print("  These indicate an agent's policy has collapsed to an extreme. The entropy boost")
+    print("  mechanism tries to rescue it; if warnings persist, check reward signal or hyperparams.")
     print(leg)
 
 
@@ -399,12 +439,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     cycling_soft = cycling_cfg.get("soft", False)
     cycling_lr_scale = cycling_cfg.get("soft_lr_scale", 0.1)
 
-    # Curriculum learning: start with shorter episodes and ramp to full length
+    # Curriculum learning (disabled — kept for config compat)
     curriculum_cfg = config.get("curriculum", {})
     curriculum_enabled = curriculum_cfg.get("enabled", False)
-    curriculum_start_years = curriculum_cfg.get("start_years", 4)
-    curriculum_ramp_episodes = curriculum_cfg.get("ramp_episodes", 3000)
     if curriculum_enabled:
+        curriculum_start_years = curriculum_cfg.get("start_years", 4)
+        curriculum_ramp_episodes = curriculum_cfg.get("ramp_episodes", 3000)
         print(f"Curriculum: {curriculum_start_years}yr → {n_years}yr "
               f"over {curriculum_ramp_episodes} episodes.")
 
@@ -529,15 +569,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             for agent in agents:
                 agent.set_kl_beta(kl_beta_now)
 
-        # Curriculum learning: ramp episode length from start_years to n_years
-        if curriculum_enabled:
-            frac = min(1.0, episode / max(curriculum_ramp_episodes, 1))
-            effective_n_years = int(round(
-                curriculum_start_years + frac * (n_years - curriculum_start_years)))
-            effective_n_years = max(curriculum_start_years, min(n_years, effective_n_years))
-            env.n_years = effective_n_years
-        else:
-            effective_n_years = n_years
+        # Always use configured n_years (curriculum disabled — 12-year episodes
+        # are short enough for direct training with terminal value rewards).
+        effective_n_years = n_years
 
         # P4: Communicate episode to environment for shaping weight + lock-in activation
         env.set_episode(episode)

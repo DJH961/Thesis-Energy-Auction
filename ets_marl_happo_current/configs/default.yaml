@@ -11,7 +11,7 @@
 # ============================================================
 
 simulation:
-  n_years: 20         # solar (2yr) and onshore (5yr) payoffs fit within episode
+  n_years: 12         # 12-year horizon: solar (2yr) and onshore (5yr) payoffs fit; terminal values handle beyond-horizon
   n_episodes: 70000   # increased for 8 agents + soft cycling
   seeds: [42, 123, 456]
 
@@ -34,7 +34,7 @@ technologies:
 # ETS parameters
 # Cap starts above total emissions (~22.5 Mt for 8 agents),
 # providing a slight surplus that transitions to scarcity
-# as the LRF tightens.  Cap at year 11 ≈ 15 Mt.
+# as the LRF tightens.  Cap at year 11 ≈ 14.6 Mt (~38% reduction).
 # ----------------------------------------------------------
 ets:
   cap_year_0: 23.5       # Mt — slight surplus vs 22.5 Mt initial emissions
@@ -196,6 +196,9 @@ reward:
   shaping_decay_episode: 12000   # episodes over which shaping_weight decays to floor
   shaping_weight_floor: 0.0      # green shaping decays fully to zero
   price_anchor_delta: 0.5        # price-proximity bonus weight (Gaussian around expected_price, decays with shaping_weight)
+  terminal_bank_value: true      # at final year, add banked-allowance terminal value to reward
+  terminal_queue_value: true     # at final year, add in-construction-queue terminal value to reward
+  terminal_payoff_years: 5       # years of future carbon savings used to value construction queue items
 # ----------------------------------------------------------
 # Opponent modeling (Option C)
 # With 8 agents: +14 dims → obs_dim_phase1 = 35, phase2 = 42
@@ -247,7 +250,7 @@ ppo:
 # Prevents carry-forward death spiral during early training.
 # ----------------------------------------------------------
 curriculum:
-  enabled: true
+  enabled: false            # disabled: 12-year episodes are short enough for direct training
   start_years: 4           # begin with 4-year episodes (agents learn basic bidding)
   ramp_episodes: 3000      # linearly ramp to full n_years over this many episodes
 

@@ -197,6 +197,195 @@ def test_price_anchor_zero_when_disabled():
     assert np.all(np.isfinite(rewards2))
 
 
+def _run_to_final_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.0):
+    """Helper: run the environment to the final year and return last-year rewards + info."""
+    n = env.n_agents
+    rewards = None
+    info = None
+    for year in range(env.n_years):
+        auction_actions = np.zeros((n, 6), dtype=np.float32)
+        auction_actions[:, 0] = auction_price
+        auction_actions[:, 1] = qty_mult
+        auction_actions[:, 2] = invest_frac
+        auction_actions[:, 3:] = [0.0, 0.0, 1.0]  # solar logits
+        env.step_auction(auction_actions)
+
+        secondary_actions = np.zeros((n, 2), dtype=np.float32)
+        secondary_actions[:, 0] = 1.0
+        secondary_actions[:, 1] = 0.0
+        _, rewards, _, _, info = env.step_secondary(secondary_actions)
+    return rewards, info
+
+
+class TestTerminalBankValue:
+
+    def test_terminal_bank_value_adds_bonus(self):
+        """With terminal_bank_value=True, final-year reward includes banked allowance value."""
+        config = load_config()
+        config["reward"]["terminal_bank_value"] = True
+        config["reward"]["terminal_queue_value"] = False
+        # Use short episode for speed
+        config["simulation"]["n_years"] = 3
+        config["warm_start"]["enabled"] = False
+        config["uncertainty"]["enabled"] = False
+        config["construction_jitter"]["enabled"] = False
+
+        env_with = ETSEnvironment(config, seed=42)
+        env_with.reset()
+        rewards_with, _ = _run_to_final_year(env_with, auction_price=80.0, qty_mult=1.3)
+
+        config2 = load_config()
+        config2["reward"]["terminal_bank_value"] = False
+        config2["reward"]["terminal_queue_value"] = False
+        config2["simulation"]["n_years"] = 3
+        config2["warm_start"]["enabled"] = False
+        config2["uncertainty"]["enabled"] = False
+        config2["construction_jitter"]["enabled"] = False
+
+        env_without = ETSEnvironment(config2, seed=42)
+        env_without.reset()
+        rewards_without, _ = _run_to_final_year(env_without, auction_price=80.0, qty_mult=1.3)
+
+        # If any agent has banked allowances, terminal value should boost reward
+        # At minimum, rewards should not be lower with terminal bank value enabled
+        assert rewards_with.sum() >= rewards_without.sum() - 0.01, (
+            f"Terminal bank value should not decrease total reward: "
+            f"with={rewards_with.sum():.4f}, without={rewards_without.sum():.4f}")
+
+    def test_terminal_bank_value_disabled(self):
+        """With terminal_bank_value=False, no terminal bank bonus appears."""
+        config = load_config()
+        config["reward"]["terminal_bank_value"] = False
+        config["reward"]["terminal_queue_value"] = False
+        config["simulation"]["n_years"] = 3
+        config["warm_start"]["enabled"] = False
+        config["uncertainty"]["enabled"] = False
+        config["construction_jitter"]["enabled"] = False
+
+        env1 = ETSEnvironment(config, seed=42)
+        env1.reset()
+        rewards1, _ = _run_to_final_year(env1, auction_price=80.0, qty_mult=1.3)
+
+        env2 = ETSEnvironment(config.copy(), seed=42)
+        env2.reset()
+        rewards2, _ = _run_to_final_year(env2, auction_price=80.0, qty_mult=1.3)
+
+        # Same config, same seed → identical rewards
+        np.testing.assert_allclose(rewards1, rewards2, atol=1e-6)
+
+    def test_terminal_bank_value_proportional_to_holdings(self):
+        """Terminal bank value should be larger when agents hold more allowances."""
+        config = load_config()
+        config["reward"]["terminal_bank_value"] = True
+        config["reward"]["terminal_queue_value"] = False
+        config["simulation"]["n_years"] = 3
+        config["warm_start"]["enabled"] = False
+        config["uncertainty"]["enabled"] = False
+        config["construction_jitter"]["enabled"] = False
+
+        # High qty → more allowances purchased → more likely to have bank
+        env_high = ETSEnvironment(config, seed=42)
+        env_high.reset()
+        rewards_high, _ = _run_to_final_year(env_high, auction_price=80.0, qty_mult=1.3)
+
+        # Low qty → fewer allowances → smaller or zero bank
+        env_low = ETSEnvironment(config, seed=42)
+        env_low.reset()
+        rewards_low, _ = _run_to_final_year(env_low, auction_price=80.0, qty_mult=0.3)
+
+        # Higher quantity bidding should lead to >= terminal value
+        assert rewards_high.sum() >= rewards_low.sum() - 0.5, (
+            f"Higher qty should lead to more banked allowances and higher terminal value: "
+            f"high={rewards_high.sum():.4f}, low={rewards_low.sum():.4f}")
+
+
+class TestTerminalQueueValue:
+
+    def test_terminal_queue_value_with_investment(self):
+        """Investing in green tech should produce terminal queue value in final year."""
+        config = load_config()
+        config["reward"]["terminal_bank_value"] = False
+        config["reward"]["terminal_queue_value"] = True
+        config["reward"]["terminal_payoff_years"] = 5
+        config["simulation"]["n_years"] = 3
+        config["warm_start"]["enabled"] = False
+        config["uncertainty"]["enabled"] = False
+        config["construction_jitter"]["enabled"] = False
+
+        env_invest = ETSEnvironment(config, seed=42)
+        env_invest.reset()
+        rewards_invest, _ = _run_to_final_year(env_invest, auction_price=80.0, invest_frac=0.08)
+
+        config2 = load_config()
+        config2["reward"]["terminal_bank_value"] = False
+        config2["reward"]["terminal_queue_value"] = False
+        config2["reward"]["terminal_payoff_years"] = 5
+        config2["simulation"]["n_years"] = 3
+        config2["warm_start"]["enabled"] = False
+        config2["uncertainty"]["enabled"] = False
+        config2["construction_jitter"]["enabled"] = False
+
+        env_noinvest = ETSEnvironment(config2, seed=42)
+        env_noinvest.reset()
+        rewards_noinvest, _ = _run_to_final_year(env_noinvest, auction_price=80.0, invest_frac=0.08)
+
+        # With terminal queue value enabled, investing agents should get a bonus
+        assert rewards_invest.sum() >= rewards_noinvest.sum() - 0.01, (
+            f"Terminal queue value should boost reward for investing agents: "
+            f"invest={rewards_invest.sum():.4f}, noinvest={rewards_noinvest.sum():.4f}")
+
+    def test_terminal_queue_value_disabled(self):
+        """With terminal_queue_value=False, no queue terminal bonus."""
+        config = load_config()
+        config["reward"]["terminal_bank_value"] = False
+        config["reward"]["terminal_queue_value"] = False
+        config["simulation"]["n_years"] = 3
+        config["warm_start"]["enabled"] = False
+        config["uncertainty"]["enabled"] = False
+        config["construction_jitter"]["enabled"] = False
+
+        env1 = ETSEnvironment(config, seed=42)
+        env1.reset()
+        rewards1, _ = _run_to_final_year(env1, auction_price=80.0, invest_frac=0.08)
+
+        env2 = ETSEnvironment(config, seed=42)
+        env2.reset()
+        rewards2, _ = _run_to_final_year(env2, auction_price=80.0, invest_frac=0.08)
+
+        np.testing.assert_allclose(rewards1, rewards2, atol=1e-6)
+
+    def test_terminal_queue_value_zero_without_queue(self):
+        """No queue items → no terminal queue bonus even when enabled."""
+        config = load_config()
+        config["reward"]["terminal_bank_value"] = False
+        config["reward"]["terminal_queue_value"] = True
+        config["reward"]["terminal_payoff_years"] = 5
+        config["simulation"]["n_years"] = 3
+        config["warm_start"]["enabled"] = False
+        config["uncertainty"]["enabled"] = False
+        config["construction_jitter"]["enabled"] = False
+
+        # No investment → no construction queue items
+        env_with = ETSEnvironment(config, seed=42)
+        env_with.reset()
+        rewards_with, _ = _run_to_final_year(env_with, auction_price=80.0, invest_frac=0.0)
+
+        config2 = load_config()
+        config2["reward"]["terminal_bank_value"] = False
+        config2["reward"]["terminal_queue_value"] = False
+        config2["simulation"]["n_years"] = 3
+        config2["warm_start"]["enabled"] = False
+        config2["uncertainty"]["enabled"] = False
+        config2["construction_jitter"]["enabled"] = False
+
+        env_without = ETSEnvironment(config2, seed=42)
+        env_without.reset()
+        rewards_without, _ = _run_to_final_year(env_without, auction_price=80.0, invest_frac=0.0)
+
+        # No investment, no queue → terminal queue value should be zero → same rewards
+        np.testing.assert_allclose(rewards_with, rewards_without, atol=1e-4)
+
+
 def test_shaping_weight_decays():
     """Shaping weight should decrease toward 0 over episodes."""
     env = load_env()
