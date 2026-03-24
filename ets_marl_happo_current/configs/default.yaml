@@ -339,11 +339,12 @@ hpp:
 
 # ----------------------------------------------------------
 # Epsilon-greedy exploration (physical-space)
-# Samples uniform random actions in [action_low, action_high]
-# with probability epsilon.  Decays linearly over training.
-# Prevents tanh/clamp saturation traps: even if the policy
-# has collapsed to the floor, epsilon forces exploration of
-# the full bid-price range.
+# Anchored Gaussian exploration: samples from N(anchor, σ)
+# per action dimension instead of uniform.
+# See ppo_agent.py for per-dimension distributions.
+# Decays linearly over training.  Prevents tanh/clamp
+# saturation traps: even if the policy has collapsed to
+# the floor, epsilon forces exploration of the full range.
 # ----------------------------------------------------------
 exploration:
   epsilon_start: 0.25      # 25% random actions early on

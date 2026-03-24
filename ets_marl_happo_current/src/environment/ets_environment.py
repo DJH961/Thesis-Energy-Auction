@@ -238,11 +238,11 @@ class ETSEnvironment(gym.Env):
 
         # Episode-level warning counters — reset each episode
         self._warnings = {
-            "under_alloc": 0, "price_floor": 0, "price_ceiling": 0,
-            "auction_failed": 0, "cover_below_one": 0, "zero_invest": 0,
-            "chronic_short": 0, "bid_cluster": 0, "bank_hoard": 0,
-            "sec_one_sided": 0, "sec_zero_vol": 0,
-            "monopoly": 0, "dyn_reserve_cancel": 0,
+            "low_alloc": 0, "price_floor": 0, "price_ceil": 0,
+            "auct_fail": 0, "low_demand": 0, "no_invest": 0,
+            "debt_spiral": 0, "bid_cluster": 0, "over_bank": 0,
+            "one_side_sec": 0, "no_trade": 0,
+            "cornering": 0, "rsv_reject": 0,
         }
         # Per-agent consecutive-shortfall counter for chronic_short detection
         self._consecutive_shortfall = np.zeros(self.n_agents, dtype=int)
@@ -567,28 +567,35 @@ class ETSEnvironment(gym.Env):
         if clearing_price <= _reserve + 1.0:
             self._warnings["price_floor"] += 1
         if clearing_price >= 0.9 * _price_max:
-            self._warnings["price_ceiling"] += 1
+            self._warnings["price_ceil"] += 1
         if auction_stats.get("auction_failed", False):
-            self._warnings["auction_failed"] += 1
-        if auction_stats.get("total_demand", 0.0) < auction_volume:
-            self._warnings["cover_below_one"] += 1
-        if float(allocations.sum()) < 0.5 * auction_volume:
-            self._warnings["under_alloc"] += 1
+            self._warnings["auct_fail"] += 1
+        if auction_stats.get("total_demand", 0.0) < 0.7 * auction_volume:
+            self._warnings["low_demand"] += 1
+        if float(allocations.sum()) < 0.3 * auction_volume:
+            self._warnings["low_alloc"] += 1
         if np.std(self._phase1_bid_prices) < 5.0:
             self._warnings["bid_cluster"] += 1
         if np.all(invest_fracs < 0.001):
-            self._warnings["zero_invest"] += 1
+            self._warnings["no_invest"] += 1
         if tnac > 2.0 * float(self._current_emissions.sum()):
-            self._warnings["bank_hoard"] += 1
-        # Monopoly warning: any agent received >50% of total allocation
+            self._warnings["over_bank"] += 1
+        # Cornering warning: agent's allocation share > 2× its emissions share
         total_alloc = float(allocations.sum())
-        if total_alloc > 1e-9:
-            if float(allocations.max()) > 0.5 * total_alloc:
-                self._warnings["monopoly"] += 1
-        # Dynamic reserve cancellation: bids rejected because below effective reserve
-        n_below_reserve = int(np.sum(self._phase1_bid_prices < _reserve - 1e-6))
-        if n_below_reserve > 0:
-            self._warnings["dyn_reserve_cancel"] += 1
+        total_emiss = float(self._current_emissions.sum())
+        if total_alloc > 0.3 * auction_volume and total_emiss > 1e-9:
+            for _ci in range(self.n_agents):
+                alloc_share = float(allocations[_ci]) / total_alloc
+                need_share = float(self._current_emissions[_ci]) / total_emiss
+                if alloc_share > 2.0 * need_share and alloc_share > 0.30:
+                    self._warnings["cornering"] += 1
+                    break  # count once per year-step
+        # Reserve-price rejection: fire when rejected volume > 25% of total bid volume
+        _below_mask = self._phase1_bid_prices < _reserve - 1e-6
+        _rejected_vol = float(self._phase1_bid_quantities[_below_mask].sum())
+        _total_bid_vol = float(self._phase1_bid_quantities.sum())
+        if _total_bid_vol > 1e-9 and _rejected_vol > 0.25 * _total_bid_vol:
+            self._warnings["rsv_reject"] += 1
 
         return obs_phase2, log
 
@@ -719,15 +726,15 @@ class ETSEnvironment(gym.Env):
 
         # ── Secondary-phase warning counters ─────────────────────────────────
         if secondary_volume < 0.01:
-            self._warnings["sec_zero_vol"] += 1
+            self._warnings["no_trade"] += 1
         sec_qty_raw = secondary_actions[:, 1]
         if np.all(sec_qty_raw > 0) or np.all(sec_qty_raw < 0):
-            self._warnings["sec_one_sided"] += 1
+            self._warnings["one_side_sec"] += 1
         for _i in range(self.n_agents):
             if shortfalls[_i] > 1e-6:
                 self._consecutive_shortfall[_i] += 1
-                if self._consecutive_shortfall[_i] >= 3:
-                    self._warnings["chronic_short"] += 1
+                if self._consecutive_shortfall[_i] >= 3 and self.current_year >= 3:
+                    self._warnings["debt_spiral"] += 1
                     self._consecutive_shortfall[_i] = 0
             else:
                 self._consecutive_shortfall[_i] = 0

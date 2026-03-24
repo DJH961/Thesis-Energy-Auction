@@ -335,32 +335,31 @@ def _print_training_legend():
     print("  These count how many year-steps within the episode triggered each condition.")
     print("  Low counts (1-2) are normal early in training. Persistent high counts signal problems.")
     print()
-    print("  under=N     : Auction under-allocation — total allocated < 50% of auction volume.")
-    print("                Agents bid too low or too little. Common early; should fade by ep ~2000.")
-    print("  floor=N     : Clearing price hit the reserve price floor. Market is not competitive —")
-    print("                agents bid near minimum. Often pairs with 'under'. Watch for persistence.")
-    print("  ceil=N      : Clearing price hit ≥90% of price_max. Agents overbidding — unlikely to")
-    print("                be optimal in a uniform-price auction. May indicate reward miscalibration.")
-    print("  fail=N      : Auction failed entirely (e.g., cancelled due to under-subscription when")
-    print("                cancel_under_subscribed=true). Zero allowances distributed that year.")
-    print("  cov<1=N     : Total demand < supply — not enough bids to buy the full cap. Agents are")
-    print("                under-bidding on quantity. Often a sign of exploration in early training.")
-    print("  0inv=N      : All agents chose invest_frac ≈ 0 this year — nobody investing in green.")
-    print("                Occasional is fine; persistent means investment signal may be too weak.")
-    print("  chron=N     : An agent had shortfall (non-compliance) 3+ consecutive years, then reset.")
-    print("                Indicates an agent stuck in a debt spiral. Carry-forward cap should help.")
-    print("  bclust=N    : Bid prices very close together (std < €5). Low differentiation — agents")
-    print("                may have converged to identical strategies. Not always bad if prices work.")
-    print("  hoard=N     : TNAC > 2× total emissions — massive over-banking. Agents stockpiling")
-    print("                allowances instead of using them. Can suppress price signals.")
-    print("  1side=N     : All agents tried to buy OR all tried to sell on secondary market —")
-    print("                no natural counterparty. Liquidity pool absorbs the imbalance.")
-    print("  0vol=N      : Secondary market volume ≈ 0. No trading happened. Common early on;")
-    print("                should decrease as agents learn to use the secondary market.")
-    print("  mono=N      : One agent received >50% of total auction allocation. Market concentration")
-    print("                risk — that agent may be cornering the market.")
-    print("  dynRsvCancel=N : Some bids fell below the dynamic reserve price and were rejected.")
-    print("                Normal if reserve is rising; problematic if agents can't adapt.")
+    print("  lowAlloc=N   : Total allocation < 30% of auction volume. Agents badly under-bidding.")
+    print("                 Common early; should fade by ep ~2000.")
+    print("  priceFloor=N : Clearing price hit the reserve price floor. Market not competitive —")
+    print("                 agents bid near minimum. Often pairs with lowAlloc.")
+    print("  priceCeil=N  : Clearing price ≥90% of price_max. Agents overbidding — unlikely to")
+    print("                 be optimal in uniform-price auction. May indicate reward miscalibration.")
+    print("  auctFail=N   : Auction cancelled (cancel_under_subscribed=true). Zero allocations.")
+    print("  lowDemand=N  : Total demand < 70% of supply. Agents under-bidding on quantity.")
+    print("                 Early exploration noise; persistent = weak quantity signal.")
+    print("  noInvest=N   : All agents chose invest_frac ≈ 0 — nobody investing in green.")
+    print("                 Occasional is fine; persistent = investment signal too weak.")
+    print("  debtSpiral=N : Agent had 3+ consecutive shortfall years (only counted from year 3+).")
+    print("                 Agent stuck in carry-forward debt spiral. CF-cap should limit this.")
+    print("  bidCluster=N : Bid price std < €5 — agents converged to near-identical bids.")
+    print("                 Not always bad if the resulting price is reasonable.")
+    print("  overBank=N   : TNAC > 2× total emissions — massive over-banking. Stockpiling")
+    print("                 allowances suppresses price signals and delays scarcity.")
+    print("  1sideSec=N   : All agents buying OR all selling on secondary market.")
+    print("                 No natural counterparty; liquidity pool absorbs the imbalance.")
+    print("  noTrade=N    : Secondary market volume ≈ 0. No trading this year-step.")
+    print("                 Common early; should decrease as agents discover secondary market.")
+    print("  cornering=N  : An agent's alloc share > 2× its emissions share AND > 30% of total,")
+    print("                 with meaningful auction volume (>30% of cap). Market concentration risk.")
+    print("  rsvReject=N  : Rejected bid volume > 25% of total bid volume (bids below dynamic")
+    print("                 reserve). Normal when reserve rises; persistent = agents can't adapt.")
     print()
     print("Streak warnings  (printed as separate ⚠ lines between log intervals)")
     print("  ⚠ CEILING BID  : Agent's avg bid ≥99% of price_max for 200+ consecutive episodes.")
@@ -1070,11 +1069,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
             # Compact warning summary — only non-zero counters
             _warn_labels = {
-                "under_alloc": "under", "price_floor": "floor", "price_ceiling": "ceil",
-                "auction_failed": "fail", "cover_below_one": "cov<1", "zero_invest": "0inv",
-                "chronic_short": "chron", "bid_cluster": "bclust", "bank_hoard": "hoard",
-                "sec_one_sided": "1side", "sec_zero_vol": "0vol",
-                "monopoly": "mono", "dyn_reserve_cancel": "dynRsvCancel",
+                "low_alloc": "lowAlloc", "price_floor": "priceFloor", "price_ceil": "priceCeil",
+                "auct_fail": "auctFail", "low_demand": "lowDemand", "no_invest": "noInvest",
+                "debt_spiral": "debtSpiral", "bid_cluster": "bidCluster", "over_bank": "overBank",
+                "one_side_sec": "1sideSec", "no_trade": "noTrade",
+                "cornering": "cornering", "rsv_reject": "rsvReject",
             }
             _warn_parts = [
                 f"{_warn_labels.get(k, k)}={v}"
