@@ -1119,7 +1119,9 @@ class ETSEnvironment(gym.Env):
             # Signal: tanh(coverage_ratio - 1) so that:
             #   ratio=1.0 → 0 (exactly covered), ratio>1 → small positive,
             #   ratio<1 → negative (under-covered, need to fix via secondary).
-            # Decays with shaping_weight so agents eventually rely on true cost signal.
+            # Permanent credit-assignment bridge: does NOT decay with shaping_weight.
+            # This is the only signal that directly connects bid actions to
+            # allocation adequacy, closing the bid→allowances→penalty gap.
             coverage_signal = 0.0
             if coverage_signal_weight > 0.0 and self._phase1_allocations is not None:
                 alloc_i = float(self._phase1_allocations[i])
@@ -1127,8 +1129,7 @@ class ETSEnvironment(gym.Env):
                     old_carry_forward[i] if old_carry_forward is not None else 0.0), 0.1)
                 coverage_ratio = (alloc_i + float(self.holdings[i])) / need_i
                 coverage_signal = (coverage_signal_weight
-                                   * float(np.tanh(coverage_ratio - 1.0))
-                                   * self.shaping_weight)
+                                   * float(np.tanh(coverage_ratio - 1.0)))
 
             rewards[i] = float(-cost_norm - emissions_intensity - penalty_norm
                                + green_bonus + queue_bonus + price_anchor_bonus

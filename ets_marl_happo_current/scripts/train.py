@@ -425,7 +425,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v5.1: MAC switching | Electricity revenue | Carry-forward{cf_str}")
+    print(f"v5.3: MAC switching | Electricity revenue | Carry-forward{cf_str} | Permanent coverage signal")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(f"{'='*60}")
     _print_training_legend()

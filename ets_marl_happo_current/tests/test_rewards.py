@@ -392,16 +392,18 @@ class TestTerminalQueueValue:
 
 
 def test_shaping_weight_decays():
-    """Shaping weight should decrease toward 0 over episodes."""
+    """Shaping weight should decrease toward floor over episodes."""
     env = load_env()
+    floor = env.config.get("reward", {}).get("shaping_weight_floor", 0.0)
+    decay_ep = env.config.get("reward", {}).get("shaping_decay_episode", 12000)
     env.set_episode(0)
     w0 = env.shaping_weight
-    env.set_episode(6000)
+    env.set_episode(decay_ep // 2)
     w_mid = env.shaping_weight
-    env.set_episode(12000)
+    env.set_episode(decay_ep * 2)
     w_end = env.shaping_weight
-    assert w0 > w_mid > w_end
-    assert w_end <= 0.01, f"Shaping weight should be ~0 at decay end: {w_end}"
+    assert w0 > w_mid >= w_end
+    assert abs(w_end - floor) < 0.01, f"Shaping weight should reach floor {floor}: {w_end}"
 
 
 def test_coverage_signal_rewards_adequate_allocation():

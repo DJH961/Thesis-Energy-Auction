@@ -12,7 +12,7 @@
 
 simulation:
   n_years: 12         # 12-year horizon: solar (2yr) and onshore (5yr) payoffs fit; terminal values handle beyond-horizon
-  n_episodes: 50000   # increased for 8 agents + soft cycling
+  n_episodes: 70000   # increased for 8 agents + soft cycling
   seeds: [42, 123, 456]
 
 # ----------------------------------------------------------
@@ -54,7 +54,7 @@ ets:
     emergency_release_amount: 0.90    # Mt released per year in emergency (scaled for 12)
 
   banking: true
-  reserve_price: 30.0    # static floor — matches price_min so no bids are silently rejected
+  reserve_price: 50.0    # static floor — realistic EU ETS reserve (prevents floor-bidding collapse)
   reserve_price_mode: "static"    # "static" = use reserve_price as-is; "dynamic" = max(reserve_price, discount × MA3)
   reserve_discount: 0.80          # fraction of MA3 price used as dynamic floor (only active in dynamic mode)
   reserve_initial: 50.0           # fallback reserve price before MA3 history is available (only active in dynamic mode)
@@ -118,7 +118,7 @@ risk:
 
 auction:
   price_max: 500.0     # penalty (100) + modest carry-forward premium; prevents ceiling-bid cornering
-  price_min: 30.0      # matches static reserve_price — no silent bid rejection
+  price_min: 50.0      # matches static reserve_price — no silent bid rejection
   quantity_max: 3.0
   reserve_ratio: 0.85
   # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
@@ -210,10 +210,10 @@ reward:
   green_floor_fossil: [0.40, 0.40, 0.30, 0.30, 0.10, 0.10, 0.00, 0.00, 0.40, 0.40, 0.30, 0.30]  # last 4 = bots
   shaping_beta: 7.0              # green_delta bonus — increased for stronger investment signal
   shaping_gamma: 1.0             # queue bonus weight — rewards active construction queue items
-  shaping_decay_episode: 12000   # episodes over which shaping_weight decays to floor
-  shaping_weight_floor: 0.0      # green shaping decays fully to zero
+  shaping_decay_episode: 25000   # episodes over which shaping_weight decays to floor
+  shaping_weight_floor: 0.15     # retain baseline shaping so green/price/queue signals never vanish
   price_anchor_delta: 0.5        # price-proximity bonus weight (Gaussian around expected_price, decays with shaping_weight)
-  coverage_signal_weight: 0.3    # immediate feedback on allocation vs need (bridges bid→compliance credit assignment)
+  coverage_signal_weight: 0.5    # immediate feedback on allocation vs need (permanent, not scaled by shaping_weight)
   terminal_bank_value: true      # at final year, add banked-allowance terminal value to reward
   terminal_queue_value: true     # at final year, add in-construction-queue terminal value to reward
   terminal_payoff_years: 5       # years of future carbon savings used to value construction queue items
@@ -261,7 +261,7 @@ ppo:
   # Prevents catastrophic policy drift within a single update.
   target_kl: 0.02
   kl_anchor_beta: 0.5            # initial weight of KL penalty against frozen BC policy
-  kl_anchor_decay_episodes: 8000 # episodes over which beta decays linearly to 0 (extended to preserve BC "don't sell while short" behavior)
+  kl_anchor_decay_episodes: 25000 # episodes over which beta decays linearly to 0 (slow release preserves BC guidance longer)
 
 # ----------------------------------------------------------
 # Curriculum learning: start with shorter episodes, ramp to full
