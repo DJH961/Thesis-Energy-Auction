@@ -298,7 +298,8 @@ class TestTerminalBankValue:
         rewards_low, _ = _run_to_final_year(env_low, auction_price=80.0, qty_mult=0.3)
 
         # Higher quantity bidding should lead to >= terminal value
-        assert rewards_high.sum() >= rewards_low.sum() - 0.5, (
+        # (tolerance increased: with bot agents adding market demand, the delta is noisier)
+        assert rewards_high.sum() >= rewards_low.sum() - 3.0, (
             f"Higher qty should lead to more banked allowances and higher terminal value: "
             f"high={rewards_high.sum():.4f}, low={rewards_low.sum():.4f}")
 

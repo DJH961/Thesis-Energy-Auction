@@ -54,12 +54,12 @@ def load_config(path: str) -> dict:
 
 
 def build_agents(env: ETSEnvironment, config: dict, seed: int):
-    """Instantiate one PPO agent per company."""
-    obs1_dim = env.companies[0].obs_dim_phase1  # 18
-    obs2_dim = env.companies[0].obs_dim_phase2  # 21
-    n_agents = config["companies"]["n_agents"]
+    """Instantiate one PPO agent per learning company (not bots)."""
+    obs1_dim = env.companies[0].obs_dim_phase1
+    obs2_dim = env.companies[0].obs_dim_phase2
+    n_agents = config["companies"]["n_agents"]  # learning agents only
 
-    # MAPPO: global state = concatenation of all agents' phase2 obs
+    # MAPPO: global state = concatenation of learning agents' phase2 obs
     centralized = config["ppo"].get("centralized_critic", False)
     global_state_dim = n_agents * obs2_dim if centralized else 0
 
@@ -307,10 +307,25 @@ def _print_training_legend():
     print("  price X→Y (peak Z) : ETS clearing price yr-0 → yr-N and peak  (€/t)")
     print("  cap                : Cap (Mt) in the final year")
     print("  TNAC               : Total allowances in circulation, final year")
-    print("  sec_price/vol/match: Secondary market stats")
     print("  entropy/shaping    : PPO entropy coef & green-shaping weight")
     print("  [ENT-DECAY]        : Entropy decay triggered")
     print("  [cyc=Ax]           : Active agent (soft cycling)")
+    print()
+    print("Secondary market line")
+    print("  N sellers (-X Mt)  : Avg sellers/yr and total sold volume")
+    print("  N buyers (+X Mt)   : Avg buyers/yr and total bought volume")
+    print("  vol/match/avg_px   : Total volume, match rate, avg trade price")
+    print()
+    print("Market dynamics line")
+    print("  avg_emiss          : Avg annual emissions across all participants (Mt/yr)")
+    print("  compliance         : % of (agent, year) pairs with zero shortfall")
+    print("  avg_green          : Avg green fraction across all participants at episode end")
+    print("  TNAC               : Total allowances in circulation, final year")
+    print()
+    print("Bot summary line (if bots enabled)")
+    print("  avg_bid/emiss      : Mean bot bid price (€/t) and emissions (Mt)")
+    print("  compliant          : Bot compliant agent-years / total bot agent-years")
+    print("  sec: Ns Nb         : Bot secondary roles (s=seller, b=buyer, h=hold)")
     print()
     print("Per-agent columns")
     print("  Green(0→N)  : Green fraction trajectory")
@@ -327,6 +342,7 @@ def _print_training_legend():
     print("  ActLoss     : Actor loss")
     print("  CriLoss     : Critic loss")
     print("  MAC_Mt      : MAC fuel-switching reduction (Mt)")
+    print("  Role        : Secondary market role: SELL / BUY / HOLD")
     print("  SecMl       : Mean secondary price multiplier (action[0]; 0.5=discount 2.0=premium)")
     print("  SqAct       : Mean secondary qty action (+buy intent / -sell intent, Mt)")
     print("  elapsed/ETA : Wall-clock elapsed time and estimated remaining time")
@@ -404,9 +420,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                f"{explore_cfg_banner.get('epsilon_final',0):.0%}"
                if explore_cfg_banner.get("epsilon_start", 0) > 0 else "")
 
+    n_bot_agents = config["companies"].get("n_bot_agents", 0)
+    bot_str = f" + {n_bot_agents} bots" if n_bot_agents > 0 else ""
+
     print(f"\n{'='*60}")
-    print(f"Training — seed {seed}, {n_agents} agents, {algo}, two-phase")
-    print(f"v5.0: MAC switching | Electricity revenue | Carry-forward{cf_str}")
+    print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
+    print(f"v5.1: MAC switching | Electricity revenue | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(f"{'='*60}")
     _print_training_legend()
@@ -1078,20 +1097,114 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             ]
             warn_str = "  │ warn: " + " ".join(_warn_parts) if _warn_parts else ""
 
+            # ── Enhanced secondary market breakdown ────────────────────
+            n_total = env.n_agents  # learning + bots
+            sec_sellers = 0; sec_buyers = 0; sec_holders = 0
+            sec_sell_vol = 0.0; sec_buy_vol = 0.0
+            for _yi in env.episode_log:
+                for _si in range(n_total):
+                    tq = _yi.get("trade_qtys", [0.0] * n_total)
+                    if _si < len(tq):
+                        if tq[_si] < -1e-6:
+                            sec_sellers += 1; sec_sell_vol += abs(tq[_si])
+                        elif tq[_si] > 1e-6:
+                            sec_buyers += 1; sec_buy_vol += tq[_si]
+                        else:
+                            sec_holders += 1
+            sec_avg_sellers = sec_sellers / max(n_years_ep, 1)
+            sec_avg_buyers = sec_buyers / max(n_years_ep, 1)
+            # Per-agent secondary role for learning agents
+            agent_sec_role = []
+            for _ai in range(n_agents):
+                avg_q = avg_sec_qty_per_agent[_ai]
+                if avg_q < -0.01:
+                    agent_sec_role.append("SELL")
+                elif avg_q > 0.01:
+                    agent_sec_role.append("BUY")
+                else:
+                    agent_sec_role.append("HOLD")
+
+            # ── Market dynamics aggregates ─────────────────────────────
+            total_emiss_ep = sum(
+                sum(yl.get("emissions", [0.0] * n_total))
+                for yl in env.episode_log
+            )
+            avg_annual_emiss = total_emiss_ep / max(n_years_ep, 1)
+            # Compliance rate: fraction of (agent, year) with no shortfall
+            total_agent_years = n_total * n_years_ep
+            compliant_ay = sum(
+                sum(1 for s in yl.get("shortfalls", [0.0] * n_total) if s < 1e-6)
+                for yl in env.episode_log
+            )
+            compliance_rate = compliant_ay / max(total_agent_years, 1)
+            avg_green_all = float(np.mean(
+                last_log.get("green_fracs", [0.0] * n_total)[:n_total]))
+
+            # ── Bot summary ────────────────────────────────────────────
+            bot_lines = []
+            n_bot_agents = config["companies"].get("n_bot_agents", 0)
+            if n_bot_agents > 0:
+                bot_avg_bid = []
+                bot_avg_emiss = []
+                bot_compliant = 0
+                bot_sec_roles = {"SELL": 0, "BUY": 0, "HOLD": 0}
+                for b in range(n_bot_agents):
+                    bidx = n_agents + b  # bots indexed after learning agents in env arrays
+                    # Since bots are at indices n_agents..n_total-1 in env arrays,
+                    # we access them via episode_log which stores n_total-length arrays
+                    b_bids = [yl["bid_prices"][bidx] for yl in env.episode_log
+                              if "bid_prices" in yl and bidx < len(yl["bid_prices"])]
+                    b_emiss = [yl["emissions"][bidx] for yl in env.episode_log
+                               if "emissions" in yl and bidx < len(yl["emissions"])]
+                    b_short = [yl["shortfalls"][bidx] for yl in env.episode_log
+                               if "shortfalls" in yl and bidx < len(yl["shortfalls"])]
+                    b_tq = [yl["trade_qtys"][bidx] for yl in env.episode_log
+                            if "trade_qtys" in yl and bidx < len(yl["trade_qtys"])]
+                    bot_avg_bid.append(np.mean(b_bids) if b_bids else 0.0)
+                    bot_avg_emiss.append(np.mean(b_emiss) if b_emiss else 0.0)
+                    bot_compliant += sum(1 for s in b_short if s < 1e-6)
+                    avg_tq = np.mean(b_tq) if b_tq else 0.0
+                    if avg_tq < -0.01:
+                        bot_sec_roles["SELL"] += 1
+                    elif avg_tq > 0.01:
+                        bot_sec_roles["BUY"] += 1
+                    else:
+                        bot_sec_roles["HOLD"] += 1
+                bot_compliant_yrs = bot_compliant
+                bot_total_yrs = n_bot_agents * n_years_ep
+                bot_sec_str = " ".join(
+                    f"{v}{k[0].lower()}" for k, v in bot_sec_roles.items() if v > 0)
+
             sep = "─" * 152
             print(sep)
             print(f"Time elapsed: {_format_hms(elapsed_s)} | ETA: {_format_hms(eta_s)} | speed={avg_ep_s:.2f}s/ep")
             print(f"Ep {episode:5d} │ price {price_start:.0f}→{price_final:.0f} (peak {price_peak:.0f})"
                   f"  cap={cap:5.0f}  TNAC={tnac:5.0f} │ "
-                  f"sec={sec_p:5.1f}€ vol={total_sec_vol:5.1f} match={sec_match_rate*100:.0f}% │ "
                   f"ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"
                   f"  eps={current_epsilon:.3f}"
                   f"{decay_str}{cyc_str}{warmup_str}{warn_str}")
+            # Enhanced secondary market line
+            print(f"  Secondary: {sec_avg_sellers:.0f} sellers (-{sec_sell_vol:.1f} Mt) "
+                  f"{sec_avg_buyers:.0f} buyers (+{sec_buy_vol:.1f} Mt) "
+                  f"│ vol={total_sec_vol:.1f} Mt  match={sec_match_rate*100:.0f}%  "
+                  f"avg_px={avg_sec_price:.1f}€  sec_clear={sec_p:.1f}€")
+            # Market dynamics line
+            print(f"  Market: avg_emiss={avg_annual_emiss:.1f} Mt/yr  "
+                  f"compliance={compliance_rate*100:.0f}%  "
+                  f"avg_green={avg_green_all*100:.0f}%  "
+                  f"TNAC={tnac:.1f} Mt")
+            # Bot summary
+            if n_bot_agents > 0:
+                print(f"  Bots ({n_bot_agents}): "
+                      f"avg_bid={np.mean(bot_avg_bid):.0f}€  "
+                      f"avg_emiss={np.mean(bot_avg_emiss):.2f} Mt  "
+                      f"compliant={bot_compliant_yrs}/{bot_total_yrs} yr  "
+                      f"sec: {bot_sec_str}")
             # Compact header covering all 8 action dimensions
             print(f"  {'':4}  {'Grn':>9} {'ΔG':>6} {'Emiss':>6} {'Alloc':>6} "
                   f"{'Sf':>5} {'Bid€':>6} {'BidMt':>6} {'InvFr':>5} "
                   f"│ {'Rew':>7} {'Short':>6} {'Pen':>7} {'ALoss':>7} {'CLoss':>7} "
-                  f"│ {'MAC_Mt':>7} │ {'SecMl':>5} {'SqAct':>6}")
+                  f"│ {'MAC_Mt':>7} │ {'Role':>4} {'SecMl':>5} {'SqAct':>6}")
             for i in range(n_agents):
                 act_mark  = "*" if (cycling_enabled and i == active_agent_idx) else " "
                 grn_str   = f"{ep_green_start[i]*100:.0f}→{ep_green_end[i]*100:.0f}%"
@@ -1106,7 +1219,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     f"{sf_str:>5} {avg_bid_per_agent[i]:6.0f} {avg_bid_qty_per_agent[i]:6.2f} {avg_invest_frac_per_agent[i]:5.3f} "
                     f"│ {total_rewards[i]:7.1f} {ep_total_shortfalls[i]:6.2f} "
                     f"{ep_total_penalties[i]:7.0f} {al_str:>7} {cl_str:>7} "
-                    f"│ {ep_total_mac_reduction[i]:7.3f} │ {avg_sec_mult_per_agent[i]:5.2f} {avg_sec_qty_per_agent[i]:6.2f}"
+                    f"│ {ep_total_mac_reduction[i]:7.3f} │ {agent_sec_role[i]:>4} {avg_sec_mult_per_agent[i]:5.2f} {avg_sec_qty_per_agent[i]:6.2f}"
                 )
             print(sep)
 

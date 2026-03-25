@@ -1,12 +1,12 @@
 # ============================================================
-# ETS MARL — Configuration v5.0
+# ETS MARL — Configuration v5.1
 # P1-P8 roadmap + structural improvements:
-#   - 8 agents (reduced market power)
+#   - 8 learning agents + 4 heuristic bot agents
 #   - price_max raised to 500 (above penalty ceiling)
-#   - cap_year_0 = 24 Mt (slight surplus at start)
+#   - cap_year_0 scaled for 12 total participants
 #   - MAC fuel-switching mechanism
 #   - Electricity revenue (margin-based reward)
-#   - Carry-forward non-compliance obligations
+#   - Carry-forward non-compliance obligations (cap=2.0×)
 #   - Re-tuned budgets, entropy, soft cycling
 # ============================================================
 
@@ -32,26 +32,26 @@ technologies:
 
 # ----------------------------------------------------------
 # ETS parameters
-# Cap starts above total emissions (~22.5 Mt for 8 agents),
+# Cap starts above total emissions (~40.9 Mt for 12 participants),
 # providing a slight surplus that transitions to scarcity
-# as the LRF tightens.  Cap at year 11 ≈ 14.6 Mt (~38% reduction).
+# as the LRF tightens.  Cap at year 11 ≈ 26.2 Mt (~38% reduction).
 # ----------------------------------------------------------
 ets:
-  cap_year_0: 23.5       # Mt — slight surplus vs 22.5 Mt initial emissions
+  cap_year_0: 43.0       # Mt — slight surplus vs ~40.9 Mt initial emissions (12 participants)
   lrf_phase1: 0.043
   lrf_phase2: 0.044
   lrf_phase_switch: 4
 
   msr:
     enabled: true
-    tnac_upper: 9.60     # scaled from 3.64 × (24/9.1)
-    tnac_lower: 3.60     # scaled from 1.37 × (24/9.1)
+    tnac_upper: 17.50    # scaled for 12 participants (9.60 × 43/23.5)
+    tnac_lower: 6.50     # scaled for 12 participants (3.60 × 43/23.5)
     withhold_rate: 0.24
-    release_amount: 0.20  # scaled from 0.08
+    release_amount: 0.35  # scaled for 12 participants (0.20 × 43/23.5)
     # P9: Price-responsive triggers — break procyclical hoarding loop
     price_containment_trigger: 0.70   # at 70% of price_max, suppress MSR withdrawal
     price_release_trigger: 0.85       # at 85% of price_max, force emergency release
-    emergency_release_amount: 0.50    # Mt released per year in emergency
+    emergency_release_amount: 0.90    # Mt released per year in emergency (scaled for 12)
 
   banking: true
   reserve_price: 30.0    # static floor — matches price_min so no bids are silently rejected
@@ -62,7 +62,7 @@ ets:
   unsold_to_msr: false   # unsold volume rolls over to next year's auction (not absorbed into MSR)
 
 # ----------------------------------------------------------
-# Companies (8 agents — 2× each of 4 archetypes)
+# Companies (8 learning agents — 2× each of 4 archetypes)
 # Reduced individual market power; each agent is 10 TWh/year.
 # ----------------------------------------------------------
 companies:
@@ -87,6 +87,24 @@ companies:
     - [0.75, 0.25]   # A7: green-leader / financial
     - [0.25, 0.75]   # A8: green-leader / green
 
+  # ----------------------------------------------------------
+  # Heuristic bot agents (indexed after learning agents)
+  # Fixed-policy bots using heuristic_policy rules.
+  # Add realistic demand from high-emission archetypes.
+  # Total market participants = n_agents + n_bot_agents = 12.
+  # ----------------------------------------------------------
+  n_bot_agents: 4
+  bot_initial_mix:
+    - [0.45, 0.35, 0.10, 0.05, 0.05]   # B1: coal-heavy / financial (id=8)
+    - [0.45, 0.35, 0.10, 0.05, 0.05]   # B2: coal-heavy / green     (id=9)
+    - [0.15, 0.50, 0.15, 0.10, 0.10]   # B3: gas-dominant / financial (id=10)
+    - [0.15, 0.50, 0.15, 0.10, 0.10]   # B4: gas-dominant / green    (id=11)
+  bot_reward_weights:
+    - [0.50, 0.50]   # B1: balanced
+    - [0.50, 0.50]   # B2: balanced
+    - [0.50, 0.50]   # B3: balanced
+    - [0.50, 0.50]   # B4: balanced
+
 investment:
   max_invest_frac: 0.10
   convexity_alpha: 0.10
@@ -106,7 +124,7 @@ auction:
   # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
   # [0.3, 1.3] centres the action around covering full need (1.0), max 130% coverage.
   qty_mult_low: 0.3
-  qty_mult_high: 1.3
+  qty_mult_high: 2.0
   # California-style holding limit: no single agent can receive > 25% of auctioned volume.
   max_agent_share: 1.0
   # cancel_under_subscribed: false — in the annual-auction abstraction, binary
@@ -137,6 +155,7 @@ secondary:
 # ----------------------------------------------------------
 budget:
   annual_budgets: [1500.0, 1500.0, 1200.0, 1200.0, 800.0, 800.0, 500.0, 500.0]
+  bot_annual_budgets: [1500.0, 1500.0, 1200.0, 1200.0]   # B1-B4: match archetype budgets
   overspend_penalty_coef: 0.5
 
 # ----------------------------------------------------------
@@ -150,7 +169,7 @@ penalty:
   rate: 100.0
   non_compliance_multiplier: 1.0   # was 1.5; reduced because carry-forward already adds future cost
   carry_forward: true
-  carry_forward_cap: 0.5           # P9: was 2.0; 0.5× prevents death spiral where CF > allocation
+  carry_forward_cap: 2.0           # relaxed from 0.5×; allows larger obligation carry-over
 
 price:
   initial_expected: 80.0
@@ -188,7 +207,7 @@ reward:
   normalizer_alpha: 0.01
   clip_min: -10.0
   clip_max: 5.0
-  green_floor_fossil: [0.40, 0.40, 0.30, 0.30, 0.10, 0.10, 0.00, 0.00]
+  green_floor_fossil: [0.40, 0.40, 0.30, 0.30, 0.10, 0.10, 0.00, 0.00, 0.40, 0.40, 0.30, 0.30]  # last 4 = bots
   shaping_beta: 7.0              # green_delta bonus — increased for stronger investment signal
   shaping_gamma: 1.0             # queue bonus weight — rewards active construction queue items
   shaping_decay_episode: 12000   # episodes over which shaping_weight decays to floor
@@ -199,7 +218,7 @@ reward:
   terminal_payoff_years: 5       # years of future carbon savings used to value construction queue items
 # ----------------------------------------------------------
 # Opponent modeling (Option C)
-# With 8 agents: +14 dims → obs_dim_phase1 = 35, phase2 = 42
+# With 12 participants: +55 dims → obs_dim_phase1 = 78, phase2 = 85
 # ----------------------------------------------------------
 opponent_modeling:
   enabled: true

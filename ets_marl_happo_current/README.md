@@ -1,14 +1,14 @@
-# ETS MARL — Current Version (HAPPO/PPO)
+# ETS MARL — Current Version (HAPPO/PPO) v5.1
 
-This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate 8 energy companies competing in a simplified EU Emissions Trading System.
+This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **heuristic bot agents** that add realistic market demand.
 
 ## What Does This Code Do?
 
 At a high level, this project:
 
 1. **Creates a virtual carbon market** that mimics the real EU ETS (auctions, caps, penalties, banking, etc.)
-2. **Places 8 AI-controlled companies** into that market, each with a different energy mix (some burn mostly coal, others are mostly green)
-3. **Lets the companies learn** over thousands of simulated episodes how to bid in auctions, trade allowances, and invest in clean energy
+2. **Places 8 AI-controlled (learning) companies** and **4 heuristic bot companies** into that market, each with a different energy mix
+3. **Lets the learning companies learn** over thousands of simulated episodes how to bid in auctions, trade allowances, and invest in clean energy — while bots provide realistic background demand
 4. **Records everything** so we can analyze what strategies emerge and what they tell us about real carbon markets
 
 ## How the Simulation Works
@@ -35,7 +35,9 @@ Both can be independently enabled/disabled via config flags (`reward.terminal_ba
 
 ### The Companies (Agents)
 
-There are **8 companies**, organized into 4 archetypes (2 of each — one financially-motivated, one green-motivated):
+There are **12 total market participants**: 8 learning agents (PPO/HAPPO) and 4 heuristic bot agents.
+
+**Learning Agents (A1-A8)** — organized into 4 archetypes (2 of each — one financially-motivated, one green-motivated):
 
 | Archetype | Energy Mix | Description |
 |-----------|-----------|-------------|
@@ -44,7 +46,18 @@ There are **8 companies**, organized into 4 archetypes (2 of each — one financ
 | **Transitioner** (A5, A6) | ~30% fossil, 70% green | Moderate emissions, well-positioned for transition |
 | **Green-leader** (A7, A8) | ~10% gas, 90% renewable | Low emissions, minimal allowance needs |
 
-All companies produce **10 TWh/year** of electricity — the same output, but very different carbon footprints. Even-indexed agents (A1, A3, A5, A7) prioritize financial performance; odd-indexed agents (A2, A4, A6, A8) prioritize green transition.
+Even-indexed agents (A1, A3, A5, A7) prioritize financial performance; odd-indexed agents (A2, A4, A6, A8) prioritize green transition.
+
+**Heuristic Bot Agents (B1-B4)** — fixed-policy agents using rule-based strategies from `heuristic_policy.py`:
+
+| Bot | Energy Mix | Description |
+|-----|-----------|-------------|
+| **B1, B2** | ~80% fossil (45% coal, 35% gas) | Coal-heavy, adds realistic high-emission demand |
+| **B3, B4** | ~65% fossil (15% coal, 50% gas) | Gas-dominant, adds medium-emission demand |
+
+Bots use the same `Company` class and participate identically in auction clearing and secondary market matching. They are **not trained** — their actions come from the heuristic policy (bid near penalty rate, invest conservatively, trade based on surplus/shortfall). Bots are indexed after learning agents (indices 8-11) and are excluded from PPO updates.
+
+All companies produce **10 TWh/year** of electricity — the same output, but very different carbon footprints.
 
 ### What Each Agent Decides
 
@@ -83,7 +96,7 @@ The reward signal balances:
 - **MAC fuel-switching**: When carbon prices exceed €65/t, companies automatically switch up to 20% of coal dispatch to gas (short-run operational change, not investment)
 - **Electricity revenue**: Companies earn revenue from electricity sales, with carbon costs partially passed through to electricity prices (80%). Green generators benefit from the same revenue with lower carbon costs.
 - **Dynamic reserve price**: Auction floor price adapts based on a 3-year moving average of secondary market prices
-- **Carry-forward**: Non-compliance shortfall is added to next year's obligation (capped at 0.5x to prevent death spirals)
+- **Carry-forward**: Non-compliance shortfall is added to next year's obligation (capped at 2.0x, allowing larger debt accumulation)
 
 ## Project Structure
 
@@ -216,8 +229,9 @@ The most important settings you might want to change:
 |---------|---------|-----------------|
 | `simulation.n_episodes` | 70,000 | How many episodes to train for (more = better but slower) |
 | `simulation.n_years` | 12 | How many years each episode simulates |
-| `companies.n_agents` | 8 | Number of companies in the market |
-| `ets.cap_year_0` | 23.5 Mt | Starting emission cap |
+| `companies.n_agents` | 8 | Number of learning agents (PPO) |
+| `companies.n_bot_agents` | 4 | Number of heuristic bot agents |
+| `ets.cap_year_0` | 43.0 Mt | Starting emission cap (scaled for 12 participants) |
 | `auction.price_max` | 500 | Maximum bid price (€/tonne) |
 | `penalty.rate` | 100 | Fine per excess tonne of CO2 (€) |
 | `reward.terminal_bank_value` | true | Value banked allowances at episode end |

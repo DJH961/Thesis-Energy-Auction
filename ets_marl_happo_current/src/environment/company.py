@@ -42,7 +42,9 @@ class Company:
     def __init__(self, agent_id: int, config: dict, initial_mix: List[float], rng):
         self.agent_id = agent_id
         self.rng = rng
-        self._n_agents = config["companies"]["n_agents"]
+        # n_total includes learning agents + bot agents (for opponent modeling obs dimension)
+        self._n_total = (config["companies"]["n_agents"]
+                         + config["companies"].get("n_bot_agents", 0))
         self._opponent_modeling = config.get("opponent_modeling", {}).get("enabled", False)
 
         co_cfg = config["companies"]
@@ -606,10 +608,11 @@ class Company:
 
     @property
     def obs_dim_phase1(self) -> int:
-        """23 base dims + 5*(N-1) opponent dims when opponent modeling is enabled.
+        """23 base dims + 5*(N_total-1) opponent dims when opponent modeling is enabled.
+        N_total = learning agents + bot agents (all market participants).
         Base dims include carry-forward at [20], TNAC proxy at [21], and effective reserve at [22]."""
-        if self._opponent_modeling and self._n_agents > 1:
-            return 23 + 5 * (self._n_agents - 1)
+        if self._opponent_modeling and self._n_total > 1:
+            return 23 + 5 * (self._n_total - 1)
         return 23
 
     @property

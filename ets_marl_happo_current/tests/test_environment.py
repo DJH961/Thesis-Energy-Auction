@@ -289,11 +289,12 @@ def test_year_log_keys():
 # ---------------------------------------------------------------------------
 
 def test_emissions_decrease_with_green():
-    """Greenest agent should have much lower emissions than coal-heavy agent."""
+    """Greenest learning agent should have much lower emissions than coal-heavy agent."""
     env = load_env()
     env.reset()
     e1 = env.companies[0].compute_emissions()  # coal-heavy
-    e_green = env.companies[-1].compute_emissions()  # near-green leader (last agent)
+    # Green leader is the last LEARNING agent (index n_agents-1), not last company (bots follow)
+    e_green = env.companies[env.n_agents - 1].compute_emissions()
     assert e_green < e1, f"Green emissions ({e_green}) should be < coal emissions ({e1})"
     assert e_green < 0.5 * e1, f"Green agent should have significantly lower emissions"
 
@@ -387,13 +388,14 @@ def test_p7_price_history_seeded():
 # ---------------------------------------------------------------------------
 
 def test_p8_obs_dims():
-    """Phase 1 obs should be 23D base (+ 5*(N-1) opponent dims) with opponent modeling.
-    23 = 22 previous dims + effective_reserve at [22]."""
+    """Phase 1 obs should be 23D base (+ 5*(N_total-1) opponent dims) with opponent modeling.
+    N_total = learning + bot agents. 23 = 22 previous dims + effective_reserve at [22]."""
     env = load_env()
     obs, _ = env.reset()
     n_agents = env.config["companies"]["n_agents"]
+    n_total = n_agents + env.config["companies"].get("n_bot_agents", 0)
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
-    expected_p1 = 23 + (5 * (n_agents - 1) if opp_enabled else 0)
+    expected_p1 = 23 + (5 * (n_total - 1) if opp_enabled else 0)
     expected_p2 = expected_p1 + 7  # +7: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
@@ -467,6 +469,15 @@ def test_unsold_volume_rolls_over_to_next_year():
     """When unsold_to_msr=false, unsold volume should appear in next year's auction supply."""
     env = load_env()
     assert not env.config["ets"].get("unsold_to_msr", True), "Expected unsold_to_msr=false"
+    # Temporarily disable bots for this test so that low bidding produces unsold volume
+    saved_n_bots = env.n_bots
+    env.n_bots = 0
+    env.n_total = env.n_agents
+    # Re-create environment without bots for clean test
+    import copy
+    config = copy.deepcopy(env.config)
+    config["companies"]["n_bot_agents"] = 0
+    env = ETSEnvironment(config, seed=42)
     env.reset(seed=42)
 
     n_agents = env.n_agents
@@ -517,9 +528,10 @@ def test_liquidity_pool_fills_at_reference_plus_spread():
     env.config["secondary"]["liquidity_pool"]["penalty_anchor_weight"] = 0.30
     env._liquidity_ref_ema = 100.0
 
-    allocations = np.zeros(env.n_agents)
-    secondary_prices = np.full(env.n_agents, 90.0)
-    secondary_qtys = np.zeros(env.n_agents)
+    n_total = env.n_total
+    allocations = np.zeros(n_total)
+    secondary_prices = np.full(n_total, 90.0)
+    secondary_qtys = np.zeros(n_total)
 
     # One buyer with no internal seller counterpart -> pool should fill.
     secondary_prices[0] = 120.0
@@ -569,5 +581,6 @@ def test_no_holding_limit():
     total_alloc = float(env._phase1_allocations.sum())
     if total_alloc > 1e-9:
         share = agent0_alloc / total_alloc
-        # With no holding limit, the high bidder should get the majority
-        assert share > 0.3, f"Agent 0 share {share:.2f} too low with no holding limit"
+        # With no holding limit, the high bidder should get a significant share
+        # (threshold lowered: 12 participants including heuristic bots dilute shares)
+        assert share > 0.15, f"Agent 0 share {share:.2f} too low with no holding limit"

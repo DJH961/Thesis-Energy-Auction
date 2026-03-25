@@ -43,6 +43,7 @@ from typing import List, Optional
 from src.auction.market_clearing_ets import market_clearing_ets, build_bids
 from src.environment.cap_schedule import CapSchedule
 from src.environment.company import Company
+from src.agents import heuristic_policy
 
 
 class ETSEnvironment(gym.Env):
@@ -53,7 +54,9 @@ class ETSEnvironment(gym.Env):
         super().__init__()
 
         self.config = config
-        self.n_agents = config["companies"]["n_agents"]
+        self.n_agents = config["companies"]["n_agents"]           # PPO learning agents (external interface)
+        self.n_bots = config["companies"].get("n_bot_agents", 0)  # heuristic bot agents
+        self.n_total = self.n_agents + self.n_bots                # total market participants
         self.n_years = config["simulation"]["n_years"]
 
         self._seed = seed
@@ -61,16 +64,30 @@ class ETSEnvironment(gym.Env):
 
         self.cap_schedule = CapSchedule(config)
 
+        # Extend config arrays to include bot entries (so Company can index by agent_id)
+        if self.n_bots > 0:
+            bot_mixes = config["companies"].get("bot_initial_mix", [])
+            bot_rw = config["companies"].get("bot_reward_weights",
+                                              [[0.5, 0.5]] * self.n_bots)
+            config["companies"]["initial_mix"] = (
+                config["companies"]["initial_mix"] + bot_mixes)
+            config["companies"]["reward_weights"] = (
+                config["companies"]["reward_weights"] + bot_rw)
+            bot_budgets = config["budget"].get("bot_annual_budgets",
+                                                [1200.0] * self.n_bots)
+            config["budget"]["annual_budgets"] = (
+                config["budget"]["annual_budgets"] + bot_budgets)
+
         initial_mixes = config["companies"]["initial_mix"]
         self.companies: List[Company] = [
             Company(
                 agent_id=i, config=config,
                 initial_mix=initial_mixes[i], rng=self.rng,
             )
-            for i in range(self.n_agents)
+            for i in range(self.n_total)
         ]
 
-        # Episode state
+        # Episode state — all arrays are n_total sized (learning + bots)
         self.current_year = 0
         self.current_episode = 0          # updated by training loop via set_episode()
         self.last_clearing_price = config["price"]["initial_expected"]
@@ -78,15 +95,15 @@ class ETSEnvironment(gym.Env):
         self._price_history: List[float] = []
         self.last_secondary_price = config["price"]["initial_expected"]
         self.last_secondary_volume = 0.0  # P8: track volume for phase1 obs
-        self._last_gaps = np.zeros(self.n_agents)
-        self.holdings = np.zeros(self.n_agents)
+        self._last_gaps = np.zeros(self.n_total)
+        self.holdings = np.zeros(self.n_total)
         self.episode_done = False
 
         # P4: shaping weight — decays from 1.0 to 0.0 over training (set by train.py)
         self.shaping_weight = 1.0
 
         # Secondary market profit tracking (EMA per agent)
-        self._secondary_profit_ema = np.zeros(self.n_agents)
+        self._secondary_profit_ema = np.zeros(self.n_total)
         self._ema_alpha = 0.1
 
         # Auction results (stored between phase 1 and phase 2)
@@ -100,16 +117,16 @@ class ETSEnvironment(gym.Env):
         self._phase1_bid_quantities = None  # actual Mt quantities after multiplier expansion
 
         # P4: Per-agent fossil fraction history within the episode (last 3 years)
-        self._fossil_frac_history: List[List[float]] = [[] for _ in range(self.n_agents)]
+        self._fossil_frac_history: List[List[float]] = [[] for _ in range(self.n_total)]
 
         # P5: Stochastic emission shocks — computed per year in step_auction()
         # Stores the shocked realized emissions and the shock values for obs/logging
-        self._current_emissions = np.zeros(self.n_agents)   # shocked
-        self._current_emission_shocks = np.zeros(self.n_agents)  # ε_it values
+        self._current_emissions = np.zeros(self.n_total)   # shocked
+        self._current_emission_shocks = np.zeros(self.n_total)  # ε_it values
 
         # P6: CF noise per agent per tech — computed per year in step_auction()
-        self._current_cf_noise = np.zeros((self.n_agents, 5))
-        self._p6_cancellations = np.zeros(self.n_agents, dtype=int)
+        self._current_cf_noise = np.zeros((self.n_total, 5))
+        self._p6_cancellations = np.zeros(self.n_total, dtype=int)
 
         # Unsold allowance rollover: volume offered at auction but not allocated
         # carries forward to the next year's auction supply.
@@ -131,15 +148,16 @@ class ETSEnvironment(gym.Env):
         self._opponent_modeling = opp_enabled
 
         # MAC fuel-switching tracking
-        self._mac_reductions = np.zeros(self.n_agents)
-        self._mac_costs = np.zeros(self.n_agents)
+        self._mac_reductions = np.zeros(self.n_total)
+        self._mac_costs = np.zeros(self.n_total)
 
         # Price normalization constant
         self._price_norm = config["auction"]["price_max"]
 
-        # Log cancel_under_subscribed state (permanently false in this config)
+        # Log environment config summary
         auction_cfg = self.config.get("auction", {})
-        print(f"[ETSEnvironment] auction.cancel_under_subscribed={auction_cfg.get('cancel_under_subscribed', False)}")
+        print(f"[ETSEnvironment] {self.n_agents} learning + {self.n_bots} bot = {self.n_total} total agents"
+              f" | cancel_under_subscribed={auction_cfg.get('cancel_under_subscribed', False)}")
 
         # Sanity check: in static mode, price_min must be >= reserve_price.
         # In dynamic mode, the effective reserve is computed each year, so
@@ -220,14 +238,14 @@ class ETSEnvironment(gym.Env):
         self.last_secondary_price = self.config["price"]["initial_expected"]
         self.last_secondary_volume = 0.0
         self._price_history = []
-        self._last_gaps = np.zeros(self.n_agents)
-        self.holdings = np.zeros(self.n_agents)
+        self._last_gaps = np.zeros(self.n_total)
+        self.holdings = np.zeros(self.n_total)
         self.episode_log = []
-        self._fossil_frac_history = [[] for _ in range(self.n_agents)]
-        self._current_emissions = np.zeros(self.n_agents)
-        self._current_emission_shocks = np.zeros(self.n_agents)
-        self._current_cf_noise = np.zeros((self.n_agents, 5))
-        self._p6_cancellations = np.zeros(self.n_agents, dtype=int)
+        self._fossil_frac_history = [[] for _ in range(self.n_total)]
+        self._current_emissions = np.zeros(self.n_total)
+        self._current_emission_shocks = np.zeros(self.n_total)
+        self._current_cf_noise = np.zeros((self.n_total, 5))
+        self._p6_cancellations = np.zeros(self.n_total, dtype=int)
         self._consecutive_years_without_valid_auction_clear = 0
         self._liquidity_ref_ema = float(self.config["price"]["initial_expected"])
 
@@ -243,7 +261,7 @@ class ETSEnvironment(gym.Env):
             "cornering": 0, "rsv_reject": 0,
         }
         # Per-agent consecutive-shortfall counter for chronic_short detection
-        self._consecutive_shortfall = np.zeros(self.n_agents, dtype=int)
+        self._consecutive_shortfall = np.zeros(self.n_total, dtype=int)
 
         initial_mixes = self.config["companies"]["initial_mix"]
         for i, company in enumerate(self.companies):
@@ -268,7 +286,7 @@ class ETSEnvironment(gym.Env):
                 stacklevel=2,
             )
 
-        obs_phase1 = self._get_obs_phase1()
+        obs_phase1 = self._get_obs_phase1()   # shape (n_agents, obs_dim)
         return obs_phase1, {}
 
     def _apply_warm_start(self, ws_cfg: dict):
@@ -351,21 +369,56 @@ class ETSEnvironment(gym.Env):
     # Phase 1: Auction + Green Investment
     # ------------------------------------------------------------------
 
+    def _generate_bot_auction_actions(self) -> np.ndarray:
+        """Generate Phase-1 actions for all bot agents using heuristic_policy."""
+        if self.n_bots == 0:
+            return np.zeros((0, 6), dtype=np.float32)
+        price_ma3 = self._compute_price_ma3()
+        reserve = self._compute_dynamic_reserve()
+        actions = np.zeros((self.n_bots, 6), dtype=np.float32)
+        for b in range(self.n_bots):
+            idx = self.n_agents + b  # bots indexed after learning agents
+            actions[b] = heuristic_policy.auction_action(
+                self.companies[idx], price_ma3, self.current_year,
+                self.n_years, self.config, reserve_price=reserve)
+        return actions
+
+    def _generate_bot_secondary_actions(self, clearing_price: float) -> np.ndarray:
+        """Generate Phase-2 actions for all bot agents using heuristic_policy."""
+        if self.n_bots == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        actions = np.zeros((self.n_bots, 2), dtype=np.float32)
+        for b in range(self.n_bots):
+            idx = self.n_agents + b  # bots indexed after learning agents
+            actions[b] = heuristic_policy.secondary_action(
+                self.companies[idx],
+                bank=float(self.holdings[idx]),
+                allocation=float(self._phase1_allocations[idx]),
+                clearing_price=clearing_price,
+                config=self.config)
+        return actions
+
     def step_auction(self, auction_actions: np.ndarray):
         """
         Phase 1: Execute auction and green investments.
 
         Parameters
         ----------
-        auction_actions : np.ndarray, shape (N_agents, 6)
+        auction_actions : np.ndarray, shape (n_learning, 6)
+            Actions for learning agents only.
             [bid_price, quantity, invest_frac, tech_logit0, tech_logit1, tech_logit2]
+            Bot actions are generated internally via heuristic_policy.
 
         Returns
         -------
-        obs_phase2 : np.ndarray, shape (N_agents, obs_dim_phase2)
+        obs_phase2 : np.ndarray, shape (n_learning, obs_dim_phase2)
         year_info : dict
         """
         assert not self.episode_done, "Episode done. Call reset()."
+
+        # Combine learning agent actions with bot actions
+        bot_auc = self._generate_bot_auction_actions()
+        auction_actions = np.concatenate([auction_actions, bot_auc], axis=0)
 
         year = self.current_year
         log = {"year": year}
@@ -375,8 +428,8 @@ class ETSEnvironment(gym.Env):
         log["bank_start"] = bank_start.tolist()
 
         # 1. P6: Cancellation check — before matured investments
-        cancellations = np.zeros(self.n_agents, dtype=int)
-        cancel_recoveries = np.zeros(self.n_agents)
+        cancellations = np.zeros(self.n_total, dtype=int)
+        cancel_recoveries = np.zeros(self.n_total)
         jitter_cfg = self.config.get("construction_jitter", {})
         if jitter_cfg.get("enabled", False):
             for i, company in enumerate(self.companies):
@@ -413,25 +466,25 @@ class ETSEnvironment(gym.Env):
             sigma = unc_cfg.get("sigma_demand", 0.07)
             rho = unc_cfg.get("corr_rho", 0.40)
             eta_common = float(self.rng.normal(0, 1))  # system-wide shock
-            idio = self.rng.normal(0, 1, self.n_agents)  # idiosyncratic shocks
+            idio = self.rng.normal(0, 1, self.n_total)  # idiosyncratic shocks
             epsilons = rho * eta_common + np.sqrt(max(0.0, 1.0 - rho ** 2)) * idio
             epsilons *= sigma
         else:
-            epsilons = np.zeros(self.n_agents)
+            epsilons = np.zeros(self.n_total)
         self._current_emission_shocks = epsilons
 
         # 5. P6: Generate capacity factor noise per tech per agent
         cf_sigma = np.array(jitter_cfg.get("cf_sigma", [0.0, 0.0, 0.08, 0.08, 0.05]))
-        cf_noise = np.zeros((self.n_agents, 5))
+        cf_noise = np.zeros((self.n_total, 5))
         if jitter_cfg.get("enabled", False):
-            for i in range(self.n_agents):
+            for i in range(self.n_total):
                 for t in range(5):
                     if cf_sigma[t] > 0:
                         cf_noise[i, t] = float(self.rng.normal(0, cf_sigma[t]))
         self._current_cf_noise = cf_noise
 
         # 6. Compute realized emissions (CF noise → P6, demand shock → P5)
-        realized_emissions = np.zeros(self.n_agents)
+        realized_emissions = np.zeros(self.n_total)
         for i, company in enumerate(self.companies):
             e_cf = company.compute_emissions_with_cf_noise(cf_noise[i])
             e_shocked = e_cf * (1.0 + epsilons[i])
@@ -441,7 +494,7 @@ class ETSEnvironment(gym.Env):
         # Store aggregate CF shock per agent for logging (mean across green techs)
         cf_shock_agg = np.array([
             float(np.mean(cf_noise[i, [2, 3, 4]]))
-            for i in range(self.n_agents)
+            for i in range(self.n_total)
         ])
 
         # 7. Auction
@@ -507,8 +560,8 @@ class ETSEnvironment(gym.Env):
             self._consecutive_years_without_valid_auction_clear += 1
 
         # 8. MAC fuel-switching (based on auction clearing price)
-        mac_reductions = np.zeros(self.n_agents)
-        mac_costs = np.zeros(self.n_agents)
+        mac_reductions = np.zeros(self.n_total)
+        mac_costs = np.zeros(self.n_total)
         for i, company in enumerate(self.companies):
             reduction, cost = company.apply_mac_switching(clearing_price)
             mac_reductions[i] = reduction
@@ -518,8 +571,8 @@ class ETSEnvironment(gym.Env):
         self._mac_costs = mac_costs
 
         # 9. Green investments
-        invest_costs = np.zeros(self.n_agents)
-        invest_fracs = np.zeros(self.n_agents)  # raw action values for logging
+        invest_costs = np.zeros(self.n_total)
+        invest_fracs = np.zeros(self.n_total)  # raw action values for logging
         for i, company in enumerate(self.companies):
             invest_frac = float(auction_actions[i, 2])
             invest_fracs[i] = invest_frac
@@ -536,8 +589,8 @@ class ETSEnvironment(gym.Env):
         self._phase1_mac_costs = mac_costs
         self._phase1_log = log
 
-        # 10. Build phase 2 observations
-        obs_phase1 = self._get_obs_phase1()
+        # 10. Build phase 2 observations (learning agents only)
+        obs_phase1 = self._get_obs_phase1()   # shape (n_agents, obs_dim)
 
         obs_phase2 = np.stack([
             self.companies[i].get_observation_phase2(
@@ -584,7 +637,7 @@ class ETSEnvironment(gym.Env):
         total_alloc = float(allocations.sum())
         total_emiss = float(self._current_emissions.sum())
         if total_alloc > 0.3 * auction_volume and total_emiss > 1e-9:
-            for _ci in range(self.n_agents):
+            for _ci in range(self.n_total):
                 alloc_share = float(allocations[_ci]) / total_alloc
                 need_share = float(self._current_emissions[_ci]) / total_emiss
                 if alloc_share > 2.0 * need_share and alloc_share > 0.30:
@@ -609,13 +662,19 @@ class ETSEnvironment(gym.Env):
 
         Parameters
         ----------
-        secondary_actions : np.ndarray, shape (N_agents, 2)
+        secondary_actions : np.ndarray, shape (n_learning, 2)
+            Actions for learning agents only.
             [price_multiplier, quantity] per agent.
+            Bot actions are generated internally via heuristic_policy.
 
         Returns
         -------
-        obs_next, rewards, terminated, truncated, info
+        obs_next (n_learning,), rewards (n_learning,), terminated, truncated, info
         """
+        # Combine learning agent actions with bot actions
+        bot_sec = self._generate_bot_secondary_actions(self._phase1_clearing_price)
+        secondary_actions = np.concatenate([secondary_actions, bot_sec], axis=0)
+
         allocations = self._phase1_allocations
         payments = self._phase1_payments
         invest_costs = self._phase1_invest_costs
@@ -659,7 +718,7 @@ class ETSEnvironment(gym.Env):
         self.last_secondary_volume = secondary_volume  # P8: track for obs
 
         # Update secondary profit EMA
-        for i in range(self.n_agents):
+        for i in range(self.n_total):
             if trade_qtys[i] < -1e-6:
                 profit_per_mt = -trade_costs[i] / abs(trade_qtys[i])
                 margin = profit_per_mt - clearing_price
@@ -684,7 +743,7 @@ class ETSEnvironment(gym.Env):
         # 6. Compliance (against realized emissions + carry-forward obligations)
         # Capture old carry-forward before it gets updated
         #old_carry_forward = np.array([c._carry_forward for c in self.companies])
-        penalties = np.zeros(self.n_agents)
+        penalties = np.zeros(self.n_total)
         for i, company in enumerate(self.companies):
             penalties[i] = company.settle_compliance_realized(
                 allowances_held=holdings[i],
@@ -692,7 +751,7 @@ class ETSEnvironment(gym.Env):
             )
 
         # Banking: surplus after surrendering for emissions + old carry-forward
-        for i in range(self.n_agents):
+        for i in range(self.n_total):
             total_obligation = realized_emissions[i] + old_carry_forward[i]
             self.holdings[i] = max(0.0, holdings[i] - total_obligation)
         self._last_gaps = self.holdings.copy()
@@ -721,7 +780,7 @@ class ETSEnvironment(gym.Env):
         # Uses local `holdings` (pre-compliance: prev_bank + alloc + secondary).
         shortfalls = np.array([
             max(0.0, realized_emissions[i] + old_carry_forward[i] - holdings[i])
-            for i in range(self.n_agents)
+            for i in range(self.n_total)
         ])
 
         # ── Secondary-phase warning counters ─────────────────────────────────
@@ -730,7 +789,7 @@ class ETSEnvironment(gym.Env):
         sec_qty_raw = secondary_actions[:, 1]
         if np.all(sec_qty_raw > 0) or np.all(sec_qty_raw < 0):
             self._warnings["one_side_sec"] += 1
-        for _i in range(self.n_agents):
+        for _i in range(self.n_total):
             if shortfalls[_i] > 1e-6:
                 self._consecutive_shortfall[_i] += 1
                 if self._consecutive_shortfall[_i] >= 3 and self.current_year >= 3:
@@ -786,15 +845,15 @@ class ETSEnvironment(gym.Env):
         terminated = self.current_year >= self.n_years
         self.episode_done = terminated
 
-        obs_next = self._get_obs_phase1()
-        return obs_next, rewards, terminated, False, {"year_log": log}
+        obs_next = self._get_obs_phase1()   # shape (n_agents, obs_dim)
+        return obs_next, rewards[:self.n_agents], terminated, False, {"year_log": log}
 
     # ------------------------------------------------------------------
     # Legacy step (calls both phases — for testing)
     # ------------------------------------------------------------------
 
     def step(self, actions: np.ndarray):
-        """Single-call step for backward compat. actions shape (N, 8)."""
+        """Single-call step for backward compat. actions shape (n_learning, 8)."""
         obs2, _ = self.step_auction(actions[:, :6])
         return self.step_secondary(actions[:, 6:])
 
@@ -811,8 +870,8 @@ class ETSEnvironment(gym.Env):
           - Returns (trade_costs, trade_qtys, secondary_clearing_price, total_volume)
         """
         cfg = self.config["trading"]
-        trade_costs = np.zeros(self.n_agents)
-        trade_qtys = np.zeros(self.n_agents)
+        trade_costs = np.zeros(self.n_total)
+        trade_qtys = np.zeros(self.n_total)
 
         liquidity_pool_info = {
             "enabled": False,
@@ -833,7 +892,7 @@ class ETSEnvironment(gym.Env):
         buyers = []
         sellers = []
 
-        for i in range(self.n_agents):
+        for i in range(self.n_total):
             qty = float(secondary_qtys[i])
             price = float(secondary_prices[i])
             if qty > 1e-6:
@@ -964,13 +1023,13 @@ class ETSEnvironment(gym.Env):
         Note: per-agent running normalisation applied in PPOAgent.normalize_reward()
         AFTER this function returns raw rewards.
         """
-        rewards = np.zeros(self.n_agents)
+        rewards = np.zeros(self.n_total)
         non_compliance_mult = self.config["penalty"].get("non_compliance_multiplier", 1.0)
         reward_cfg = self.config.get("reward", {})
         trading_cfg = self.config.get("trading", {})
         elec_cfg = self.config.get("electricity", {})
 
-        green_floor_fossil = reward_cfg.get("green_floor_fossil", [0.0] * self.n_agents)
+        green_floor_fossil = reward_cfg.get("green_floor_fossil", [0.0] * self.n_total)
         beta_shaping = reward_cfg.get("shaping_beta", 10.0)
         gamma_shaping = reward_cfg.get("shaping_gamma", 1.0)
         price_anchor_delta = reward_cfg.get("price_anchor_delta", 0.5)
@@ -985,7 +1044,7 @@ class ETSEnvironment(gym.Env):
             elec_price = base_elec_price + carbon_passthrough * clearing_price * system_avg_ef
 
         if mac_costs is None:
-            mac_costs = np.zeros(self.n_agents)
+            mac_costs = np.zeros(self.n_total)
 
         for i, company in enumerate(self.companies):
             auction_cost = float(payments[i])
@@ -1087,8 +1146,9 @@ class ETSEnvironment(gym.Env):
         return float(np.mean(window))
 
     def _get_obs_phase1(self) -> np.ndarray:
-        """Phase 1 observations for all agents.
-        Base: 23D. With opponent modeling: 23 + 5*(N-1) dims.
+        """Phase 1 observations for learning agents only.
+        Base: 23D. With opponent modeling: 23 + 5*(N_total-1) dims.
+        Opponent modeling includes ALL market participants (learning + bots).
         """
         cap_t = self.cap_schedule.get_cap(self.current_year)
         price_ma3 = self._compute_price_ma3()
@@ -1097,15 +1157,16 @@ class ETSEnvironment(gym.Env):
         tnac = float(self.holdings.sum())
         tnac_proxy = tnac / max(cap_t, 1e-6)
 
-        # Pre-compute 5D public info for all agents (used for opponent modeling)
-        if self._opponent_modeling and self.n_agents > 1:
+        # Pre-compute 5D public info for ALL participants (learning + bots)
+        if self._opponent_modeling and self.n_total > 1:
             public_infos = [c.get_public_info() for c in self.companies]
 
         obs_list = []
-        for i, c in enumerate(self.companies):
-            if self._opponent_modeling and self.n_agents > 1:
+        for i in range(self.n_agents):  # only learning agents get observations
+            c = self.companies[i]
+            if self._opponent_modeling and self.n_total > 1:
                 opp_parts = []
-                for j in range(self.n_agents):
+                for j in range(self.n_total):  # all participants as opponents
                     if j != i:
                         pi = public_infos[j]
                         opp_parts.extend([
