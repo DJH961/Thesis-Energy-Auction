@@ -267,8 +267,10 @@ def test_anchor_config_passed_to_policy():
         config=config, seed=42,
     )
 
-    # Verify the anchor reached the policy by checking initial deterministic output
-    obs = torch.zeros(1, 22)
+    # Verify the anchor reached the policy by checking initial deterministic output.
+    # Keep obs on the policy device so the test is robust on both CPU and GPU runs.
+    policy_device = next(agent.auction_policy.parameters()).device
+    obs = torch.zeros(1, 22, device=policy_device)
     with torch.no_grad():
         action, _, _ = agent.auction_policy.act(obs, deterministic=True)
     price = action[0, 0].item()
