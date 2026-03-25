@@ -484,12 +484,14 @@ class ETSEnvironment(gym.Env):
             cancel_under_subscribed=self.config["auction"].get(
                 "cancel_under_subscribed", False),
         )
-        # Unsold: kept as logged metric only — fed into MSR instead of next year's volume
+        # Unsold allowances: either absorbed into MSR or rolled over to next year's auction
         unsold = max(0.0, auction_volume - float(allocations.sum()))
-        self._unsold_rollover = unsold  # metric only
+        self._unsold_rollover = unsold
         log["unsold_rollover_out"] = round(unsold, 4)
         if self.config["ets"].get("unsold_to_msr", True):
             self.cap_schedule.absorb_unsold(unsold)
+        else:
+            self.cap_schedule.rollover_unsold(unsold)
         self.last_clearing_price = clearing_price
         self._phase1_clearing_price = clearing_price
         log["clearing_price"] = clearing_price

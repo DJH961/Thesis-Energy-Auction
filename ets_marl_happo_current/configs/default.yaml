@@ -54,12 +54,12 @@ ets:
     emergency_release_amount: 0.50    # Mt released per year in emergency
 
   banking: true
-  reserve_price: 5.0     # absolute floor (dynamic reserve computes effective floor each year)
-  reserve_price_mode: "dynamic"   # "static" = use reserve_price as-is; "dynamic" = max(reserve_price, discount × MA3)
-  reserve_discount: 0.80          # fraction of MA3 price used as dynamic floor
-  reserve_initial: 50.0           # fallback reserve price before MA3 history is available
+  reserve_price: 30.0    # static floor — matches price_min so no bids are silently rejected
+  reserve_price_mode: "static"    # "static" = use reserve_price as-is; "dynamic" = max(reserve_price, discount × MA3)
+  reserve_discount: 0.80          # fraction of MA3 price used as dynamic floor (only active in dynamic mode)
+  reserve_initial: 50.0           # fallback reserve price before MA3 history is available (only active in dynamic mode)
   reserve_anchor: "secondary"    # "secondary" (default) or "auction" (legacy)
-  unsold_to_msr: true    # feed unsold auction allowances into MSR reserve (else discarded)
+  unsold_to_msr: false   # unsold volume rolls over to next year's auction (not absorbed into MSR)
 
 # ----------------------------------------------------------
 # Companies (8 agents — 2× each of 4 archetypes)
@@ -100,7 +100,7 @@ risk:
 
 auction:
   price_max: 500.0     # penalty (100) + modest carry-forward premium; prevents ceiling-bid cornering
-  price_min: 5.0       # low floor — dynamic reserve provides the effective floor each year
+  price_min: 30.0      # matches static reserve_price — no silent bid rejection
   quantity_max: 3.0
   reserve_ratio: 0.85
   # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.

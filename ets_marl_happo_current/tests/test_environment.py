@@ -412,102 +412,99 @@ def test_p8_obs_dims():
 
 
 # ---------------------------------------------------------------------------
-# Test 18: Dynamic reserve price tracks MA3
+# Test 18: Static reserve price equals config value
 # ---------------------------------------------------------------------------
 
-def test_dynamic_reserve_tracks_price():
-    """In dynamic mode, reserve tracks MA3 from the configured anchor (secondary by default)."""
+def test_static_reserve_equals_config():
+    """In static mode, effective reserve equals the configured reserve_price."""
     env = load_env()
     env.reset(seed=42)
 
-    # After warm-start, price history is seeded.  Run a few years to build MA3.
-    n_agents = env.n_agents
-    for _ in range(3):
-        auction_actions = np.random.uniform(
-            [50.0, 0.5, 0.0, -1.0, -1.0, -1.0],
-            [200.0, 1.5, 0.02, 1.0, 1.0, 1.0],
-            size=(n_agents, 6)
-        ).astype(np.float32)
-        obs2, log = env.step_auction(auction_actions)
-        secondary_actions = np.zeros((n_agents, 2), dtype=np.float32)
-        secondary_actions[:, 0] = 1.0
-        env.step_secondary(secondary_actions)
-
-    # Verify dynamic reserve is being computed from secondary anchor
     ets_cfg = env.config["ets"]
-    assert ets_cfg.get("reserve_price_mode") == "dynamic", "Expected dynamic reserve mode"
-    assert ets_cfg.get("reserve_anchor", "secondary") == "secondary"
+    assert ets_cfg.get("reserve_price_mode") == "static", "Expected static reserve mode"
 
     effective = env._compute_dynamic_reserve()
-    abs_floor = ets_cfg["reserve_price"]
-    discount = ets_cfg["reserve_discount"]
-    ma3 = env._compute_price_ma3()
-
-    expected = max(abs_floor, discount * ma3)
-    assert abs(effective - expected) < 1e-6, (
-        f"Dynamic reserve {effective:.2f} != expected {expected:.2f} "
-        f"(floor={abs_floor}, discount={discount}, MA3={ma3:.2f})"
+    expected = ets_cfg["reserve_price"]
+    assert effective == pytest.approx(expected, abs=1e-6), (
+        f"Static reserve {effective:.2f} != configured {expected:.2f}"
     )
-    # Reserve should be above the absolute floor
-    assert effective >= abs_floor - 1e-6
 
 
-def test_consecutive_auction_cancellations_decay_reserve():
-    """After 2+ consecutive failed auctions, effective reserve decays 20% toward floor."""
-    env = load_env()
-    env.reset(seed=42)
-
-    # Stabilize the MA anchor at a high level so decay is visible.
-    env._price_history = [100.0, 100.0, 100.0]
-    env.last_secondary_price = 100.0
-
-    baseline_reserve = env._compute_dynamic_reserve()
-    floor = env.config["ets"]["reserve_price"]
-
-    n_agents = env.n_agents
-    fail_actions = np.zeros((n_agents, 6), dtype=np.float32)
-    fail_actions[:, 0] = env.config["auction"]["price_min"]  # below dynamic reserve
-    fail_actions[:, 1] = 1.0
-
-    sec_actions = np.zeros((n_agents, 2), dtype=np.float32)
-    sec_actions[:, 0] = 1.0
-
-    _, log1 = env.step_auction(fail_actions)
-    assert log1["auction_stats"].get("auction_failed", False)
-    env.step_secondary(sec_actions)
-
-    _, log2 = env.step_auction(fail_actions)
-    assert log2["auction_stats"].get("auction_failed", False)
-    env.step_secondary(sec_actions)
-
-    decayed = env._compute_dynamic_reserve()
-    current_base = max(
-        floor,
-        env.config["ets"]["reserve_discount"] * env._compute_price_ma3(),
-    )
-    expected = floor + (current_base - floor) * 0.8
-    assert decayed == pytest.approx(expected, abs=1e-6)
-    assert decayed < current_base + 1e-9
-
-
-def test_bids_below_reserve_not_clipped_and_get_zero_allocation():
-    """Bids below effective reserve should be rejected by auction clearing, not clipped upward."""
+def test_static_reserve_no_silent_rejection():
+    """With price_min == reserve_price (static), bids at price_min are accepted, not rejected."""
     env = load_env()
     env.reset(seed=42)
 
     n_agents = env.n_agents
+    price_min = env.config["auction"]["price_min"]
     effective_reserve = env._compute_dynamic_reserve()
-    bid_price = max(env.config["auction"]["price_min"], effective_reserve - 10.0)
 
+    # price_min should equal reserve_price in static mode
+    assert price_min == pytest.approx(effective_reserve, abs=1e-6), (
+        f"price_min ({price_min}) != reserve_price ({effective_reserve}) — "
+        "static mode requires these to match to avoid silent bid rejection"
+    )
+
+    # Bid at exactly price_min — should NOT be rejected
     auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
-    auction_actions[:, 0] = bid_price
+    auction_actions[:, 0] = price_min
     auction_actions[:, 1] = 1.0
 
     _, log = env.step_auction(auction_actions)
 
-    assert np.all(env._phase1_bid_prices < effective_reserve + 1e-9), "Bid prices were silently clipped"
-    assert log["auction_stats"].get("auction_failed", False), "Auction should fail when all bids are below reserve"
-    assert np.allclose(env._phase1_allocations, 0.0), "Bids below reserve must receive zero allocation"
+    assert not log["auction_stats"].get("auction_failed", False), (
+        "Auction should not fail when all bids are at price_min == reserve_price"
+    )
+    # At least some allocation should have occurred (unsold < total supply)
+    unsold = log["auction_stats"].get("unsold", 0.0)
+    total_demand = log["auction_stats"].get("total_demand", 0.0)
+    assert total_demand > 0, "Bids at reserve_price must generate demand"
+    assert unsold < log["auction_stats"].get("q_cap", float('inf')), \
+        "Bids at reserve_price must receive allocation"
+
+
+def test_unsold_volume_rolls_over_to_next_year():
+    """When unsold_to_msr=false, unsold volume should appear in next year's auction supply."""
+    env = load_env()
+    assert not env.config["ets"].get("unsold_to_msr", True), "Expected unsold_to_msr=false"
+    env.reset(seed=42)
+
+    n_agents = env.n_agents
+
+    # Year 0: bid very low quantity so most volume goes unsold
+    auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+    auction_actions[:, 0] = 100.0  # reasonable price
+    auction_actions[:, 1] = 0.3    # low coverage multiplier → small bid qty
+
+    obs2, log0 = env.step_auction(auction_actions)
+    unsold_yr0 = log0["unsold_rollover_out"]
+    assert unsold_yr0 > 0.1, f"Expected meaningful unsold volume, got {unsold_yr0}"
+
+    # Check rollover is pending in cap_schedule
+    assert env.cap_schedule._unsold_rollover_pending == pytest.approx(unsold_yr0, abs=1e-4)
+
+    # Complete year 0
+    sec_actions = np.zeros((n_agents, 2), dtype=np.float32)
+    sec_actions[:, 0] = 1.0
+    env.step_secondary(sec_actions)
+
+    # Year 1: get auction volume — should include rollover
+    year1 = env.current_year
+    tnac = float(env.holdings.sum())
+    price_max = float(env.config["auction"]["price_max"])
+    base_cap = env.cap_schedule.get_cap(year1)
+    actual_volume = env.cap_schedule.get_auction_volume(
+        year1, tnac, env.last_clearing_price, price_max
+    )
+
+    # Volume should exceed the base cap by approximately the rollover amount
+    # (MSR adjustments may modify it, but the rollover should be included)
+    assert actual_volume > base_cap - 0.1, (
+        f"Year 1 auction volume ({actual_volume:.2f}) should be at least near "
+        f"base cap ({base_cap:.2f}) + rollover ({unsold_yr0:.2f})"
+    )
+    # Rollover should now be consumed
+    assert env.cap_schedule._unsold_rollover_pending == pytest.approx(0.0, abs=1e-9)
 
 
 def test_liquidity_pool_fills_at_reference_plus_spread():

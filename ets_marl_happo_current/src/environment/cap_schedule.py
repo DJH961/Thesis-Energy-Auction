@@ -51,6 +51,9 @@ class CapSchedule:
         # (distinct from normal TNAC-triggered withholding)
         self._unsold_absorbed = 0.0
 
+        # Unsold volume pending rollover to next year's auction
+        self._unsold_rollover_pending = 0.0
+
         # History for logging
         self.cap_history = []
         self.volume_history = []
@@ -100,6 +103,11 @@ class CapSchedule:
             auction_vol = self._apply_msr(auction_vol, tnac,
                                           clearing_price, price_max)
 
+        # Add any unsold volume rolled over from the previous year
+        rollover = self._unsold_rollover_pending
+        self._unsold_rollover_pending = 0.0
+        auction_vol += rollover
+
         # Store for logging
         self.cap_history.append(cap_t)
         self.volume_history.append(auction_vol)
@@ -120,6 +128,15 @@ class CapSchedule:
         amount = max(0.0, amount)
         self._msr_reserve += amount
         self._unsold_absorbed += amount
+
+    def rollover_unsold(self, amount: float):
+        """
+        Roll over unsold auction volume to the next year's auction supply.
+
+        Unlike absorb_unsold (which feeds into MSR), this adds the volume
+        directly to the next call to get_auction_volume().
+        """
+        self._unsold_rollover_pending += max(0.0, amount)
 
     # ------------------------------------------------------------------
     # Internal MSR logic
@@ -176,5 +193,6 @@ class CapSchedule:
         """Reset schedule to initial state (call at episode start)."""
         self._msr_reserve = 0.0
         self._unsold_absorbed = 0.0
+        self._unsold_rollover_pending = 0.0
         self.cap_history = []
         self.volume_history = []

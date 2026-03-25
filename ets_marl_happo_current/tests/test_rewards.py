@@ -12,11 +12,15 @@ Covers:
 
 import sys
 import os
+import warnings
 import numpy as np
 import pytest
 import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+# Suppress weak-scarcity warnings from short test episodes (n_years=3)
+pytestmark = pytest.mark.filterwarnings("ignore:.*Weak scarcity.*:UserWarning")
 
 from src.environment.ets_environment import ETSEnvironment
 from src.agents.ppo_agent import RewardNormalizer
