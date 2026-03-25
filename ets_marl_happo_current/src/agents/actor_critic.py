@@ -65,6 +65,7 @@ class AuctionPolicy(nn.Module):
         return torch.cat([price_mean, qty_mean, rest_mean], dim=-1)             # (B, 6)
 
     def forward(self, obs):
+        obs = obs.to(self.action_scale.device)
         obs = torch.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
         x = F.relu(self.fc1(obs))
         x = F.relu(self.fc2(x))
@@ -97,6 +98,7 @@ class AuctionPolicy(nn.Module):
     def evaluate(self, obs, raw_actions):
         """Given stored raw actions, recompute log_prob and entropy."""
         dist = self.forward(obs)
+        raw_actions = raw_actions.to(self.action_scale.device)
         log_prob = dist.log_prob(raw_actions).sum(dim=-1, keepdim=True)
         entropy = dist.entropy().sum(dim=-1, keepdim=True)
         return log_prob, entropy
@@ -142,6 +144,7 @@ class SecondaryPolicy(nn.Module):
         self._init_weights()
 
     def forward(self, obs):
+        obs = obs.to(self.action_scale.device)
         obs = torch.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
         x = F.relu(self.fc1(obs))
         x = F.relu(self.fc2(x))
@@ -169,6 +172,7 @@ class SecondaryPolicy(nn.Module):
 
     def evaluate(self, obs, raw_actions):
         dist = self.forward(obs)
+        raw_actions = raw_actions.to(self.action_scale.device)
         log_prob = dist.log_prob(raw_actions).sum(dim=-1, keepdim=True)
         entropy = dist.entropy().sum(dim=-1, keepdim=True)
         return log_prob, entropy
