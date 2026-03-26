@@ -122,7 +122,7 @@ def plot_qtable_heatmaps(qtables: dict, n_agents: int = 8,
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  Saved: {save_path}")
-    plt.close()
+        plt.close()
 
 
 def plot_secondary_heatmaps(qtables: dict, n_agents: int = 8,
@@ -163,7 +163,7 @@ def plot_secondary_heatmaps(qtables: dict, n_agents: int = 8,
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  Saved: {save_path}")
-    plt.close()
+        plt.close()
 
 
 # =====================================================================
@@ -243,7 +243,7 @@ def plot_strategy_frequency(df: pd.DataFrame, n_agents: int = 8,
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  Saved: {save_path}")
-    plt.close()
+        plt.close()
 
 
 # =====================================================================
@@ -288,7 +288,7 @@ def plot_reward_comparison(ql_df: pd.DataFrame, ppo_df: pd.DataFrame = None,
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  Saved: {save_path}")
-    plt.close()
+        plt.close()
 
 
 def plot_price_comparison(ql_df: pd.DataFrame, ppo_df: pd.DataFrame = None,
@@ -314,7 +314,7 @@ def plot_price_comparison(ql_df: pd.DataFrame, ppo_df: pd.DataFrame = None,
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  Saved: {save_path}")
-    plt.close()
+        plt.close()
 
 
 def plot_green_comparison(ql_df: pd.DataFrame, ppo_df: pd.DataFrame = None,
@@ -346,7 +346,7 @@ def plot_green_comparison(ql_df: pd.DataFrame, ppo_df: pd.DataFrame = None,
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  Saved: {save_path}")
-    plt.close()
+        plt.close()
 
 
 def plot_compliance_comparison(ql_df: pd.DataFrame, ppo_df: pd.DataFrame = None,
@@ -381,7 +381,7 @@ def plot_compliance_comparison(ql_df: pd.DataFrame, ppo_df: pd.DataFrame = None,
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  Saved: {save_path}")
-    plt.close()
+        plt.close()
 
 
 # =====================================================================

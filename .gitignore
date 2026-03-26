@@ -209,3 +209,4 @@ __marimo__/
 # Training results — CSVs and model checkpoints
 *.csv
 *.pt
+*.pkl

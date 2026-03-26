@@ -36,6 +36,29 @@ This repo currently contains **three versions** of the project, reflecting how i
 | [ets_marl_legacy_ppo](ets_marl_legacy_ppo) | An earlier version that used PPO agents. Kept for reference only. | Archived |
 | [ets_marl_legacy_test](ets_marl_legacy_test) | The original prototype using DDPG agents (4 companies, simpler setup). Kept for historical comparison. | Archived |
 
+### Q-Learning Baseline
+
+The active version includes a **tabular Q-learning baseline** for comparison with PPO/HAPPO. This provides a lower bound on what a simple RL approach can achieve in the same environment.
+
+- **State space**: 5 features (time progress, carbon price, green fraction, compliance gap, carry-forward) discretized into 3 bins each = 243 states
+- **Action space**: 6 predefined auction profiles (Conservative, Moderate, Aggressive, GreenPush, Financial, PanicBuy) x 4 secondary market profiles (Hold, Sell, Buy, AggressiveBuy)
+- **Algorithm**: Standard Q-learning with epsilon-greedy exploration
+
+Key files:
+| File | Purpose |
+|------|---------|
+| `ets_marl_happo_current/src/agents/q_learning_agent.py` | StateDiscretizer, ActionProfileMapper, QLearningAgent |
+| `ets_marl_happo_current/src/train_qlearning.py` | Training loop + greedy evaluation |
+| `ets_marl_happo_current/configs/qlearning.yaml` | Q-learning hyperparameters (disables reward shaping) |
+| `ets_marl_happo_current/src/analysis/qlearning_analysis.py` | Q-table heatmaps, strategy histograms, PPO comparison plots |
+| `ets_marl_happo_current/notebooks/ets_marl - Q-Learning Baseline.ipynb` | Interactive training and analysis notebook |
+
+Run the baseline:
+```bash
+cd ets_marl_happo_current
+python src/train_qlearning.py --config configs/default.yaml --ql-config configs/qlearning.yaml --seed 42
+```
+
 ### Where Should I Start?
 
 **Go to [ets_marl_happo_current/](ets_marl_happo_current).** That folder has its own detailed README with setup instructions, architecture explanations, and how to run experiments.
