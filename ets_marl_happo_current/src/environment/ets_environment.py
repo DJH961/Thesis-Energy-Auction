@@ -1021,8 +1021,13 @@ class ETSEnvironment(gym.Env):
                 ema_alpha * float(clearing_price) +
                 (1.0 - ema_alpha) * self._liquidity_ref_ema
             )
-            penalty_rate = float(self.config.get("penalty", {}).get("rate", 100.0))
-            ref_price = (1.0 - penalty_weight) * self._liquidity_ref_ema + penalty_weight * penalty_rate
+            # Keep pool pricing anchored to market reference by default.
+            # Optional override allows explicit anchor experiments.
+            penalty_anchor_price = float(pool_cfg.get("penalty_anchor_price", clearing_price))
+            ref_price = (
+                (1.0 - penalty_weight) * self._liquidity_ref_ema
+                + penalty_weight * penalty_anchor_price
+            )
             pool_buy_price = ref_price * (1.0 - spread)   # pool buys from agents
             pool_sell_price = ref_price * (1.0 + spread)  # pool sells to agents
 
@@ -1182,7 +1187,7 @@ class ETSEnvironment(gym.Env):
             for i, company in enumerate(self.companies):
                 # Terminal bank value: banked allowances × terminal_price
                 if terminal_bank:
-                    bank_value = self.holdings[i] * terminal_price / 1000.0
+                    bank_value = self.holdings[i] * terminal_price / 100.0
                     rewards[i] += bank_value
                     terminal_bank_values[i] = bank_value
 

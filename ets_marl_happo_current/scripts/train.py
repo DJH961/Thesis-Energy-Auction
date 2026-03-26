@@ -506,9 +506,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # Per-agent FIFO pool of actor state_dicts (auction + secondary only)
     hpp_pools = [collections.deque(maxlen=hpp_pool_size) for _ in range(n_agents)]
     if hpp_enabled:
-          auto_note = " [auto]" if (hpp_save_auto or hpp_warmup_auto) else ""
-        print(f"HPP: pool={hpp_pool_size}, save every {hpp_save_interval} eps, "
-              f"swap_prob={hpp_swap_prob:.0%}, warmup={hpp_warmup} eps{auto_note}.")
+        auto_note = " [auto]" if (hpp_save_auto or hpp_warmup_auto) else ""
+        print(
+            f"HPP: pool={hpp_pool_size}, save every {hpp_save_interval} eps, "
+            f"swap_prob={hpp_swap_prob:.0%}, warmup={hpp_warmup} eps{auto_note}."
+        )
 
     # Batch accumulation: collect N episodes before triggering PPO update
     episodes_per_update = ppo_cfg.get("episodes_per_update", 1)
