@@ -215,7 +215,7 @@ reward:
   green_floor_fossil: [0.40, 0.40, 0.30, 0.30, 0.10, 0.10, 0.00, 0.00, 0.40, 0.40, 0.30, 0.30, 0.10, 0.10, 0.00, 0.00]
   shaping_beta: 7.0              # green_delta bonus weight
   shaping_gamma: 1.0             # queue bonus weight
-  shaping_decay_episode: 12000   # episodes over which shaping_weight decays to floor
+  shaping_decay_episode: 0       # auto: 12% of n_episodes, clamped to [300, 8000]
   shaping_weight_floor: 0.0      # shaping decays fully to zero
   price_anchor_delta: 0.0        # DISABLED — caused floor-bidding collapse
   terminal_bank_value: true      # value banked allowances at terminal_price in final year

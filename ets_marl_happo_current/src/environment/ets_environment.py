@@ -567,10 +567,16 @@ class ETSEnvironment(gym.Env):
         qty_mult_low = self.config["auction"].get("qty_mult_low", 0.3)
         qty_mult_high = self.config["auction"].get("qty_mult_high", 1.3)
         lot_size = self.config["auction"].get("lot_size", 0.0)
+        bid_qty_multipliers = np.zeros(self.n_total)
+        estimate_needs = np.zeros(self.n_total)
+        bid_coverages = np.zeros(self.n_total)
         for i, company in enumerate(self.companies):
             multiplier = float(np.clip(auction_actions[i, 1], qty_mult_low, qty_mult_high))
             base_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
             bid_actions[i, 1] = multiplier * base_need
+            bid_qty_multipliers[i] = multiplier
+            estimate_needs[i] = base_need
+            bid_coverages[i] = bid_actions[i, 1] / max(base_need, 1e-6)
             # EU lot-size discretization: round to nearest multiple of lot_size
             if lot_size > 0:
                 bid_actions[i, 1] = max(lot_size, round(bid_actions[i, 1] / lot_size) * lot_size)
@@ -628,11 +634,13 @@ class ETSEnvironment(gym.Env):
         # 9. Green investments
         invest_costs = np.zeros(self.n_total)
         invest_fracs = np.zeros(self.n_total)  # raw action values for logging
+        invest_tech_choices = np.zeros(self.n_total, dtype=int)
         for i, company in enumerate(self.companies):
             invest_frac = float(auction_actions[i, 2])
             invest_fracs[i] = invest_frac
             tech_logits = auction_actions[i, 3:6]
             tech_choice = int(np.argmax(tech_logits))
+            invest_tech_choices[i] = tech_choice
             invest_costs[i] = company.plan_investment(tech_choice, invest_frac, year)
             # Apply any cancellation recovery as a credit to invest_costs
             invest_costs[i] -= cancel_recoveries[i]
@@ -668,6 +676,13 @@ class ETSEnvironment(gym.Env):
         log["mac_costs"] = mac_costs.tolist()
         log["bid_quantities"] = self._phase1_bid_quantities.tolist()  # Mt per agent
         log["invest_fracs"] = invest_fracs.tolist()                   # raw action[2] per agent
+        log["bid_qty_multipliers"] = bid_qty_multipliers.tolist()     # raw multiplier action
+        log["estimate_needs"] = estimate_needs.tolist()               # Mt before multiplier
+        log["bid_coverages"] = bid_coverages.tolist()                 # bid_qty / est_need
+        log["invest_tech_choices"] = invest_tech_choices.tolist()     # 0=onshore,1=offshore,2=solar
+        log["bid_to_reserve_ratio"] = (
+            self._phase1_bid_prices / max(self._last_effective_reserve, 1e-6)
+        ).tolist()
 
         # ── Auction-phase warning counters ────────────────────────────────────
         _reserve = self._last_effective_reserve
@@ -855,6 +870,10 @@ class ETSEnvironment(gym.Env):
                 self._consecutive_shortfall[_i] = 0
 
         # 8. Log
+        sec_action_sides = np.where(
+            secondary_actions[:, 1] > 1e-6, 1,
+            np.where(secondary_actions[:, 1] < -1e-6, -1, 0)
+        )
         log.update({
             "allocations": allocations.tolist(),
             "payments": payments.tolist(),
@@ -884,6 +903,7 @@ class ETSEnvironment(gym.Env):
             "mac_costs": self._mac_costs.tolist(),
             "sec_price_mults": secondary_actions[:, 0].tolist(),  # Phase 2 action[0] (raw)
             "sec_qty_actions": secondary_actions[:, 1].tolist(),  # Phase 2 action[1] (raw)
+            "sec_action_sides": sec_action_sides.tolist(),         # -1=sell, 0=hold, 1=buy intent
             "liquidity_pool": liquidity_pool_info,
         })
         self.episode_log.append(log)

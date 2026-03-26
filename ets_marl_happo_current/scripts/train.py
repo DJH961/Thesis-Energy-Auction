@@ -390,6 +390,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     n_episodes = config["simulation"]["n_episodes"]
     n_years = config["simulation"]["n_years"]
 
+    # Reward shaping decay schedule: allow auto-scaling from n_episodes.
+    reward_cfg = config.setdefault("reward", {})
+    shaping_decay_eps, shaping_decay_auto = _resolve_auto_episode_count(
+        reward_cfg.get("shaping_decay_episode", 3000), n_episodes,
+        frac=0.12, min_count=300, max_count=8000,
+    )
+    reward_cfg["shaping_decay_episode"] = shaping_decay_eps
+
     happo_enabled = config["ppo"].get("happo", False)
     clip_eps = config["ppo"].get("clip_eps", 0.2)
 
@@ -419,6 +427,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(f"{'='*60}")
     _print_training_legend()
+
+    if shaping_decay_auto:
+        print("Reward shaping decay auto-scale: "
+              f"{shaping_decay_eps} episodes "
+              f"(n_episodes={n_episodes}, clamp=[300, 8000]).")
 
     env = ETSEnvironment(config, seed=seed)
     agents = build_agents(env, config, seed)
@@ -554,7 +567,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         ep_fields += [f"sec_buy_vol_A{i+1}", f"sec_sell_vol_A{i+1}",
                       f"sec_buy_avg_px_A{i+1}", f"sec_sell_avg_px_A{i+1}",
                       f"sec_buy_years_A{i+1}", f"sec_sell_years_A{i+1}",
-                      f"avg_sec_mult_A{i+1}", f"avg_sec_qty_A{i+1}"]
+                      f"avg_sec_mult_A{i+1}", f"avg_sec_qty_A{i+1}",
+                      f"avg_bid_mult_A{i+1}", f"avg_bid_coverage_A{i+1}",
+                      f"sec_buy_intent_share_A{i+1}", f"sec_sell_intent_share_A{i+1}",
+                      f"inv_onshore_share_A{i+1}", f"inv_offshore_share_A{i+1}",
+                      f"inv_solar_share_A{i+1}"]
     ep_fields += ["price_start", "price_peak", "price_std"]  # episode price trajectory
     for i in range(n_total_agents):  # allocation + P5/P6/P8/MAC episode aggregates
         ep_fields += [f"mean_alloc_A{i+1}",
@@ -594,7 +611,13 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"terminal_queue_value_A{i+1}",
                       f"terminal_liquidation_value_A{i+1}",
                       f"sec_price_mult_A{i+1}",   # Phase 2 action[0] per year
-                      f"sec_qty_action_A{i+1}"]   # Phase 2 action[1] per year (+buy/-sell)
+                      f"sec_qty_action_A{i+1}",   # Phase 2 action[1] per year (+buy/-sell)
+                      f"sec_action_side_A{i+1}",  # -1=sell, 0=hold, 1=buy intent
+                      f"bid_qty_mult_A{i+1}",
+                      f"estimate_need_A{i+1}",
+                      f"bid_coverage_A{i+1}",
+                      f"bid_to_reserve_A{i+1}",
+                      f"invest_tech_choice_A{i+1}"]
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -795,6 +818,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 yr_row[f"terminal_liquidation_value_A{i+1}"] = _get("terminal_liquidation_values")
                 yr_row[f"sec_price_mult_A{i+1}"] = round(_get("sec_price_mults", default=1.0), 4)
                 yr_row[f"sec_qty_action_A{i+1}"] = round(_get("sec_qty_actions", default=0.0), 4)
+                yr_row[f"sec_action_side_A{i+1}"] = int(_get("sec_action_sides", default=0))
+                yr_row[f"bid_qty_mult_A{i+1}"] = round(_get("bid_qty_multipliers", default=0.0), 4)
+                yr_row[f"estimate_need_A{i+1}"] = round(_get("estimate_needs", default=0.0), 4)
+                yr_row[f"bid_coverage_A{i+1}"] = round(_get("bid_coverages", default=0.0), 4)
+                yr_row[f"bid_to_reserve_A{i+1}"] = round(_get("bid_to_reserve_ratio", default=0.0), 4)
+                yr_row[f"invest_tech_choice_A{i+1}"] = int(_get("invest_tech_choices", default=-1))
             yr_writer.writerow(yr_row)
 
             obs1 = obs1_next
@@ -1054,6 +1083,59 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             ]
             avg_sec_qty_per_agent.append(np.mean(sqt_this_ep) if sqt_this_ep else 0.0)
 
+        # Average Phase-1 bid multiplier + coverage ratio per agent
+        avg_bid_mult_per_agent = []
+        avg_bid_coverage_per_agent = []
+        for i in range(n_total_agents):
+            mult_this_ep = [
+                yl["bid_qty_multipliers"][i]
+                for yl in env.episode_log
+                if "bid_qty_multipliers" in yl and i < len(yl["bid_qty_multipliers"])
+            ]
+            cov_this_ep = [
+                yl["bid_coverages"][i]
+                for yl in env.episode_log
+                if "bid_coverages" in yl and i < len(yl["bid_coverages"])
+            ]
+            avg_bid_mult_per_agent.append(np.mean(mult_this_ep) if mult_this_ep else 0.0)
+            avg_bid_coverage_per_agent.append(np.mean(cov_this_ep) if cov_this_ep else 0.0)
+
+        # Secondary intent shares and investment-tech usage shares per agent
+        sec_buy_intent_share = []
+        sec_sell_intent_share = []
+        inv_onshore_share = []
+        inv_offshore_share = []
+        inv_solar_share = []
+        for i in range(n_total_agents):
+            sec_sides = [
+                yl["sec_action_sides"][i]
+                for yl in env.episode_log
+                if "sec_action_sides" in yl and i < len(yl["sec_action_sides"])
+            ]
+            tech_choices = [
+                yl["invest_tech_choices"][i]
+                for yl in env.episode_log
+                if "invest_tech_choices" in yl and i < len(yl["invest_tech_choices"])
+            ]
+
+            if sec_sides:
+                sec_sides_arr = np.array(sec_sides)
+                sec_buy_intent_share.append(float(np.mean(sec_sides_arr > 0)))
+                sec_sell_intent_share.append(float(np.mean(sec_sides_arr < 0)))
+            else:
+                sec_buy_intent_share.append(0.0)
+                sec_sell_intent_share.append(0.0)
+
+            if tech_choices:
+                tech_arr = np.array(tech_choices)
+                inv_onshore_share.append(float(np.mean(tech_arr == 0)))
+                inv_offshore_share.append(float(np.mean(tech_arr == 1)))
+                inv_solar_share.append(float(np.mean(tech_arr == 2)))
+            else:
+                inv_onshore_share.append(0.0)
+                inv_offshore_share.append(0.0)
+                inv_solar_share.append(0.0)
+
         # Per-agent secondary buy/sell breakdown across the episode
         per_agent_sec_stats = []
         for i in range(n_total_agents):
@@ -1204,6 +1286,13 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             ep_row[f"sec_sell_years_A{i+1}"]  = ss["sell_years"]
             ep_row[f"avg_sec_mult_A{i+1}"]    = round(avg_sec_mult_per_agent[i], 4)
             ep_row[f"avg_sec_qty_A{i+1}"]     = round(avg_sec_qty_per_agent[i], 4)
+            ep_row[f"avg_bid_mult_A{i+1}"]    = round(avg_bid_mult_per_agent[i], 4)
+            ep_row[f"avg_bid_coverage_A{i+1}"] = round(avg_bid_coverage_per_agent[i], 4)
+            ep_row[f"sec_buy_intent_share_A{i+1}"] = round(sec_buy_intent_share[i], 4)
+            ep_row[f"sec_sell_intent_share_A{i+1}"] = round(sec_sell_intent_share[i], 4)
+            ep_row[f"inv_onshore_share_A{i+1}"] = round(inv_onshore_share[i], 4)
+            ep_row[f"inv_offshore_share_A{i+1}"] = round(inv_offshore_share[i], 4)
+            ep_row[f"inv_solar_share_A{i+1}"] = round(inv_solar_share[i], 4)
 
         ep_row["warn_lowAlloc"] = int(env._warnings.get("low_alloc", 0))
         ep_row["warn_priceFloor"] = int(env._warnings.get("price_floor", 0))
