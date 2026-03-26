@@ -6,16 +6,16 @@ Rule-based heuristic actions for behavioral cloning warm-start.
 Provides one function per decision phase that mirrors the agent's action space:
 
   auction_action(company, price_ma3, current_year, n_years, config)
-      → np.ndarray [bid_price, qty_multiplier, invest_frac,
+      -> np.ndarray [bid_price, qty_multiplier, invest_frac,
                     logit_onshore, logit_offshore, logit_solar]
 
   secondary_action(company, bank, allocation, clearing_price, config)
-      → np.ndarray [sec_price_multiplier, sec_qty]
+      -> np.ndarray [sec_price_multiplier, sec_qty]
 
 All outputs are in physical (action) space. The calling code in train.py
 inverse-maps them through atanh for MSE supervision on the policy mean heads.
 
-Agent objectives (4×2 factorial: archetype × objective)
+Agent objectives (4x2 factorial: archetype x objective)
 -------------------------------------------------------
 Even-indexed agents (0, 2, 4, 6) are *financial*: prioritize cost minimization,
 invest conservatively, and sell surplus aggressively.
@@ -24,34 +24,36 @@ bid higher to guarantee allocation, and hold surplus rather than selling.
 
 Design rationale
 ----------------
-auction_action:
-  - bid_price is floored at reserve_price + 5 to guarantee valid bids,
-    anchored to 1.15× MA3 price (slight premium reflecting compliance urgency)
-    and capped at penalty_rate (100 €/t).  In a uniform-price auction, bidding
-    near true valuation is weakly dominant — you pay the clearing price
-    regardless, so bidding higher guarantees allocation without raising cost.
-    Green-objective agents bid a further 10% premium to ensure allocation
-    for their transition strategy.
-  - qty_multiplier = 1.0 normally; raised to 1.3 when carry-forward > 0
-    (agent must cover the rolled-over shortfall).
-  - invest_frac: financial agents use 0.03/0.005 (NPV-gated); green-objective
-    agents use 0.07/0.02 (invest aggressively regardless of short-run NPV).
-  - tech: solar (fast, 2yr) near end of episode; onshore wind (higher capacity)
-    in the early years.
+auction_action (valuation-based):
+  - bid_price = min(penalty_rate_inflated,
+      base_anchor * (1.4 - 0.3 * coverage_ratio))
+    where coverage_ratio = bank / max(annual_need, 0.1).
+    High bank -> lower bid (already covered), low bank -> bid near penalty.
+    Green-objective agents add a 5% premium.
+  - qty_mult: target-bank logic.
+    target_bank = annual_need * min(remaining_years, 2) * 0.3
+    qty_mult = clip((annual_need - bank + target_bank) / annual_need, low, high)
+  - invest_frac: NPV-gated.
+    avoided_carbon_npv = emission_reduction * price * effective_horizon
+    invest proportional to NPV (higher for green agents).
+  - tech choice: maximize (remaining_years - delay + terminal_horizon)
+    * capacity_factor / capex  (effective payoff metric).
 
-secondary_action:
-  - Compute surplus = bank + allocation - need.
-  - Financial agents: sell surplus aggressively (half at 1.1×), buy shortfall.
-  - Green-objective agents: hold surplus as a buffer (only sell large excess),
-    buy shortfall more aggressively (1.3× premium, up to 1.5× shortfall).
+secondary_action (target-bank trajectory):
+  - target_bank = annual_need * min(remaining_years - 1, 2) * 0.3
+  - trade_target = (target_bank - bank) * 0.5
+    Positive -> buy, negative -> sell.
+  - Price multiplier scales by deficit/surplus severity.
 """
 
 import numpy as np
 
 
 # buildable tech indices inside company.mix: 2=onshore, 3=offshore, 4=solar
-_TECH_SOLAR = 4
 _TECH_ONSHORE = 2
+_TECH_OFFSHORE = 3
+_TECH_SOLAR = 4
+_BUILDABLE = [_TECH_ONSHORE, _TECH_OFFSHORE, _TECH_SOLAR]
 
 
 def auction_action(
@@ -71,13 +73,17 @@ def auction_action(
     company : Company
         The company object for this agent.
     price_ma3 : float
-        3-year moving average of clearing price (€/t).
+        3-year moving average of clearing price (EUR/t).
     current_year : int
         Current year index (0-based).
     n_years : int
         Total episode length.
     config : dict
         Full training config.
+    reserve_price : float, optional
+        Dynamic reserve price override.
+    inflation_factor : float, optional
+        Cumulative inflation factor override.
 
     Returns
     -------
@@ -91,14 +97,7 @@ def auction_action(
         reserve_price = config["ets"].get("reserve_price", 0.0)
     is_green = (company.agent_id % 2) == 1  # odd indices = green-objective
 
-    # --- Bid price ---
-    # In a uniform-price auction, bidding near your true valuation is
-    # (weakly) dominant: you pay the clearing price regardless, so bidding
-    # higher just guarantees allocation without raising your cost.
-    # True valuation = min(penalty_rate, price_max).
-    # We anchor near penalty_rate so BC warm-start seeds realistic compliance
-    # prices from the first episodes, while still reacting to MA3.
-    # Green-objective agents add a small premium to ensure allocation.
+    # --- Penalty rate (valuation ceiling) ---
     pen_cfg = config.get("penalty", {})
     base_penalty = pen_cfg.get("rate", 100.0)
     if inflation_factor is None:
@@ -106,57 +105,83 @@ def auction_action(
         penalty_rate = base_penalty * (1.0 + infl) ** current_year
     else:
         penalty_rate = base_penalty * float(inflation_factor)
-    ma3_anchor = price_ma3 * (1.15 if not is_green else 1.20)
-    near_penalty_anchor = 0.7 * penalty_rate + 0.3 * ma3_anchor
+
+    # --- Coverage ratio ---
+    annual_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
+    bank = getattr(company, '_bank', 0.0)
+    # Try to get bank from holdings if available; fall back to 0
+    coverage_ratio = max(bank / annual_need, 0.0)
+
+    # --- Bid price (valuation-based) ---
+    # base_anchor blends penalty rate with MA3 signal
+    base_anchor = 0.7 * penalty_rate + 0.3 * max(price_ma3, reserve_price)
+    # High coverage -> bid less aggressively; low coverage -> bid near penalty
+    bid_price = min(penalty_rate, base_anchor * (1.4 - 0.3 * min(coverage_ratio, 3.0)))
     if is_green:
-        near_penalty_anchor *= 1.05
+        bid_price *= 1.05  # green premium to ensure allocation
     bid_price = float(np.clip(
-        max(reserve_price + 5.0, min(penalty_rate, near_penalty_anchor)),
+        max(reserve_price + 5.0, bid_price),
         aq["price_min"], aq["price_max"],
     ))
 
-    # --- Quantity multiplier ---
-    # Cover full estimated need; increase by 30% if there is a carry-forward.
-    qty_mult = 1.3 if company._carry_forward > 1e-6 else 1.0
+    # --- Quantity multiplier (target-bank logic) ---
+    remaining_years = max(1, n_years - current_year)
+    target_bank = annual_need * min(remaining_years, 2) * 0.3
+    qty_mult = (annual_need - bank + target_bank) / max(annual_need, 0.1)
     qty_mult = float(np.clip(
-        qty_mult, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 1.3),
+        qty_mult, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0),
     ))
 
-    # --- Investment fraction ---
-    # Simple NPV proxy: compare (years_left × annual carbon saving) to invest cost.
-    # annual_carbon_saving = emission reduction from shifting invest_frac_test to solar,
-    #                        valued at the current MA3 carbon price.
-    # Green-objective agents invest more aggressively (higher frac, lower threshold).
-    years_left = max(1, n_years - current_year)
+    # --- Investment fraction (NPV-gated) ---
+    terminal_horizon = config.get("reward", {}).get("terminal_payoff_years", 5)
+    tech_cfg = config["technologies"]
+    deploy_delays = tech_cfg["deploy_delays"]
+    capacity_factors = tech_cfg["capacity_factors"]
+    capex_arr = tech_cfg["capex"]
+
+    # Pick best buildable tech by effective payoff metric
+    best_tech = _TECH_SOLAR  # default
+    best_score = -1.0
+    for t in _BUILDABLE:
+        effective_years = remaining_years - deploy_delays[t] + terminal_horizon
+        if effective_years <= 0:
+            continue
+        score = effective_years * capacity_factors[t] / max(capex_arr[t], 1.0)
+        if score > best_score:
+            best_score = score
+            best_tech = t
+
+    # NPV of avoided carbon
+    ef_saved = max(0.0, company.weighted_emission_factor - company.emission_factors[best_tech])
+    effective_horizon = max(0, remaining_years - deploy_delays[best_tech] + terminal_horizon)
     frac_test = 0.07 if is_green else 0.03
-
-    invest_cost = company.compute_investment_cost(_TECH_SOLAR, frac_test, current_year)  # M€
-
-    ef_saved = max(0.0, company.weighted_emission_factor - company.emission_factors[_TECH_SOLAR])
     annual_emission_reduction = frac_test * company.output_mwh * ef_saved / 1e6  # Mt
-    annual_carbon_saving = annual_emission_reduction * price_ma3  # M€ (at MA3 price)
+    avoided_carbon_npv = annual_emission_reduction * price_ma3 * effective_horizon  # M EUR
+    invest_cost = company.compute_investment_cost(best_tech, frac_test, current_year)  # M EUR
 
     if is_green:
-        # Green agents invest aggressively: high frac when NPV positive, still
-        # moderate when not (always push the transition).
+        # Green agents: invest proportionally to NPV ratio, minimum floor
+        npv_ratio = avoided_carbon_npv / max(invest_cost, 1e-6)
         invest_frac = float(np.clip(
-            0.07 if years_left * annual_carbon_saving > invest_cost * 0.5 else 0.02,
-            0.0, inv["max_invest_frac"],
+            frac_test * min(npv_ratio, 2.0) / 2.0 + 0.02,
+            0.02, inv["max_invest_frac"],
         ))
     else:
-        # Financial agents invest conservatively: strict NPV gate.
-        invest_frac = float(np.clip(
-            0.03 if years_left * annual_carbon_saving > invest_cost else 0.005,
-            0.0, inv["max_invest_frac"],
-        ))
+        # Financial agents: strict NPV gate
+        npv_ratio = avoided_carbon_npv / max(invest_cost, 1e-6)
+        if npv_ratio > 1.0:
+            invest_frac = float(np.clip(
+                frac_test * min(npv_ratio, 2.0) / 2.0,
+                0.005, inv["max_invest_frac"],
+            ))
+        else:
+            invest_frac = 0.005
 
     # --- Technology choice (logits) ---
-    # Solar (2yr delay) near the end when there is little time for onshore (5yr) to deliver.
-    # Logits: [onshore, offshore, solar] — argmax selects the technology.
-    if years_left < 5:
-        logits = np.array([-1.0, -1.0,  1.0], dtype=np.float32)  # solar
-    else:
-        logits = np.array([ 1.0, -1.0, -1.0], dtype=np.float32)  # onshore wind
+    # Use the best_tech selected by effective payoff metric
+    logits = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
+    tech_logit_idx = best_tech - _TECH_ONSHORE  # 0=onshore, 1=offshore, 2=solar
+    logits[tech_logit_idx] = 1.0
 
     return np.array([bid_price, qty_mult, invest_frac, *logits], dtype=np.float32)
 
@@ -167,6 +192,8 @@ def secondary_action(
     allocation: float,
     clearing_price: float,
     config: dict,
+    current_year: int = 0,
+    n_years: int = 12,
 ) -> np.ndarray:
     """
     Heuristic Phase-2 (secondary market) action.
@@ -180,9 +207,13 @@ def secondary_action(
     allocation : float
         Allowances received at the primary auction (Mt).
     clearing_price : float
-        Auction clearing price (€/t); used to scale the price multiplier target.
+        Auction clearing price (EUR/t); used to scale the price multiplier target.
     config : dict
         Full training config.
+    current_year : int
+        Current year index (0-based).
+    n_years : int
+        Total episode length.
 
     Returns
     -------
@@ -194,35 +225,39 @@ def secondary_action(
     is_green = (company.agent_id % 2) == 1  # odd indices = green-objective
 
     need = max(company.compute_estimate_need() + company._carry_forward, 1e-6)
-    surplus = bank + allocation - need
+    remaining_years = max(1, n_years - current_year)
 
-    if is_green:
-        # Green-objective: hold surplus as compliance buffer; only sell large excess.
-        if surplus > need * 0.3:
-            sell_qty = min(surplus / 3.0, qty_max)
-            sec_qty = float(-sell_qty)
-            price_mult = 1.2  # demand higher price if selling
-        elif surplus < 0:
-            # Buy aggressively — cover 1.5× shortfall to build buffer
-            buy_qty = min(abs(surplus) * 1.5, qty_max)
-            sec_qty = float(buy_qty)
-            price_mult = 1.3
+    # Target-bank trajectory: hold a buffer of allowances for future years
+    target_bank = need * min(remaining_years - 1, 2) * 0.3
+    current_position = bank + allocation - need  # surplus after this year's compliance
+    trade_target = (target_bank - current_position) * 0.5  # positive = buy, negative = sell
+
+    # Scale price multiplier by deficit/surplus severity
+    severity = abs(trade_target) / max(need, 0.1)  # normalized severity
+
+    if trade_target > 0.01:
+        # Need to buy
+        buy_qty = min(abs(trade_target), qty_max)
+        sec_qty = float(buy_qty)
+        # More severe deficit -> higher premium (willing to pay more)
+        if is_green:
+            price_mult = 1.05 + 0.25 * min(severity, 1.0)  # 1.05-1.30
         else:
-            sec_qty = 0.0
-            price_mult = 1.0
+            price_mult = 1.0 + 0.20 * min(severity, 1.0)   # 1.00-1.20
+    elif trade_target < -0.01:
+        # Have excess -> sell
+        sell_qty = min(abs(trade_target), qty_max)
+        sec_qty = float(-sell_qty)
+        # More surplus -> willing to sell cheaper (lower mult)
+        if is_green:
+            # Green agents hold more: only sell at premium
+            price_mult = 1.15 + 0.10 * min(severity, 1.0)  # 1.15-1.25
+        else:
+            # Financial agents sell aggressively
+            price_mult = 1.0 + 0.10 * min(severity, 1.0)   # 1.00-1.10
     else:
-        # Financial: sell surplus aggressively for profit, buy shortfall.
-        if surplus > need * 0.1:
-            sell_qty = min(surplus / 2.0, qty_max)
-            sec_qty = float(-sell_qty)
-            price_mult = 1.1
-        elif surplus < 0:
-            buy_qty = min(abs(surplus), qty_max)
-            sec_qty = float(buy_qty)
-            price_mult = 1.3
-        else:
-            sec_qty = 0.0
-            price_mult = 1.0
+        sec_qty = 0.0
+        price_mult = 1.0
 
     sec_low = config.get("trading", {}).get("sec_mult_low", 0.8)
     sec_high = config.get("trading", {}).get("sec_mult_high", 1.3)

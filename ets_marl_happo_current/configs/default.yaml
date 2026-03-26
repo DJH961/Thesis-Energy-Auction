@@ -1,6 +1,6 @@
 # ============================================================
-# ETS MARL — Configuration v5.3
-#   - 8 learning agents + 4 heuristic bot agents (12 total)
+# ETS MARL — Configuration v5.4
+#   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
 #   - Episode-level inflation randomness window (small stochastic variation)
@@ -31,20 +31,20 @@ technologies:
 
 # ----------------------------------------------------------
 # ETS parameters
-# Cap starts above total emissions (~40.9 Mt for 12 participants),
+# Cap starts above total emissions (~45.0 Mt for 16 participants),
 # providing a slight surplus that transitions to scarcity.
-# Cap at year 11 ~ 26.2 Mt (~38% reduction).
+# Scaled from v5.3 (12 agents) by factor 16/12.
 # ----------------------------------------------------------
 ets:
-  cap_year_0: 43.0       # Mt — slight surplus vs ~40.9 Mt initial emissions
+  cap_year_0: 57.0       # Mt — surplus vs ~45.0 Mt initial emissions (16 agents)
   lrf_phase1: 0.043
   lrf_phase2: 0.044
   lrf_phase_switch: 4
 
   msr:
     enabled: true
-    tnac_upper: 25.0     # relaxed to reduce procyclical MSR intervention
-    tnac_lower: 12.0     # relaxed to reduce procyclical MSR intervention
+    tnac_upper: 33.3     # scaled 16/12 from 25.0
+    tnac_lower: 16.0     # scaled 16/12 from 12.0
     withhold_rate: 0.24
     release_amount: 0.55  # increased to ensure adequate supply release
     price_containment_trigger: 0.70   # at 70% of price_max, suppress MSR withdrawal
@@ -68,37 +68,46 @@ companies:
   output_twh: 10.0
   initial_mix:                     # [coal, gas, onshore, offshore, solar]
     - [0.40, 0.40, 0.10, 0.05, 0.05]   # A1: coal-heavy / financial
-    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A2: coal-heavy / green
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A2: coal-heavy / ESG
     - [0.15, 0.45, 0.20, 0.10, 0.10]   # A3: gas-dominant / financial
-    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A4: gas-dominant / green
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A4: gas-dominant / ESG
     - [0.05, 0.25, 0.35, 0.20, 0.15]   # A5: transitioner / financial
-    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A6: transitioner / green
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A6: transitioner / ESG
     - [0.00, 0.10, 0.30, 0.35, 0.25]   # A7: green-leader / financial
-    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A8: green-leader / green
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A8: green-leader / ESG
   reward_weights:                  # [w_cost, w_green]
-    - [0.75, 0.25]   # A1
-    - [0.25, 0.75]   # A2
-    - [0.75, 0.25]   # A3
-    - [0.25, 0.75]   # A4
-    - [0.75, 0.25]   # A5
-    - [0.25, 0.75]   # A6
-    - [0.75, 0.25]   # A7
-    - [0.25, 0.75]   # A8
+    - [1.0, 0.0]   # A1: even → pure financial
+    - [0.5, 0.5]   # A2: odd  → balanced ESG
+    - [1.0, 0.0]   # A3: even → pure financial
+    - [0.5, 0.5]   # A4: odd  → balanced ESG
+    - [1.0, 0.0]   # A5: even → pure financial
+    - [0.5, 0.5]   # A6: odd  → balanced ESG
+    - [1.0, 0.0]   # A7: even → pure financial
+    - [0.5, 0.5]   # A8: odd  → balanced ESG
 
   # Heuristic bot agents (indexed after learning agents).
   # Must keep bot_initial_mix, bot_reward_weights, bot_annual_budgets
   # arrays in sync with n_bot_agents.
-  n_bot_agents: 4
+  # bot_reward_weights are for eval logging only — bots use heuristic_policy, not rewards.
+  n_bot_agents: 8
   bot_initial_mix:
-    - [0.45, 0.35, 0.10, 0.05, 0.05]   # B1: coal-heavy (id=8)
-    - [0.45, 0.35, 0.10, 0.05, 0.05]   # B2: coal-heavy (id=9)
-    - [0.15, 0.50, 0.15, 0.10, 0.10]   # B3: gas-dominant (id=10)
-    - [0.15, 0.50, 0.15, 0.10, 0.10]   # B4: gas-dominant (id=11)
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # B1: coal-heavy (id=8)
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # B2: coal-heavy (id=9)
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # B3: gas-dominant (id=10)
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # B4: gas-dominant (id=11)
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # B5: transitioner (id=12)
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # B6: transitioner (id=13)
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # B7: green-leader (id=14)
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # B8: green-leader (id=15)
   bot_reward_weights:
-    - [0.50, 0.50]   # B1
-    - [0.50, 0.50]   # B2
-    - [0.50, 0.50]   # B3
-    - [0.50, 0.50]   # B4
+    - [1.0, 0.0]   # B1
+    - [0.5, 0.5]   # B2
+    - [1.0, 0.0]   # B3
+    - [0.5, 0.5]   # B4
+    - [1.0, 0.0]   # B5
+    - [0.5, 0.5]   # B6
+    - [1.0, 0.0]   # B7
+    - [0.5, 0.5]   # B8
 
 investment:
   max_invest_frac: 0.10
@@ -146,7 +155,7 @@ secondary:
 # ----------------------------------------------------------
 budget:
   annual_budgets: [1500.0, 1500.0, 1200.0, 1200.0, 800.0, 800.0, 500.0, 500.0]
-  bot_annual_budgets: [1500.0, 1500.0, 1200.0, 1200.0]
+  bot_annual_budgets: [1500.0, 1500.0, 1200.0, 1200.0, 800.0, 800.0, 500.0, 500.0]
   overspend_penalty_coef: 0.5
 
 # ----------------------------------------------------------
@@ -202,8 +211,8 @@ reward:
   clip_min: -10.0
   clip_max: 5.0
   # Per-agent fossil floor for emissions_intensity calculation.
-  # Length must equal n_agents + n_bot_agents (12).
-  green_floor_fossil: [0.40, 0.40, 0.30, 0.30, 0.10, 0.10, 0.00, 0.00, 0.40, 0.40, 0.30, 0.30]
+  # Length must equal n_agents + n_bot_agents (16).
+  green_floor_fossil: [0.40, 0.40, 0.30, 0.30, 0.10, 0.10, 0.00, 0.00, 0.40, 0.40, 0.30, 0.30, 0.10, 0.10, 0.00, 0.00]
   shaping_beta: 7.0              # green_delta bonus weight
   shaping_gamma: 1.0             # queue bonus weight
   shaping_decay_episode: 12000   # episodes over which shaping_weight decays to floor
@@ -215,8 +224,8 @@ reward:
 
 # ----------------------------------------------------------
 # Opponent modeling — 5D public info per opponent.
-# obs_dim_phase1 = 23 + 5*(N_total-1) = 78 (for 12 agents)
-# obs_dim_phase2 = phase1 + 7 = 85
+# obs_dim_phase1 = 23 + 5*(N_total-1) = 98 (for 16 agents)
+# obs_dim_phase2 = phase1 + 7 = 105
 # ----------------------------------------------------------
 opponent_modeling:
   enabled: true
@@ -233,7 +242,7 @@ agent_cycling:
 # PPO / HAPPO
 # ----------------------------------------------------------
 ppo:
-  hidden_size: 256           # actor network width (obs: 78D phase1 / 85D phase2)
+  hidden_size: 256           # actor network width (obs: 98D phase1 / 105D phase2)
   lr: 0.0002
   gamma: 0.99
   gae_lambda: 0.97

@@ -1,13 +1,13 @@
-# ETS MARL — Current Version (HAPPO/PPO) v5.3
+# ETS MARL — Current Version (HAPPO/PPO) v5.4
 
-This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **heuristic bot agents** that add realistic market demand.
+This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
 
 ## What Does This Code Do?
 
 At a high level, this project:
 
 1. **Creates a virtual carbon market** that mimics the real EU ETS (auctions, caps, penalties, banking, etc.)
-2. **Places 8 AI-controlled (learning) companies** and **4 heuristic bot companies** into that market, each with a different energy mix
+2. **Places 8 AI-controlled (learning) companies** and **8 heuristic bot companies** into that market, each with a different energy mix
 3. **Lets the learning companies learn** over thousands of simulated episodes how to bid in auctions, trade allowances, and invest in clean energy — while bots provide realistic background demand
 4. **Records everything** so we can analyze what strategies emerge and what they tell us about real carbon markets
 
@@ -17,7 +17,7 @@ At a high level, this project:
 
 Each "episode" simulates **12 years** of a carbon market. Every year:
 
-1. The government sets a **cap** — the total CO2 allowed. This cap **shrinks each year** (by about 4.3-4.4%) to push companies toward cleaner energy. Over 12 years, the cap drops from 23.5 Mt to ~14.4 Mt (~39% reduction).
+1. The government sets a **cap** — the total CO2 allowed. This cap **shrinks each year** (by about 4.3-4.4%) to push companies toward cleaner energy. Over 12 years, the cap drops from 57.0 Mt (~45 Mt initial emissions for 16 participants).
 2. Companies participate in an **auction** where they bid for emission allowances (each allowance = right to emit 1 tonne of CO2).
 3. The auction uses a **uniform price** — everyone pays the same price, which is the lowest winning bid. This is how the real EU ETS works.
 4. Companies that don't have enough allowances to cover their emissions face a **penalty** (base **€138.75/t in 2026**, indexed from €132.06 in 2024; plus carry-forward obligations).
@@ -35,27 +35,29 @@ Both can be independently enabled/disabled via config flags (`reward.terminal_ba
 
 ### The Companies (Agents)
 
-There are **12 total market participants**: 8 learning agents (PPO/HAPPO) and 4 heuristic bot agents.
+There are **16 total market participants**: 8 learning agents (PPO/HAPPO) and 8 heuristic bot agents.
 
-**Learning Agents (A1-A8)** — organized into 4 archetypes (2 of each — one financially-motivated, one green-motivated):
+**Learning Agents (A1-A8)** — organized into 4 archetypes (2 of each — one financially-motivated, one ESG-balanced):
 
-| Archetype | Energy Mix | Description |
-|-----------|-----------|-------------|
-| **Coal-heavy** (A1, A2) | ~80% fossil (40% coal, 40% gas) | High emissions, high cost pressure from carbon pricing |
-| **Gas-dominant** (A3, A4) | ~60% gas, 40% green | Medium emissions, more flexible |
-| **Transitioner** (A5, A6) | ~30% fossil, 70% green | Moderate emissions, well-positioned for transition |
-| **Green-leader** (A7, A8) | ~10% gas, 90% renewable | Low emissions, minimal allowance needs |
+| Archetype | Energy Mix | Reward Weights [w_cost, w_green] |
+|-----------|-----------|----------------------------------|
+| **Coal-heavy** (A1, A2) | ~80% fossil (40% coal, 40% gas) | A1: [1.0, 0.0] pure financial; A2: [0.5, 0.5] balanced ESG |
+| **Gas-dominant** (A3, A4) | ~60% gas, 40% green | A3: [1.0, 0.0] pure financial; A4: [0.5, 0.5] balanced ESG |
+| **Transitioner** (A5, A6) | ~30% fossil, 70% green | A5: [1.0, 0.0] pure financial; A6: [0.5, 0.5] balanced ESG |
+| **Green-leader** (A7, A8) | ~10% gas, 90% renewable | A7: [1.0, 0.0] pure financial; A8: [0.5, 0.5] balanced ESG |
 
-Even-indexed agents (A1, A3, A5, A7) prioritize financial performance; odd-indexed agents (A2, A4, A6, A8) prioritize green transition.
+Even-indexed agents (A1, A3, A5, A7) have pure financial reward weights [1.0, 0.0]; odd-indexed agents (A2, A4, A6, A8) have balanced ESG weights [0.5, 0.5].
 
-**Heuristic Bot Agents (B1-B4)** — fixed-policy agents using rule-based strategies from `heuristic_policy.py`:
+**Heuristic Bot Agents (B1-B8)** — fixed-policy agents using rule-based strategies from `heuristic_policy.py`, mirroring all 8 learning agent archetypes:
 
 | Bot | Energy Mix | Description |
 |-----|-----------|-------------|
-| **B1, B2** | ~80% fossil (45% coal, 35% gas) | Coal-heavy, adds realistic high-emission demand |
-| **B3, B4** | ~65% fossil (15% coal, 50% gas) | Gas-dominant, adds medium-emission demand |
+| **B1, B2** | ~80% fossil (40% coal, 40% gas) | Coal-heavy mirrors |
+| **B3, B4** | ~60% gas, 40% green | Gas-dominant mirrors |
+| **B5, B6** | ~30% fossil, 70% green | Transitioner mirrors |
+| **B7, B8** | ~10% gas, 90% renewable | Green-leader mirrors |
 
-Bots use the same `Company` class and participate identically in auction clearing and secondary market matching. They are **not trained** — their actions come from the heuristic policy (bid near penalty rate, invest conservatively, trade based on surplus/shortfall). Bots are indexed after learning agents (indices 8-11) and are excluded from PPO updates.
+Bots use the same `Company` class and participate identically in auction clearing and secondary market matching. They are **not trained** — their actions come from the heuristic policy (valuation-based bidding, NPV-gated investment, target-bank trajectory trading). Bots are indexed after learning agents (indices 8-15) and are excluded from PPO updates. Bot `reward_weights` in the config are for evaluation logging only — bots use `heuristic_policy`, not rewards.
 
 All companies produce **10 TWh/year** of electricity — the same output, but very different carbon footprints.
 
@@ -232,8 +234,8 @@ The most important settings you might want to change:
 | `simulation.n_episodes` | 70,000 | How many episodes to train for (more = better but slower) |
 | `simulation.n_years` | 12 | How many years each episode simulates |
 | `companies.n_agents` | 8 | Number of learning agents (PPO) |
-| `companies.n_bot_agents` | 4 | Number of heuristic bot agents |
-| `ets.cap_year_0` | 43.0 Mt | Starting emission cap (scaled for 12 participants) |
+| `companies.n_bot_agents` | 8 | Number of heuristic bot agents |
+| `ets.cap_year_0` | 57.0 Mt | Starting emission cap (scaled for 16 participants) |
 | `auction.price_max` | 500 | Maximum bid price (€/tonne) |
 | `penalty.rate` | 138.75 | Fine per excess tonne of CO2 (€), base level at simulation year-0 (2026) |
 | `penalty.inflation_rate` | 0.020 | Mean annual inflation for nominal indexing (μ) |

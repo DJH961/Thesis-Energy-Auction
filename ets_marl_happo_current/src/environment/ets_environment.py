@@ -448,7 +448,9 @@ class ETSEnvironment(gym.Env):
                 bank=float(self.holdings[idx]),
                 allocation=float(self._phase1_allocations[idx]),
                 clearing_price=clearing_price,
-                config=self.config)
+                config=self.config,
+                current_year=self.current_year,
+                n_years=self.n_years)
         return actions
 
     def step_auction(self, auction_actions: np.ndarray):

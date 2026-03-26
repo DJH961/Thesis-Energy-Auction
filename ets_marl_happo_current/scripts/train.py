@@ -208,6 +208,8 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
                     allocation=float(env._phase1_allocations[i]),
                     clearing_price=env._phase1_clearing_price,
                     config=config,
+                    current_year=current_year,
+                    n_years=n_years,
                 )
                 secondary_actions[i] = h_sec
 
