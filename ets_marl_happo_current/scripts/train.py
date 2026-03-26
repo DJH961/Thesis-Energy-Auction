@@ -432,6 +432,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     env = ETSEnvironment(config, seed=seed)
     agents = build_agents(env, config, seed)
+    n_total_agents = env.n_total
 
     ppo_cfg = config["ppo"]
 
@@ -502,17 +503,26 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     ep_fields = ["episode", "clearing_price_last", "cap_last", "entropy_coef",
                  "shaping_weight", "entropy_decay_triggered", "active_agent",
                  "epsilon"]
-    for i in range(n_agents):
+    for i in range(n_total_agents):
         ep_fields += [f"reward_A{i+1}", f"green_frac_A{i+1}", f"delta_green_A{i+1}",
                       f"penalty_A{i+1}", f"shortfall_A{i+1}", f"queue_size_A{i+1}",
                       f"actor_loss_A{i+1}", f"critic_loss_A{i+1}", f"bid_price_A{i+1}"]
     ep_fields += ["secondary_volume", "secondary_avg_price", "secondary_match_rate"]
     ep_fields += ["price_start", "price_peak", "price_std"]  # episode price trajectory
-    for i in range(n_agents):  # allocation + P5/P6/P8/MAC episode aggregates
+    for i in range(n_total_agents):  # allocation + P5/P6/P8/MAC episode aggregates
         ep_fields += [f"mean_alloc_A{i+1}",
                       f"mean_shock_A{i+1}", f"max_shock_A{i+1}",
                       f"mean_cf_shock_A{i+1}", f"total_cancels_A{i+1}",
                       f"total_mac_reduction_A{i+1}"]
+    ep_fields += [
+        "warn_lowAlloc", "warn_priceFloor", "warn_priceCeil", "warn_auctFail",
+        "warn_lowDemand", "warn_noInvest", "warn_debtSpiral", "warn_bidCluster",
+        "warn_overBank", "warn_1sideSec", "warn_noTrade", "warn_cornering",
+        "warn_rsvReject",
+        "warn_agents_stuck_ceiling", "warn_agents_stuck_floor", "warn_agents_stuck_zeroQty",
+    ]
+    for i in range(n_agents):
+        ep_fields += [f"streak_ceil_A{i+1}", f"streak_floor_A{i+1}", f"streak_zeroqty_A{i+1}"]
     ep_csv = open(ep_path, "w", newline="")
     ep_writer = csv.DictWriter(ep_csv, fieldnames=ep_fields)
     ep_writer.writeheader()
@@ -521,7 +531,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     yr_path = os.path.join(results_dir, f"year_log_s{seed}.csv")
     yr_fields = ["episode", "year", "cap", "auction_volume", "tnac",
                  "clearing_price", "secondary_price", "msr_reserve"]
-    for i in range(n_agents):
+    for i in range(n_total_agents):
         yr_fields += [f"bank_start_A{i+1}", f"alloc_A{i+1}", f"emissions_A{i+1}",
                       f"trade_qty_A{i+1}", f"trade_cost_A{i+1}", f"green_frac_A{i+1}",
                       f"delta_green_A{i+1}", f"shortfall_A{i+1}", f"penalty_A{i+1}",
@@ -684,9 +694,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 "secondary_price": yl.get("secondary_clearing", 0),
                 "msr_reserve": yl.get("msr_reserve", 0),
             }
-            for i in range(n_agents):
+            for i in range(n_total_agents):
                 def _get(log_key, default=0):
-                    vals = yl.get(log_key, [default] * n_agents)
+                    vals = yl.get(log_key, [default] * n_total_agents)
                     return vals[i] if i < len(vals) else default
                 yr_row[f"bank_start_A{i+1}"] = _get("bank_start")
                 yr_row[f"alloc_A{i+1}"] = _get("allocations")
@@ -855,7 +865,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         # Average bid price per agent across the episode
         avg_bid_per_agent = []
-        for i in range(n_agents):
+        for i in range(n_total_agents):
             bids_this_ep = [
                 yl["bid_prices"][i]
                 for yl in env.episode_log
@@ -865,7 +875,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         # Average bid quantity (Mt) per agent — Phase 1 action[1] after multiplier expansion
         avg_bid_qty_per_agent = []
-        for i in range(n_agents):
+        for i in range(n_total_agents):
             qtys_this_ep = [
                 yl["bid_quantities"][i]
                 for yl in env.episode_log
@@ -924,7 +934,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         # Average invest_frac action per agent — Phase 1 action[2]
         avg_invest_frac_per_agent = []
-        for i in range(n_agents):
+        for i in range(n_total_agents):
             frac_this_ep = [
                 yl["invest_fracs"][i]
                 for yl in env.episode_log
@@ -934,7 +944,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         # Average secondary price multiplier per agent — Phase 2 action[0]
         avg_sec_mult_per_agent = []
-        for i in range(n_agents):
+        for i in range(n_total_agents):
             mults_this_ep = [
                 yl["sec_price_mults"][i]
                 for yl in env.episode_log
@@ -944,7 +954,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         # Average secondary qty action per agent — Phase 2 action[1] (+ve=buy -ve=sell)
         avg_sec_qty_per_agent = []
-        for i in range(n_agents):
+        for i in range(n_total_agents):
             sqt_this_ep = [
                 yl["sec_qty_actions"][i]
                 for yl in env.episode_log
@@ -954,45 +964,50 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         # Per-agent episode aggregates
         ep_total_shortfalls = [
-            sum(yl.get("shortfalls", [0]*n_agents)[i] for yl in env.episode_log)
-            for i in range(n_agents)
+            sum(yl.get("shortfalls", [0] * n_total_agents)[i] for yl in env.episode_log)
+            for i in range(n_total_agents)
         ]
         ep_total_penalties = [
-            sum(yl.get("penalties", [0]*n_agents)[i] for yl in env.episode_log)
-            for i in range(n_agents)
+            sum(yl.get("penalties", [0] * n_total_agents)[i] for yl in env.episode_log)
+            for i in range(n_total_agents)
         ]
         ep_delta_greens = [
-            sum(yl.get("delta_greens", [0]*n_agents)[i] for yl in env.episode_log)
-            for i in range(n_agents)
+            sum(yl.get("delta_greens", [0] * n_total_agents)[i] for yl in env.episode_log)
+            for i in range(n_total_agents)
         ]
         ep_avg_queue = [
-            np.mean([yl.get("queue_sizes", [0]*n_agents)[i] for yl in env.episode_log])
-            for i in range(n_agents)
+            np.mean([yl.get("queue_sizes", [0] * n_total_agents)[i] for yl in env.episode_log])
+            for i in range(n_total_agents)
         ]
 
         # P5/P6/P8 episode aggregates for diagnostics
         ep_mean_shock = [                                              # mean |ε| over years
-            np.mean([abs(yl.get("emission_shocks", [0]*n_agents)[i])
+            np.mean([abs(yl.get("emission_shocks", [0] * n_total_agents)[i])
                      for yl in env.episode_log])
-            for i in range(n_agents)
+            for i in range(n_total_agents)
         ]
         ep_max_shock = [                                               # worst-case ε
-            max(yl.get("emission_shocks", [0]*n_agents)[i]
+            max(yl.get("emission_shocks", [0] * n_total_agents)[i]
                 for yl in env.episode_log)
-            for i in range(n_agents)
+            for i in range(n_total_agents)
         ]
         ep_mean_cf_shock = [                                           # mean |CF noise|
-            np.mean([abs(yl.get("cf_shocks", [0]*n_agents)[i])
+            np.mean([abs(yl.get("cf_shocks", [0] * n_total_agents)[i])
                      for yl in env.episode_log])
-            for i in range(n_agents)
+            for i in range(n_total_agents)
         ]
         ep_total_cancels = [                                           # total project cancellations
-            sum(int(yl.get("cancellations", [0]*n_agents)[i]) for yl in env.episode_log)
-            for i in range(n_agents)
+            sum(int(yl.get("cancellations", [0] * n_total_agents)[i]) for yl in env.episode_log)
+            for i in range(n_total_agents)
         ]
         ep_total_mac_reduction = [                                     # total MAC abatement (Mt)
-            sum(yl.get("mac_reductions", [0.0]*n_agents)[i] for yl in env.episode_log)
-            for i in range(n_agents)
+            sum(yl.get("mac_reductions", [0.0] * n_total_agents)[i] for yl in env.episode_log)
+            for i in range(n_total_agents)
+        ]
+
+        ep_total_rewards_all = [
+            sum(yl.get("rewards", [0.0] * n_total_agents)[i] for yl in env.episode_log)
+            for i in range(n_total_agents)
         ]
 
         # Episode trajectory stats (across all years) — used in console only
@@ -1004,23 +1019,23 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         price_peak  = max(prices_ep) if prices_ep else 0.0
 
         ep_green_start = [
-            first_log.get("green_fracs", [0.0]*n_agents)[i] for i in range(n_agents)
+            first_log.get("green_fracs", [0.0] * n_total_agents)[i] for i in range(n_total_agents)
         ]
         ep_green_end = [
-            last_log.get("green_fracs", [0.0]*n_agents)[i] for i in range(n_agents)
+            last_log.get("green_fracs", [0.0] * n_total_agents)[i] for i in range(n_total_agents)
         ]
         ep_mean_emiss = [
-            np.mean([yl.get("emissions", [0.0]*n_agents)[i] for yl in env.episode_log])
-            for i in range(n_agents)
+            np.mean([yl.get("emissions", [0.0] * n_total_agents)[i] for yl in env.episode_log])
+            for i in range(n_total_agents)
         ]
         ep_mean_alloc = [
-            np.mean([yl.get("allocations", [0.0]*n_agents)[i] for yl in env.episode_log])
-            for i in range(n_agents)
+            np.mean([yl.get("allocations", [0.0] * n_total_agents)[i] for yl in env.episode_log])
+            for i in range(n_total_agents)
         ]
         ep_shortfall_years = [                       # count of years where agent had shortfall
             sum(1 for yl in env.episode_log
-                if yl.get("shortfalls", [0.0]*n_agents)[i] > 1e-6)
-            for i in range(n_agents)
+                if yl.get("shortfalls", [0.0] * n_total_agents)[i] > 1e-6)
+            for i in range(n_total_agents)
         ]
 
         price_std = float(np.std(prices_ep)) if len(prices_ep) > 1 else 0.0
@@ -1041,10 +1056,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             "price_peak": round(price_peak, 2),
             "price_std": round(price_std, 2),
         }
-        for i in range(n_agents):
-            ep_row[f"reward_A{i+1}"] = round(total_rewards[i], 4)
+        for i in range(n_total_agents):
+            ep_row[f"reward_A{i+1}"] = round(ep_total_rewards_all[i], 4)
             ep_row[f"green_frac_A{i+1}"] = round(
-                last_log.get("green_fracs", [0]*n_agents)[i], 4)
+                last_log.get("green_fracs", [0] * n_total_agents)[i], 4)
             ep_row[f"delta_green_A{i+1}"] = round(ep_delta_greens[i], 5)
             ep_row[f"penalty_A{i+1}"] = round(ep_total_penalties[i], 6)
             ep_row[f"shortfall_A{i+1}"] = round(ep_total_shortfalls[i], 6)
@@ -1056,12 +1071,33 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             ep_row[f"mean_cf_shock_A{i+1}"]      = round(ep_mean_cf_shock[i], 5)
             ep_row[f"total_cancels_A{i+1}"]      = ep_total_cancels[i]
             ep_row[f"total_mac_reduction_A{i+1}"] = round(ep_total_mac_reduction[i], 4)
-            if latest_losses[i]:
+            if i < n_agents and latest_losses[i]:
                 ep_row[f"actor_loss_A{i+1}"] = round(latest_losses[i]["actor_loss"], 6)
                 ep_row[f"critic_loss_A{i+1}"] = round(latest_losses[i]["critic_loss"], 6)
             else:
                 ep_row[f"actor_loss_A{i+1}"] = 0.0
                 ep_row[f"critic_loss_A{i+1}"] = 0.0
+
+        ep_row["warn_lowAlloc"] = int(env._warnings.get("low_alloc", 0))
+        ep_row["warn_priceFloor"] = int(env._warnings.get("price_floor", 0))
+        ep_row["warn_priceCeil"] = int(env._warnings.get("price_ceil", 0))
+        ep_row["warn_auctFail"] = int(env._warnings.get("auct_fail", 0))
+        ep_row["warn_lowDemand"] = int(env._warnings.get("low_demand", 0))
+        ep_row["warn_noInvest"] = int(env._warnings.get("no_invest", 0))
+        ep_row["warn_debtSpiral"] = int(env._warnings.get("debt_spiral", 0))
+        ep_row["warn_bidCluster"] = int(env._warnings.get("bid_cluster", 0))
+        ep_row["warn_overBank"] = int(env._warnings.get("over_bank", 0))
+        ep_row["warn_1sideSec"] = int(env._warnings.get("one_side_sec", 0))
+        ep_row["warn_noTrade"] = int(env._warnings.get("no_trade", 0))
+        ep_row["warn_cornering"] = int(env._warnings.get("cornering", 0))
+        ep_row["warn_rsvReject"] = int(env._warnings.get("rsv_reject", 0))
+        ep_row["warn_agents_stuck_ceiling"] = int(np.sum(_streak_ceil >= _broken_window))
+        ep_row["warn_agents_stuck_floor"] = int(np.sum(_streak_floor >= _broken_window))
+        ep_row["warn_agents_stuck_zeroQty"] = int(np.sum(_streak_qty >= _broken_window))
+        for i in range(n_agents):
+            ep_row[f"streak_ceil_A{i+1}"] = int(_streak_ceil[i])
+            ep_row[f"streak_floor_A{i+1}"] = int(_streak_floor[i])
+            ep_row[f"streak_zeroqty_A{i+1}"] = int(_streak_qty[i])
 
         ep_writer.writerow(ep_row)
 
@@ -1098,7 +1134,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             warn_str = "  │ warn: " + " ".join(_warn_parts) if _warn_parts else ""
 
             # ── Enhanced secondary market breakdown ────────────────────
-            n_total = env.n_agents  # learning + bots
+            n_total = env.n_total  # learning + bots
             sec_sellers = 0; sec_buyers = 0; sec_holders = 0
             sec_sell_vol = 0.0; sec_buy_vol = 0.0
             for _yi in env.episode_log:
