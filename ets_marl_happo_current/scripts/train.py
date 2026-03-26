@@ -342,9 +342,12 @@ def _print_training_legend():
     print("  ActLoss     : Actor loss")
     print("  CriLoss     : Critic loss")
     print("  MAC_Mt      : MAC fuel-switching reduction (Mt)")
-    print("  Role        : Secondary market role: SELL / BUY / HOLD")
+    print("  Role        : Secondary market role: SELL / BUY / HOLD (net over episode)")
     print("  SecMl       : Mean secondary price multiplier (action[0]; 0.5=discount 2.0=premium)")
     print("  SqAct       : Mean secondary qty action (+buy intent / -sell intent, Mt)")
+    print("  BuyY/SellY  : Number of years agent was buyer / seller on secondary market")
+    print("  Sec detail  : Per-agent breakdown: BNy/V.VMt@P€ = bought N years, V Mt at avg P€")
+    print("                                     SNy/V.VMt@P€ = sold N years, V Mt at avg P€")
     print("  elapsed/ETA : Wall-clock elapsed time and estimated remaining time")
     print()
     print("Inline warnings  (appear as │ warn: key=N at end of market header line)")
@@ -508,6 +511,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"penalty_A{i+1}", f"shortfall_A{i+1}", f"queue_size_A{i+1}",
                       f"actor_loss_A{i+1}", f"critic_loss_A{i+1}", f"bid_price_A{i+1}"]
     ep_fields += ["secondary_volume", "secondary_avg_price", "secondary_match_rate"]
+    for i in range(n_total_agents):
+        ep_fields += [f"sec_buy_vol_A{i+1}", f"sec_sell_vol_A{i+1}",
+                      f"sec_buy_avg_px_A{i+1}", f"sec_sell_avg_px_A{i+1}",
+                      f"sec_buy_years_A{i+1}", f"sec_sell_years_A{i+1}",
+                      f"avg_sec_mult_A{i+1}", f"avg_sec_qty_A{i+1}"]
     ep_fields += ["price_start", "price_peak", "price_std"]  # episode price trajectory
     for i in range(n_total_agents):  # allocation + P5/P6/P8/MAC episode aggregates
         ep_fields += [f"mean_alloc_A{i+1}",
@@ -541,7 +549,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"cancellation_A{i+1}",  # P6
                       f"auction_cost_A{i+1}", f"secondary_net_A{i+1}",  # cost breakdown
                       f"compliance_surplus_A{i+1}", f"bank_end_A{i+1}",  # compliance
-                      f"mac_reduction_A{i+1}", f"mac_cost_A{i+1}"]  # MAC
+                      f"mac_reduction_A{i+1}", f"mac_cost_A{i+1}",  # MAC
+                      f"terminal_bank_value_A{i+1}",
+                      f"terminal_queue_value_A{i+1}",
+                      f"terminal_liquidation_value_A{i+1}",
+                      f"sec_price_mult_A{i+1}",   # Phase 2 action[0] per year
+                      f"sec_qty_action_A{i+1}"]   # Phase 2 action[1] per year (+buy/-sell)
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -731,6 +744,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 yr_row[f"bank_end_A{i+1}"]          = round(_holdings, 4)  # post-compliance
                 yr_row[f"mac_reduction_A{i+1}"]     = _get("mac_reductions")
                 yr_row[f"mac_cost_A{i+1}"]          = _get("mac_costs")
+                yr_row[f"terminal_bank_value_A{i+1}"] = _get("terminal_bank_values")
+                yr_row[f"terminal_queue_value_A{i+1}"] = _get("terminal_queue_values")
+                yr_row[f"terminal_liquidation_value_A{i+1}"] = _get("terminal_liquidation_values")
+                yr_row[f"sec_price_mult_A{i+1}"] = round(_get("sec_price_mults", default=1.0), 4)
+                yr_row[f"sec_qty_action_A{i+1}"] = round(_get("sec_qty_actions", default=0.0), 4)
             yr_writer.writerow(yr_row)
 
             obs1 = obs1_next
@@ -962,6 +980,32 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             ]
             avg_sec_qty_per_agent.append(np.mean(sqt_this_ep) if sqt_this_ep else 0.0)
 
+        # Per-agent secondary buy/sell breakdown across the episode
+        per_agent_sec_stats = []
+        for i in range(n_total_agents):
+            buy_vol = 0.0; sell_vol = 0.0
+            buy_cost = 0.0; sell_rev = 0.0
+            buy_years = 0; sell_years = 0
+            for yl in env.episode_log:
+                tq = yl.get("trade_qtys", [0.0] * n_total_agents)
+                tc = yl.get("trade_costs", [0.0] * n_total_agents)
+                if i < len(tq):
+                    if tq[i] > 1e-6:
+                        buy_vol += tq[i]
+                        buy_cost += tc[i]
+                        buy_years += 1
+                    elif tq[i] < -1e-6:
+                        sell_vol += abs(tq[i])
+                        sell_rev += abs(tc[i])
+                        sell_years += 1
+            buy_avg_px = buy_cost / buy_vol if buy_vol > 1e-6 else 0.0
+            sell_avg_px = sell_rev / sell_vol if sell_vol > 1e-6 else 0.0
+            per_agent_sec_stats.append({
+                "buy_vol": buy_vol, "sell_vol": sell_vol,
+                "buy_avg_px": buy_avg_px, "sell_avg_px": sell_avg_px,
+                "buy_years": buy_years, "sell_years": sell_years,
+            })
+
         # Per-agent episode aggregates
         ep_total_shortfalls = [
             sum(yl.get("shortfalls", [0] * n_total_agents)[i] for yl in env.episode_log)
@@ -1077,6 +1121,15 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             else:
                 ep_row[f"actor_loss_A{i+1}"] = 0.0
                 ep_row[f"critic_loss_A{i+1}"] = 0.0
+            ss = per_agent_sec_stats[i]
+            ep_row[f"sec_buy_vol_A{i+1}"]     = round(ss["buy_vol"], 4)
+            ep_row[f"sec_sell_vol_A{i+1}"]    = round(ss["sell_vol"], 4)
+            ep_row[f"sec_buy_avg_px_A{i+1}"]  = round(ss["buy_avg_px"], 2)
+            ep_row[f"sec_sell_avg_px_A{i+1}"] = round(ss["sell_avg_px"], 2)
+            ep_row[f"sec_buy_years_A{i+1}"]   = ss["buy_years"]
+            ep_row[f"sec_sell_years_A{i+1}"]  = ss["sell_years"]
+            ep_row[f"avg_sec_mult_A{i+1}"]    = round(avg_sec_mult_per_agent[i], 4)
+            ep_row[f"avg_sec_qty_A{i+1}"]     = round(avg_sec_qty_per_agent[i], 4)
 
         ep_row["warn_lowAlloc"] = int(env._warnings.get("low_alloc", 0))
         ep_row["warn_priceFloor"] = int(env._warnings.get("price_floor", 0))
@@ -1224,6 +1277,19 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                   f"{sec_avg_buyers:.0f} buyers (+{sec_buy_vol:.1f} Mt) "
                   f"│ vol={total_sec_vol:.1f} Mt  match={sec_match_rate*100:.0f}%  "
                   f"avg_px={avg_sec_price:.1f}€  sec_clear={sec_p:.1f}€")
+            # Per-agent secondary trade summary (buy/sell years and avg prices)
+            sec_detail_parts = []
+            for _ai in range(n_agents):
+                ss = per_agent_sec_stats[_ai]
+                parts = []
+                if ss["buy_years"] > 0:
+                    parts.append(f"B{ss['buy_years']}y/{ss['buy_vol']:.1f}Mt@{ss['buy_avg_px']:.0f}€")
+                if ss["sell_years"] > 0:
+                    parts.append(f"S{ss['sell_years']}y/{ss['sell_vol']:.1f}Mt@{ss['sell_avg_px']:.0f}€")
+                if not parts:
+                    parts.append("HOLD")
+                sec_detail_parts.append(f"A{_ai+1}={'+'.join(parts)}")
+            print(f"  Sec detail: {' │ '.join(sec_detail_parts)}")
             # Market dynamics line
             print(f"  Market: avg_emiss={avg_annual_emiss:.1f} Mt/yr  "
                   f"compliance={compliance_rate*100:.0f}%  "
@@ -1240,7 +1306,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             print(f"  {'':4}  {'Grn':>9} {'ΔG':>6} {'Emiss':>6} {'Alloc':>6} "
                   f"{'Sf':>5} {'Bid€':>6} {'BidMt':>6} {'InvFr':>5} "
                   f"│ {'Rew':>7} {'Short':>6} {'Pen':>7} {'ALoss':>7} {'CLoss':>7} "
-                  f"│ {'MAC_Mt':>7} │ {'Role':>4} {'SecMl':>5} {'SqAct':>6}")
+                  f"│ {'MAC_Mt':>7} │ {'Role':>4} {'SecMl':>5} {'SqAct':>6} {'BuyY':>4} {'SellY':>5}")
             for i in range(n_agents):
                 act_mark  = "*" if (cycling_enabled and i == active_agent_idx) else " "
                 grn_str   = f"{ep_green_start[i]*100:.0f}→{ep_green_end[i]*100:.0f}%"
@@ -1249,13 +1315,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 loss_i    = latest_losses[i]
                 al_str    = f"{loss_i['actor_loss']:.4f}"  if loss_i else "   n/a"
                 cl_str    = f"{loss_i['critic_loss']:.4f}" if loss_i else "   n/a"
+                ss_i = per_agent_sec_stats[i]
                 print(
                     f"  A{i+1}{act_mark}: "
                     f"{grn_str:>9} {dgrn_str:>6} {ep_mean_emiss[i]:6.2f} {ep_mean_alloc[i]:6.2f} "
                     f"{sf_str:>5} {avg_bid_per_agent[i]:6.0f} {avg_bid_qty_per_agent[i]:6.2f} {avg_invest_frac_per_agent[i]:5.3f} "
                     f"│ {total_rewards[i]:7.1f} {ep_total_shortfalls[i]:6.2f} "
                     f"{ep_total_penalties[i]:7.0f} {al_str:>7} {cl_str:>7} "
-                    f"│ {ep_total_mac_reduction[i]:7.3f} │ {agent_sec_role[i]:>4} {avg_sec_mult_per_agent[i]:5.2f} {avg_sec_qty_per_agent[i]:6.2f}"
+                    f"│ {ep_total_mac_reduction[i]:7.3f} │ {agent_sec_role[i]:>4} {avg_sec_mult_per_agent[i]:5.2f} {avg_sec_qty_per_agent[i]:6.2f} {ss_i['buy_years']:>4} {ss_i['sell_years']:>5}"
                 )
             print(sep)
 

@@ -70,6 +70,7 @@ class Company:
         self.max_invest_frac = inv_cfg["max_invest_frac"]
         self.convexity_alpha = inv_cfg["convexity_alpha"]
         self.penalty_rate = pen_cfg["rate"]
+        self._penalty_inflation_rate = pen_cfg.get("inflation_rate", 0.0)
 
         # Risk curve parameters
         self.p_fail_min = risk_cfg["p_fail_min"]
@@ -473,11 +474,16 @@ class Company:
     # Compliance
     # ------------------------------------------------------------------
 
-    def settle_compliance(self, allowances_held: float) -> float:
-        shortfall = max(0.0, self.compute_emissions() - allowances_held)
-        return shortfall * self.penalty_rate
+    def effective_penalty_rate(self, current_year: int = 0) -> float:
+        """Penalty rate adjusted for inflation: base_rate × (1 + inflation_rate)^year."""
+        return self.penalty_rate * (1.0 + self._penalty_inflation_rate) ** current_year
 
-    def settle_compliance_realized(self, allowances_held: float, realized_emissions: float) -> float:
+    def settle_compliance(self, allowances_held: float, current_year: int = 0) -> float:
+        shortfall = max(0.0, self.compute_emissions() - allowances_held)
+        return shortfall * self.effective_penalty_rate(current_year)
+
+    def settle_compliance_realized(self, allowances_held: float, realized_emissions: float,
+                                   current_year: int = 0) -> float:
         """
         Settle compliance against realized (shocked) emissions.
         With carry_forward enabled, shortfall is added to next year's obligation,
@@ -493,7 +499,7 @@ class Company:
                 self._carry_forward = min(shortfall, cap_mult * base_emiss)
             else:
                 self._carry_forward = shortfall
-        return shortfall * self.penalty_rate
+        return shortfall * self.effective_penalty_rate(current_year)
 
     # ------------------------------------------------------------------
     # Observations — Phase 1: 23D base (+5*(N-1) opponent) | Phase 2: +7

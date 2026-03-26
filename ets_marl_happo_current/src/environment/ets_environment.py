@@ -151,6 +151,13 @@ class ETSEnvironment(gym.Env):
         self._mac_reductions = np.zeros(self.n_total)
         self._mac_costs = np.zeros(self.n_total)
 
+        # Terminal liquidation components from the latest reward computation.
+        # These are logged into year_log so notebook diagnostics can mirror
+        # the exact reward logic without re-implementing formulas.
+        self._last_terminal_bank_values = np.zeros(self.n_total)
+        self._last_terminal_queue_values = np.zeros(self.n_total)
+        self._last_terminal_liquidation_values = np.zeros(self.n_total)
+
         # Price normalization constant
         self._price_norm = config["auction"]["price_max"]
 
@@ -246,6 +253,9 @@ class ETSEnvironment(gym.Env):
         self._current_emission_shocks = np.zeros(self.n_total)
         self._current_cf_noise = np.zeros((self.n_total, 5))
         self._p6_cancellations = np.zeros(self.n_total, dtype=int)
+        self._last_terminal_bank_values = np.zeros(self.n_total)
+        self._last_terminal_queue_values = np.zeros(self.n_total)
+        self._last_terminal_liquidation_values = np.zeros(self.n_total)
         self._consecutive_years_without_valid_auction_clear = 0
         self._liquidity_ref_ema = float(self.config["price"]["initial_expected"])
 
@@ -356,7 +366,8 @@ class ETSEnvironment(gym.Env):
             self._price_history.append(synthetic_price)
             self.last_clearing_price = synthetic_price
             rho = self.config["price"].get("ar1_persistence", 0.85)
-            price_floor = self.config["price"].get("price_floor", 50.0)
+            price_floor = self.config["price"].get("ar1_floor",
+                            self.config["price"].get("price_floor", 50.0))
             vol_std = self.config["price"].get("volatility_std", 0.15)
             shock = self.rng.normal(0, vol_std) * synthetic_price
             self.expected_price = max(
@@ -748,6 +759,7 @@ class ETSEnvironment(gym.Env):
             penalties[i] = company.settle_compliance_realized(
                 allowances_held=holdings[i],
                 realized_emissions=realized_emissions[i],
+                current_year=self.current_year,
             )
 
         # Banking: surplus after surrendering for emissions + old carry-forward
@@ -819,6 +831,9 @@ class ETSEnvironment(gym.Env):
             "bid_prices": self._phase1_bid_prices.tolist() if self._phase1_bid_prices is not None else [],
             "delta_greens": [c.green_frac - c.prev_green_frac for c in self.companies],
             "queue_sizes": [len(c._construction_queue) for c in self.companies],
+            "terminal_bank_values": self._last_terminal_bank_values.tolist(),
+            "terminal_queue_values": self._last_terminal_queue_values.tolist(),
+            "terminal_liquidation_values": self._last_terminal_liquidation_values.tolist(),
             "mac_reductions": self._mac_reductions.tolist(),
             "mac_costs": self._mac_costs.tolist(),
             "sec_price_mults": secondary_actions[:, 0].tolist(),  # Phase 2 action[0] (raw)
@@ -831,7 +846,8 @@ class ETSEnvironment(gym.Env):
         if self._reserve_anchor == "secondary":
             self._price_history.append(secondary_clearing)
         rho = self.config["price"].get("ar1_persistence", 0.85)
-        price_floor = self.config["price"].get("price_floor", 50.0)
+        price_floor = self.config["price"].get("ar1_floor",
+                        self.config["price"].get("price_floor", 50.0))
         vol_std = self.config["price"].get("volatility_std", 0.15)
 
         if clearing_price > 0:
@@ -1024,6 +1040,8 @@ class ETSEnvironment(gym.Env):
         AFTER this function returns raw rewards.
         """
         rewards = np.zeros(self.n_total)
+        terminal_bank_values = np.zeros(self.n_total)
+        terminal_queue_values = np.zeros(self.n_total)
         non_compliance_mult = self.config["penalty"].get("non_compliance_multiplier", 1.0)
         reward_cfg = self.config.get("reward", {})
         trading_cfg = self.config.get("trading", {})
@@ -1111,11 +1129,18 @@ class ETSEnvironment(gym.Env):
             gamma_discount = self.config["ppo"].get("gamma", 0.99)
             terminal_payoff_years = reward_cfg.get("terminal_payoff_years", 5)
 
+            # Shared terminal price: max(clearing, last_secondary, 80% of inflation-adjusted penalty)
+            pen_cfg = self.config["penalty"]
+            inflation_rate = pen_cfg.get("inflation_rate", 0.025)
+            eff_penalty = pen_cfg["rate"] * (1.0 + inflation_rate) ** self.current_year
+            terminal_price = max(clearing_price, self.last_secondary_price, eff_penalty * 0.8)
+
             for i, company in enumerate(self.companies):
-                # Terminal bank value: banked allowances × clearing price
+                # Terminal bank value: banked allowances × terminal_price
                 if terminal_bank:
-                    bank_value = self.holdings[i] * clearing_price / 1000.0
+                    bank_value = self.holdings[i] * terminal_price / 1000.0
                     rewards[i] += bank_value
+                    terminal_bank_values[i] = bank_value
 
                 # Terminal queue value: NPV of future carbon savings from in-construction projects
                 if terminal_queue:
@@ -1125,10 +1150,16 @@ class ETSEnvironment(gym.Env):
                         annual_saving = (max(0.0, delta_ef)
                                          * item["frac_delta"]
                                          * company.output_mwh / 1e6
-                                         * clearing_price)
+                                         * terminal_price)
                         discount = gamma_discount ** max(0, item["completion_year"] - self.current_year)
                         queue_value += annual_saving * terminal_payoff_years * discount
-                    rewards[i] += queue_value / 1000.0
+                    queue_term = queue_value / 1000.0
+                    rewards[i] += queue_term
+                    terminal_queue_values[i] = queue_term
+
+        self._last_terminal_bank_values = terminal_bank_values
+        self._last_terminal_queue_values = terminal_queue_values
+        self._last_terminal_liquidation_values = terminal_bank_values + terminal_queue_values
 
         return rewards
 
