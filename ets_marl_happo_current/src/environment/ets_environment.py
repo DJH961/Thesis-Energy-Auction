@@ -574,7 +574,7 @@ class ETSEnvironment(gym.Env):
         mac_reductions = np.zeros(self.n_total)
         mac_costs = np.zeros(self.n_total)
         for i, company in enumerate(self.companies):
-            reduction, cost = company.apply_mac_switching(clearing_price)
+            reduction, cost = company.apply_mac_switching(clearing_price, current_year=year)
             mac_reductions[i] = reduction
             mac_costs[i] = cost
         self._current_emissions = np.maximum(self._current_emissions - mac_reductions, 0.0)
@@ -1052,14 +1052,17 @@ class ETSEnvironment(gym.Env):
         gamma_shaping = reward_cfg.get("shaping_gamma", 1.0)
         price_anchor_delta = reward_cfg.get("price_anchor_delta", 0.5)
 
-        # Electricity revenue parameters
+        # Electricity revenue parameters (base price inflation-indexed)
         elec_enabled = elec_cfg.get("enabled", False)
         base_elec_price = elec_cfg.get("base_price", 50.0)
         carbon_passthrough = elec_cfg.get("carbon_passthrough", 0.80)
+        pen_cfg = self.config["penalty"]
+        inflation_rate = pen_cfg.get("inflation_rate", 0.0)
+        inflation_factor = (1.0 + inflation_rate) ** self.current_year
 
         if elec_enabled:
             system_avg_ef = float(np.mean([c.weighted_emission_factor for c in self.companies]))
-            elec_price = base_elec_price + carbon_passthrough * clearing_price * system_avg_ef
+            elec_price = base_elec_price * inflation_factor + carbon_passthrough * clearing_price * system_avg_ef
 
         if mac_costs is None:
             mac_costs = np.zeros(self.n_total)
@@ -1069,7 +1072,7 @@ class ETSEnvironment(gym.Env):
             secondary_cost = float(trade_costs[i])
             penalty_cost = float(penalties[i])
             investment_cost = float(invest_costs[i])
-            operational_cost = company.compute_operational_cost()
+            operational_cost = company.compute_operational_cost(self.current_year)
             mac_cost_i = float(mac_costs[i])
 
             company.record_spending(auction_cost + max(0.0, secondary_cost)

@@ -149,13 +149,13 @@ budget:
   overspend_penalty_coef: 0.5
 
 # ----------------------------------------------------------
-# Non-compliance penalty (EU ETS Directive)
-# Inflation-indexed: effective_rate = rate x (1 + inflation_rate)^year
-# Carry-forward: shortfall added to next year's obligation.
+# Non-compliance penalty & general inflation
+# inflation_rate applies economy-wide: penalty, CapEx, OpEx,
+# decommission costs, MAC switching cost, electricity base price.
 # ----------------------------------------------------------
 penalty:
   rate: 100.0
-  inflation_rate: 0.025            # 2.5% annual (per EU ETS Directive)
+  inflation_rate: 0.025            # 2.5% annual — applied to all nominal costs
   non_compliance_multiplier: 1.0   # reduced since carry-forward already adds future cost
   carry_forward: true
   carry_forward_cap: 2.0           # max carry-forward as multiple of base annual emissions

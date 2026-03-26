@@ -70,7 +70,7 @@ class Company:
         self.max_invest_frac = inv_cfg["max_invest_frac"]
         self.convexity_alpha = inv_cfg["convexity_alpha"]
         self.penalty_rate = pen_cfg["rate"]
-        self._penalty_inflation_rate = pen_cfg.get("inflation_rate", 0.0)
+        self._inflation_rate = pen_cfg.get("inflation_rate", 0.0)
 
         # Risk curve parameters
         self.p_fail_min = risk_cfg["p_fail_min"]
@@ -196,7 +196,7 @@ class Company:
 
         return float(self.output_mwh * np.dot(realized_mix, self.emission_factors) / 1e6)
 
-    def apply_mac_switching(self, carbon_price: float) -> tuple:
+    def apply_mac_switching(self, carbon_price: float, current_year: int = 0) -> tuple:
         """
         MAC fuel-switching: temporarily switch coal dispatch to gas when
         carbon price exceeds the marginal abatement cost.
@@ -204,7 +204,8 @@ class Company:
         Returns (emissions_reduction_Mt, cost_M€).
         Does NOT modify the permanent capacity mix.
         """
-        if not self._mac_enabled or carbon_price <= self._mac_cost:
+        mac_cost = self._mac_cost * self.inflation_factor(current_year)
+        if not self._mac_enabled or carbon_price <= mac_cost:
             return 0.0, 0.0
 
         switchable = min(self.mix[0], self._mac_max_switch)
@@ -214,7 +215,7 @@ class Company:
         ef_reduction = self.emission_factors[0] - self.emission_factors[1]  # tCO2/MWh
         switched_mwh = switchable * self.output_mwh
         emissions_reduction = switched_mwh * ef_reduction / 1e6  # Mt
-        cost = emissions_reduction * self._mac_cost  # M€
+        cost = emissions_reduction * mac_cost  # M€
         return emissions_reduction, cost
 
     def compute_risk_factor(self) -> float:
@@ -227,9 +228,9 @@ class Company:
     # Operational costs
     # ------------------------------------------------------------------
 
-    def compute_operational_cost(self) -> float:
-        """Annual operational cost in M€ (fuel + O&M, excl. ETS)."""
-        return self.output_mwh * float(np.dot(self.mix, self.operational_costs)) / 1e6
+    def compute_operational_cost(self, current_year: int = 0) -> float:
+        """Annual operational cost in M€ (fuel + O&M, excl. ETS), inflation-indexed."""
+        return self.output_mwh * float(np.dot(self.mix, self.operational_costs)) / 1e6 * self.inflation_factor(current_year)
 
     def compute_ets_fuel_cost(self, ets_price: float) -> float:
         """Annual ETS cost in M€ based on current mix and carbon price."""
@@ -245,11 +246,12 @@ class Company:
             p_base -= self.exp_discount
         return max(self.p_fail_min, p_base)
 
-    def compute_investment_cost(self, tech_idx: int, frac_delta: float) -> float:
+    def compute_investment_cost(self, tech_idx: int, frac_delta: float,
+                               current_year: int = 0) -> float:
         """
         Compute real-data-grounded investment cost for adding renewable capacity.
 
-        Cost = ΔP × CapEx × (1 + α × ΔP / TotalCapacity)
+        Cost = ΔP × CapEx × (1 + α × ΔP / TotalCapacity) × inflation_factor
 
         where ΔP = ΔMWh / (CF × 8760) is the new capacity in kW.
 
@@ -270,17 +272,18 @@ class Company:
         base_cost = delta_kw * self.capex[tech_idx]  # €
         convexity = 1.0 + self.convexity_alpha * delta_kw / max(total_kw, 1e-6)
         cost_eur = base_cost * convexity
-        return cost_eur / 1e6  # M€
+        return cost_eur / 1e6 * self.inflation_factor(current_year)  # M€
 
-    def compute_decommission_cost(self, fossil_tech_idx: int, frac_delta: float) -> float:
-        """Cost to decommission fossil capacity in M€."""
+    def compute_decommission_cost(self, fossil_tech_idx: int, frac_delta: float,
+                                  current_year: int = 0) -> float:
+        """Cost to decommission fossil capacity in M€, inflation-indexed."""
         if frac_delta <= 0 or self.decommission_costs[fossil_tech_idx] <= 0:
             return 0.0
         delta_mwh = frac_delta * self.output_mwh
         cf = self.capacity_factors[fossil_tech_idx]
         delta_mw = delta_mwh / (cf * 8760)
         delta_kw = delta_mw * 1000.0
-        return delta_kw * self.decommission_costs[fossil_tech_idx] / 1e6
+        return delta_kw * self.decommission_costs[fossil_tech_idx] / 1e6 * self.inflation_factor(current_year)
 
     def plan_investment(self, tech_choice: int, invest_frac: float, current_year: int) -> float:
         """
@@ -314,7 +317,7 @@ class Company:
             return 0.0
 
         # Investment cost for new green capacity
-        invest_cost = self.compute_investment_cost(tech_idx, frac)
+        invest_cost = self.compute_investment_cost(tech_idx, frac, current_year)
 
         # Decommission cost: retire highest-emission fossil first
         decom_cost = 0.0
@@ -325,7 +328,7 @@ class Company:
             available = self.mix[fossil_idx]
             retire_this = min(frac_to_retire, available)
             if retire_this > 1e-6:
-                decom_cost += self.compute_decommission_cost(fossil_idx, retire_this)
+                decom_cost += self.compute_decommission_cost(fossil_idx, retire_this, current_year)
                 frac_to_retire -= retire_this
 
         total_cost = invest_cost + decom_cost
@@ -474,9 +477,13 @@ class Company:
     # Compliance
     # ------------------------------------------------------------------
 
+    def inflation_factor(self, current_year: int = 0) -> float:
+        """General inflation multiplier: (1 + inflation_rate)^year."""
+        return (1.0 + self._inflation_rate) ** current_year
+
     def effective_penalty_rate(self, current_year: int = 0) -> float:
-        """Penalty rate adjusted for inflation: base_rate × (1 + inflation_rate)^year."""
-        return self.penalty_rate * (1.0 + self._penalty_inflation_rate) ** current_year
+        """Penalty rate adjusted for inflation: base_rate × inflation_factor."""
+        return self.penalty_rate * self.inflation_factor(current_year)
 
     def settle_compliance(self, allowances_held: float, current_year: int = 0) -> float:
         shortfall = max(0.0, self.compute_emissions() - allowances_held)

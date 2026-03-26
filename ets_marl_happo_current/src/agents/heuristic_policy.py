@@ -98,7 +98,10 @@ def auction_action(
     # We anchor near penalty_rate so BC warm-start seeds realistic compliance
     # prices from the first episodes, while still reacting to MA3.
     # Green-objective agents add a small premium to ensure allocation.
-    penalty_rate = config.get("penalty", {}).get("rate", 100.0)
+    pen_cfg = config.get("penalty", {})
+    base_penalty = pen_cfg.get("rate", 100.0)
+    infl = pen_cfg.get("inflation_rate", 0.0)
+    penalty_rate = base_penalty * (1.0 + infl) ** current_year
     ma3_anchor = price_ma3 * (1.15 if not is_green else 1.20)
     near_penalty_anchor = 0.7 * penalty_rate + 0.3 * ma3_anchor
     if is_green:
@@ -123,7 +126,7 @@ def auction_action(
     years_left = max(1, n_years - current_year)
     frac_test = 0.07 if is_green else 0.03
 
-    invest_cost = company.compute_investment_cost(_TECH_SOLAR, frac_test)  # M€
+    invest_cost = company.compute_investment_cost(_TECH_SOLAR, frac_test, current_year)  # M€
 
     ef_saved = max(0.0, company.weighted_emission_factor - company.emission_factors[_TECH_SOLAR])
     annual_emission_reduction = frac_test * company.output_mwh * ef_saved / 1e6  # Mt
