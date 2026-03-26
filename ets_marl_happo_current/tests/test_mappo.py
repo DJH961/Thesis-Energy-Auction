@@ -135,22 +135,10 @@ def test_estimate_value_global_state():
     assert np.isfinite(val), f"Value should be finite, got {val}"
 
 
-def test_mappo_full_episode():
-    """Run one full episode with MAPPO and verify PPO update completes."""
-    config = _load_config()
-    config["ppo"]["centralized_critic"] = True
-    config["pretrain"]["enabled"] = False
-    config["ppo"]["critic_warmup_episodes"] = 0
-
-    env = ETSEnvironment(config, seed=42)
-    agents = build_agents(env, config, seed=42)
-    n_agents = config["companies"]["n_agents"]
-    n_years = config["simulation"]["n_years"]
-
+def _run_one_episode(env, agents, n_agents, n_years, config):
+    """Run one full episode, storing transitions. Returns obs1 for chaining."""
     obs1, _ = env.reset(seed=42)
-
     for year in range(n_years):
-        # Phase 1: Auction
         auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
         auction_raws, auction_logps = [], []
         for i in range(n_agents):
@@ -160,9 +148,9 @@ def test_mappo_full_episode():
             auction_logps.append(lp)
 
         obs2, _ = env.step_auction(auction_actions)
-        global_state = obs2.flatten()  # MAPPO global state
+        _centralized = config["ppo"].get("centralized_critic", False)
+        global_state = obs2.flatten() if _centralized else None
 
-        # Phase 2: Secondary
         sec_actions = np.zeros((n_agents, 2), dtype=np.float32)
         sec_raws, sec_logps = [], []
         for i in range(n_agents):
@@ -173,9 +161,9 @@ def test_mappo_full_episode():
 
         obs1_next, rewards, done, _, _ = env.step_secondary(sec_actions)
 
-        # Store transitions with global state
         for i in range(n_agents):
-            value = agents[i].estimate_value(global_state)
+            value = agents[i].estimate_value(
+                global_state if _centralized else obs2[i])
             agents[i].store_transition(
                 obs1[i], obs2[i], auction_raws[i], sec_raws[i],
                 auction_logps[i], sec_logps[i], rewards[i], done, value,
@@ -185,6 +173,23 @@ def test_mappo_full_episode():
         obs1 = obs1_next
         if done:
             break
+    return obs1
+
+
+def test_mappo_full_episode():
+    """Run one full episode with MAPPO and verify PPO update completes."""
+    config = _load_config()
+    config["ppo"]["centralized_critic"] = True
+    config["pretrain"]["enabled"] = False
+    config["ppo"]["critic_warmup_episodes"] = 0
+    config["ppo"]["mini_batch_size"] = 6  # small batch for single-episode test
+
+    env = ETSEnvironment(config, seed=42)
+    agents = build_agents(env, config, seed=42)
+    n_agents = config["companies"]["n_agents"]
+    n_years = config["simulation"]["n_years"]
+
+    _run_one_episode(env, agents, n_agents, n_years, config)
 
     # PPO update should work without errors
     for i, agent in enumerate(agents):
@@ -198,3 +203,121 @@ def test_mappo_full_episode():
     # Verify buffer was cleared after update
     for agent in agents:
         assert len(agent.buffer) == 0, "Buffer should be cleared after update"
+
+
+# ------------------------------------------------------------------
+# Batch accumulation tests
+# ------------------------------------------------------------------
+
+def test_batch_accumulation_buffer_size():
+    """After episodes_per_update episodes, buffer should contain ~N*n_years transitions."""
+    config = _load_config()
+    config["ppo"]["centralized_critic"] = True
+    config["pretrain"]["enabled"] = False
+    config["ppo"]["episodes_per_update"] = 4
+
+    env = ETSEnvironment(config, seed=42)
+    agents = build_agents(env, config, seed=42)
+    n_agents = config["companies"]["n_agents"]
+    n_years = config["simulation"]["n_years"]
+
+    # Run 4 episodes without clearing buffers
+    for _ in range(4):
+        _run_one_episode(env, agents, n_agents, n_years, config)
+
+    # Each episode has n_years transitions, 4 episodes → ~4*n_years
+    expected_transitions = 4 * n_years
+    for i, agent in enumerate(agents):
+        actual = len(agent.buffer)
+        assert actual == expected_transitions, (
+            f"Agent {i}: expected {expected_transitions} transitions, got {actual}")
+
+
+def test_gae_respects_done_flags():
+    """GAE should NOT bootstrap across episode boundaries (done=True)."""
+    config = _load_config()
+    config["ppo"]["centralized_critic"] = True
+    config["pretrain"]["enabled"] = False
+    config["ppo"]["mini_batch_size"] = 6
+
+    env = ETSEnvironment(config, seed=42)
+    agents = build_agents(env, config, seed=42)
+    n_agents = config["companies"]["n_agents"]
+    n_years = config["simulation"]["n_years"]
+
+    # Run 2 episodes to accumulate transitions
+    for _ in range(2):
+        _run_one_episode(env, agents, n_agents, n_years, config)
+
+    agent = agents[0]
+    dones = np.array(agent.buffer.dones, dtype=np.float32)
+
+    # The last step of each episode should have done=True
+    # With 2 episodes of n_years steps each, done should be True at indices n_years-1 and 2*n_years-1
+    assert dones[n_years - 1] == 1.0, "First episode boundary should have done=True"
+    assert dones[2 * n_years - 1] == 1.0, "Second episode boundary should have done=True"
+
+    # Compute GAE and verify it doesn't produce NaN
+    adv, ret, buf = agent.compute_gae(last_value=0.0)
+    assert adv is not None, "GAE returned None"
+    assert torch.isfinite(adv).all(), "GAE advantages contain non-finite values"
+    assert torch.isfinite(ret).all(), "GAE returns contain non-finite values"
+
+
+def test_separate_optimizers_step():
+    """Verify actor_optimizer and critic_optimizer both step correctly."""
+    config = _load_config()
+    config["ppo"]["centralized_critic"] = True
+    config["pretrain"]["enabled"] = False
+    config["ppo"]["critic_warmup_episodes"] = 0
+    config["ppo"]["mini_batch_size"] = 6
+
+    env = ETSEnvironment(config, seed=42)
+    agents = build_agents(env, config, seed=42)
+    n_agents = config["companies"]["n_agents"]
+    n_years = config["simulation"]["n_years"]
+
+    agent = agents[0]
+
+    # Check separate optimizers exist with correct param counts
+    actor_param_count = sum(p.numel() for p in agent.auction_policy.parameters()) + \
+                        sum(p.numel() for p in agent.secondary_policy.parameters())
+    critic_param_count = sum(p.numel() for p in agent.value_net.parameters())
+
+    actor_opt_params = sum(
+        sum(p.numel() for p in group["params"])
+        for group in agent.actor_optimizer.param_groups
+    )
+    critic_opt_params = sum(
+        sum(p.numel() for p in group["params"])
+        for group in agent.critic_optimizer.param_groups
+    )
+
+    assert actor_opt_params == actor_param_count, (
+        f"Actor optimizer param count mismatch: {actor_opt_params} vs {actor_param_count}")
+    assert critic_opt_params == critic_param_count, (
+        f"Critic optimizer param count mismatch: {critic_opt_params} vs {critic_param_count}")
+
+    # Verify different learning rates
+    actor_lr = agent.actor_optimizer.param_groups[0]["lr"]
+    critic_lr = agent.critic_optimizer.param_groups[0]["lr"]
+    expected_actor_lr = config["ppo"]["lr"]
+    expected_critic_lr = config["ppo"].get("critic_lr", config["ppo"]["lr"])
+    assert abs(actor_lr - expected_actor_lr) < 1e-8, f"Actor LR mismatch: {actor_lr}"
+    assert abs(critic_lr - expected_critic_lr) < 1e-8, f"Critic LR mismatch: {critic_lr}"
+
+    # Run an episode and verify update works
+    _run_one_episode(env, agents, n_agents, n_years, config)
+
+    # Snapshot weights before update
+    critic_w_before = agent.value_net.fc1.weight.data.clone()
+    actor_w_before = agent.auction_policy.fc1.weight.data.clone()
+
+    result = agent.update(last_value=0.0)
+    assert result is not None
+
+    # Both networks should have been updated
+    critic_changed = not torch.equal(critic_w_before, agent.value_net.fc1.weight.data)
+    actor_changed = not torch.equal(actor_w_before, agent.auction_policy.fc1.weight.data)
+    assert critic_changed, "Critic weights should change after update"
+    assert actor_changed, "Actor weights should change after update"

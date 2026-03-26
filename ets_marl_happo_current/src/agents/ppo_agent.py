@@ -190,12 +190,17 @@ class PPOAgent:
         else:
             self.value_net = ValueNetwork(obs_dim_phase2, hidden).to(self.device)
 
-        all_params = (
+        # Separate actor/critic optimizers for independent learning rates
+        actor_params = (
             list(self.auction_policy.parameters()) +
-            list(self.secondary_policy.parameters()) +
-            list(self.value_net.parameters())
+            list(self.secondary_policy.parameters())
         )
-        self.optimizer = optim.Adam(all_params, lr=ppo["lr"])
+        critic_params = list(self.value_net.parameters())
+        self.actor_optimizer = optim.Adam(actor_params, lr=ppo["lr"])
+        critic_lr = ppo.get("critic_lr", ppo["lr"])
+        self.critic_optimizer = optim.Adam(critic_params, lr=critic_lr)
+        # Backwards-compat alias used by cycling code in train.py
+        self.optimizer = self.actor_optimizer
 
         self.buffer = RolloutBuffer()
         self.actor_loss_history = []
@@ -512,43 +517,49 @@ class PPOAgent:
                         kl_sec = kl_divergence(curr_sec_dist, bc_sec_dist).mean()
                         kl_pen = self.kl_beta * (kl_auc + kl_sec) * 0.5
 
-                    loss = (policy_loss
-                            + self.value_coef * value_loss
-                            - self.entropy_coef * entropy
-                            + kl_pen)
+                    actor_loss_total = (policy_loss
+                                        - self.entropy_coef * entropy
+                                        + kl_pen)
+                    critic_loss_total = self.value_coef * value_loss
                 else:
                     # Critic-warmup: train value network only
                     policy_loss = torch.tensor(0.0, device=self.device)
-                    loss = self.value_coef * value_loss
+                    actor_loss_total = None
+                    critic_loss_total = self.value_coef * value_loss
 
-                if not torch.isfinite(loss):
+                # --- Critic step ---
+                if not torch.isfinite(critic_loss_total):
                     continue
-
-                self.optimizer.zero_grad()
-                loss.backward()
-
+                self.critic_optimizer.zero_grad()
+                critic_loss_total.backward(retain_graph=(actor_loss_total is not None))
                 nn.utils.clip_grad_norm_(
-                    list(self.auction_policy.parameters()) +
-                    list(self.secondary_policy.parameters()) +
-                    list(self.value_net.parameters()),
-                    self.max_grad_norm
-                )
+                    list(self.value_net.parameters()), self.max_grad_norm)
+                bad_crit = any(
+                    p.grad is not None and not torch.isfinite(p.grad).all()
+                    for p in self.value_net.parameters())
+                if bad_crit:
+                    self.critic_optimizer.zero_grad()
+                else:
+                    self.critic_optimizer.step()
 
-                bad_grad = False
-                for p in (
-                    list(self.auction_policy.parameters()) +
-                    list(self.secondary_policy.parameters()) +
-                    list(self.value_net.parameters())
-                ):
-                    if p.grad is not None and not torch.isfinite(p.grad).all():
-                        bad_grad = True
-                        break
-
-                if bad_grad:
-                    self.optimizer.zero_grad()
-                    continue
-
-                self.optimizer.step()
+                # --- Actor step ---
+                if actor_loss_total is not None:
+                    if not torch.isfinite(actor_loss_total):
+                        total_v_loss += value_loss.item()
+                        n_up += 1
+                        continue
+                    self.actor_optimizer.zero_grad()
+                    actor_loss_total.backward()
+                    actor_params = (list(self.auction_policy.parameters()) +
+                                    list(self.secondary_policy.parameters()))
+                    nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
+                    bad_actor = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in actor_params)
+                    if bad_actor:
+                        self.actor_optimizer.zero_grad()
+                    else:
+                        self.actor_optimizer.step()
 
                 total_a_loss += policy_loss.item()
                 total_v_loss += value_loss.item()
@@ -739,42 +750,48 @@ class PPOAgent:
                         kl_sec = kl_divergence(curr_sec_dist, bc_sec_dist).mean()
                         kl_pen = self.kl_beta * (kl_auc + kl_sec) * 0.5
 
-                    loss = (policy_loss
-                            + self.value_coef * value_loss
-                            - self.entropy_coef * entropy
-                            + kl_pen)
+                    actor_loss_total = (policy_loss
+                                        - self.entropy_coef * entropy
+                                        + kl_pen)
+                    critic_loss_total = self.value_coef * value_loss
                 else:
                     policy_loss = torch.tensor(0.0, device=self.device)
-                    loss = self.value_coef * value_loss
+                    actor_loss_total = None
+                    critic_loss_total = self.value_coef * value_loss
 
-                if not torch.isfinite(loss):
+                # --- Critic step ---
+                if not torch.isfinite(critic_loss_total):
                     continue
-
-                self.optimizer.zero_grad()
-                loss.backward()
-
+                self.critic_optimizer.zero_grad()
+                critic_loss_total.backward(retain_graph=(actor_loss_total is not None))
                 nn.utils.clip_grad_norm_(
-                    list(self.auction_policy.parameters()) +
-                    list(self.secondary_policy.parameters()) +
-                    list(self.value_net.parameters()),
-                    self.max_grad_norm
-                )
+                    list(self.value_net.parameters()), self.max_grad_norm)
+                bad_crit = any(
+                    p.grad is not None and not torch.isfinite(p.grad).all()
+                    for p in self.value_net.parameters())
+                if bad_crit:
+                    self.critic_optimizer.zero_grad()
+                else:
+                    self.critic_optimizer.step()
 
-                bad_grad = False
-                for p in (
-                    list(self.auction_policy.parameters()) +
-                    list(self.secondary_policy.parameters()) +
-                    list(self.value_net.parameters())
-                ):
-                    if p.grad is not None and not torch.isfinite(p.grad).all():
-                        bad_grad = True
-                        break
-
-                if bad_grad:
-                    self.optimizer.zero_grad()
-                    continue
-
-                self.optimizer.step()
+                # --- Actor step ---
+                if actor_loss_total is not None:
+                    if not torch.isfinite(actor_loss_total):
+                        total_v_loss += value_loss.item()
+                        n_up += 1
+                        continue
+                    self.actor_optimizer.zero_grad()
+                    actor_loss_total.backward()
+                    actor_params = (list(self.auction_policy.parameters()) +
+                                    list(self.secondary_policy.parameters()))
+                    nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
+                    bad_actor = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in actor_params)
+                    if bad_actor:
+                        self.actor_optimizer.zero_grad()
+                    else:
+                        self.actor_optimizer.step()
 
                 total_a_loss += policy_loss.item()
                 total_v_loss += value_loss.item()
@@ -833,6 +850,8 @@ class PPOAgent:
             "auction_policy": self.auction_policy.state_dict(),
             "secondary_policy": self.secondary_policy.state_dict(),
             "value_net": self.value_net.state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
         }, path)
 
     def load(self, path):
@@ -840,3 +859,7 @@ class PPOAgent:
         self.auction_policy.load_state_dict(ckpt["auction_policy"])
         self.secondary_policy.load_state_dict(ckpt["secondary_policy"])
         self.value_net.load_state_dict(ckpt["value_net"])
+        if "actor_optimizer" in ckpt:
+            self.actor_optimizer.load_state_dict(ckpt["actor_optimizer"])
+        if "critic_optimizer" in ckpt:
+            self.critic_optimizer.load_state_dict(ckpt["critic_optimizer"])

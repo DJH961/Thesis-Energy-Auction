@@ -240,16 +240,20 @@ ppo:
   entropy_decay_start: 3000
   entropy_decay_window: 0    # 0 = auto (80% of n_episodes)
   value_coef: 0.5
-  max_grad_norm: 0.3
-  n_epochs: 3
-  mini_batch_size: 6
+  max_grad_norm: 0.5         # relaxed from 0.3 — less conservative with larger batches
+  n_epochs: 5                # increased from 3 — extract more signal from larger batch
+  mini_batch_size: 32        # increased from 6 — reasonable with 96 transitions per batch
+  episodes_per_update: 8     # batch accumulation: collect 8 episodes before PPO update
   normalize_advantages: true
-  log_std_min: -1.5          # e^-1.5 ~ 0.22
+  log_std_min: -2.5          # e^-2.5 ~ 0.08 — allows tighter final convergence
   log_std_max: 0.0           # e^0 = 1.0
   centralized_critic: true
   happo: true
-  critic_hidden_size: 256
-  critic_warmup_episodes: 100
+  critic_lr: 0.001           # separate faster critic learning rate
+  critic_hidden_size: 512    # increased from 256 — more capacity for 680D input
+  critic_warmup_episodes: 500  # increased from 100 — give critic time to converge
+  lr_decay: cosine           # cosine annealing schedule for both optimizers
+  lr_min: 0.00001            # minimum learning rate at end of cosine decay
   target_kl: 0.02            # KL-based early stopping per PPO epoch
   kl_anchor_beta: 0.5        # KL penalty weight against frozen BC policy
   kl_anchor_decay_episodes: 8000

@@ -192,13 +192,15 @@ class SecondaryPolicy(nn.Module):
 
 
 class ValueNetwork(nn.Module):
-    """V(s) for PPO. Takes enriched obs(21) = full state."""
+    """V(s) for PPO. Two hidden layers: input→hidden_size→ReLU→hidden2→ReLU→1.
+    hidden2 defaults to hidden_size//2 (e.g. 512→256→1)."""
 
     def __init__(self, obs_dim, hidden_size):
         super().__init__()
+        hidden2 = max(hidden_size // 2, 64)
         self.fc1 = nn.Linear(obs_dim, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, 1)
+        self.fc2 = nn.Linear(hidden_size, hidden2)
+        self.fc3 = nn.Linear(hidden2, 1)
         self._init_weights()
 
     def forward(self, obs):

@@ -27,6 +27,7 @@ import copy
 import csv
 import datetime
 import io
+import math
 import os
 import sys
 import time
@@ -494,6 +495,21 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         print(f"HPP: pool={hpp_pool_size}, save every {hpp_save_interval} eps, "
               f"swap_prob={hpp_swap_prob:.0%}, warmup={hpp_warmup} eps.")
 
+    # Batch accumulation: collect N episodes before triggering PPO update
+    episodes_per_update = ppo_cfg.get("episodes_per_update", 1)
+    if episodes_per_update > 1:
+        print(f"Batch accumulation: {episodes_per_update} episodes per update "
+              f"(~{episodes_per_update * n_years} transitions per batch).")
+
+    # Cosine LR decay setup
+    lr_decay_mode = ppo_cfg.get("lr_decay", "none")
+    lr_min = ppo_cfg.get("lr_min", 0.0)
+    actor_lr_init = ppo_cfg["lr"]
+    critic_lr_init = ppo_cfg.get("critic_lr", ppo_cfg["lr"])
+    if lr_decay_mode == "cosine":
+        print(f"Cosine LR decay: actor {actor_lr_init}→{lr_min}, "
+              f"critic {critic_lr_init}→{lr_min} over {n_episodes} episodes.")
+
     # Condition-based entropy tracker (auto-scales to n_episodes)
     entropy_tracker = EntropyConditionTracker(ppo_cfg, n_agents, n_episodes)
 
@@ -773,7 +789,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     copy.deepcopy(agents[i].secondary_policy.state_dict()),
                 ))
 
-        # === PPO Update (end of episode) ===
+        # === PPO Update (batched: every episodes_per_update episodes) ===
         # Time-based entropy decay
         entropy_coef = entropy_tracker.update(episode)
         for i, agent in enumerate(agents):
@@ -789,77 +805,96 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     agent_ent = max(entropy_coef, _stuck_boost_coef)
             agent.set_entropy_coef(agent_ent)
 
+        # Batch accumulation: only update every episodes_per_update episodes.
+        # Do NOT clear buffers between episodes within a batch.
+        is_update_episode = ((episode + 1) % episodes_per_update == 0) or (episode == n_episodes - 1)
+
         latest_losses = []
-        if happo_enabled:
-            # === HAPPO: Sequential update with cumulative importance ratios ===
-            # 1. Compute GAE advantages per agent (using their own centralized critics)
-            gae_data = []
-            for i in range(n_agents):
-                adv, ret, buf = agents[i].compute_gae(last_value=0.0)
-                gae_data.append((adv, ret, buf))
+        if is_update_episode:
+            if happo_enabled:
+                # === HAPPO: Sequential update with cumulative importance ratios ===
+                # 1. Compute GAE advantages per agent (using their own centralized critics)
+                gae_data = []
+                for i in range(n_agents):
+                    adv, ret, buf = agents[i].compute_gae(last_value=0.0)
+                    gae_data.append((adv, ret, buf))
 
-            # 2. Sequential update in random order
-            order = np.random.permutation(n_agents).tolist()
-            # Find T from first agent with non-empty buffer
-            T = 0
-            for _gd in gae_data:
-                if _gd[2] is not None:
-                    T = _gd[2]["T"]
-                    break
-            cumulative_ratio = torch.ones(T, 1) if T > 0 else None
+                # 2. Sequential update in random order
+                order = np.random.permutation(n_agents).tolist()
+                # Find T from first agent with non-empty buffer
+                T = 0
+                for _gd in gae_data:
+                    if _gd[2] is not None:
+                        T = _gd[2]["T"]
+                        break
+                cumulative_ratio = torch.ones(T, 1) if T > 0 else None
 
-            for j in order:
-                adv_j, ret_j, buf_j = gae_data[j]
-                if buf_j is None:
-                    latest_losses.append(None)
-                    continue
+                for j in order:
+                    adv_j, ret_j, buf_j = gae_data[j]
+                    if buf_j is None:
+                        latest_losses.append(None)
+                        continue
 
-                loss = agents[j].update_happo(
-                    adv_t=adv_j,
-                    ret_t=ret_j,
-                    buf_tensors=buf_j,
-                    advantage_weights=cumulative_ratio,
-                    actor_update=actor_update,
-                )
-                latest_losses.append(loss)
-
-                # Compute post-update importance ratio for this agent
-                if actor_update and cumulative_ratio is not None:
-                    ratio_j = agents[j].compute_post_update_ratio(buf_j)
-                    clipped_j = torch.min(
-                        ratio_j,
-                        torch.clamp(ratio_j, 1 - clip_eps, 1 + clip_eps)
+                    loss = agents[j].update_happo(
+                        adv_t=adv_j,
+                        ret_t=ret_j,
+                        buf_tensors=buf_j,
+                        advantage_weights=cumulative_ratio,
+                        actor_update=actor_update,
                     )
-                    cumulative_ratio = cumulative_ratio * clipped_j.detach().cpu()
+                    latest_losses.append(loss)
 
-            # Reorder losses to match agent index (not update order)
-            ordered_losses = latest_losses
-            latest_losses = [None] * n_agents
-            for idx_in_order, j in enumerate(order):
-                latest_losses[j] = ordered_losses[idx_in_order]
-        else:
-            # === IPPO / cycling update (fallback) ===
-            for i in range(n_agents):
-                # HPP: skip update for agents whose buffer was cleared (swapped)
-                if i in hpp_swapped:
-                    latest_losses.append(None)
-                    continue
-                if cycling_enabled:
-                    if i == active_agent_idx:
-                        loss = agents[i].update(last_value=0.0, actor_update=actor_update)
-                    elif cycling_soft:
-                        orig_lr = agents[i].optimizer.param_groups[0]["lr"]
-                        for pg in agents[i].optimizer.param_groups:
-                            pg["lr"] = orig_lr * cycling_lr_scale
-                        loss = agents[i].update(last_value=0.0, actor_update=actor_update)
-                        for pg in agents[i].optimizer.param_groups:
-                            pg["lr"] = orig_lr
+                    # Compute post-update importance ratio for this agent
+                    if actor_update and cumulative_ratio is not None:
+                        ratio_j = agents[j].compute_post_update_ratio(buf_j)
+                        clipped_j = torch.min(
+                            ratio_j,
+                            torch.clamp(ratio_j, 1 - clip_eps, 1 + clip_eps)
+                        )
+                        cumulative_ratio = cumulative_ratio * clipped_j.detach().cpu()
+
+                # Reorder losses to match agent index (not update order)
+                ordered_losses = latest_losses
+                latest_losses = [None] * n_agents
+                for idx_in_order, j in enumerate(order):
+                    latest_losses[j] = ordered_losses[idx_in_order]
+            else:
+                # === IPPO / cycling update (fallback) ===
+                for i in range(n_agents):
+                    # HPP: skip update for agents whose buffer was cleared (swapped)
+                    if i in hpp_swapped:
+                        latest_losses.append(None)
+                        continue
+                    if cycling_enabled:
+                        if i == active_agent_idx:
+                            loss = agents[i].update(last_value=0.0, actor_update=actor_update)
+                        elif cycling_soft:
+                            orig_lr = agents[i].actor_optimizer.param_groups[0]["lr"]
+                            for pg in agents[i].actor_optimizer.param_groups:
+                                pg["lr"] = orig_lr * cycling_lr_scale
+                            loss = agents[i].update(last_value=0.0, actor_update=actor_update)
+                            for pg in agents[i].actor_optimizer.param_groups:
+                                pg["lr"] = orig_lr
+                        else:
+                            agents[i].buffer.clear()
+                            loss = None
                     else:
-                        agents[i].buffer.clear()
-                        loss = None
-                else:
-                    loss = agents[i].update(last_value=0.0, actor_update=actor_update)
-                latest_losses.append(loss)
+                        loss = agents[i].update(last_value=0.0, actor_update=actor_update)
+                    latest_losses.append(loss)
+
+            # --- Cosine LR decay (applied after each PPO update batch) ---
+            if lr_decay_mode == "cosine":
+                frac = episode / max(n_episodes - 1, 1)
+                actor_lr_now = lr_min + 0.5 * (actor_lr_init - lr_min) * (1 + math.cos(math.pi * frac))
+                critic_lr_now = lr_min + 0.5 * (critic_lr_init - lr_min) * (1 + math.cos(math.pi * frac))
+                for agent in agents:
+                    for pg in agent.actor_optimizer.param_groups:
+                        pg["lr"] = actor_lr_now
+                    for pg in agent.critic_optimizer.param_groups:
+                        pg["lr"] = critic_lr_now
+        else:
+            # Non-update episode: keep buffers, report no losses
+            latest_losses = [None] * n_agents
 
         # --- Episode-level logging ---
         last_log = env.episode_log[-1] if env.episode_log else {}
