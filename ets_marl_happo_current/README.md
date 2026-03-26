@@ -1,4 +1,4 @@
-# ETS MARL — Current Version (HAPPO/PPO) v5.1
+# ETS MARL — Current Version (HAPPO/PPO) v5.3
 
 This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **heuristic bot agents** that add realistic market demand.
 
@@ -20,7 +20,7 @@ Each "episode" simulates **12 years** of a carbon market. Every year:
 1. The government sets a **cap** — the total CO2 allowed. This cap **shrinks each year** (by about 4.3-4.4%) to push companies toward cleaner energy. Over 12 years, the cap drops from 23.5 Mt to ~14.4 Mt (~39% reduction).
 2. Companies participate in an **auction** where they bid for emission allowances (each allowance = right to emit 1 tonne of CO2).
 3. The auction uses a **uniform price** — everyone pays the same price, which is the lowest winning bid. This is how the real EU ETS works.
-4. Companies that don't have enough allowances to cover their emissions face a **penalty** (€100 per excess tonne, plus they must make up the shortfall next year via carry-forward).
+4. Companies that don't have enough allowances to cover their emissions face a **penalty** (base **€138.75/t in 2026**, indexed from €132.06 in 2024; plus carry-forward obligations).
 5. Companies can **bank** (save) unused allowances for future years.
 6. A **Market Stability Reserve (MSR)** automatically adjusts the auction supply — if too many allowances are floating around, it pulls some out; if prices spike, it releases extras. Price-responsive triggers prevent procyclical hoarding.
 
@@ -81,6 +81,7 @@ The agents use **HAPPO (Heterogeneous-Agent PPO)**, a multi-agent reinforcement 
 - Each agent has a centralized critic that sees the global state, enabling coordinated learning
 - **Epsilon-greedy exploration** decays from 25% to 5% over training, preventing policy collapse
 - **Historical Policy Pool** maintains past policy snapshots for opponent diversity
+- **Auto-scaled schedules**: warmup, pretraining, exploration decay, and HPP timing can scale automatically with `n_episodes`
 - Over 70,000 episodes, agents converge on sophisticated market strategies
 
 The reward signal balances:
@@ -93,6 +94,7 @@ The reward signal balances:
 
 ### Key Mechanisms
 
+- **Inflation path**: Annual inflation is sampled from historical calibration **N(μ=2.0%, σ=1.5%)**, then applied economy-wide to nominal costs
 - **MAC fuel-switching**: When carbon prices exceed €65/t, companies automatically switch up to 20% of coal dispatch to gas (short-run operational change, not investment)
 - **Electricity revenue**: Companies earn revenue from electricity sales, with carbon costs partially passed through to electricity prices (80%). Green generators benefit from the same revenue with lower carbon costs.
 - **Dynamic reserve price**: Auction floor price adapts based on a 3-year moving average of secondary market prices
@@ -233,7 +235,10 @@ The most important settings you might want to change:
 | `companies.n_bot_agents` | 4 | Number of heuristic bot agents |
 | `ets.cap_year_0` | 43.0 Mt | Starting emission cap (scaled for 12 participants) |
 | `auction.price_max` | 500 | Maximum bid price (€/tonne) |
-| `penalty.rate` | 100 | Fine per excess tonne of CO2 (€) |
+| `penalty.rate` | 138.75 | Fine per excess tonne of CO2 (€), base level at simulation year-0 (2026) |
+| `penalty.inflation_rate` | 0.020 | Mean annual inflation for nominal indexing (μ) |
+| `penalty.inflation_random_std` | 0.015 | Annual inflation standard deviation (σ), sampled with a normal distribution |
+| `penalty.inflation_random_window` | 0.0 | Legacy fallback: uniform ±window (used only if `inflation_random_std = 0`) |
 | `reward.terminal_bank_value` | true | Value banked allowances at episode end |
 | `reward.terminal_queue_value` | true | Value in-construction projects at episode end |
 | `reward.terminal_payoff_years` | 5 | Horizon for terminal queue value NPV calculation |

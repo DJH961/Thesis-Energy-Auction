@@ -143,6 +143,11 @@ class ETSEnvironment(gym.Env):
         # Secondary liquidity pool EMA anchor state (only used when pool enabled)
         self._liquidity_ref_ema = float(config["price"]["initial_expected"])
 
+        # Episode-level inflation path (shared by all participants)
+        self._inflation_rates: List[float] = []
+        self._inflation_factors: List[float] = [1.0]
+        self._build_episode_inflation_path()
+
         # Opponent modeling (5D public info per opponent)
         opp_enabled = config.get("opponent_modeling", {}).get("enabled", False)
         self._opponent_modeling = opp_enabled
@@ -229,6 +234,39 @@ class ETSEnvironment(gym.Env):
 
         return base_reserve
 
+    def _build_episode_inflation_path(self):
+        """Build one inflation path per episode, shared by all agents."""
+        pen_cfg = self.config.get("penalty", {})
+        base_rate = float(pen_cfg.get("inflation_rate", 0.0))
+        rand_std = float(max(0.0, pen_cfg.get("inflation_random_std", 0.0)))
+        rand_window = float(max(0.0, pen_cfg.get("inflation_random_window", 0.0)))
+
+        if rand_std > 0.0:
+            rates = self.rng.normal(base_rate, rand_std, size=self.n_years)
+            rates = np.maximum(rates, -0.99)
+            self._inflation_rates = [float(r) for r in rates]
+        elif rand_window > 0.0:
+            low = max(-0.99, base_rate - rand_window)
+            high = base_rate + rand_window
+            rates = self.rng.uniform(low, high, size=self.n_years)
+            self._inflation_rates = [float(r) for r in rates]
+        else:
+            self._inflation_rates = [base_rate for _ in range(self.n_years)]
+
+        self._inflation_factors = [1.0]
+        for r in self._inflation_rates:
+            self._inflation_factors.append(self._inflation_factors[-1] * (1.0 + r))
+
+    def _inflation_factor(self, current_year: int) -> float:
+        y = max(0, min(int(current_year), len(self._inflation_factors) - 1))
+        return float(self._inflation_factors[y])
+
+    def _inflation_rate(self, current_year: int) -> float:
+        if not self._inflation_rates:
+            return float(self.config.get("penalty", {}).get("inflation_rate", 0.0))
+        y = max(0, min(int(current_year), len(self._inflation_rates) - 1))
+        return float(self._inflation_rates[y])
+
     # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
@@ -261,6 +299,7 @@ class ETSEnvironment(gym.Env):
 
         self.cap_schedule.reset()
         self._unsold_rollover = 0.0
+        self._build_episode_inflation_path()
 
         # Episode-level warning counters — reset each episode
         self._warnings = {
@@ -277,6 +316,7 @@ class ETSEnvironment(gym.Env):
         for i, company in enumerate(self.companies):
             company.reset(initial_mix=initial_mixes[i])
             company.rng = self.rng
+            company.set_inflation_path(self._inflation_rates)
 
         # P7: Warm-start — seed construction queue, holdings, price history
         ws_cfg = self.config.get("warm_start", {})
@@ -386,12 +426,14 @@ class ETSEnvironment(gym.Env):
             return np.zeros((0, 6), dtype=np.float32)
         price_ma3 = self._compute_price_ma3()
         reserve = self._compute_dynamic_reserve()
+        infl_factor = self._inflation_factor(self.current_year)
         actions = np.zeros((self.n_bots, 6), dtype=np.float32)
         for b in range(self.n_bots):
             idx = self.n_agents + b  # bots indexed after learning agents
             actions[b] = heuristic_policy.auction_action(
                 self.companies[idx], price_ma3, self.current_year,
-                self.n_years, self.config, reserve_price=reserve)
+            self.n_years, self.config, reserve_price=reserve,
+            inflation_factor=infl_factor)
         return actions
 
     def _generate_bot_secondary_actions(self, clearing_price: float) -> np.ndarray:
@@ -824,6 +866,8 @@ class ETSEnvironment(gym.Env):
             "penalties": penalties.tolist(),
             "invest_costs": invest_costs.tolist(),
             "rewards": rewards.tolist(),
+            "inflation_rate": self._inflation_rate(self.current_year),
+            "inflation_factor": self._inflation_factor(self.current_year),
             "green_fracs": [c.green_frac for c in self.companies],
             "tech_mixes": [c.mix.tolist() for c in self.companies],
             "holdings": self.holdings.tolist(),
@@ -1056,9 +1100,7 @@ class ETSEnvironment(gym.Env):
         elec_enabled = elec_cfg.get("enabled", False)
         base_elec_price = elec_cfg.get("base_price", 50.0)
         carbon_passthrough = elec_cfg.get("carbon_passthrough", 0.80)
-        pen_cfg = self.config["penalty"]
-        inflation_rate = pen_cfg.get("inflation_rate", 0.0)
-        inflation_factor = (1.0 + inflation_rate) ** self.current_year
+        inflation_factor = self._inflation_factor(self.current_year)
 
         if elec_enabled:
             system_avg_ef = float(np.mean([c.weighted_emission_factor for c in self.companies]))
@@ -1134,8 +1176,7 @@ class ETSEnvironment(gym.Env):
 
             # Shared terminal price: max(clearing, last_secondary, 80% of inflation-adjusted penalty)
             pen_cfg = self.config["penalty"]
-            inflation_rate = pen_cfg.get("inflation_rate", 0.025)
-            eff_penalty = pen_cfg["rate"] * (1.0 + inflation_rate) ** self.current_year
+            eff_penalty = pen_cfg["rate"] * self._inflation_factor(self.current_year)
             terminal_price = max(clearing_price, self.last_secondary_price, eff_penalty * 0.8)
 
             for i, company in enumerate(self.companies):

@@ -300,103 +300,87 @@ class EntropyConditionTracker:
 
 def _print_training_legend():
     """Print field guide once at the start of each training run."""
-    leg = "─" * 82
+    leg = "═" * 82
     print(f"\n{leg}")
-    print("TRAINING CONSOLE — COLUMN GUIDE")
+    print("  TRAINING CONSOLE — COLUMN GUIDE")
     print(leg)
-    print("Market header  (printed every log_interval episodes)")
-    print("  price X→Y (peak Z) : ETS clearing price yr-0 → yr-N and peak  (€/t)")
-    print("  cap                : Cap (Mt) in the final year")
-    print("  TNAC               : Total allowances in circulation, final year")
-    print("  entropy/shaping    : PPO entropy coef & green-shaping weight")
-    print("  [ENT-DECAY]        : Entropy decay triggered")
-    print("  [cyc=Ax]           : Active agent (soft cycling)")
     print()
-    print("Secondary market line")
-    print("  N sellers (-X Mt)  : Avg sellers/yr and total sold volume")
-    print("  N buyers (+X Mt)   : Avg buyers/yr and total bought volume")
-    print("  vol/match/avg_px   : Total volume, match rate, avg trade price")
+    print("  EPISODE HEADER")
+    print("    Ep / elapsed / ETA  : Episode number, wall-clock time, estimated remaining")
+    print("    ent / shp / eps     : Entropy coef, shaping weight, epsilon-greedy")
+    print("    [ENT-DECAY]         : Entropy decay triggered")
+    print("    [cyc=Ax]            : Active agent (soft cycling)")
     print()
-    print("Market dynamics line")
-    print("  avg_emiss          : Avg annual emissions across all participants (Mt/yr)")
-    print("  compliance         : % of (agent, year) pairs with zero shortfall")
-    print("  avg_green          : Avg green fraction across all participants at episode end")
-    print("  TNAC               : Total allowances in circulation, final year")
+    print("  YEAR-BY-YEAR TRAJECTORIES")
+    print("    Price/yr   : Clearing price each year (€/t), with std dev")
+    print("    Emiss/yr   : Total emissions each year (Mt), with avg")
+    print("    Cap/yr     : Cap each year (Mt), with final TNAC")
     print()
-    print("Bot summary line (if bots enabled)")
-    print("  avg_bid/emiss      : Mean bot bid price (€/t) and emissions (Mt)")
-    print("  compliant          : Bot compliant agent-years / total bot agent-years")
-    print("  sec: Ns Nb         : Bot secondary roles (s=seller, b=buyer, h=hold)")
+    print("  MARKET & SECONDARY SUMMARY")
+    print("    comply / green      : Compliance rate, avg green fraction")
+    print("    vol / match / avg_px: Sec market total volume, match rate, avg price")
+    print("    warn: key=N         : Episode warnings (see below)")
     print()
-    print("Per-agent columns")
-    print("  Green(0→N)  : Green fraction trajectory")
-    print("  ΔGreen      : Net green change (pp)")
-    print("  AvgEmiss    : Mean emissions (Mt)")
-    print("  AvgAlloc    : Mean allocation (Mt)")
-    print("  SfYrs       : Shortfall years")
-    print("  AvgBid€     : Mean bid price (€/t)")
-    print("  BidMt       : Mean bid volume (Mt) — after coverage-multiplier expansion")
-    print("  InvFr       : Mean invest_frac action (how aggressively agent invests)")
-    print("  TotRew      : Total raw reward")
-    print("  TotShort    : Total shortfall (Mt)")
-    print("  TotPenalty  : Total penalty (M\u20ac)")
-    print("  ActLoss     : Actor loss")
-    print("  CriLoss     : Critic loss")
-    print("  MAC_Mt      : MAC fuel-switching reduction (Mt)")
-    print("  Role        : Secondary market role: SELL / BUY / HOLD (net over episode)")
-    print("  SecMl       : Mean secondary price multiplier (action[0]; 0.5=discount 2.0=premium)")
-    print("  SqAct       : Mean secondary qty action (+buy intent / -sell intent, Mt)")
-    print("  BuyY/SellY  : Number of years agent was buyer / seller on secondary market")
-    print("  Sec detail  : Per-agent breakdown: BNy/V.VMt@P€ = bought N years, V Mt at avg P€")
-    print("                                     SNy/V.VMt@P€ = sold N years, V Mt at avg P€")
-    print("  elapsed/ETA : Wall-clock elapsed time and estimated remaining time")
+    print("  PER-AGENT COLUMNS")
+    print("    Grn       : Green fraction start→end (%)")
+    print("    ΔG        : Net green change (pp)")
+    print("    Emiss     : Mean annual emissions (Mt)")
+    print("    Alloc     : Mean annual allocation (Mt)")
+    print("    Sf        : Shortfall years / total years")
+    print("    Bid€      : Mean bid price (€/t)")
+    print("    BidMt     : Mean bid volume (Mt)")
+    print("    InvFr     : Mean invest fraction")
+    print("    Rew       : Total reward")
+    print("    Short     : Total shortfall (Mt)")
+    print("    Pen       : Total penalty (M€)")
+    print("    ALoss     : Actor loss")
+    print("    CLoss     : Critic loss")
+    print("    MAC       : MAC fuel-switching reduction (Mt)")
+    print("    Secondary : Trade detail — BNy/V.VMt@P€ = bought N yrs, V Mt at avg P€")
+    print("                               SNy/V.VMt@P€ = sold N yrs, V Mt at avg P€")
+    print("                               HOLD = no trades")
     print()
-    print("Inline warnings  (appear as │ warn: key=N at end of market header line)")
-    print("  These count how many year-steps within the episode triggered each condition.")
-    print("  Low counts (1-2) are normal early in training. Persistent high counts signal problems.")
+    print("  INLINE WARNINGS  (│ warn: key=N — counts year-steps triggering each condition)")
+    print("    lowAlloc    Alloc < 30% of volume    │  priceCeil  Price ≥90% of price_max")
+    print("    priceFloor  Price hit reserve floor   │  lowDemand  Demand < 70% of supply")
+    print("    noInvest    All invest_frac ≈ 0       │  debtSpiral 3+ shortfall years in a row")
+    print("    bidCluster  Bid std < €5              │  overBank   TNAC > 2× total emissions")
+    print("    1sideSec    All same side (sec mkt)   │  noTrade    Zero sec market volume")
+    print("    cornering   Alloc concentration risk  │  rsvReject  >25% bids below reserve")
     print()
-    print("  lowAlloc=N   : Total allocation < 30% of auction volume. Agents badly under-bidding.")
-    print("                 Common early; should fade by ep ~2000.")
-    print("  priceFloor=N : Clearing price hit the reserve price floor. Market not competitive —")
-    print("                 agents bid near minimum. Often pairs with lowAlloc.")
-    print("  priceCeil=N  : Clearing price ≥90% of price_max. Agents overbidding — unlikely to")
-    print("                 be optimal in uniform-price auction. May indicate reward miscalibration.")
-    print("  auctFail=N   : Auction cancelled (cancel_under_subscribed=true, currently disabled).")
-    print("  lowDemand=N  : Total demand < 70% of supply. Agents under-bidding on quantity.")
-    print("                 Early exploration noise; persistent = weak quantity signal.")
-    print("  noInvest=N   : All agents chose invest_frac ≈ 0 — nobody investing in green.")
-    print("                 Occasional is fine; persistent = investment signal too weak.")
-    print("  debtSpiral=N : Agent had 3+ consecutive shortfall years (only counted from year 3+).")
-    print("                 Agent stuck in carry-forward debt spiral. CF-cap should limit this.")
-    print("  bidCluster=N : Bid price std < €5 — agents converged to near-identical bids.")
-    print("                 Not always bad if the resulting price is reasonable.")
-    print("  overBank=N   : TNAC > 2× total emissions — massive over-banking. Stockpiling")
-    print("                 allowances suppresses price signals and delays scarcity.")
-    print("  1sideSec=N   : All agents buying OR all selling on secondary market.")
-    print("                 No natural counterparty exists — expected in thin compliance markets.")
-    print("                 Informational, not pathological (pool disabled, pure agent-to-agent).")
-    print("  noTrade=N    : Secondary market volume ≈ 0. No trading this year-step.")
-    print("                 Expected in compliance-only market without liquidity pool.")
-    print("                 Signals thin market, not a bug. Watch for trends, not individual counts.")
-    print("  cornering=N  : An agent's alloc share > 2× its emissions share AND > 30% of total,")
-    print("                 with meaningful auction volume (>30% of cap). Market concentration risk.")
-    print("  rsvReject=N  : Rejected bid volume > 25% of total bid volume (bids below dynamic")
-    print("                 reserve). Normal when reserve rises; persistent = agents can't adapt.")
-    print()
-    print("Streak warnings  (printed as separate ⚠ lines between log intervals)")
-    print("  ⚠ CEILING BID  : Agent's avg bid ≥99% of price_max for 200+ consecutive episodes.")
-    print("  ⚠ FLOOR BID    : Agent's avg bid ≤102% of price_min for 200+ consecutive episodes.")
-    print("  ⚠ ZERO QUANTITY : Agent's avg bid qty ≤1% of qty_max for 200+ consecutive episodes.")
-    print("  🔄 ENTROPY BOOST: Agent stuck at floor/ceiling → entropy temporarily boosted to")
-    print("                    force re-exploration. Resets once agent moves away from extreme.")
-    print("  These indicate an agent's policy has collapsed to an extreme. The entropy boost")
-    print("  mechanism tries to rescue it; if warnings persist, check reward signal or hyperparams.")
+    print("  STREAK WARNINGS  (separate ⚠ lines between log intervals)")
+    print("    ⚠ CEILING BID   : Avg bid ≥99% price_max for 200+ episodes")
+    print("    ⚠ FLOOR BID     : Avg bid ≤102% price_min for 200+ episodes")
+    print("    ⚠ ZERO QUANTITY  : Avg bid qty ≤1% qty_max for 200+ episodes")
+    print("    🔄 ENTROPY BOOST : Stuck → entropy boosted to force re-exploration")
     print(leg)
 
 
 def _format_hms(seconds: float) -> str:
     """Format seconds as HH:MM:SS."""
     return str(datetime.timedelta(seconds=max(0, int(round(float(seconds))))))
+
+
+def _resolve_auto_episode_count(raw_value, n_episodes: int,
+                                frac: float, min_count: int, max_count: int):
+    """Resolve integer schedule values that may be set to auto/0."""
+    auto = False
+    if isinstance(raw_value, str):
+        auto = (raw_value.strip().lower() == "auto")
+    elif raw_value is None:
+        auto = True
+    else:
+        try:
+            auto = int(raw_value) <= 0
+        except Exception:
+            auto = True
+
+    if auto:
+        val = int(round(n_episodes * frac))
+        val = max(min_count, min(max_count, val))
+        return val, True
+
+    return int(raw_value), False
 
 
 def train_one_seed(config: dict, seed: int, on_log=None):
@@ -441,9 +425,25 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     ppo_cfg = config["ppo"]
 
     pretrain_cfg = config.get("pretrain", {})
+    eff_pretrain_cfg = dict(pretrain_cfg)
+    pretrain_eps_eff, pretrain_eps_auto = _resolve_auto_episode_count(
+        pretrain_cfg.get("episodes", 0), n_episodes,
+        frac=0.04, min_count=40, max_count=800,
+    )
+    pretrain_epochs_eff, pretrain_epochs_auto = _resolve_auto_episode_count(
+        pretrain_cfg.get("epochs", 0), n_episodes,
+        frac=0.0002, min_count=4, max_count=12,
+    )
+    eff_pretrain_cfg["episodes"] = pretrain_eps_eff
+    eff_pretrain_cfg["epochs"] = pretrain_epochs_eff
+
     bc_ran = False
     if pretrain_cfg.get("enabled", False):
-        pretrain_behavioral_cloning(agents, env, config, pretrain_cfg, seed)
+        if pretrain_eps_auto or pretrain_epochs_auto:
+            print("Pretrain auto-scale: "
+                  f"episodes={pretrain_eps_eff}, epochs={pretrain_epochs_eff} "
+                  f"(n_episodes={n_episodes}).")
+        pretrain_behavioral_cloning(agents, env, config, eff_pretrain_cfg, seed)
         bc_ran = True
 
     # Snapshot BC-trained weights as frozen KL anchors (only when BC was run)
@@ -454,10 +454,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         print(f"KL anchor: frozen BC policies captured for all {n_agents} agents "
               f"(β₀={kl_beta_init}, decay={ppo_cfg.get('kl_anchor_decay_episodes', 2000)} eps).")
 
-    critic_warmup_eps = ppo_cfg.get("critic_warmup_episodes", 0)
+    critic_warmup_eps, critic_warmup_auto = _resolve_auto_episode_count(
+        ppo_cfg.get("critic_warmup_episodes", 0), n_episodes,
+        frac=0.06, min_count=60, max_count=1200,
+    )
     kl_decay_eps     = ppo_cfg.get("kl_anchor_decay_episodes", 2000)
     if critic_warmup_eps > 0:
-        print(f"Critic-warmup: actor gradients frozen for first {critic_warmup_eps} episodes.")
+        auto_note = " [auto]" if critic_warmup_auto else ""
+        print(f"Critic-warmup: actor gradients frozen for first {critic_warmup_eps} episodes{auto_note}.")
 
     cycling_cfg = config.get("agent_cycling", {})
     cycling_enabled = cycling_cfg.get("enabled", False)
@@ -477,23 +481,34 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     explore_cfg = config.get("exploration", {})
     eps_start = explore_cfg.get("epsilon_start", 0.0)
     eps_final = explore_cfg.get("epsilon_final", 0.0)
-    eps_decay_episodes = explore_cfg.get("epsilon_decay_episodes", 5000)
+    eps_decay_episodes, eps_decay_auto = _resolve_auto_episode_count(
+        explore_cfg.get("epsilon_decay_episodes", 0), n_episodes,
+        frac=0.35, min_count=300, max_count=12000,
+    )
     if eps_start > 0.0:
+        auto_note = " [auto]" if eps_decay_auto else ""
         print(f"Epsilon-greedy: {eps_start:.2f} → {eps_final:.2f} "
-              f"over {eps_decay_episodes} episodes (physical-space).")
+              f"over {eps_decay_episodes} episodes (physical-space){auto_note}.")
 
     # Historical Policy Pool (HPP) — anti-regression safety net
     hpp_cfg = config.get("hpp", {})
     hpp_enabled = hpp_cfg.get("enabled", False)
     hpp_pool_size = hpp_cfg.get("pool_size", 10)
-    hpp_save_interval = hpp_cfg.get("save_interval", 500)
+    hpp_save_interval, hpp_save_auto = _resolve_auto_episode_count(
+        hpp_cfg.get("save_interval", 0), n_episodes,
+        frac=0.03, min_count=50, max_count=1000,
+    )
     hpp_swap_prob = hpp_cfg.get("swap_prob", 0.20)
-    hpp_warmup = hpp_cfg.get("warmup_episodes", 1000)
+    hpp_warmup, hpp_warmup_auto = _resolve_auto_episode_count(
+        hpp_cfg.get("warmup_episodes", 0), n_episodes,
+        frac=0.20, min_count=200, max_count=6000,
+    )
     # Per-agent FIFO pool of actor state_dicts (auction + secondary only)
     hpp_pools = [collections.deque(maxlen=hpp_pool_size) for _ in range(n_agents)]
     if hpp_enabled:
+          auto_note = " [auto]" if (hpp_save_auto or hpp_warmup_auto) else ""
         print(f"HPP: pool={hpp_pool_size}, save every {hpp_save_interval} eps, "
-              f"swap_prob={hpp_swap_prob:.0%}, warmup={hpp_warmup} eps.")
+              f"swap_prob={hpp_swap_prob:.0%}, warmup={hpp_warmup} eps{auto_note}.")
 
     # Batch accumulation: collect N episodes before triggering PPO update
     episodes_per_update = ppo_cfg.get("episodes_per_update", 1)
@@ -583,6 +598,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     )
     csv_flush_interval = max(1, csv_flush_interval)
     best_total_reward = -np.inf
+    # Persist most recent available update losses so sparse update schedules
+    # still show losses at coarse log intervals (e.g. every 50 episodes).
+    last_available_losses = [None] * n_agents
+    last_loss_episode = [None] * n_agents
 
     train_t0 = time.time()
     recent_ep_durations = collections.deque(maxlen=200)
@@ -821,13 +840,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
                 # 2. Sequential update in random order
                 order = np.random.permutation(n_agents).tolist()
-                # Find T from first agent with non-empty buffer
-                T = 0
-                for _gd in gae_data:
-                    if _gd[2] is not None:
-                        T = _gd[2]["T"]
-                        break
-                cumulative_ratio = torch.ones(T, 1) if T > 0 else None
+                # Keep independent cumulative ratios per rollout length.
+                # Some agents may have shorter buffers when HPP swaps clear
+                # their trajectories, so a single shared ratio can mismatch.
+                cumulative_ratio_by_T = {}
 
                 for j in order:
                     adv_j, ret_j, buf_j = gae_data[j]
@@ -835,23 +851,30 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                         latest_losses.append(None)
                         continue
 
+                    T_j = int(buf_j["T"])
+                    if T_j not in cumulative_ratio_by_T:
+                        cumulative_ratio_by_T[T_j] = torch.ones(T_j, 1)
+                    ratio_weight_j = cumulative_ratio_by_T[T_j]
+
                     loss = agents[j].update_happo(
                         adv_t=adv_j,
                         ret_t=ret_j,
                         buf_tensors=buf_j,
-                        advantage_weights=cumulative_ratio,
+                        advantage_weights=ratio_weight_j,
                         actor_update=actor_update,
                     )
                     latest_losses.append(loss)
 
                     # Compute post-update importance ratio for this agent
-                    if actor_update and cumulative_ratio is not None:
+                    if actor_update:
                         ratio_j = agents[j].compute_post_update_ratio(buf_j)
                         clipped_j = torch.min(
                             ratio_j,
                             torch.clamp(ratio_j, 1 - clip_eps, 1 + clip_eps)
                         )
-                        cumulative_ratio = cumulative_ratio * clipped_j.detach().cpu()
+                        cumulative_ratio_by_T[T_j] = (
+                            cumulative_ratio_by_T[T_j] * clipped_j.detach().cpu()
+                        )
 
                 # Reorder losses to match agent index (not update order)
                 ordered_losses = latest_losses
@@ -895,6 +918,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         else:
             # Non-update episode: keep buffers, report no losses
             latest_losses = [None] * n_agents
+
+        for i in range(n_agents):
+            if i < len(latest_losses) and latest_losses[i]:
+                last_available_losses[i] = latest_losses[i]
+                last_loss_episode[i] = episode
 
         # --- Episode-level logging ---
         last_log = env.episode_log[-1] if env.episode_log else {}
@@ -1299,65 +1327,74 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 bot_sec_str = " ".join(
                     f"{v}{k[0].lower()}" for k, v in bot_sec_roles.items() if v > 0)
 
-            sep = "─" * 152
+            sep = "═" * 120
+            thin = "─" * 120
             print(sep)
-            print(f"Time elapsed: {_format_hms(elapsed_s)} | ETA: {_format_hms(eta_s)} | speed={avg_ep_s:.2f}s/ep")
-            print(f"Ep {episode:5d} │ price {price_start:.0f}→{price_final:.0f} (peak {price_peak:.0f})"
-                  f"  cap={cap:5.0f}  TNAC={tnac:5.0f} │ "
-                  f"ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"
+            print(f"  Ep {episode:5d} │ {_format_hms(elapsed_s)} elapsed  ETA {_format_hms(eta_s)}  ({avg_ep_s:.2f} s/ep)"
+                  f" │ ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"
                   f"  eps={current_epsilon:.3f}"
-                  f"{decay_str}{cyc_str}{warmup_str}{warn_str}")
-            # Enhanced secondary market line
-            print(f"  Secondary: {sec_avg_sellers:.0f} sellers (-{sec_sell_vol:.1f} Mt) "
-                  f"{sec_avg_buyers:.0f} buyers (+{sec_buy_vol:.1f} Mt) "
-                  f"│ vol={total_sec_vol:.1f} Mt  match={sec_match_rate*100:.0f}%  "
-                  f"avg_px={avg_sec_price:.1f}€  sec_clear={sec_p:.1f}€")
-            # Per-agent secondary trade summary (buy/sell years and avg prices)
-            sec_detail_parts = []
-            for _ai in range(n_agents):
-                ss = per_agent_sec_stats[_ai]
-                parts = []
-                if ss["buy_years"] > 0:
-                    parts.append(f"B{ss['buy_years']}y/{ss['buy_vol']:.1f}Mt@{ss['buy_avg_px']:.0f}€")
-                if ss["sell_years"] > 0:
-                    parts.append(f"S{ss['sell_years']}y/{ss['sell_vol']:.1f}Mt@{ss['sell_avg_px']:.0f}€")
-                if not parts:
-                    parts.append("HOLD")
-                sec_detail_parts.append(f"A{_ai+1}={'+'.join(parts)}")
-            print(f"  Sec detail: {' │ '.join(sec_detail_parts)}")
-            # Market dynamics line
-            print(f"  Market: avg_emiss={avg_annual_emiss:.1f} Mt/yr  "
-                  f"compliance={compliance_rate*100:.0f}%  "
-                  f"avg_green={avg_green_all*100:.0f}%  "
-                  f"TNAC={tnac:.1f} Mt")
+                  f"{decay_str}{cyc_str}{warmup_str}")
+
+            # Year-by-year price trajectory
+            price_traj = "  ".join(f"{p:3.0f}" for p in prices_ep)
+            print(f"  Price/yr:  {price_traj}   (σ={price_std:.0f})")
+
+            # Year-by-year total emissions trajectory
+            yr_emiss = [sum(yl.get("emissions", [0.0] * n_total)[j] for j in range(n_total))
+                        for yl in env.episode_log]
+            yr_caps  = [yl.get("cap", 0.0) for yl in env.episode_log]
+            emiss_traj = "  ".join(f"{e:3.1f}" for e in yr_emiss)
+            cap_traj   = "  ".join(f"{c:3.1f}" for c in yr_caps)
+            print(f"  Emiss/yr:  {emiss_traj}   (avg {avg_annual_emiss:.1f} Mt/yr)")
+            print(f"  Cap/yr:    {cap_traj}   (TNAC={tnac:.1f} Mt)")
+
+            # Market + secondary summary (merged into one compact block)
+            print(f"  Market: comply={compliance_rate*100:.0f}%  green={avg_green_all*100:.0f}%"
+                  f" │ Sec: vol={total_sec_vol:.1f} Mt  match={sec_match_rate*100:.0f}%"
+                  f"  avg_px={avg_sec_price:.1f}€  clear={sec_p:.1f}€"
+                  f"  ({sec_avg_sellers:.0f}sell/{sec_avg_buyers:.0f}buy per yr)"
+                  f"{warn_str}")
+
             # Bot summary
             if n_bot_agents > 0:
-                print(f"  Bots ({n_bot_agents}): "
-                      f"avg_bid={np.mean(bot_avg_bid):.0f}€  "
-                      f"avg_emiss={np.mean(bot_avg_emiss):.2f} Mt  "
-                      f"compliant={bot_compliant_yrs}/{bot_total_yrs} yr  "
-                      f"sec: {bot_sec_str}")
-            # Compact header covering all 8 action dimensions
+                print(f"  Bots ({n_bot_agents}): bid={np.mean(bot_avg_bid):.0f}€"
+                      f"  emiss={np.mean(bot_avg_emiss):.2f} Mt"
+                      f"  comply={bot_compliant_yrs}/{bot_total_yrs}yr"
+                      f"  sec: {bot_sec_str}")
+
+            # Per-agent table with integrated secondary detail
+            print(thin)
             print(f"  {'':4}  {'Grn':>9} {'ΔG':>6} {'Emiss':>6} {'Alloc':>6} "
                   f"{'Sf':>5} {'Bid€':>6} {'BidMt':>6} {'InvFr':>5} "
-                  f"│ {'Rew':>7} {'Short':>6} {'Pen':>7} {'ALoss':>7} {'CLoss':>7} "
-                  f"│ {'MAC_Mt':>7} │ {'Role':>4} {'SecMl':>5} {'SqAct':>6} {'BuyY':>4} {'SellY':>5}")
+                  f"│ {'Rew':>7} {'Short':>6} {'Pen':>7} {'ALoss':>7} {'CLoss':>7} {'LΔ':>4} "
+                  f"│ {'MAC':>5} │ {'Secondary':>20}")
             for i in range(n_agents):
                 act_mark  = "*" if (cycling_enabled and i == active_agent_idx) else " "
                 grn_str   = f"{ep_green_start[i]*100:.0f}→{ep_green_end[i]*100:.0f}%"
                 dgrn_str  = f"{(ep_green_end[i]-ep_green_start[i])*100:+.1f}"
                 sf_str    = f"{ep_shortfall_years[i]}/{n_years_ep}"
-                loss_i    = latest_losses[i]
+                loss_i    = latest_losses[i] if latest_losses[i] else last_available_losses[i]
                 al_str    = f"{loss_i['actor_loss']:.4f}"  if loss_i else "   n/a"
                 cl_str    = f"{loss_i['critic_loss']:.4f}" if loss_i else "   n/a"
+                if loss_i and last_loss_episode[i] is not None:
+                    loss_age_str = f"{episode - last_loss_episode[i]:4d}"
+                else:
+                    loss_age_str = " n/a"
+                # Build compact secondary detail string
                 ss_i = per_agent_sec_stats[i]
+                sec_parts = []
+                if ss_i["buy_years"] > 0:
+                    sec_parts.append(f"B{ss_i['buy_years']}y/{ss_i['buy_vol']:.1f}Mt@{ss_i['buy_avg_px']:.0f}€")
+                if ss_i["sell_years"] > 0:
+                    sec_parts.append(f"S{ss_i['sell_years']}y/{ss_i['sell_vol']:.1f}Mt@{ss_i['sell_avg_px']:.0f}€")
+                sec_str = " ".join(sec_parts) if sec_parts else "HOLD"
                 print(
                     f"  A{i+1}{act_mark}: "
                     f"{grn_str:>9} {dgrn_str:>6} {ep_mean_emiss[i]:6.2f} {ep_mean_alloc[i]:6.2f} "
                     f"{sf_str:>5} {avg_bid_per_agent[i]:6.0f} {avg_bid_qty_per_agent[i]:6.2f} {avg_invest_frac_per_agent[i]:5.3f} "
                     f"│ {total_rewards[i]:7.1f} {ep_total_shortfalls[i]:6.2f} "
-                    f"{ep_total_penalties[i]:7.0f} {al_str:>7} {cl_str:>7} "
-                    f"│ {ep_total_mac_reduction[i]:7.3f} │ {agent_sec_role[i]:>4} {avg_sec_mult_per_agent[i]:5.2f} {avg_sec_qty_per_agent[i]:6.2f} {ss_i['buy_years']:>4} {ss_i['sell_years']:>5}"
+                    f"{ep_total_penalties[i]:7.0f} {al_str:>7} {cl_str:>7} {loss_age_str:>4} "
+                    f"│ {ep_total_mac_reduction[i]:5.3f} │ {sec_str}"
                 )
             print(sep)
 

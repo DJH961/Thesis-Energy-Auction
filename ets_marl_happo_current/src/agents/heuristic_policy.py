@@ -61,6 +61,7 @@ def auction_action(
     n_years: int,
     config: dict,
     reserve_price: float = None,
+    inflation_factor: float = None,
 ) -> np.ndarray:
     """
     Heuristic Phase-1 (auction + investment) action.
@@ -100,8 +101,11 @@ def auction_action(
     # Green-objective agents add a small premium to ensure allocation.
     pen_cfg = config.get("penalty", {})
     base_penalty = pen_cfg.get("rate", 100.0)
-    infl = pen_cfg.get("inflation_rate", 0.0)
-    penalty_rate = base_penalty * (1.0 + infl) ** current_year
+    if inflation_factor is None:
+        infl = pen_cfg.get("inflation_rate", 0.0)
+        penalty_rate = base_penalty * (1.0 + infl) ** current_year
+    else:
+        penalty_rate = base_penalty * float(inflation_factor)
     ma3_anchor = price_ma3 * (1.15 if not is_green else 1.20)
     near_penalty_anchor = 0.7 * penalty_rate + 0.3 * ma3_anchor
     if is_green:

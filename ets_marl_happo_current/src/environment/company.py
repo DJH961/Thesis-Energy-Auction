@@ -71,6 +71,10 @@ class Company:
         self.convexity_alpha = inv_cfg["convexity_alpha"]
         self.penalty_rate = pen_cfg["rate"]
         self._inflation_rate = pen_cfg.get("inflation_rate", 0.0)
+        self._inflation_random_std = float(max(0.0, pen_cfg.get("inflation_random_std", 0.0)))
+        self._inflation_random_window = float(max(0.0, pen_cfg.get("inflation_random_window", 0.0)))
+        self._inflation_rates_by_year = {}
+        self._inflation_factor_by_year = {0: 1.0}
 
         # Risk curve parameters
         self.p_fail_min = risk_cfg["p_fail_min"]
@@ -477,9 +481,38 @@ class Company:
     # Compliance
     # ------------------------------------------------------------------
 
+    def set_inflation_path(self, annual_rates: List[float]):
+        """Set shared episode inflation path (one rate per simulated year)."""
+        self._inflation_rates_by_year = {i: float(r) for i, r in enumerate(annual_rates)}
+        self._inflation_factor_by_year = {0: 1.0}
+
+    def _inflation_rate_for_year(self, year_idx: int) -> float:
+        if year_idx not in self._inflation_rates_by_year:
+            rate = self._inflation_rate
+            if self._inflation_random_std > 0.0:
+                rate = float(self.rng.normal(self._inflation_rate, self._inflation_random_std))
+                rate = max(-0.99, rate)
+            elif self._inflation_random_window > 0.0:
+                low = max(-0.99, self._inflation_rate - self._inflation_random_window)
+                high = self._inflation_rate + self._inflation_random_window
+                rate = float(self.rng.uniform(low, high))
+            self._inflation_rates_by_year[year_idx] = float(rate)
+        return float(self._inflation_rates_by_year[year_idx])
+
+    def inflation_rate_for_year(self, current_year: int = 0) -> float:
+        """Year-specific inflation rate used for this episode and year index."""
+        return self._inflation_rate_for_year(max(0, int(current_year)))
+
     def inflation_factor(self, current_year: int = 0) -> float:
-        """General inflation multiplier: (1 + inflation_rate)^year."""
-        return (1.0 + self._inflation_rate) ** current_year
+        """General inflation multiplier using compounded year-specific rates."""
+        current_year = max(0, int(current_year))
+        if current_year not in self._inflation_factor_by_year:
+            start = max(self._inflation_factor_by_year.keys()) + 1
+            for y in range(start, current_year + 1):
+                prev_factor = self._inflation_factor_by_year[y - 1]
+                prev_rate = self._inflation_rate_for_year(y - 1)
+                self._inflation_factor_by_year[y] = prev_factor * (1.0 + prev_rate)
+        return float(self._inflation_factor_by_year[current_year])
 
     def effective_penalty_rate(self, current_year: int = 0) -> float:
         """Penalty rate adjusted for inflation: base_rate × inflation_factor."""
@@ -645,3 +678,5 @@ class Company:
         self.year_cost = 0.0
         self.budget_spent_this_year = 0.0
         self._carry_forward = 0.0
+        self._inflation_rates_by_year = {}
+        self._inflation_factor_by_year = {0: 1.0}

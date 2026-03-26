@@ -1,8 +1,9 @@
 # ============================================================
-# ETS MARL — Configuration v5.2
+# ETS MARL — Configuration v5.3
 #   - 8 learning agents + 4 heuristic bot agents (12 total)
 #   - HAPPO sequential policy update
-#   - Inflation-indexed non-compliance penalty
+#   - 2026-indexed non-compliance penalty with annual inflation path
+#   - Episode-level inflation randomness window (small stochastic variation)
 #   - MAC fuel-switching, electricity revenue
 #   - Carry-forward obligations (cap=2.0x)
 #   - Terminal valuation: max(clearing, secondary, 80% eff_penalty)
@@ -154,8 +155,10 @@ budget:
 # decommission costs, MAC switching cost, electricity base price.
 # ----------------------------------------------------------
 penalty:
-  rate: 100.0
-  inflation_rate: 0.025            # 2.5% annual — applied to all nominal costs
+  rate: 138.75                     # EUR/tCO2 base in 2026 (132.06 in 2024 indexed by 2.5% for 2 years)
+  inflation_rate: 0.020            # μ = 2.0% annual inflation (historical average)
+  inflation_random_std: 0.015      # σ = 1.5%-pt annual inflation volatility (normal sampling)
+  inflation_random_window: 0.0     # legacy fallback (uniform ±window) if inflation_random_std = 0
   non_compliance_multiplier: 1.0   # reduced since carry-forward already adds future cost
   carry_forward: true
   carry_forward_cap: 2.0           # max carry-forward as multiple of base annual emissions
@@ -237,7 +240,7 @@ ppo:
   clip_eps: 0.2
   entropy_coef: 0.05
   entropy_coef_final: 0.03
-  entropy_decay_start: 3000
+  entropy_decay_start: 0     # auto: 5% of n_episodes
   entropy_decay_window: 0    # 0 = auto (80% of n_episodes)
   value_coef: 0.5
   max_grad_norm: 0.5         # relaxed from 0.3 — less conservative with larger batches
@@ -251,7 +254,7 @@ ppo:
   happo: true
   critic_lr: 0.001           # separate faster critic learning rate
   critic_hidden_size: 512    # increased from 256 — more capacity for 680D input
-  critic_warmup_episodes: 500  # increased from 100 — give critic time to converge
+  critic_warmup_episodes: 0    # auto: 6% of n_episodes, clamped to [60, 1200]
   lr_decay: cosine           # cosine annealing schedule for both optimizers
   lr_min: 0.00001            # minimum learning rate at end of cosine decay
   target_kl: 0.02            # KL-based early stopping per PPO epoch
@@ -310,8 +313,8 @@ logging:
 # ----------------------------------------------------------
 pretrain:
   enabled: true
-  episodes: 300
-  epochs: 10
+  episodes: 0   # auto: 4% of n_episodes, clamped to [40, 800]
+  epochs: 0     # auto: scales with n_episodes, clamped to [4, 12]
   lr: 0.001
 
 # ----------------------------------------------------------
@@ -335,9 +338,9 @@ diagnostics:
 hpp:
   enabled: true
   pool_size: 10
-  save_interval: 500
+  save_interval: 0      # auto: 3% of n_episodes, clamped to [50, 1000]
   swap_prob: 0.20
-  warmup_episodes: 1000
+  warmup_episodes: 0    # auto: 20% of n_episodes, clamped to [200, 6000]
 
 # ----------------------------------------------------------
 # Epsilon-greedy exploration (physical-space)
@@ -347,7 +350,7 @@ hpp:
 exploration:
   epsilon_start: 0.25
   epsilon_final: 0.05
-  epsilon_decay_episodes: 7000
+  epsilon_decay_episodes: 0   # auto: 35% of n_episodes, clamped to [300, 12000]
   # Action anchors in physical space (set initial policy mean via head bias).
   # Auction: [bid_price, qty_mult, invest_frac, logit_onshore, logit_offshore, logit_solar]
   auction_anchors: [80.0, 1.0, 0.03, 0.3, -0.5, 0.5]
