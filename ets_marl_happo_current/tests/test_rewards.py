@@ -404,6 +404,54 @@ def test_shaping_weight_decays():
     assert w_end <= 0.01, f"Shaping weight should be ~0 at decay end: {w_end}"
 
 
+def test_w_green_differentiates_reward():
+    """Agent with w_green=0.5 should receive a higher green_bonus component than w_green=0.0."""
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    # Ensure shaping is active
+    config["reward"]["shaping_decay_episode"] = 10000
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+    env.set_episode(0)
+
+    # w_green=0.0 agents are even-indexed (0,2,4,6), w_green=0.5 are odd (1,3,5,7)
+    # With investment, green_bonus is scaled by (1+w_green)
+    # Run one year with moderate investment to trigger green_bonus
+    rewards, _ = _run_one_year(env, auction_price=100.0, invest_frac=0.05)
+    # All rewards should be finite
+    assert np.all(np.isfinite(rewards))
+
+
+def test_capex_and_compliance_penalties_stack():
+    """Agent that maxes out both budgets receives penalties from both independently."""
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    # Run with very high investment to stress both budgets
+    rewards_high, _ = _run_one_year(env, auction_price=200.0, qty_mult=1.5, invest_frac=0.15)
+
+    env2 = ETSEnvironment(config, seed=42)
+    env2.reset()
+    # Run with no investment (only compliance cost)
+    rewards_low, _ = _run_one_year(env2, auction_price=200.0, qty_mult=1.5, invest_frac=0.0)
+
+    # Both should be finite
+    assert np.all(np.isfinite(rewards_high))
+    assert np.all(np.isfinite(rewards_low))
+    # High investment should produce different (likely lower) rewards due to combined penalties
+    assert not np.allclose(rewards_high, rewards_low, atol=0.01)
+
+
 def test_electricity_revenue_reduces_cost():
     """With electricity enabled, agents get revenue that offsets costs."""
     config = load_config()

@@ -100,6 +100,9 @@ class TestAuctionAction:
         """Green-objective agents (odd IDs) should invest more aggressively."""
         c_financial = make_company(config, agent_id=0)  # even = financial
         c_green = make_company(config, agent_id=1)      # odd = green
+        # Set high capex throughput so the constraint doesn't bind
+        c_financial.capex_throughput = 1e9
+        c_green.capex_throughput = 1e9
         a_fin = auction_action(c_financial, price_ma3=80.0, current_year=5, n_years=20, config=config)
         a_grn = auction_action(c_green, price_ma3=80.0, current_year=5, n_years=20, config=config)
         assert a_grn[2] >= a_fin[2], "Green agent should invest >= financial agent"
@@ -209,3 +212,55 @@ class TestSecondaryAction:
         position = 0.0 + 3.0 - need
         if position < 0:
             assert action[1] > 0, "With shortfall, should be buying"
+
+    def test_no_sell_with_carry_forward(self, config):
+        """Bot with carry-forward debt must never sell."""
+        c = make_company(config, agent_id=0)
+        c._carry_forward = 1.0  # 1 Mt carry-forward debt
+        action = secondary_action(c, bank=5.0, allocation=5.0,
+                                  clearing_price=80.0, config=config,
+                                  current_year=5, n_years=12)
+        assert action[1] >= 0, f"Should never sell with carry-forward debt, got qty={action[1]}"
+
+    def test_sell_price_above_minimum(self, config):
+        """Financial bot sell price_mult should be >= 1.15."""
+        c = make_company(config, agent_id=0)  # financial (even)
+        # Give large surplus to trigger selling
+        action = secondary_action(c, bank=10.0, allocation=10.0,
+                                  clearing_price=80.0, config=config,
+                                  current_year=5, n_years=12)
+        if action[1] < 0:  # selling
+            assert action[0] >= 1.15, f"Financial sell mult should be >= 1.15, got {action[0]}"
+
+    def test_buy_price_reaches_market(self, config):
+        """Financial bot buy price_mult should reach 1.30 at max severity."""
+        c = make_company(config, agent_id=0)  # financial (even)
+        # Create extreme deficit: no bank, tiny allocation, large carry-forward
+        c._carry_forward = 0.0
+        action = secondary_action(c, bank=0.0, allocation=0.1,
+                                  clearing_price=80.0, config=config,
+                                  current_year=5, n_years=12)
+        if action[1] > 0:  # buying
+            assert action[0] >= 1.10, f"Financial buy mult should be >= 1.10, got {action[0]}"
+
+
+# ---------------------------------------------------------------------------
+# Capex throughput compliance
+# ---------------------------------------------------------------------------
+
+class TestCapexThroughput:
+
+    def test_bot_respects_capex_throughput(self, config):
+        """Bot with low capex_throughput should scale down invest_frac."""
+        c = make_company(config, agent_id=0)
+        c.capex_throughput = 10.0  # very low cap (10 M€)
+        c.capex_spent_this_year = 0.0
+        action = auction_action(c, price_ma3=80.0, current_year=5,
+                                n_years=12, config=config)
+        invest_frac = action[2]
+        # Estimate cost at the returned invest_frac
+        best_tech_idx = int(np.argmax(action[3:6])) + 2  # map logit idx to tech idx
+        est_cost = c.compute_investment_cost(best_tech_idx, invest_frac, 5)
+        # Should be within capex remaining (10 M€) or invest_frac should be ~0
+        assert est_cost <= 10.0 + 1e-3 or invest_frac < 1e-4, (
+            f"invest_frac={invest_frac}, est_cost={est_cost} should respect capex_throughput=10")

@@ -414,3 +414,66 @@ def test_queue_capacity_shape(config):
     qc = c.get_queue_capacity()
     assert qc.shape == (3,)  # onshore, offshore, solar
     assert np.all(qc >= 0)
+
+
+# ---------------------------------------------------------------------------
+# Capex throughput enforcement
+# ---------------------------------------------------------------------------
+
+def test_capex_no_penalty_within_cap(config):
+    """Spend within capex_throughput → zero capex penalty."""
+    config["budget"]["capex_throughputs"] = [100.0, 100.0, 100.0, 100.0]
+    config["budget"]["capex_overspend_coef"] = 1.0
+    c = make_company(config, agent_id=0)
+    c.reset_capex_budget()
+    c.record_capex_spending(80.0)  # within 100 cap
+    assert c.compute_capex_penalty() == 0.0
+
+def test_capex_penalty_on_overshoot(config):
+    """Spend above capex_throughput → positive penalty."""
+    config["budget"]["capex_throughputs"] = [100.0, 100.0, 100.0, 100.0]
+    config["budget"]["capex_overspend_coef"] = 1.0
+    c = make_company(config, agent_id=0)
+    c.reset_capex_budget()
+    c.record_capex_spending(150.0)  # 50 over 100 cap
+    penalty = c.compute_capex_penalty()
+    assert penalty > 0, "Should penalize capex overshoot"
+
+def test_capex_penalty_quadratic(config):
+    """Penalty = coef × (overshoot/cap)² × cap."""
+    config["budget"]["capex_throughputs"] = [100.0, 100.0, 100.0, 100.0]
+    config["budget"]["capex_overspend_coef"] = 1.0
+    c = make_company(config, agent_id=0)
+    c.reset_capex_budget()
+    c.record_capex_spending(150.0)
+    overshoot = 50.0
+    ratio = overshoot / 100.0
+    expected = 1.0 * (ratio ** 2) * 100.0
+    assert abs(c.compute_capex_penalty() - expected) < 1e-6
+
+def test_capex_independent_of_compliance_budget(config):
+    """Capex within cap, compliance budget stressed → zero capex penalty."""
+    config["budget"]["capex_throughputs"] = [100.0, 100.0, 100.0, 100.0]
+    config["budget"]["capex_overspend_coef"] = 1.0
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.reset_capex_budget()
+    c.record_spending(700.0)        # heavy compliance spending
+    c.record_capex_spending(80.0)   # within capex cap
+    assert c.compute_capex_penalty() == 0.0
+    # Compliance budget may or may not be penalized — that's independent
+    # Just verify capex penalty is zero
+
+def test_investment_hits_both_budgets(config):
+    """Investment cost should increment both budget_spent and capex_spent."""
+    config["budget"]["capex_throughputs"] = [100.0, 100.0, 100.0, 100.0]
+    config["budget"]["capex_overspend_coef"] = 1.0
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.reset_capex_budget()
+    # Simulate what the environment does: record investment cost in both
+    invest_cost = 50.0
+    c.record_spending(invest_cost)
+    c.record_capex_spending(invest_cost)
+    assert c.budget_spent_this_year == 50.0
+    assert c.capex_spent_this_year == 50.0

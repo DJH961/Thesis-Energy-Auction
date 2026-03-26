@@ -77,6 +77,10 @@ class ETSEnvironment(gym.Env):
                                                 [1200.0] * self.n_bots)
             config["budget"]["annual_budgets"] = (
                 config["budget"]["annual_budgets"] + bot_budgets)
+            bot_capex_tp = config["budget"].get("bot_capex_throughputs",
+                                                 [130.0] * self.n_bots)
+            config["budget"]["capex_throughputs"] = (
+                config["budget"].get("capex_throughputs", []) + bot_capex_tp)
 
         initial_mixes = config["companies"]["initial_mix"]
         self.companies: List[Company] = [
@@ -196,6 +200,10 @@ class ETSEnvironment(gym.Env):
         self.current_episode = episode
         reward_cfg = self.config.get("reward", {})
         decay_ep = reward_cfg.get("shaping_decay_episode", 3000)
+        if decay_ep <= 0:
+            # Auto: 12% of n_episodes, clamped to [300, 8000]
+            n_ep = self.config.get("simulation", {}).get("n_episodes", 10000)
+            decay_ep = max(300, min(8000, int(0.12 * n_ep)))
         floor = reward_cfg.get("shaping_weight_floor", 0.0)
         self.shaping_weight = max(floor, 1.0 - episode / decay_ep)
 
@@ -322,6 +330,12 @@ class ETSEnvironment(gym.Env):
         ws_cfg = self.config.get("warm_start", {})
         if ws_cfg.get("enabled", False):
             self._apply_warm_start(ws_cfg)
+        else:
+            # Seed initial bank: ~0.3× annual need so year-0 coverage_ratio > 0,
+            # pushing initial bids down from penalty ceiling toward realistic levels.
+            for i, company in enumerate(self.companies):
+                initial_bank = 0.3 * company.compute_estimate_need()
+                self.holdings[i] = initial_bank
 
         # Scarcity check: warn if cap trajectory doesn't tighten enough over the episode
         cap_year_0 = self.cap_schedule.get_cap(0)
@@ -499,6 +513,7 @@ class ETSEnvironment(gym.Env):
         for company in self.companies:
             company.apply_matured_investments(year)
             company.reset_budget()
+            company.reset_capex_budget()
 
         # 3. Compute TNAC and auction volume
         cap_t = self.cap_schedule.get_cap(year)
@@ -1146,10 +1161,12 @@ class ETSEnvironment(gym.Env):
 
             company.record_spending(auction_cost + max(0.0, secondary_cost)
                                     + investment_cost + mac_cost_i)
+            company.record_capex_spending(investment_cost)
             budget_penalty = company.compute_budget_penalty()
+            capex_penalty = company.compute_capex_penalty()
 
             total_cost = (auction_cost + secondary_cost + investment_cost
-                         + operational_cost + budget_penalty + mac_cost_i)
+                         + operational_cost + budget_penalty + capex_penalty + mac_cost_i)
 
             # Electricity revenue
             revenue = 0.0
@@ -1159,18 +1176,20 @@ class ETSEnvironment(gym.Env):
             cost_norm = (total_cost - revenue) / 1000.0
 
             # Emissions intensity (capped at initial fossil floor)
+            # Scaled by (1 + w_green) so ESG agents (w_green=0.5) get 1.5× the signal
             fossil_floor_i = green_floor_fossil[i] if i < len(green_floor_fossil) else 0.0
             initial_ef_at_floor = fossil_floor_i * max(company.emission_factors[~company.is_green])
             penalisable_ef = max(0.0, company.weighted_emission_factor - initial_ef_at_floor)
-            emissions_intensity = penalisable_ef / 0.82
+            emissions_intensity = penalisable_ef / 0.82 * (1.0 + company.w_green)
 
             # Linear non-compliance penalty — denominator 100 so €100M penalty = 1.0 signal
             penalty_norm = (penalty_cost / 100.0) * non_compliance_mult
 
             # Green investment bonus with diminishing returns
+            # Scaled by (1 + w_green) so ESG agents get stronger green incentive
             green_delta = max(0.0, company.green_frac - company.prev_green_frac)
             fossil_scale = max(company.fossil_frac, 0.05)
-            green_bonus = beta_shaping * green_delta * fossil_scale * self.shaping_weight
+            green_bonus = beta_shaping * green_delta * fossil_scale * self.shaping_weight * (1.0 + company.w_green)
 
             # Queue bonus: reward for having active construction projects
             n_active_queue = len(company._construction_queue)

@@ -1,4 +1,4 @@
-# ETS MARL — Current Version (HAPPO/PPO) v5.4
+# ETS MARL — Current Version (HAPPO/PPO) v5.5
 
 This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
 
@@ -17,7 +17,7 @@ At a high level, this project:
 
 Each "episode" simulates **12 years** of a carbon market. Every year:
 
-1. The government sets a **cap** — the total CO2 allowed. This cap **shrinks each year** (by about 4.3-4.4%) to push companies toward cleaner energy. Over 12 years, the cap drops from 57.0 Mt (~45 Mt initial emissions for 16 participants).
+1. The government sets a **cap** — the total CO2 allowed. This cap **shrinks each year** (by about 4.3-4.4%) to push companies toward cleaner energy. Over 12 years, the cap drops from 50.0 Mt (~11% surplus over ~45 Mt initial emissions for 16 participants).
 2. Companies participate in an **auction** where they bid for emission allowances (each allowance = right to emit 1 tonne of CO2).
 3. The auction uses a **uniform price** — everyone pays the same price, which is the lowest winning bid. This is how the real EU ETS works.
 4. Companies that don't have enough allowances to cover their emissions face a **penalty** (base **€138.75/t in 2026**, indexed from €132.06 in 2024; plus carry-forward obligations).
@@ -68,11 +68,11 @@ Every year, each AI agent makes **6 decisions** (Phase 1) plus **2 more** (Phase
 **Phase 1 — Auction & Investment:**
 - **Bid price**: How much to offer per allowance (€/tonne, range: 5-500)
 - **Bid quantity**: Coverage multiplier on estimated annual need (0.3-1.3x)
-- **Investment fraction**: What share of capacity to convert to green (0-10%)
-- **Technology choice**: Where to invest — onshore wind (3yr delay), offshore wind (5yr delay), or solar (1yr delay)
+- **Investment fraction**: What share of capacity to convert to green (0-20%, subject to capex throughput cap)
+- **Technology choice**: Where to invest — onshore wind (4yr delay), offshore wind (7yr delay), or solar (2yr delay)
 
 **Phase 2 — Secondary Market:**
-- **Secondary price**: Price multiplier on clearing price (0.8-1.3x)
+- **Secondary price**: Price multiplier on clearing price (0.8-1.4x)
 - **Secondary quantity**: How many allowances to trade (positive = buy, negative = sell)
 
 ### How Agents Learn
@@ -99,8 +99,12 @@ The reward signal balances:
 - **Inflation path**: Annual inflation is sampled from historical calibration **N(μ=2.0%, σ=1.5%)**, then applied economy-wide to nominal costs
 - **MAC fuel-switching**: When carbon prices exceed €65/t, companies automatically switch up to 20% of coal dispatch to gas (short-run operational change, not investment)
 - **Electricity revenue**: Companies earn revenue from electricity sales, with carbon costs partially passed through to electricity prices (80%). Green generators benefit from the same revenue with lower carbon costs.
+- **Unified financial envelope**: Each company has a single annual budget covering all spending (compliance + capex + MAC), calibrated to realistic revenue retention (~€724M for 10 TWh). Coal-heavy companies have the tightest budgets due to higher fuel OPEX.
+- **Capex throughput cap**: Organizational constraint on annual construction spend (M€), modelling permitting pipeline capacity, EPC contractor access, and management bandwidth. Independent of the financial budget — a company can afford more investment than it can physically deliver.
 - **Dynamic reserve price**: Auction floor price adapts based on a 3-year moving average of secondary market prices
 - **Carry-forward**: Non-compliance shortfall is added to next year's obligation (capped at 2.0x, allowing larger debt accumulation)
+- **Initial bank seeding**: Each agent starts with ~30% of annual need as banked allowances (real EU ETS companies always hold some reserves), preventing year-0 bid prices from saturating at the penalty ceiling
+- **ESG reward weighting**: `w_green` reward weights now scale green_bonus and emissions_intensity signals, making the financial/ESG distinction meaningful for learned agents
 
 ## Project Structure
 
@@ -127,7 +131,7 @@ ets_marl_happo_current/
 │       └── replay_buffer.py      # Stores past experiences for learning
 │
 ├── configs/
-│   └── default.yaml              # All simulation parameters (v5.0)
+│   └── default.yaml              # All simulation parameters (v5.5)
 │
 ├── scripts/
 │   ├── train.py                  # Starts a training run
@@ -235,7 +239,7 @@ The most important settings you might want to change:
 | `simulation.n_years` | 12 | How many years each episode simulates |
 | `companies.n_agents` | 8 | Number of learning agents (PPO) |
 | `companies.n_bot_agents` | 8 | Number of heuristic bot agents |
-| `ets.cap_year_0` | 57.0 Mt | Starting emission cap (scaled for 16 participants) |
+| `ets.cap_year_0` | 50.0 Mt | Starting emission cap (~11% surplus for 16 participants) |
 | `auction.price_max` | 500 | Maximum bid price (€/tonne) |
 | `penalty.rate` | 138.75 | Fine per excess tonne of CO2 (€), base level at simulation year-0 (2026) |
 | `penalty.inflation_rate` | 0.020 | Mean annual inflation for nominal indexing (μ) |

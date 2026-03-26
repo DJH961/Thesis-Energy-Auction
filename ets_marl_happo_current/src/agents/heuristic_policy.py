@@ -113,8 +113,8 @@ def auction_action(
     coverage_ratio = max(bank / annual_need, 0.0)
 
     # --- Bid price (valuation-based) ---
-    # base_anchor blends penalty rate with MA3 signal
-    base_anchor = 0.7 * penalty_rate + 0.3 * max(price_ma3, reserve_price)
+    # base_anchor blends penalty rate with MA3 signal (40/60 to avoid penalty-ceiling saturation)
+    base_anchor = 0.4 * penalty_rate + 0.6 * max(price_ma3, reserve_price)
     # High coverage -> bid less aggressively; low coverage -> bid near penalty
     bid_price = min(penalty_rate, base_anchor * (1.4 - 0.3 * min(coverage_ratio, 3.0)))
     if is_green:
@@ -177,6 +177,16 @@ def auction_action(
         else:
             invest_frac = 0.005
 
+    # --- Capex throughput check ---
+    # Scale down invest_frac if estimated cost exceeds remaining capex capacity
+    capex_tp = getattr(company, 'capex_throughput', 1e9)
+    capex_spent = getattr(company, 'capex_spent_this_year', 0.0)
+    capex_remaining = max(0.0, capex_tp - capex_spent)
+    est_cost = company.compute_investment_cost(best_tech, invest_frac, current_year)
+    if est_cost > capex_remaining and est_cost > 1e-6:
+        invest_frac *= capex_remaining / est_cost
+        invest_frac = max(0.0, invest_frac)
+
     # --- Technology choice (logits) ---
     # Use the best_tech selected by effective payoff metric
     logits = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
@@ -232,6 +242,10 @@ def secondary_action(
     current_position = bank + allocation - need  # surplus after this year's compliance
     trade_target = (target_bank - current_position) * 0.5  # positive = buy, negative = sell
 
+    # Compliance-urgency override: never sell if carrying forward debt
+    if company._carry_forward > 0.01:
+        trade_target = max(0.0, trade_target)
+
     # Scale price multiplier by deficit/surplus severity
     severity = abs(trade_target) / max(need, 0.1)  # normalized severity
 
@@ -243,7 +257,7 @@ def secondary_action(
         if is_green:
             price_mult = 1.05 + 0.25 * min(severity, 1.0)  # 1.05-1.30
         else:
-            price_mult = 1.0 + 0.20 * min(severity, 1.0)   # 1.00-1.20
+            price_mult = 1.10 + 0.20 * min(severity, 1.0)   # 1.10-1.30
     elif trade_target < -0.01:
         # Have excess -> sell
         sell_qty = min(abs(trade_target), qty_max)
@@ -253,8 +267,8 @@ def secondary_action(
             # Green agents hold more: only sell at premium
             price_mult = 1.15 + 0.10 * min(severity, 1.0)  # 1.15-1.25
         else:
-            # Financial agents sell aggressively
-            price_mult = 1.0 + 0.10 * min(severity, 1.0)   # 1.00-1.10
+            # Financial agents: sell above market (not below)
+            price_mult = 1.15 + 0.10 * min(severity, 1.0)   # 1.15-1.25
     else:
         sec_qty = 0.0
         price_mult = 1.0

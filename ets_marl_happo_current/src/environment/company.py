@@ -95,6 +95,12 @@ class Company:
         self.overspend_coef = budget_cfg.get("overspend_penalty_coef", 2.0)
         self.budget_spent_this_year = 0.0
 
+        # Capex throughput constraint (organizational construction spend cap)
+        capex_tp = budget_cfg.get("capex_throughputs", [])
+        self.capex_throughput = capex_tp[agent_id] if agent_id < len(capex_tp) else 1e9
+        self.capex_overspend_coef = budget_cfg.get("capex_overspend_coef", 1.0)
+        self.capex_spent_this_year = 0.0
+
         # P6: Construction jitter config
         jitter_cfg = config.get("construction_jitter", {})
         self._jitter_enabled = jitter_cfg.get("enabled", False)
@@ -478,6 +484,26 @@ class Company:
         return self.budget_spent_this_year / max(self.annual_budget, 1e-6)
 
     # ------------------------------------------------------------------
+    # Capex throughput
+    # ------------------------------------------------------------------
+
+    def reset_capex_budget(self):
+        self.capex_spent_this_year = 0.0
+
+    def record_capex_spending(self, amount: float):
+        self.capex_spent_this_year += float(amount)
+
+    def compute_capex_penalty(self) -> float:
+        overshoot = max(0.0, self.capex_spent_this_year - self.capex_throughput)
+        if overshoot < 1e-6:
+            return 0.0
+        ratio = overshoot / self.capex_throughput
+        return self.capex_overspend_coef * (ratio ** 2) * self.capex_throughput
+
+    def get_capex_utilization(self) -> float:
+        return self.capex_spent_this_year / max(self.capex_throughput, 1e-6)
+
+    # ------------------------------------------------------------------
     # Compliance
     # ------------------------------------------------------------------
 
@@ -677,6 +703,7 @@ class Company:
         self._consecutive_successes = 0
         self.year_cost = 0.0
         self.budget_spent_this_year = 0.0
+        self.capex_spent_this_year = 0.0
         self._carry_forward = 0.0
         self._inflation_rates_by_year = {}
         self._inflation_factor_by_year = {0: 1.0}
