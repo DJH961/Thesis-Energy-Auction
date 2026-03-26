@@ -259,7 +259,7 @@ ppo:
   lr_min: 0.00001            # minimum learning rate at end of cosine decay
   target_kl: 0.02            # KL-based early stopping per PPO epoch
   kl_anchor_beta: 0.5        # KL penalty weight against frozen BC policy
-  kl_anchor_decay_episodes: 8000
+  kl_anchor_decay_episodes: 0   # auto: 50% of n_episodes, clamped to [500, 40000]
 
 # ----------------------------------------------------------
 # Curriculum learning (disabled — 12-year episodes train directly)

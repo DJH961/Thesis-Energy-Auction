@@ -448,17 +448,21 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     # Snapshot BC-trained weights as frozen KL anchors (only when BC was run)
     kl_beta_init = ppo_cfg.get("kl_anchor_beta", 0.0)
+    kl_decay_eps, kl_decay_auto = _resolve_auto_episode_count(
+        ppo_cfg.get("kl_anchor_decay_episodes", 0), n_episodes,
+        frac=0.50, min_count=500, max_count=40000,
+    )
     if bc_ran and kl_beta_init > 0.0:
         for agent in agents:
             agent.set_bc_anchor()
+        auto_note = " [auto]" if kl_decay_auto else ""
         print(f"KL anchor: frozen BC policies captured for all {n_agents} agents "
-              f"(β₀={kl_beta_init}, decay={ppo_cfg.get('kl_anchor_decay_episodes', 2000)} eps).")
+              f"(β₀={kl_beta_init}, decay={kl_decay_eps} eps{auto_note}).")
 
     critic_warmup_eps, critic_warmup_auto = _resolve_auto_episode_count(
         ppo_cfg.get("critic_warmup_episodes", 0), n_episodes,
         frac=0.06, min_count=60, max_count=1200,
     )
-    kl_decay_eps     = ppo_cfg.get("kl_anchor_decay_episodes", 2000)
     if critic_warmup_eps > 0:
         auto_note = " [auto]" if critic_warmup_auto else ""
         print(f"Critic-warmup: actor gradients frozen for first {critic_warmup_eps} episodes{auto_note}.")
@@ -571,7 +575,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # Year-level
     yr_path = os.path.join(results_dir, f"year_log_s{seed}.csv")
     yr_fields = ["episode", "year", "cap", "auction_volume", "tnac",
-                 "clearing_price", "secondary_price", "msr_reserve"]
+                 "clearing_price", "secondary_price", "msr_reserve",
+                 "inflation_rate", "inflation_factor"]
     for i in range(n_total_agents):
         yr_fields += [f"bank_start_A{i+1}", f"alloc_A{i+1}", f"emissions_A{i+1}",
                       f"trade_qty_A{i+1}", f"trade_cost_A{i+1}", f"green_frac_A{i+1}",
@@ -743,6 +748,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 "tnac": yl.get("tnac", 0), "clearing_price": yl.get("clearing_price", 0),
                 "secondary_price": yl.get("secondary_clearing", 0),
                 "msr_reserve": yl.get("msr_reserve", 0),
+                "inflation_rate": yl.get("inflation_rate", 0),
+                "inflation_factor": yl.get("inflation_factor", 1.0),
             }
             for i in range(n_total_agents):
                 def _get(log_key, default=0):
