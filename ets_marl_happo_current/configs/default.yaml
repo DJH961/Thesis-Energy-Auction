@@ -1,12 +1,15 @@
 # ============================================================
-# ETS MARL — Configuration v5.5
+# ETS MARL — Configuration v6.0
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
 #   - Episode-level inflation randomness window (small stochastic variation)
-#   - MAC fuel-switching, electricity revenue
+#   - MAC fuel-switching (48 EUR/tCO2), electricity revenue
 #   - Carry-forward obligations (cap=2.0x)
 #   - Terminal valuation: max(clearing, secondary, 80% eff_penalty)
+#   - Fundamentals-based heuristic bidding (MAC→penalty gradient)
+#   - Absolute-price secondary market (no multiplier)
+#   - ESG reward signal (saved-carbon-years formula)
 # ============================================================
 
 simulation:
@@ -46,10 +49,10 @@ ets:
 
   msr:
     enabled: true
-    tnac_upper: 33.3     # scaled 16/12 from 25.0
-    tnac_lower: 16.0     # scaled 16/12 from 12.0
+    tnac_upper: 48.0
+    tnac_lower: 20.0
     withhold_rate: 0.24
-    release_amount: 0.55  # increased to ensure adequate supply release
+    release_amount: 0.80
     price_containment_trigger: 0.70   # at 70% of price_max, suppress MSR withdrawal
     price_release_trigger: 0.85       # at 85% of price_max, force emergency release
     emergency_release_amount: 0.90    # Mt released per year in emergency
@@ -57,9 +60,6 @@ ets:
   banking: true
   reserve_price: 30.0              # auction bid floor (matches price_min)
   reserve_price_mode: "static"     # "static" or "dynamic" (= max(reserve_price, discount x MA3))
-  reserve_discount: 0.80           # only used in dynamic mode
-  reserve_initial: 50.0            # only used in dynamic mode (before MA3 available)
-  reserve_anchor: "secondary"      # which price feeds MA3: "secondary" or "auction"
   unsold_to_msr: false             # unsold volume rolls over to next year (not absorbed into MSR)
 
 # ----------------------------------------------------------
@@ -144,9 +144,9 @@ auction:
 trading:
   enabled: true
   transaction_cost: 0.5
-  spread_tolerance: 0.07      # +/-7% of clearing_price for bid-ask matching
-  sec_mult_low: 0.8           # secondary price multiplier lower bound (x clearing_price)
-  sec_mult_high: 1.4          # secondary price multiplier upper bound (x clearing_price)
+  spread_tolerance: 0.12      # +/-12% of clearing_price for bid-ask matching
+  sec_price_min: 30.0         # absolute secondary price floor (= reserve price)
+  sec_price_max_mult: 2.0     # secondary price cap = 2.0 × effective_penalty_rate
 
 secondary:
   liquidity_pool:
@@ -182,7 +182,6 @@ penalty:
   inflation_rate: 0.020            # μ = 2.0% annual inflation (historical average)
   inflation_random_std: 0.015      # σ = 1.5%-pt annual inflation volatility (normal sampling)
   inflation_random_window: 0.0     # legacy fallback (uniform ±window) if inflation_random_std = 0
-  non_compliance_multiplier: 1.0   # reduced since carry-forward already adds future cost
   carry_forward: true
   carry_forward_cap: 2.0           # max carry-forward as multiple of base annual emissions
 
@@ -203,7 +202,7 @@ price:
 # ----------------------------------------------------------
 mac:
   enabled: true
-  coal_to_gas_cost: 65.0     # EUR/tCO2 abated
+  coal_to_gas_cost: 48.0     # EUR/tCO2 — mid-range ICIS 2020-2025 front-month switching cost for avg-efficiency plants
   max_switch_frac: 0.20      # max fraction of coal output switchable per year
 
 # ----------------------------------------------------------
@@ -224,17 +223,25 @@ reward:
   normalizer_alpha: 0.01
   clip_min: -10.0
   clip_max: 5.0
-  # Per-agent fossil floor for emissions_intensity calculation.
-  # Length must equal n_agents + n_bot_agents (16).
-  green_floor_fossil: [0.40, 0.40, 0.30, 0.30, 0.10, 0.10, 0.00, 0.00, 0.40, 0.40, 0.30, 0.30, 0.10, 0.10, 0.00, 0.00]
   shaping_beta: 7.0              # green_delta bonus weight
   shaping_gamma: 1.0             # queue bonus weight
   shaping_decay_episode: 0       # auto: 12% of n_episodes, clamped to [300, 8000]
   shaping_weight_floor: 0.0      # shaping decays fully to zero
-  price_anchor_delta: 0.0        # DISABLED — caused floor-bidding collapse
   terminal_bank_value: true      # value banked allowances at terminal_price in final year
   terminal_queue_value: true     # value construction queue via NPV of carbon savings
   terminal_payoff_years: 5       # years of future savings for queue valuation
+
+# ----------------------------------------------------------
+# ESG signal — saved-carbon-years formula
+# esg = w_green × ef_ratio × time_ratio × (annual_budget / 1000)
+# where ef_ratio = (initial_ef - current_ef) / initial_ef
+#       time_ratio = remaining_years / n_years
+# Terminal ESG: queue items valued by γ^years_late discount
+#   with effective_remaining = max(0, terminal_payoff_years - years_late)
+#   normalized by initial_ef × output_twh × n_years
+# ----------------------------------------------------------
+esg:
+  enabled: true
 
 # ----------------------------------------------------------
 # Opponent modeling — 5D public info per opponent.
@@ -377,5 +384,5 @@ exploration:
   # Action anchors in physical space (set initial policy mean via head bias).
   # Auction: [bid_price, qty_mult, invest_frac, logit_onshore, logit_offshore, logit_solar]
   auction_anchors: [80.0, 1.0, 0.03, 0.3, -0.5, 0.5]
-  # Secondary: [sec_price_multiplier, sec_qty]
-  secondary_anchors: [1.05, 0.0]
+  # Secondary: [sec_price (absolute €/t), sec_qty]
+  secondary_anchors: [80.0, 0.0]

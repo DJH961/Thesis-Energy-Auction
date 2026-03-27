@@ -68,7 +68,7 @@ def config():
             "annual_budgets": [1500.0, 1200.0, 800.0, 500.0],
             "overspend_penalty_coef": 0.5,
         },
-        "mac": {"enabled": True, "coal_to_gas_cost": 65.0, "max_switch_frac": 0.20},
+        "mac": {"enabled": True, "coal_to_gas_cost": 48.0, "max_switch_frac": 0.20},
         "opponent_modeling": {"enabled": False},
         "construction_jitter": {"enabled": False},
     }
@@ -155,14 +155,14 @@ def test_greener_company_emits_less(config):
 def test_mac_no_switch_below_cost(config):
     """No switching when carbon price < MAC cost."""
     c = make_company(config, agent_id=0)
-    reduction, cost = c.apply_mac_switching(carbon_price=50.0)  # below 65
+    reduction, cost = c.apply_mac_switching(carbon_price=40.0)  # below 48
     assert reduction == 0.0
     assert cost == 0.0
 
 def test_mac_switch_above_cost(config):
     """Switching occurs when carbon price > MAC cost."""
     c = make_company(config, agent_id=0)
-    reduction, cost = c.apply_mac_switching(carbon_price=100.0)  # above 65
+    reduction, cost = c.apply_mac_switching(carbon_price=80.0)  # above 48
     assert reduction > 0
     assert cost > 0
 

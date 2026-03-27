@@ -77,12 +77,20 @@ def build_agents(env: ETSEnvironment, config: dict, seed: int):
         aq["price_max"], aq.get("qty_mult_high", 1.3), inv["max_invest_frac"], 1.0, 1.0, 1.0
     ], dtype=np.float32)
 
-    # Phase 2: [sec_price_multiplier, sec_qty]
+    # Phase 2: [sec_price (absolute EUR/t), sec_qty]
+    # Secondary price range: [sec_price_min, sec_price_max_mult × max_penalty_rate]
+    # Use worst-case penalty rate (final year inflation) for action space bounds.
     trading_cfg = config.get("trading", {})
-    sec_mult_low = trading_cfg.get("sec_mult_low", 0.8)
-    sec_mult_high = trading_cfg.get("sec_mult_high", 1.3)
-    secondary_low = np.array([sec_mult_low, -aq["quantity_max"]], dtype=np.float32)
-    secondary_high = np.array([sec_mult_high, aq["quantity_max"]], dtype=np.float32)
+    sec_price_min = trading_cfg.get("sec_price_min", 30.0)
+    sec_price_max_mult = trading_cfg.get("sec_price_max_mult", 2.0)
+    pen_cfg = config.get("penalty", {})
+    base_penalty = pen_cfg.get("rate", 138.75)
+    infl_rate = pen_cfg.get("inflation_rate", 0.02)
+    n_yrs = config["simulation"]["n_years"]
+    max_penalty = base_penalty * (1.0 + infl_rate) ** n_yrs
+    sec_price_high = sec_price_max_mult * max_penalty
+    secondary_low = np.array([sec_price_min, -aq["quantity_max"]], dtype=np.float32)
+    secondary_high = np.array([sec_price_high, aq["quantity_max"]], dtype=np.float32)
 
     agents = []
     for i in range(n_agents):
@@ -316,7 +324,7 @@ def _print_training_legend():
     print("  YEAR-BY-YEAR TRAJECTORIES")
     print("    Price/yr   : Clearing price each year (€/t), with std dev")
     print("    Emiss/yr   : Total emissions each year (Mt), with avg")
-    print("    Cap/yr     : Cap each year (Mt), with final TNAC")
+    print("    Auct/yr    : Auction volume each year (Mt, post-MSR), with final TNAC")
     print()
     print("  MARKET & SECONDARY SUMMARY")
     print("    comply / green      : Compliance rate, avg green fraction")
@@ -423,15 +431,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v5.1: MAC switching | Electricity revenue | Carry-forward{cf_str}")
+    print(f"v6.0: MAC 48€ | Absolute-price secondary | ESG signal | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(f"{'='*60}")
     _print_training_legend()
 
     if shaping_decay_auto:
-        print("Reward shaping decay auto-scale: "
-              f"{shaping_decay_eps} episodes "
-              f"(n_episodes={n_episodes}, clamp=[300, 8000]).")
+        print(f"Reward shaping decay: → 0 at episode {shaping_decay_eps} [auto] "
+              f"(12% of {n_episodes}, clamp=[300, 8000]).")
 
     env = ETSEnvironment(config, seed=seed)
     agents = build_agents(env, config, seed)
@@ -548,6 +555,18 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     # Condition-based entropy tracker (auto-scales to n_episodes)
     entropy_tracker = EntropyConditionTracker(ppo_cfg, n_agents, n_episodes)
+
+    # Print consolidated decay-to-zero schedules
+    print(f"\nDecay-to-zero schedules (episode → 0):")
+    print(f"  Shaping weight:   → 0 at ep {shaping_decay_eps}")
+    print(f"  Entropy coef:     {entropy_tracker.coef_init:.4f} → {entropy_tracker.coef_final:.4f} "
+          f"(start={entropy_tracker.decay_start}, window={entropy_tracker.decay_window})")
+    if kl_beta_init > 0.0:
+        print(f"  KL anchor beta:   {kl_beta_init} → 0 at ep {kl_decay_eps}")
+    if eps_start > 0.0:
+        print(f"  Epsilon-greedy:   {eps_start:.2f} → {eps_final:.2f} over {eps_decay_episodes} eps")
+    if critic_warmup_eps > 0:
+        print(f"  Critic warmup:    actor frozen for {critic_warmup_eps} eps")
 
     # --- CSV loggers ---
     results_dir = config["logging"]["results_dir"]
@@ -1442,11 +1461,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             # Year-by-year total emissions trajectory
             yr_emiss = [sum(yl.get("emissions", [0.0] * n_total)[j] for j in range(n_total))
                         for yl in env.episode_log]
-            yr_caps  = [yl.get("cap", 0.0) for yl in env.episode_log]
+            yr_auct_vol = [yl.get("auction_volume", yl.get("cap", 0.0)) for yl in env.episode_log]
             emiss_traj = "  ".join(f"{e:3.1f}" for e in yr_emiss)
-            cap_traj   = "  ".join(f"{c:3.1f}" for c in yr_caps)
+            auct_traj  = "  ".join(f"{c:3.1f}" for c in yr_auct_vol)
             print(f"  Emiss/yr:  {emiss_traj}   (avg {avg_annual_emiss:.1f} Mt/yr)")
-            print(f"  Cap/yr:    {cap_traj}   (TNAC={tnac:.1f} Mt)")
+            print(f"  Auct/yr:   {auct_traj}   (TNAC={tnac:.1f} Mt)")
 
             # Market + secondary summary (merged into one compact block)
             print(f"  Market: comply={compliance_rate*100:.0f}%  green={avg_green_all*100:.0f}%"

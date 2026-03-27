@@ -23,10 +23,10 @@ BASE_CONFIG = {
         "reserve_price": 0.0,
         "msr": {
             "enabled": True,
-            "tnac_upper": 8.33,
-            "tnac_lower": 4.00,
+            "tnac_upper": 14.0,   # 48.0 × 14.6/50.0
+            "tnac_lower": 5.84,   # 20.0 × 14.6/50.0
             "withhold_rate": 0.24,
-            "release_amount": 0.10,
+            "release_amount": 0.80,
         },
     }
 }
@@ -86,7 +86,7 @@ def test_cap_year_10():
 def test_msr_no_adjustment_within_band():
     """TNAC between thresholds → auction volume = cap."""
     s = make_schedule(msr_enabled=True)
-    tnac = 6.0   # between 4.00 and 8.33
+    tnac = 8.0   # between 5.84 and 14.0
     vol = s.get_auction_volume(year=1, tnac=tnac)
     cap = s.get_cap(1)
     assert vol == pytest.approx(cap, rel=1e-6)
@@ -95,11 +95,11 @@ def test_msr_no_adjustment_within_band():
 def test_msr_withhold_when_tnac_high():
     """TNAC > upper threshold → volume reduced, reserve grows."""
     s = make_schedule(msr_enabled=True)
-    tnac = 10.0   # > 8.33
+    tnac = 16.0   # > 14.0
     cap = s.get_cap(1)
     vol = s.get_auction_volume(year=1, tnac=tnac)
 
-    excess = tnac - 8.33
+    excess = tnac - 14.0
     expected_withheld = 0.24 * excess
     assert vol == pytest.approx(cap - expected_withheld, rel=1e-5)
     assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-5)
@@ -109,14 +109,14 @@ def test_msr_release_when_tnac_low():
     """TNAC < lower threshold → release from reserve into auction."""
     s = make_schedule(msr_enabled=True)
     # First build up some reserve
-    s._msr_reserve = 0.50
+    s._msr_reserve = 1.00
 
-    tnac = 2.0   # < 4.00
+    tnac = 3.0   # < 5.84
     cap = s.get_cap(1)
     vol = s.get_auction_volume(year=1, tnac=tnac)
 
-    assert vol == pytest.approx(cap + 0.10, rel=1e-5)   # release_amount = 0.10
-    assert s.msr_reserve() == pytest.approx(0.40, rel=1e-5)
+    assert vol == pytest.approx(cap + 0.80, rel=1e-5)   # release_amount = 0.80
+    assert s.msr_reserve() == pytest.approx(0.20, rel=1e-5)
 
 
 def test_msr_disabled():

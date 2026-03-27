@@ -137,11 +137,8 @@ class ETSEnvironment(gym.Env):
         self._unsold_rollover = 0.0
 
         # Dynamic reserve tracking
-        self._last_effective_reserve = config["ets"].get("reserve_initial",
-                                                          config["ets"].get("reserve_price", 0.0))
-        self._reserve_anchor = config["ets"].get("reserve_anchor", "secondary")
-        if self._reserve_anchor not in {"secondary", "auction"}:
-            self._reserve_anchor = "secondary"
+        self._last_effective_reserve = config["ets"].get("reserve_price", 0.0)
+        self._reserve_anchor = "secondary"  # price history fed by secondary clearing
         self._consecutive_years_without_valid_auction_clear = 0
 
         # Secondary liquidity pool EMA anchor state (only used when pool enabled)
@@ -204,8 +201,10 @@ class ETSEnvironment(gym.Env):
             # Auto: 12% of n_episodes, clamped to [300, 8000]
             n_ep = self.config.get("simulation", {}).get("n_episodes", 10000)
             decay_ep = max(300, min(8000, int(0.12 * n_ep)))
+            # Write back so subsequent calls don't re-resolve
+            reward_cfg["shaping_decay_episode"] = decay_ep
         floor = reward_cfg.get("shaping_weight_floor", 0.0)
-        self.shaping_weight = max(floor, 1.0 - episode / decay_ep)
+        self.shaping_weight = max(floor, 1.0 - episode / max(decay_ep, 1))
 
     # ------------------------------------------------------------------
     # Dynamic reserve price
@@ -767,16 +766,20 @@ class ETSEnvironment(gym.Env):
         clearing_price = self._phase1_clearing_price
         log = self._phase1_log
 
-        # 5. Secondary market
+        # 5. Secondary market (absolute prices)
         trading_cfg = self.config.get("trading", {})
-        sec_mult_low = trading_cfg.get("sec_mult_low", 0.8)
-        sec_mult_high = trading_cfg.get("sec_mult_high", 1.3)
+        sec_price_min = trading_cfg.get("sec_price_min", 30.0)
+        sec_price_max_mult = trading_cfg.get("sec_price_max_mult", 2.0)
 
         realized_emissions = self._current_emissions
         old_carry_forward = np.array([c._carry_forward for c in self.companies], dtype=float)
 
-        secondary_prices = clearing_price * np.clip(
-            secondary_actions[:, 0], sec_mult_low, sec_mult_high)
+        # Per-agent secondary price cap = 2.0 × effective_penalty_rate
+        secondary_prices = np.zeros(self.n_total)
+        for i in range(self.n_total):
+            agent_sec_max = sec_price_max_mult * self.companies[i].effective_penalty_rate(self.current_year)
+            secondary_prices[i] = float(np.clip(
+                secondary_actions[i, 0], sec_price_min, agent_sec_max))
 
         raw_secondary_qtys = np.clip(
             secondary_actions[:, 1],
@@ -916,7 +919,7 @@ class ETSEnvironment(gym.Env):
             "terminal_liquidation_values": self._last_terminal_liquidation_values.tolist(),
             "mac_reductions": self._mac_reductions.tolist(),
             "mac_costs": self._mac_costs.tolist(),
-            "sec_price_mults": secondary_actions[:, 0].tolist(),  # Phase 2 action[0] (raw)
+            "sec_price_mults": secondary_prices.tolist(),  # Phase 2 absolute prices (clipped)
             "sec_qty_actions": secondary_actions[:, 1].tolist(),  # Phase 2 action[1] (raw)
             "sec_action_sides": sec_action_sides.tolist(),         # -1=sell, 0=hold, 1=buy intent
             "liquidity_pool": liquidity_pool_info,
@@ -1112,31 +1115,28 @@ class ETSEnvironment(gym.Env):
                          mac_costs=None, precompliance_holdings=None,
                          old_carry_forward=None):
         """
-        Reward (HAPPO-compliant):
-          R_i = -cost_norm - emissions_intensity - penalty_norm + green_bonus + queue_bonus
+        Reward (HAPPO-compliant, v6.0):
+          R_i = -cost_norm + green_bonus + queue_bonus + esg_signal
 
-        Five core economic signals:
-          cost_norm:           total costs (auction + secondary + invest + ops + MAC - revenue) / 1000
-          emissions_intensity: penalisable emission factor / 0.82
-          penalty_norm:        linear non-compliance penalty (penalty / 100)
-          green_bonus:         diminishing-returns bonus for green investment progress
-          queue_bonus:         reward for active construction queue items (decays with shaping_weight)
+        Core signals:
+          cost_norm:   (total_cost + penalty - revenue) / 1000
+          green_bonus: diminishing-returns bonus for green investment progress
+          queue_bonus: reward for active construction queue items (decays with shaping_weight)
+          esg_signal:  saved-carbon-years formula (w_green-gated)
 
-        Note: per-agent running normalisation applied in PPOAgent.normalize_reward()
-        AFTER this function returns raw rewards.
+        Penalty is folded into total_cost (recorded via company.record_spending).
+        Terminal bonuses: bank /1000 + ESG terminal queue.
         """
         rewards = np.zeros(self.n_total)
         terminal_bank_values = np.zeros(self.n_total)
         terminal_queue_values = np.zeros(self.n_total)
-        non_compliance_mult = self.config["penalty"].get("non_compliance_multiplier", 1.0)
         reward_cfg = self.config.get("reward", {})
-        trading_cfg = self.config.get("trading", {})
         elec_cfg = self.config.get("electricity", {})
+        esg_cfg = self.config.get("esg", {})
+        esg_enabled = esg_cfg.get("enabled", False)
 
-        green_floor_fossil = reward_cfg.get("green_floor_fossil", [0.0] * self.n_total)
         beta_shaping = reward_cfg.get("shaping_beta", 10.0)
         gamma_shaping = reward_cfg.get("shaping_gamma", 1.0)
-        price_anchor_delta = reward_cfg.get("price_anchor_delta", 0.5)
 
         # Electricity revenue parameters (base price inflation-indexed)
         elec_enabled = elec_cfg.get("enabled", False)
@@ -1151,6 +1151,8 @@ class ETSEnvironment(gym.Env):
         if mac_costs is None:
             mac_costs = np.zeros(self.n_total)
 
+        remaining_years = max(1, self.n_years - self.current_year)
+
         for i, company in enumerate(self.companies):
             auction_cost = float(payments[i])
             secondary_cost = float(trade_costs[i])
@@ -1159,14 +1161,17 @@ class ETSEnvironment(gym.Env):
             operational_cost = company.compute_operational_cost(self.current_year)
             mac_cost_i = float(mac_costs[i])
 
+            # Record spending: penalty now included in budget tracking
             company.record_spending(auction_cost + max(0.0, secondary_cost)
-                                    + investment_cost + mac_cost_i)
+                                    + investment_cost + mac_cost_i + penalty_cost)
             company.record_capex_spending(investment_cost)
             budget_penalty = company.compute_budget_penalty()
             capex_penalty = company.compute_capex_penalty()
 
+            # Penalty folded into total_cost (no separate penalty_norm)
             total_cost = (auction_cost + secondary_cost + investment_cost
-                         + operational_cost + budget_penalty + capex_penalty + mac_cost_i)
+                         + operational_cost + budget_penalty + capex_penalty
+                         + mac_cost_i + penalty_cost)
 
             # Electricity revenue
             revenue = 0.0
@@ -1175,41 +1180,24 @@ class ETSEnvironment(gym.Env):
 
             cost_norm = (total_cost - revenue) / 1000.0
 
-            # Emissions intensity (capped at initial fossil floor)
-            # Scaled by (1 + w_green) so ESG agents (w_green=0.5) get 1.5× the signal
-            fossil_floor_i = green_floor_fossil[i] if i < len(green_floor_fossil) else 0.0
-            initial_ef_at_floor = fossil_floor_i * max(company.emission_factors[~company.is_green])
-            penalisable_ef = max(0.0, company.weighted_emission_factor - initial_ef_at_floor)
-            emissions_intensity = penalisable_ef / 0.82 * (1.0 + company.w_green)
-
-            # Linear non-compliance penalty — denominator 100 so €100M penalty = 1.0 signal
-            penalty_norm = (penalty_cost / 100.0) * non_compliance_mult
-
             # Green investment bonus with diminishing returns
-            # Scaled by (1 + w_green) so ESG agents get stronger green incentive
+            # Scaled by (0.2 + w_green) so financial agents still get some signal
             green_delta = max(0.0, company.green_frac - company.prev_green_frac)
             fossil_scale = max(company.fossil_frac, 0.05)
-            green_bonus = beta_shaping * green_delta * fossil_scale * self.shaping_weight * (1.0 + company.w_green)
+            green_bonus = beta_shaping * green_delta * fossil_scale * self.shaping_weight * (0.2 + company.w_green)
 
             # Queue bonus: reward for having active construction projects
             n_active_queue = len(company._construction_queue)
             queue_bonus = gamma_shaping * n_active_queue * 0.1 * self.shaping_weight
 
-            # Price-anchor bonus: encourage bidding near expected price (decays with shaping_weight).
-            # Uses a Gaussian-shaped bonus: max at expected_price, falls off with distance.
-            # Normalised so the bonus ∈ [0, price_anchor_delta] when shaping_weight=1.
-            price_anchor_bonus = 0.0
-            if price_anchor_delta > 0.0 and self.shaping_weight > 0.0:
-                bid_price_i = float(self._phase1_bid_prices[i])
-                ref_price = max(self.expected_price, 10.0)  # AR(1) expected price
-                price_dev = (bid_price_i - ref_price) / ref_price  # fractional deviation
-                # Gaussian kernel: exp(-dev²/2σ²) with σ=0.5 (±50% gets ~60% of max bonus)
-                price_anchor_bonus = (price_anchor_delta
-                                      * np.exp(-0.5 * (price_dev / 0.5) ** 2)
-                                      * self.shaping_weight)
+            # ESG signal: saved-carbon-years formula
+            esg_signal = 0.0
+            if esg_enabled and company.w_green > 0.0 and company.initial_ef > 1e-6:
+                ef_ratio = (company.initial_ef - company.weighted_emission_factor) / company.initial_ef
+                time_ratio = remaining_years / self.n_years
+                esg_signal = company.w_green * ef_ratio * time_ratio * (company.annual_budget / 1000.0)
 
-            rewards[i] = float(-cost_norm - emissions_intensity - penalty_norm
-                               + green_bonus + queue_bonus + price_anchor_bonus)
+            rewards[i] = float(-cost_norm + green_bonus + queue_bonus + esg_signal)
 
         # Terminal value bonuses (final year only)
         is_final_year = self.current_year >= self.n_years - 1
@@ -1226,24 +1214,31 @@ class ETSEnvironment(gym.Env):
             terminal_price = max(clearing_price, self.last_secondary_price, eff_penalty * 0.8)
 
             for i, company in enumerate(self.companies):
-                # Terminal bank value: banked allowances × terminal_price
+                # Terminal bank value: banked allowances × terminal_price / 1000
                 if terminal_bank:
-                    bank_value = self.holdings[i] * terminal_price / 100.0
+                    bank_value = self.holdings[i] * terminal_price / 1000.0
                     rewards[i] += bank_value
                     terminal_bank_values[i] = bank_value
 
-                # Terminal queue value: NPV of future carbon savings from in-construction projects
+                # Terminal queue value: ESG from queue items with γ^years_late discount
                 if terminal_queue:
                     queue_value = 0.0
                     for item in company._construction_queue:
+                        years_late = max(0, item["completion_year"] - self.current_year)
+                        effective_remaining = max(0, terminal_payoff_years - years_late)
+                        if effective_remaining <= 0 or company.initial_ef < 1e-6:
+                            continue
                         delta_ef = company.weighted_emission_factor - company.emission_factors[item["tech_idx"]]
-                        annual_saving = (max(0.0, delta_ef)
-                                         * item["frac_delta"]
-                                         * company.output_mwh / 1e6
-                                         * terminal_price)
-                        discount = gamma_discount ** max(0, item["completion_year"] - self.current_year)
-                        queue_value += annual_saving * terminal_payoff_years * discount
-                    queue_term = queue_value / 1000.0
+                        if delta_ef <= 0:
+                            continue
+                        annual_saving = (delta_ef * item["frac_delta"]
+                                         * company.output_mwh / 1e6)
+                        discount = gamma_discount ** years_late
+                        # Normalize by initial_ef × output_twh × n_years
+                        normalizer = company.initial_ef * company.output_twh * self.n_years
+                        queue_value += (annual_saving * effective_remaining * discount
+                                        * terminal_price / max(normalizer, 1e-6))
+                    queue_term = queue_value
                     rewards[i] += queue_term
                     terminal_queue_values[i] = queue_term
 

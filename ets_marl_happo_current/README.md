@@ -1,4 +1,4 @@
-# ETS MARL — Current Version (HAPPO/PPO) v5.5
+# ETS MARL — Current Version (HAPPO/PPO) v6.0
 
 This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
 
@@ -57,7 +57,7 @@ Even-indexed agents (A1, A3, A5, A7) have pure financial reward weights [1.0, 0.
 | **B5, B6** | ~30% fossil, 70% green | Transitioner mirrors |
 | **B7, B8** | ~10% gas, 90% renewable | Green-leader mirrors |
 
-Bots use the same `Company` class and participate identically in auction clearing and secondary market matching. They are **not trained** — their actions come from the heuristic policy (valuation-based bidding, NPV-gated investment, target-bank trajectory trading). Bots are indexed after learning agents (indices 8-15) and are excluded from PPO updates. Bot `reward_weights` in the config are for evaluation logging only — bots use `heuristic_policy`, not rewards.
+Bots use the same `Company` class and participate identically in auction clearing and secondary market matching. They are **not trained** — their actions come from the heuristic policy (fundamentals-based MAC→penalty bidding, NPV-gated investment, target-bank trajectory trading with absolute-price secondary market). Bots are indexed after learning agents (indices 8-15) and are excluded from PPO updates. Bot `reward_weights` in the config are for evaluation logging only — bots use `heuristic_policy`, not rewards.
 
 All companies produce **10 TWh/year** of electricity — the same output, but very different carbon footprints.
 
@@ -72,7 +72,7 @@ Every year, each AI agent makes **6 decisions** (Phase 1) plus **2 more** (Phase
 - **Technology choice**: Where to invest — onshore wind (4yr delay), offshore wind (7yr delay), or solar (2yr delay)
 
 **Phase 2 — Secondary Market:**
-- **Secondary price**: Price multiplier on clearing price (0.8-1.4x)
+- **Secondary price**: Absolute price in €/tonne (range: reserve price to 2× effective penalty rate)
 - **Secondary quantity**: How many allowances to trade (positive = buy, negative = sell)
 
 ### How Agents Learn
@@ -88,23 +88,24 @@ The agents use **HAPPO (Heterogeneous-Agent PPO)**, a multi-agent reinforcement 
 
 The reward signal balances:
 - **Revenue** from selling electricity (including carbon cost passthrough)
-- **Costs** of buying allowances, trading, investing, and operations
-- **Penalties** for non-compliance (with carry-forward obligations)
-- **Emissions intensity** — penalizes higher emission factors
-- **Green investment shaping** — bonus for increasing green fraction (decays over training)
-- **Terminal values** — end-of-episode valuation of banked allowances and in-construction projects
+- **Total costs** including allowances, trading, investing, operations, MAC, and penalties (folded into one cost signal)
+- **Green investment shaping** — bonus for increasing green fraction (decays over training), scaled by (0.2 + w_green)
+- **ESG signal** — saved-carbon-years formula: `w_green × ef_ratio × time_ratio × (budget/1000)`, rewarding early emission reductions more than late ones
+- **Terminal values** — bank value (/1000 scaling) and ESG terminal queue value with γ^years_late discount
 
 ### Key Mechanisms
 
 - **Inflation path**: Annual inflation is sampled from historical calibration **N(μ=2.0%, σ=1.5%)**, then applied economy-wide to nominal costs
-- **MAC fuel-switching**: When carbon prices exceed €65/t, companies automatically switch up to 20% of coal dispatch to gas (short-run operational change, not investment)
+- **MAC fuel-switching**: When carbon prices exceed €48/t (ICIS mid-range switching cost), companies automatically switch up to 20% of coal dispatch to gas (short-run operational change, not investment)
 - **Electricity revenue**: Companies earn revenue from electricity sales, with carbon costs partially passed through to electricity prices (80%). Green generators benefit from the same revenue with lower carbon costs.
 - **Unified financial envelope**: Each company has a single annual budget covering all spending (compliance + capex + MAC), calibrated to realistic revenue retention (~€724M for 10 TWh). Coal-heavy companies have the tightest budgets due to higher fuel OPEX.
 - **Capex throughput cap**: Organizational constraint on annual construction spend (M€), modelling permitting pipeline capacity, EPC contractor access, and management bandwidth. Independent of the financial budget — a company can afford more investment than it can physically deliver.
-- **Dynamic reserve price**: Auction floor price adapts based on a 3-year moving average of secondary market prices
+- **Static reserve price**: Auction floor price at €30/t (matching price_min)
 - **Carry-forward**: Non-compliance shortfall is added to next year's obligation (capped at 2.0x, allowing larger debt accumulation)
 - **Initial bank seeding**: Each agent starts with ~30% of annual need as banked allowances (real EU ETS companies always hold some reserves), preventing year-0 bid prices from saturating at the penalty ceiling
-- **ESG reward weighting**: `w_green` reward weights now scale green_bonus and emissions_intensity signals, making the financial/ESG distinction meaningful for learned agents
+- **Fundamentals-based heuristic**: Bot bidding uses MAC→penalty gradient (`mac_cost + urgency × (penalty - mac_cost)`), removing dependence on price moving average
+- **Absolute-price secondary market**: Secondary prices are expressed in €/t (not as multipliers), clipped to [sec_price_min, 2× effective penalty rate]
+- **ESG signal**: Saved-carbon-years formula rewards emission factor improvements proportional to remaining time, gated by w_green
 
 ## Project Structure
 
@@ -131,7 +132,7 @@ ets_marl_happo_current/
 │       └── replay_buffer.py      # Stores past experiences for learning
 │
 ├── configs/
-│   └── default.yaml              # All simulation parameters (v5.5)
+│   └── default.yaml              # All simulation parameters (v6.0)
 │
 ├── scripts/
 │   ├── train.py                  # Starts a training run

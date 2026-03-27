@@ -114,6 +114,7 @@ class Company:
         # State: technology mix vector [coal, gas, onshore, offshore, solar]
         self.mix = np.array(initial_mix, dtype=np.float64)
         assert abs(self.mix.sum() - 1.0) < 1e-6, f"Mix must sum to 1.0, got {self.mix.sum()}"
+        self.initial_ef = self.weighted_emission_factor  # snapshot for ESG signal
         self.prev_green_frac = self.green_frac
 
         # Construction queue: list of {tech_idx, frac_delta, completion_year, success, capex_spent}
@@ -698,6 +699,7 @@ class Company:
 
     def reset(self, initial_mix: List[float]):
         self.mix = np.array(initial_mix, dtype=np.float64)
+        self.initial_ef = self.weighted_emission_factor
         self.prev_green_frac = self.green_frac
         self._construction_queue = []
         self._consecutive_successes = 0

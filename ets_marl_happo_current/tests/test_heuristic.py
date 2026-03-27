@@ -55,14 +55,17 @@ class TestAuctionAction:
             assert action[0] >= config["auction"]["price_min"]
             assert action[0] <= config["auction"]["price_max"]
 
-    def test_bid_price_anchored_to_ma3(self, config):
-        """Bid price should scale with MA3 price (when below penalty ceiling)."""
-        c = make_company(config, agent_id=0)
-        # Use year 0 so penalty rate is low (~138.75) and MA3 can influence
-        # Use MA3 values well below penalty so ceiling doesn't bind
-        action_low = auction_action(c, price_ma3=30.0, current_year=0, n_years=20, config=config)
-        action_high = auction_action(c, price_ma3=120.0, current_year=0, n_years=20, config=config)
-        assert action_high[0] >= action_low[0], "Higher MA3 should produce higher bid"
+    def test_bid_price_fundamentals_range(self, config):
+        """Bid price should be between MAC cost and inflated penalty_rate * 1.05."""
+        mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
+        pen_rate = config["penalty"]["rate"]
+        infl = config["penalty"].get("inflation_rate", 0.02)
+        for i in range(8):
+            c = make_company(config, agent_id=i)
+            action = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config)
+            inflated_penalty = pen_rate * (1 + infl) ** 5
+            assert action[0] >= config["auction"]["price_min"], f"Agent {i} bid below price_min"
+            assert action[0] <= inflated_penalty * 1.05 + 1.0, f"Agent {i} bid above penalty ceiling"
 
     def test_coverage_based_bid_differentiation(self, config):
         """High bank (high coverage) should produce a lower bid than low bank."""
@@ -153,13 +156,15 @@ class TestSecondaryAction:
         assert action.shape == (2,)
         assert action.dtype == np.float32
 
-    def test_price_mult_within_bounds(self, config):
+    def test_price_within_bounds(self, config):
+        """Secondary price should be within [sec_price_min, 2 × penalty_rate]."""
         c = make_company(config, agent_id=0)
         action = secondary_action(c, bank=2.0, allocation=3.0,
                                   clearing_price=80.0, config=config)
-        sec_low = config["trading"]["sec_mult_low"]
-        sec_high = config["trading"]["sec_mult_high"]
-        assert sec_low <= action[0] <= sec_high
+        sec_price_min = config["trading"]["sec_price_min"]
+        penalty_rate = c.effective_penalty_rate(0)
+        sec_price_max = config["trading"]["sec_price_max_mult"] * penalty_rate
+        assert sec_price_min <= action[0] <= sec_price_max
 
     def test_qty_within_bounds(self, config):
         c = make_company(config, agent_id=0)
@@ -222,26 +227,30 @@ class TestSecondaryAction:
                                   current_year=5, n_years=12)
         assert action[1] >= 0, f"Should never sell with carry-forward debt, got qty={action[1]}"
 
-    def test_sell_price_above_minimum(self, config):
-        """Financial bot sell price_mult should be >= 1.15."""
+    def test_sell_price_above_mac(self, config):
+        """Financial bot sell price should be above MAC cost."""
         c = make_company(config, agent_id=0)  # financial (even)
+        mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
         # Give large surplus to trigger selling
         action = secondary_action(c, bank=10.0, allocation=10.0,
                                   clearing_price=80.0, config=config,
                                   current_year=5, n_years=12)
         if action[1] < 0:  # selling
-            assert action[0] >= 1.15, f"Financial sell mult should be >= 1.15, got {action[0]}"
+            assert action[0] >= mac_cost, f"Sell price should be >= MAC ({mac_cost}), got {action[0]}"
 
-    def test_buy_price_reaches_market(self, config):
-        """Financial bot buy price_mult should reach 1.30 at max severity."""
+    def test_buy_price_near_penalty_when_desperate(self, config):
+        """Financial bot buy price should approach penalty rate when desperate."""
         c = make_company(config, agent_id=0)  # financial (even)
-        # Create extreme deficit: no bank, tiny allocation, large carry-forward
+        penalty_rate = c.effective_penalty_rate(5)
+        mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
+        # Create extreme deficit: no bank, tiny allocation
         c._carry_forward = 0.0
         action = secondary_action(c, bank=0.0, allocation=0.1,
                                   clearing_price=80.0, config=config,
                                   current_year=5, n_years=12)
         if action[1] > 0:  # buying
-            assert action[0] >= 1.10, f"Financial buy mult should be >= 1.10, got {action[0]}"
+            assert action[0] >= mac_cost, f"Buy price should be >= MAC ({mac_cost}), got {action[0]}"
+            assert action[0] <= 2.0 * penalty_rate + 1.0, f"Buy price too high: {action[0]}"
 
 
 # ---------------------------------------------------------------------------

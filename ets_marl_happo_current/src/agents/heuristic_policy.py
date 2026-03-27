@@ -10,7 +10,7 @@ Provides one function per decision phase that mirrors the agent's action space:
                     logit_onshore, logit_offshore, logit_solar]
 
   secondary_action(company, bank, allocation, clearing_price, config)
-      -> np.ndarray [sec_price_multiplier, sec_qty]
+      -> np.ndarray [sec_price (absolute), sec_qty]
 
 All outputs are in physical (action) space. The calling code in train.py
 inverse-maps them through atanh for MSE supervision on the policy mean heads.
@@ -24,11 +24,10 @@ bid higher to guarantee allocation, and hold surplus rather than selling.
 
 Design rationale
 ----------------
-auction_action (valuation-based):
-  - bid_price = min(penalty_rate_inflated,
-      base_anchor * (1.4 - 0.3 * coverage_ratio))
-    where coverage_ratio = bank / max(annual_need, 0.1).
-    High bank -> lower bid (already covered), low bank -> bid near penalty.
+auction_action (fundamentals-based):
+  - bid_price = mac_cost + urgency * (penalty_rate - mac_cost)
+    where urgency = max(0.0, 1.0 - coverage_ratio / 2.0).
+    Covered agents bid near MAC, desperate agents bid near penalty.
     Green-objective agents add a 5% premium.
   - qty_mult: target-bank logic.
     target_bank = annual_need * min(remaining_years, 2) * 0.3
@@ -39,11 +38,12 @@ auction_action (valuation-based):
   - tech choice: maximize (remaining_years - delay + terminal_horizon)
     * capacity_factor / capex  (effective payoff metric).
 
-secondary_action (target-bank trajectory):
+secondary_action (absolute-price, fundamentals-based):
   - target_bank = annual_need * min(remaining_years - 1, 2) * 0.3
   - trade_target = (target_bank - bank) * 0.5
     Positive -> buy, negative -> sell.
-  - Price multiplier scales by deficit/surplus severity.
+  - Absolute price from fundamentals: mac_cost + f(urgency) * (penalty_rate - mac_cost).
+    Clipped to [sec_price_min, 2.0 * effective_penalty_rate].
 """
 
 import numpy as np
@@ -112,11 +112,10 @@ def auction_action(
     # Try to get bank from holdings if available; fall back to 0
     coverage_ratio = max(bank / annual_need, 0.0)
 
-    # --- Bid price (valuation-based) ---
-    # base_anchor blends penalty rate with MA3 signal (40/60 to avoid penalty-ceiling saturation)
-    base_anchor = 0.4 * penalty_rate + 0.6 * max(price_ma3, reserve_price)
-    # High coverage -> bid less aggressively; low coverage -> bid near penalty
-    bid_price = min(penalty_rate, base_anchor * (1.4 - 0.3 * min(coverage_ratio, 3.0)))
+    # --- Bid price (fundamentals-based: MAC→penalty gradient) ---
+    mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
+    urgency = max(0.0, 1.0 - coverage_ratio / 2.0)
+    bid_price = mac_cost + urgency * (penalty_rate - mac_cost)
     if is_green:
         bid_price *= 1.05  # green premium to ensure allocation
     bid_price = float(np.clip(
@@ -217,7 +216,7 @@ def secondary_action(
     allocation : float
         Allowances received at the primary auction (Mt).
     clearing_price : float
-        Auction clearing price (EUR/t); used to scale the price multiplier target.
+        Auction clearing price (EUR/t); used as reference for price logic.
     config : dict
         Full training config.
     current_year : int
@@ -228,7 +227,7 @@ def secondary_action(
     Returns
     -------
     action : np.ndarray, shape (2,)
-        [sec_price_multiplier, sec_qty] in physical space.
+        [sec_price (absolute EUR/t), sec_qty] in physical space.
     """
     aq = config["auction"]
     qty_max = aq["quantity_max"]
@@ -246,36 +245,42 @@ def secondary_action(
     if company._carry_forward > 0.01:
         trade_target = max(0.0, trade_target)
 
-    # Scale price multiplier by deficit/surplus severity
+    # Fundamentals-based absolute price (MAC→penalty gradient)
+    mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
+    penalty_rate = company.effective_penalty_rate(current_year)
+    trading_cfg = config.get("trading", {})
+    sec_price_min = trading_cfg.get("sec_price_min", 30.0)
+    sec_price_max_mult = trading_cfg.get("sec_price_max_mult", 2.0)
+    sec_price_max = sec_price_max_mult * penalty_rate
+
+    # Coverage ratio for urgency
+    coverage_ratio = max((bank + allocation) / need, 0.0)
+    urgency = max(0.0, 1.0 - coverage_ratio / 2.0)
+
     severity = abs(trade_target) / max(need, 0.1)  # normalized severity
 
     if trade_target > 0.01:
-        # Need to buy
+        # Need to buy — price from fundamentals, higher with urgency
         buy_qty = min(abs(trade_target), qty_max)
         sec_qty = float(buy_qty)
-        # More severe deficit -> higher premium (willing to pay more)
+        price_frac = urgency + 0.2 * min(severity, 1.0)
         if is_green:
-            price_mult = 1.05 + 0.25 * min(severity, 1.0)  # 1.05-1.30
-        else:
-            price_mult = 1.10 + 0.20 * min(severity, 1.0)   # 1.10-1.30
+            price_frac += 0.05  # green premium
+        sec_price = mac_cost + price_frac * (penalty_rate - mac_cost)
     elif trade_target < -0.01:
-        # Have excess -> sell
+        # Have excess -> sell — ask above MAC
         sell_qty = min(abs(trade_target), qty_max)
         sec_qty = float(-sell_qty)
-        # More surplus -> willing to sell cheaper (lower mult)
+        # Sellers ask above MAC, modulated by severity (more surplus → lower ask)
+        price_frac = max(0.3, urgency) + 0.15 * min(severity, 1.0)
         if is_green:
-            # Green agents hold more: only sell at premium
-            price_mult = 1.15 + 0.10 * min(severity, 1.0)  # 1.15-1.25
-        else:
-            # Financial agents: sell above market (not below)
-            price_mult = 1.15 + 0.10 * min(severity, 1.0)   # 1.15-1.25
+            price_frac += 0.10  # green agents demand higher price for selling
+        sec_price = mac_cost + price_frac * (penalty_rate - mac_cost)
     else:
         sec_qty = 0.0
-        price_mult = 1.0
+        sec_price = clearing_price  # neutral
 
-    sec_low = config.get("trading", {}).get("sec_mult_low", 0.8)
-    sec_high = config.get("trading", {}).get("sec_mult_high", 1.3)
-    price_mult = float(np.clip(price_mult, sec_low, sec_high))
+    sec_price = float(np.clip(sec_price, sec_price_min, sec_price_max))
     sec_qty = float(np.clip(sec_qty, -qty_max, qty_max))
 
-    return np.array([price_mult, sec_qty], dtype=np.float32)
+    return np.array([sec_price, sec_qty], dtype=np.float32)
