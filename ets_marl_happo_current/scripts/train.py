@@ -1488,6 +1488,21 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"  emiss={np.mean(bot_avg_emiss):.2f} Mt"
                       f"  comply={bot_compliant_yrs}/{bot_total_yrs}yr"
                       f"  sec: {bot_sec_str}")
+                bot_idxs = list(range(n_agents, n_total_agents))
+                bot_bid_mult = float(np.mean([avg_bid_mult_per_agent[j] for j in bot_idxs]))
+                bot_bid_cov = float(np.mean([avg_bid_coverage_per_agent[j] for j in bot_idxs]))
+                bot_buy_int = float(np.mean([sec_buy_intent_share[j] for j in bot_idxs]))
+                bot_sell_int = float(np.mean([sec_sell_intent_share[j] for j in bot_idxs]))
+                bot_hold_int = max(0.0, 1.0 - bot_buy_int - bot_sell_int)
+                bot_inv_on = float(np.mean([inv_onshore_share[j] for j in bot_idxs]))
+                bot_inv_off = float(np.mean([inv_offshore_share[j] for j in bot_idxs]))
+                bot_inv_sol = float(np.mean([inv_solar_share[j] for j in bot_idxs]))
+                bot_buy_vol = float(np.sum([per_agent_sec_stats[j]["buy_vol"] for j in bot_idxs]))
+                bot_sell_vol = float(np.sum([per_agent_sec_stats[j]["sell_vol"] for j in bot_idxs]))
+                print(f"      behavior: bid_mult={bot_bid_mult:.2f}x  cov={bot_bid_cov:.2f}x"
+                    f"  intent(B/S/H)={bot_buy_int*100:.0f}/{bot_sell_int*100:.0f}/{bot_hold_int*100:.0f}%"
+                    f"  inv(on/off/sol)={bot_inv_on*100:.0f}/{bot_inv_off*100:.0f}/{bot_inv_sol*100:.0f}%"
+                    f"  flow(B/S)={bot_buy_vol:.1f}/{bot_sell_vol:.1f} Mt")
 
             # Per-agent table with integrated secondary detail
             print(thin)
