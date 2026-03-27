@@ -197,6 +197,7 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
                 company = env.companies[i]
                 h_auc = heuristic_policy.auction_action(
                     company, price_ma3, current_year, n_years, config,
+                    bank=float(env.holdings[i]),
                     reserve_price=env._compute_dynamic_reserve())
                 auction_actions[i] = h_auc
 

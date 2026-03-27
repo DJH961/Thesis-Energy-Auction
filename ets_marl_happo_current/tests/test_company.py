@@ -17,10 +17,14 @@ import sys
 import os
 import numpy as np
 import pytest
+import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.environment.company import Company, N_TECHS, BUILDABLE_INDICES
+from src.environment.ets_environment import ETSEnvironment
+
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "configs", "default.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +71,10 @@ def config():
         "budget": {
             "annual_budgets": [1500.0, 1200.0, 800.0, 500.0],
             "overspend_penalty_coef": 0.5,
+            "contingency_zone": 0.10,
+            "hard_cap_multiplier": 1.20,
+            "contingency_penalty_coef": 0.05,
+            "capex_throughputs": [200.0, 200.0, 200.0, 200.0],
         },
         "mac": {"enabled": True, "coal_to_gas_cost": 48.0, "max_switch_frac": 0.20},
         "opponent_modeling": {"enabled": False},
@@ -78,6 +86,18 @@ def make_company(config, agent_id=0, seed=42):
     rng = np.random.default_rng(seed)
     mix = config["companies"]["initial_mix"][agent_id]
     return Company(agent_id=agent_id, config=config, initial_mix=mix, rng=rng)
+
+
+def load_env_config(seed=42):
+    with open(CONFIG_PATH) as f:
+        cfg = yaml.safe_load(f)
+    cfg["simulation"]["n_years"] = 1
+    cfg["companies"]["n_bot_agents"] = 0
+    cfg["warm_start"]["enabled"] = False
+    cfg["uncertainty"]["enabled"] = False
+    cfg["construction_jitter"]["enabled"] = False
+    cfg["simulation"]["seeds"] = [seed]
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -323,21 +343,99 @@ def test_budget_penalty_on_overspend(config):
     penalty = c.compute_budget_penalty()
     assert penalty > 0, "Should penalize overspending"
 
-def test_budget_penalty_quadratic(config):
-    """Penalty = coef × (overspend/budget)² × budget."""
+def test_budget_penalty_contingency_zone(config):
+    """5% overspend should be small but non-zero in the contingency zone."""
     c = make_company(config, agent_id=0)
     c.reset_budget()
-    c.record_spending(2000.0)
-    overspend = 500.0
-    ratio = overspend / 1500.0
-    expected = 0.5 * (ratio ** 2) * 1500.0
-    assert abs(c.compute_budget_penalty() - expected) < 1e-6
+    c.record_spending(1.05 * c.annual_budget)
+    p = c.compute_budget_penalty()
+    assert p > 0.0
+    assert p < 0.2
+
+
+def test_budget_penalty_quadratic_zone_larger(config):
+    """15% overspend should trigger a larger penalty than 5% overspend."""
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.record_spending(1.05 * c.annual_budget)
+    p_5 = c.compute_budget_penalty()
+
+    c.reset_budget()
+    c.record_spending(1.15 * c.annual_budget)
+    p_15 = c.compute_budget_penalty()
+    assert p_15 > p_5
 
 def test_budget_utilization(config):
     c = make_company(config, agent_id=0)
     c.reset_budget()
     c.record_spending(750.0)
     assert abs(c.get_budget_utilization() - 0.5) < 1e-6
+
+
+def test_investment_scaled_to_budget_hard_cap():
+    """Overspend attempt above 20% should be clipped by hard_cap_multiplier."""
+    cfg = load_env_config(seed=11)
+    n_agents = cfg["companies"]["n_agents"]
+    cfg["budget"]["annual_budgets"] = [100.0] * n_agents
+    cfg["budget"]["hard_cap_multiplier"] = 1.20
+    cfg["budget"]["capex_throughputs"] = [1e9] * n_agents
+
+    env = ETSEnvironment(cfg, seed=11)
+    env.reset(seed=11)
+
+    actions = np.zeros((env.n_agents, 6), dtype=np.float32)
+    actions[:, 0] = 120.0
+    actions[:, 1] = 1.0
+    actions[:, 2] = 0.20
+    actions[:, 3] = 1.0  # onshore
+    env.step_auction(actions)
+    sec = np.zeros((env.n_agents, 2), dtype=np.float32)
+    sec[:, 0] = 80.0
+    _, _, _, _, info = env.step_secondary(sec)
+
+    year_log = info["year_log"]
+    inv_costs = year_log["invest_costs"]
+    budget_ceiling = 100.0 * 1.20
+    assert max(inv_costs) <= budget_ceiling + 1e-6
+
+
+def test_capex_throughput_exact_allowed_and_over_blocked():
+    """Capex at throughput is allowed; larger request is clipped to throughput."""
+    cfg = load_env_config(seed=22)
+    n_agents = cfg["companies"]["n_agents"]
+    cfg["budget"]["annual_budgets"] = [5000.0] * n_agents
+    cfg["budget"]["hard_cap_multiplier"] = 10.0
+    cfg["technologies"]["decommission_costs"] = [0, 0, 0, 0, 0]
+
+    probe_env = ETSEnvironment(cfg, seed=22)
+    probe_env.reset(seed=22)
+    probe_company = probe_env.companies[0]
+    target_frac = 0.08
+    target_cost = probe_company.compute_investment_cost(2, target_frac, 0)
+
+    cfg["budget"]["capex_throughputs"] = [target_cost] * n_agents
+    env = ETSEnvironment(cfg, seed=22)
+    env.reset(seed=22)
+
+    actions = np.zeros((env.n_agents, 6), dtype=np.float32)
+    actions[:, 0] = 120.0
+    actions[:, 1] = 1.0
+    actions[:, 2] = target_frac
+    actions[:, 3] = 1.0  # onshore
+    env.step_auction(actions)
+    sec = np.zeros((env.n_agents, 2), dtype=np.float32)
+    sec[:, 0] = 80.0
+    _, _, _, _, info = env.step_secondary(sec)
+    invest_exact = float(info["year_log"]["invest_costs"][0])
+    assert invest_exact == pytest.approx(target_cost, rel=1e-4)
+
+    cfg["budget"]["capex_throughputs"] = [0.5 * target_cost] * n_agents
+    env2 = ETSEnvironment(cfg, seed=22)
+    env2.reset(seed=22)
+    env2.step_auction(actions)
+    _, _, _, _, info2 = env2.step_secondary(sec)
+    invest_blocked = float(info2["year_log"]["invest_costs"][0])
+    assert invest_blocked <= 0.5 * target_cost + 1e-4
 
 
 # ---------------------------------------------------------------------------

@@ -210,7 +210,8 @@ With 16 total participants:
 Per-agent reward is:
 
 $$
-R_i = -\text{costNorm}_i + \text{greenBonus}_i + \text{queueBonus}_i + \text{esgSignal}_i + \text{terminalValues}_i
+R_i = w_{cost,i}(-\text{costNorm}_i) + w_{green,i}(\text{esgScale}\cdot \text{esgRaw}_i)
+      + \text{greenBonus}_i + \text{queueBonus}_i + \text{terminalValues}_i
 $$
 
 Where:
@@ -218,7 +219,13 @@ Where:
 - Costs include auction, secondary, investment, OPEX, budget penalties, capex throughput penalties, MAC cost, and compliance penalty.
 - `greenBonus` rewards positive green share change with shaping decay over training.
 - `queueBonus` rewards maintaining active construction pipeline.
-- `esgSignal` uses saved-carbon-years style term, gated by ESG weight.
+- `esgRaw` uses saved-carbon-years style term before weighting.
+- `esgScale` calibrates ESG magnitude to the same range as `costNorm`.
+
+This structure makes objective weights explicit:
+- Financial agents (`w_cost=1.0`, `w_green=0.0`) optimize pure cost.
+- ESG agents (`w_cost=0.5`, `w_green=0.5`) are guaranteed an exact 50/50 split
+  between financial and environmental reward channels (excluding transient shaping terms).
 
 Terminal values in final year (configurable):
 - bank terminal value (bank * terminal price)

@@ -43,7 +43,7 @@ class TestAuctionAction:
 
     def test_output_shape(self, config):
         c = make_company(config, agent_id=0)
-        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config)
+        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config, bank=0.0)
         assert action.shape == (6,)
         assert action.dtype == np.float32
 
@@ -51,52 +51,54 @@ class TestAuctionAction:
         """Bid price should be within [price_min, price_max]."""
         for i in range(8):
             c = make_company(config, agent_id=i)
-            action = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config)
+            action = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
             assert action[0] >= config["auction"]["price_min"]
             assert action[0] <= config["auction"]["price_max"]
 
     def test_bid_price_fundamentals_range(self, config):
-        """Bid price should be between MAC cost and inflated penalty_rate * 1.05."""
+        """Bid price should not exceed the configured 1.8x penalty ceiling (before global clips)."""
         mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
         pen_rate = config["penalty"]["rate"]
         infl = config["penalty"].get("inflation_rate", 0.02)
         for i in range(8):
             c = make_company(config, agent_id=i)
-            action = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config)
+            action = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
             inflated_penalty = pen_rate * (1 + infl) ** 5
             assert action[0] >= config["auction"]["price_min"], f"Agent {i} bid below price_min"
-            assert action[0] <= inflated_penalty * 1.05 + 1.0, f"Agent {i} bid above penalty ceiling"
+            assert action[0] <= min(config["auction"]["price_max"], 1.8 * inflated_penalty) + 1.0, (
+                f"Agent {i} bid above penalty ceiling"
+            )
 
     def test_coverage_based_bid_differentiation(self, config):
         """High bank (high coverage) should produce a lower bid than low bank."""
         c_low_bank = make_company(config, agent_id=0)
-        c_low_bank._bank = 0.0
         c_high_bank = make_company(config, agent_id=0)
-        c_high_bank._bank = 10.0  # large bank relative to annual need
+        low_bank = 0.0
+        high_bank = 10.0  # large bank relative to annual need
         action_low = auction_action(c_low_bank, price_ma3=80.0, current_year=5,
-                                    n_years=20, config=config)
+                                    n_years=20, config=config, bank=low_bank)
         action_high = auction_action(c_high_bank, price_ma3=80.0, current_year=5,
-                                     n_years=20, config=config)
+                                     n_years=20, config=config, bank=high_bank)
         assert action_high[0] <= action_low[0], \
             "High bank coverage should produce lower bid"
 
     def test_qty_multiplier_within_bounds(self, config):
         c = make_company(config, agent_id=0)
-        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config)
+        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config, bank=0.0)
         assert action[1] >= config["auction"]["qty_mult_low"]
         assert action[1] <= config["auction"]["qty_mult_high"]
 
     def test_qty_increases_with_carry_forward(self, config):
         """Carry-forward > 0 should increase quantity multiplier."""
         c = make_company(config, agent_id=0)
-        action_no_cf = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config)
+        action_no_cf = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
         c._carry_forward = 1.0  # 1 Mt carry-forward
-        action_cf = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config)
+        action_cf = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
         assert action_cf[1] >= action_no_cf[1], "Carry-forward should increase qty"
 
     def test_invest_frac_within_bounds(self, config):
         c = make_company(config, agent_id=0)
-        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config)
+        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config, bank=0.0)
         assert 0.0 <= action[2] <= config["investment"]["max_invest_frac"]
 
     def test_green_agent_invests_more(self, config):
@@ -106,23 +108,23 @@ class TestAuctionAction:
         # Set high capex throughput so the constraint doesn't bind
         c_financial.capex_throughput = 1e9
         c_green.capex_throughput = 1e9
-        a_fin = auction_action(c_financial, price_ma3=80.0, current_year=5, n_years=20, config=config)
-        a_grn = auction_action(c_green, price_ma3=80.0, current_year=5, n_years=20, config=config)
+        a_fin = auction_action(c_financial, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
+        a_grn = auction_action(c_green, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
         assert a_grn[2] >= a_fin[2], "Green agent should invest >= financial agent"
 
     def test_npv_investment_gating(self, config):
         """Financial agent should invest less when carbon price is very low (bad NPV)."""
         c = make_company(config, agent_id=0)  # financial agent
         action_high_price = auction_action(c, price_ma3=200.0, current_year=2,
-                                           n_years=20, config=config)
+                                           n_years=20, config=config, bank=0.0)
         action_low_price = auction_action(c, price_ma3=5.0, current_year=2,
-                                          n_years=20, config=config)
+                                          n_years=20, config=config, bank=0.0)
         assert action_high_price[2] >= action_low_price[2], \
             "Higher carbon price (better NPV) should lead to more investment"
 
     def test_tech_logits_shape(self, config):
         c = make_company(config, agent_id=0)
-        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config)
+        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config, bank=0.0)
         logits = action[3:6]
         assert logits.shape == (3,)
 
@@ -130,17 +132,50 @@ class TestAuctionAction:
         """With very few years left, the fastest-deploying tech should win."""
         c = make_company(config, agent_id=0)
         # Near end: solar (delay=1) should beat onshore (delay=3) and offshore (delay=5)
-        action = auction_action(c, price_ma3=80.0, current_year=18, n_years=20, config=config)
+        action = auction_action(c, price_ma3=80.0, current_year=18, n_years=20, config=config, bank=0.0)
         logits = action[3:6]  # [onshore, offshore, solar]
         assert np.argmax(logits) == 2, "Solar should be preferred near episode end"
 
-    def test_green_agent_bids_higher(self, config):
-        """Green agents should bid a premium over financial agents."""
+    def test_green_and_financial_bid_same_for_same_state(self, config):
+        """Bid pricing should not depend on green/financial objective split."""
         c_fin = make_company(config, agent_id=0)
         c_grn = make_company(config, agent_id=1)
-        a_fin = auction_action(c_fin, price_ma3=80.0, current_year=5, n_years=20, config=config)
-        a_grn = auction_action(c_grn, price_ma3=80.0, current_year=5, n_years=20, config=config)
-        assert a_grn[0] >= a_fin[0], "Green agent should bid >= financial"
+        bank = 1.0
+        a_fin = auction_action(c_fin, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=bank)
+        a_grn = auction_action(c_grn, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=bank)
+        assert a_grn[0] == pytest.approx(a_fin[0], abs=1e-6)
+
+    def test_year0_avg_bid_in_realistic_band(self, config):
+        """At MA3=80 and mixed coverage, year-0 average bid should be in [85, 100] EUR/t."""
+        rng = np.random.default_rng(123)
+        bids = []
+        c = make_company(config, agent_id=0)
+        annual_need = max(c.compute_estimate_need(), 1e-6)
+        for cov in rng.uniform(0.5, 2.0, size=200):
+            bank = float(cov * annual_need)
+            action = auction_action(c, price_ma3=80.0, current_year=0, n_years=12, config=config, bank=bank)
+            bids.append(float(action[0]))
+        avg_bid = float(np.mean(bids))
+        assert 85.0 <= avg_bid <= 100.0, f"Year-0 average bid out of band: {avg_bid:.2f}"
+
+    def test_bid_capped_at_1p8_penalty_with_high_ma3(self, config):
+        """Very high MA3 should still respect the 1.8x penalty cap."""
+        c = make_company(config, agent_id=0)
+        action = auction_action(c, price_ma3=300.0, current_year=0, n_years=12, config=config, bank=0.0)
+        penalty = c.effective_penalty_rate(0)
+        assert action[0] <= min(config["auction"]["price_max"], 1.8 * penalty) + 1e-6
+
+    def test_year12_bid_bounds(self, config):
+        """Near terminal years, bids should remain within calibrated [130, 230] EUR/t range."""
+        c = make_company(config, agent_id=0)
+        annual_need = max(c.compute_estimate_need(), 1e-6)
+        banks = np.linspace(0.5 * annual_need, 2.0 * annual_need, num=30)
+        bids = [
+            float(auction_action(c, price_ma3=160.0, current_year=11, n_years=12, config=config, bank=b)[0])
+            for b in banks
+        ]
+        assert min(bids) >= 130.0
+        assert max(bids) <= 230.0
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +226,8 @@ class TestSecondaryAction:
                                   current_year=5, n_years=12)
         assert action[1] > 0, "Deficit should lead to buying (positive qty)"
 
-    def test_green_agent_holds_more(self, config):
-        """Green agent should sell less of its surplus than financial agent."""
+    def test_green_and_financial_secondary_same_for_same_state(self, config):
+        """Secondary pricing and quantity should not depend on green/financial split."""
         c_fin = make_company(config, agent_id=0)
         c_grn = make_company(config, agent_id=1)
         a_fin = secondary_action(c_fin, bank=5.0, allocation=5.0,
@@ -201,8 +236,8 @@ class TestSecondaryAction:
         a_grn = secondary_action(c_grn, bank=5.0, allocation=5.0,
                                  clearing_price=80.0, config=config,
                                  current_year=5, n_years=12)
-        # Green agent sells less (qty closer to 0)
-        assert a_grn[1] >= a_fin[1], "Green agent should hold more (sell less)"
+        assert a_grn[0] == pytest.approx(a_fin[0], abs=1e-6)
+        assert a_grn[1] == pytest.approx(a_fin[1], abs=1e-6)
 
     def test_target_bank_trading(self, config):
         """With zero bank at mid-episode, agent should buy to build buffer."""
@@ -265,7 +300,7 @@ class TestCapexThroughput:
         c.capex_throughput = 10.0  # very low cap (10 M€)
         c.capex_spent_this_year = 0.0
         action = auction_action(c, price_ma3=80.0, current_year=5,
-                                n_years=12, config=config)
+                                n_years=12, config=config, bank=0.0)
         invest_frac = action[2]
         # Estimate cost at the returned invest_frac
         best_tech_idx = int(np.argmax(action[3:6])) + 2  # map logit idx to tech idx

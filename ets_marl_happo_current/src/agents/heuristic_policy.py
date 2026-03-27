@@ -5,45 +5,52 @@ Rule-based heuristic actions for behavioral cloning warm-start.
 
 Provides one function per decision phase that mirrors the agent's action space:
 
-  auction_action(company, price_ma3, current_year, n_years, config)
-      -> np.ndarray [bid_price, qty_multiplier, invest_frac,
-                    logit_onshore, logit_offshore, logit_solar]
+    auction_action(company, price_ma3, current_year, n_years, config)
+            -> np.ndarray [bid_price, qty_multiplier, invest_frac,
+                                        logit_onshore, logit_offshore, logit_solar]
 
-  secondary_action(company, bank, allocation, clearing_price, config)
-      -> np.ndarray [sec_price (absolute), sec_qty]
+    secondary_action(company, bank, allocation, clearing_price, config)
+            -> np.ndarray [sec_price (absolute), sec_qty]
 
 All outputs are in physical (action) space. The calling code in train.py
 inverse-maps them through atanh for MSE supervision on the policy mean heads.
 
 Agent objectives (4x2 factorial: archetype x objective)
 -------------------------------------------------------
-Even-indexed agents (0, 2, 4, 6) are *financial*: prioritize cost minimization,
+Even-indexed agents (0, 2, 4, 6) are financial: prioritize cost minimization,
 invest conservatively, and sell surplus aggressively.
-Odd-indexed agents (1, 3, 5, 7) are *green-objective*: invest more aggressively,
-bid higher to guarantee allocation, and hold surplus rather than selling.
+Odd-indexed agents (1, 3, 5, 7) are green-objective: invest more aggressively,
+and hold surplus rather than selling.
+
+Green/financial split affects investment behavior only, not auction bidding
+or secondary pricing formulas.
 
 Design rationale
 ----------------
 auction_action (fundamentals-based):
-  - bid_price = mac_cost + urgency * (penalty_rate - mac_cost)
-    where urgency = max(0.0, 1.0 - coverage_ratio / 2.0).
-    Covered agents bid near MAC, desperate agents bid near penalty.
-    Green-objective agents add a 5% premium.
-  - qty_mult: target-bank logic.
-    target_bank = annual_need * min(remaining_years, 2) * 0.3
-    qty_mult = clip((annual_need - bank + target_bank) / annual_need, low, high)
-  - invest_frac: NPV-gated.
-    avoided_carbon_npv = emission_reduction * price * effective_horizon
-    invest proportional to NPV (higher for green agents).
-  - tech choice: maximize (remaining_years - delay + terminal_horizon)
-    * capacity_factor / capex  (effective payoff metric).
+    - market_anchor = max(mac_cost, price_ma3)
+    - bid_price = market_anchor + urgency * (penalty_rate - market_anchor)
+        where urgency = max(0.0, 1.0 - coverage_ratio / 1.5).
+        Covered agents bid near market anchor, desperate agents bid near penalty.
+    - bid_price ceiling before clip: 1.8 * penalty_rate.
+    - qty_mult: target-bank logic.
+        target_bank = annual_need * min(remaining_years, 2) * 0.3
+        qty_mult = clip((annual_need - bank + target_bank) / annual_need, low, high)
+    - invest_frac: NPV-gated.
+        avoided_carbon_npv = emission_reduction * price * effective_horizon
+        invest proportional to NPV (higher for green agents).
+    - tech choice: maximize (remaining_years - delay + terminal_horizon)
+        * capacity_factor / capex  (effective payoff metric).
 
 secondary_action (absolute-price, fundamentals-based):
-  - target_bank = annual_need * min(remaining_years - 1, 2) * 0.3
-  - trade_target = (target_bank - bank) * 0.5
-    Positive -> buy, negative -> sell.
-  - Absolute price from fundamentals: mac_cost + f(urgency) * (penalty_rate - mac_cost).
-    Clipped to [sec_price_min, 2.0 * effective_penalty_rate].
+    - target_bank = annual_need * min(remaining_years - 1, 2) * 0.3
+    - trade_target = (target_bank - bank) * 0.5
+        Positive -> buy, negative -> sell.
+    - market_anchor = max(mac_cost, clearing_price)
+    - Absolute price from fundamentals: market_anchor + f(urgency) *
+        (penalty_rate - market_anchor).
+    - Price ceiling before clip: 1.8 * penalty_rate.
+    - Clipped to [sec_price_min, 2.0 * effective_penalty_rate].
 """
 
 import numpy as np
@@ -62,6 +69,7 @@ def auction_action(
     current_year: int,
     n_years: int,
     config: dict,
+    bank: float = 0.0,
     reserve_price: float = None,
     inflation_factor: float = None,
 ) -> np.ndarray:
@@ -108,16 +116,14 @@ def auction_action(
 
     # --- Coverage ratio ---
     annual_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
-    bank = getattr(company, '_bank', 0.0)
-    # Try to get bank from holdings if available; fall back to 0
     coverage_ratio = max(bank / annual_need, 0.0)
 
     # --- Bid price (fundamentals-based: MAC→penalty gradient) ---
     mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
-    urgency = max(0.0, 1.0 - coverage_ratio / 2.0)
-    bid_price = mac_cost + urgency * (penalty_rate - mac_cost)
-    if is_green:
-        bid_price *= 1.05  # green premium to ensure allocation
+    urgency = max(0.0, 1.0 - coverage_ratio / 1.5)
+    market_anchor = max(mac_cost, price_ma3)
+    bid_price = market_anchor + urgency * (penalty_rate - market_anchor)
+    bid_price = min(bid_price, 1.8 * penalty_rate)
     bid_price = float(np.clip(
         max(reserve_price + 5.0, bid_price),
         aq["price_min"], aq["price_max"],
@@ -186,6 +192,10 @@ def auction_action(
         invest_frac *= capex_remaining / est_cost
         invest_frac = max(0.0, invest_frac)
 
+    # Smooth year-to-year investment to avoid on/off oscillation.
+    prev = getattr(company, "prev_invest_frac", 0.0)
+    invest_frac = float(np.clip(0.5 * invest_frac + 0.5 * prev, 0.0, inv["max_invest_frac"]))
+
     # --- Technology choice (logits) ---
     # Use the best_tech selected by effective payoff metric
     logits = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
@@ -231,7 +241,6 @@ def secondary_action(
     """
     aq = config["auction"]
     qty_max = aq["quantity_max"]
-    is_green = (company.agent_id % 2) == 1  # odd indices = green-objective
 
     need = max(company.compute_estimate_need() + company._carry_forward, 1e-6)
     remaining_years = max(1, n_years - current_year)
@@ -255,7 +264,8 @@ def secondary_action(
 
     # Coverage ratio for urgency
     coverage_ratio = max((bank + allocation) / need, 0.0)
-    urgency = max(0.0, 1.0 - coverage_ratio / 2.0)
+    urgency = max(0.0, 1.0 - coverage_ratio / 1.5)
+    market_anchor = max(mac_cost, clearing_price)
 
     severity = abs(trade_target) / max(need, 0.1)  # normalized severity
 
@@ -264,22 +274,19 @@ def secondary_action(
         buy_qty = min(abs(trade_target), qty_max)
         sec_qty = float(buy_qty)
         price_frac = urgency + 0.2 * min(severity, 1.0)
-        if is_green:
-            price_frac += 0.05  # green premium
-        sec_price = mac_cost + price_frac * (penalty_rate - mac_cost)
+        sec_price = market_anchor + price_frac * (penalty_rate - market_anchor)
     elif trade_target < -0.01:
         # Have excess -> sell — ask above MAC
         sell_qty = min(abs(trade_target), qty_max)
         sec_qty = float(-sell_qty)
         # Sellers ask above MAC, modulated by severity (more surplus → lower ask)
         price_frac = max(0.3, urgency) + 0.15 * min(severity, 1.0)
-        if is_green:
-            price_frac += 0.10  # green agents demand higher price for selling
-        sec_price = mac_cost + price_frac * (penalty_rate - mac_cost)
+        sec_price = market_anchor + price_frac * (penalty_rate - market_anchor)
     else:
         sec_qty = 0.0
         sec_price = clearing_price  # neutral
 
+    sec_price = min(sec_price, 1.8 * penalty_rate)
     sec_price = float(np.clip(sec_price, sec_price_min, sec_price_max))
     sec_qty = float(np.clip(sec_qty, -qty_max, qty_max))
 

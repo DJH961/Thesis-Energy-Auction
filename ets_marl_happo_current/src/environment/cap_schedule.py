@@ -36,6 +36,7 @@ class CapSchedule:
         self.tnac_lower = msr["tnac_lower"]               # Mt
         self.withhold_rate = msr["withhold_rate"]         # fraction
         self.release_amount = msr["release_amount"]       # Mt/year
+        self.min_auction_frac = msr.get("min_auction_frac", 0.10)
 
         self.reserve_price = ets_cfg.get("reserve_price", 0.0)
 
@@ -102,6 +103,12 @@ class CapSchedule:
         if self.msr_enabled:
             auction_vol = self._apply_msr(auction_vol, tnac,
                                           clearing_price, price_max)
+
+        # Safety floor: no EU ETS equivalent but the Auctioning Regulation
+        # (2023/2830) guarantees member state minimum volumes.
+        # Prevents micro-ETS strangulation where MSR zeros out auctions.
+        min_vol = self.min_auction_frac * cap_t
+        auction_vol = max(auction_vol, min_vol)
 
         # Add any unsold volume rolled over from the previous year
         rollover = self._unsold_rollover_pending
@@ -176,8 +183,7 @@ class CapSchedule:
 
         # Normal MSR logic
         if tnac > self.tnac_upper:
-            excess = tnac - self.tnac_upper
-            withheld = self.withhold_rate * excess
+            withheld = self.withhold_rate * tnac
             withheld = min(withheld, auction_vol)
             self._msr_reserve += withheld
             auction_vol -= withheld

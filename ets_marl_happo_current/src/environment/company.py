@@ -42,6 +42,7 @@ class Company:
     def __init__(self, agent_id: int, config: dict, initial_mix: List[float], rng):
         self.agent_id = agent_id
         self.rng = rng
+        self.config = config
         # n_total includes learning agents + bot agents (for opponent modeling obs dimension)
         self._n_total = (config["companies"]["n_agents"]
                          + config["companies"].get("n_bot_agents", 0))
@@ -94,6 +95,7 @@ class Company:
         self.annual_budget = budgets[agent_id] if agent_id < len(budgets) else 1e9
         self.overspend_coef = budget_cfg.get("overspend_penalty_coef", 2.0)
         self.budget_spent_this_year = 0.0
+        self.prev_invest_frac = 0.0
 
         # Capex throughput constraint (organizational construction spend cap)
         capex_tp = budget_cfg.get("capex_throughputs", [])
@@ -475,11 +477,22 @@ class Company:
         self.budget_spent_this_year += float(amount)
 
     def compute_budget_penalty(self) -> float:
-        overspend = max(0.0, self.budget_spent_this_year - self.annual_budget)
-        if overspend < 1e-6:
+        budget_cfg = self.config.get("budget", {})
+        contingency = float(budget_cfg.get("contingency_zone", 0.10))
+        hard_cap = float(budget_cfg.get("hard_cap_multiplier", 1.20))
+        contingency_coef = float(budget_cfg.get("contingency_penalty_coef", 0.05))
+
+        overspend_frac = max(0.0, self.budget_spent_this_year / max(self.annual_budget, 1e-6) - 1.0)
+        if overspend_frac <= 0.0:
             return 0.0
-        ratio = overspend / self.annual_budget
-        return self.overspend_coef * (ratio ** 2) * self.annual_budget
+        if overspend_frac <= contingency:
+            return contingency_coef * (overspend_frac / max(contingency, 1e-6)) * (self.annual_budget / 1000.0)
+        if overspend_frac <= (hard_cap - 1.0):
+            base_penalty = contingency_coef * (self.annual_budget / 1000.0)
+            excess = overspend_frac - contingency
+            zone_width = max((hard_cap - 1.0) - contingency, 1e-6)
+            return base_penalty + self.overspend_coef * (excess / zone_width) ** 2 * (self.annual_budget / 1000.0)
+        return self.overspend_coef * 3.0 * (self.annual_budget / 1000.0)
 
     def get_budget_utilization(self) -> float:
         return self.budget_spent_this_year / max(self.annual_budget, 1e-6)
@@ -706,6 +719,7 @@ class Company:
         self.year_cost = 0.0
         self.budget_spent_this_year = 0.0
         self.capex_spent_this_year = 0.0
+        self.prev_invest_frac = 0.0
         self._carry_forward = 0.0
         self._inflation_rates_by_year = {}
         self._inflation_factor_by_year = {0: 1.0}

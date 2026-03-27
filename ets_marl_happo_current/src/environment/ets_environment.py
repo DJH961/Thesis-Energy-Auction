@@ -411,9 +411,11 @@ class ETSEnvironment(gym.Env):
             self.holdings[i] = annual_need * seed_multiple
 
         # (C) Seed price history with synthetic burn-in prices
+        burnin_mean = float(self.config["price"].get("initial_expected", 80.0))
+        burnin_std = float(self.config["price"].get("burnin_std", 10.0))
         for _ in range(n_burnin):
             synthetic_price = float(np.clip(
-                self.rng.normal(60.0, 15.0),
+                self.rng.normal(burnin_mean, burnin_std),
                 self.config["auction"]["price_min"],
                 self.config["auction"]["price_max"],
             ))
@@ -446,8 +448,11 @@ class ETSEnvironment(gym.Env):
             idx = self.n_agents + b  # bots indexed after learning agents
             actions[b] = heuristic_policy.auction_action(
                 self.companies[idx], price_ma3, self.current_year,
-            self.n_years, self.config, reserve_price=reserve,
-            inflation_factor=infl_factor)
+                self.n_years, self.config,
+                bank=float(self.holdings[idx]),
+                reserve_price=reserve,
+                inflation_factor=infl_factor,
+            )
         return actions
 
     def _generate_bot_secondary_actions(self, clearing_price: float) -> np.ndarray:
@@ -649,15 +654,49 @@ class ETSEnvironment(gym.Env):
 
         # 9. Green investments
         invest_costs = np.zeros(self.n_total)
-        invest_fracs = np.zeros(self.n_total)  # raw action values for logging
+        invest_fracs = np.zeros(self.n_total)  # actual investment fractions used
         invest_tech_choices = np.zeros(self.n_total, dtype=int)
+        budget_cfg = self.config.get("budget", {})
+        hard_cap_mult = float(budget_cfg.get("hard_cap_multiplier", 1.20))
+
+        def _estimate_decommission_cost(company: Company, frac_delta: float) -> float:
+            frac_to_retire = min(max(frac_delta, 0.0), company.fossil_frac)
+            decom_cost = 0.0
+            for fossil_idx in [0, 1]:
+                if frac_to_retire <= 0.0:
+                    break
+                retire_this = min(frac_to_retire, float(company.mix[fossil_idx]))
+                if retire_this > 1e-6:
+                    decom_cost += company.compute_decommission_cost(fossil_idx, retire_this, year)
+                    frac_to_retire -= retire_this
+            return float(decom_cost)
+
         for i, company in enumerate(self.companies):
-            invest_frac = float(auction_actions[i, 2])
-            invest_fracs[i] = invest_frac
+            invest_frac = float(np.clip(auction_actions[i, 2], 0.0, company.max_invest_frac))
             tech_logits = auction_actions[i, 3:6]
             tech_choice = int(np.argmax(tech_logits))
             invest_tech_choices[i] = tech_choice
+
+            tech_idx = tech_choice + 2  # 0/1/2 -> onshore/offshore/solar in company mix
+
+            budget_ceiling = company.annual_budget * hard_cap_mult
+            budget_remaining = max(0.0, budget_ceiling - company.budget_spent_this_year)
+            capex_cost = company.compute_investment_cost(tech_idx, invest_frac, year)
+            total_proj_cost = capex_cost + _estimate_decommission_cost(company, invest_frac)
+            if total_proj_cost > budget_remaining and total_proj_cost > 1e-6:
+                invest_frac *= budget_remaining / total_proj_cost
+                capex_cost = company.compute_investment_cost(tech_idx, invest_frac, year)
+
+            capex_remaining = max(0.0, company.capex_throughput - company.capex_spent_this_year)
+            if capex_cost > capex_remaining and capex_cost > 1e-6:
+                invest_frac *= capex_remaining / capex_cost
+
+            invest_frac = float(np.clip(invest_frac, 0.0, company.max_invest_frac))
+            invest_frac = min(invest_frac, company.fossil_frac)
+            invest_fracs[i] = invest_frac
+
             invest_costs[i] = company.plan_investment(tech_choice, invest_frac, year)
+            company.prev_invest_frac = invest_frac
             # Apply any cancellation recovery as a credit to invest_costs
             invest_costs[i] -= cancel_recoveries[i]
 
@@ -691,7 +730,7 @@ class ETSEnvironment(gym.Env):
         log["mac_reductions"] = mac_reductions.tolist()
         log["mac_costs"] = mac_costs.tolist()
         log["bid_quantities"] = self._phase1_bid_quantities.tolist()  # Mt per agent
-        log["invest_fracs"] = invest_fracs.tolist()                   # raw action[2] per agent
+        log["invest_fracs"] = invest_fracs.tolist()                   # actual executed invest_frac per agent
         log["bid_qty_multipliers"] = bid_qty_multipliers.tolist()     # raw multiplier action
         log["estimate_needs"] = estimate_needs.tolist()               # Mt before multiplier
         log["bid_coverages"] = bid_coverages.tolist()                 # bid_qty / est_need
@@ -1118,13 +1157,14 @@ class ETSEnvironment(gym.Env):
                          old_carry_forward=None):
         """
         Reward (HAPPO-compliant, v6.0):
-          R_i = -cost_norm + green_bonus + queue_bonus + esg_signal
+                    R_i = w_cost * (-cost_norm) + w_green * (esg_scale * esg_raw)
+                                + green_bonus + queue_bonus
 
         Core signals:
           cost_norm:   (total_cost + penalty - revenue) / 1000
           green_bonus: diminishing-returns bonus for green investment progress
           queue_bonus: reward for active construction queue items (decays with shaping_weight)
-          esg_signal:  saved-carbon-years formula (w_green-gated)
+                    esg_raw:     saved-carbon-years formula before weighting
 
         Penalty is folded into total_cost (recorded via company.record_spending).
         Terminal bonuses: bank /1000 + ESG terminal queue.
@@ -1136,6 +1176,7 @@ class ETSEnvironment(gym.Env):
         elec_cfg = self.config.get("electricity", {})
         esg_cfg = self.config.get("esg", {})
         esg_enabled = esg_cfg.get("enabled", False)
+        esg_scale = float(esg_cfg.get("scale", 2.0))
 
         beta_shaping = reward_cfg.get("shaping_beta", 10.0)
         gamma_shaping = reward_cfg.get("shaping_gamma", 1.0)
@@ -1197,12 +1238,18 @@ class ETSEnvironment(gym.Env):
 
             # ESG signal: saved-carbon-years formula
             esg_signal = 0.0
-            if esg_enabled and company.w_green > 0.0 and company.initial_ef > 1e-6:
+            if esg_enabled and company.initial_ef > 1e-6:
                 ef_ratio = (company.initial_ef - company.weighted_emission_factor) / company.initial_ef
                 time_ratio = remaining_years / self.n_years
-                esg_signal = company.w_green * ef_ratio * time_ratio * (company.annual_budget / 1000.0)
+                esg_raw = ef_ratio * time_ratio * (company.annual_budget / 1000.0)
+                esg_signal = esg_scale * esg_raw
 
-            rewards[i] = float(-cost_norm + green_bonus + queue_bonus + esg_signal)
+            rewards[i] = float(
+                company.w_cost * (-cost_norm)
+                + company.w_green * esg_signal
+                + green_bonus
+                + queue_bonus
+            )
 
         # Terminal value bonuses (final year only)
         is_final_year = self.current_year >= self.n_years - 1

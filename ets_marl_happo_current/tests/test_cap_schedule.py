@@ -27,6 +27,7 @@ BASE_CONFIG = {
             "tnac_lower": 5.84,   # 20.0 × 14.6/50.0
             "withhold_rate": 0.24,
             "release_amount": 0.80,
+            "min_auction_frac": 0.10,
         },
     }
 }
@@ -99,10 +100,18 @@ def test_msr_withhold_when_tnac_high():
     cap = s.get_cap(1)
     vol = s.get_auction_volume(year=1, tnac=tnac)
 
-    excess = tnac - 14.0
-    expected_withheld = 0.24 * excess
-    assert vol == pytest.approx(cap - expected_withheld, rel=1e-5)
+    expected_withheld = min(0.24 * tnac, cap)
+    expected_vol = max(cap - expected_withheld, 0.10 * cap)
+    assert vol == pytest.approx(expected_vol, rel=1e-5)
     assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-5)
+
+
+def test_auction_volume_has_min_floor():
+    """Auction volume is never below min_auction_frac * cap even with extreme TNAC."""
+    s = make_schedule(msr_enabled=True)
+    cap = s.get_cap(1)
+    vol = s.get_auction_volume(year=1, tnac=1_000.0)
+    assert vol >= 0.10 * cap - 1e-9
 
 
 def test_msr_release_when_tnac_low():
