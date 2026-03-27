@@ -394,6 +394,10 @@ def _resolve_auto_episode_count(raw_value, n_episodes: int,
 
 
 def train_one_seed(config: dict, seed: int, on_log=None):
+    # Isolate per-run auto-resolved schedule values (e.g. shaping decay)
+    # so earlier short runs do not mutate config used by later long runs.
+    config = copy.deepcopy(config)
+
     n_agents = config["companies"]["n_agents"]
     n_episodes = config["simulation"]["n_episodes"]
     n_years = config["simulation"]["n_years"]
