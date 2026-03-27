@@ -478,7 +478,13 @@ class Company:
         if overspend < 1e-6:
             return 0.0
         ratio = overspend / self.annual_budget
-        return self.overspend_coef * (ratio ** 2) * self.annual_budget
+        # Soft linear penalty for small overspend (<20%), quadratic beyond.
+        # Prevents over-punishment for marginal budget breaches while still
+        # discouraging large violations.
+        if ratio <= 0.20:
+            return self.overspend_coef * ratio * self.annual_budget
+        else:
+            return self.overspend_coef * (ratio ** 2) * self.annual_budget
 
     def get_budget_utilization(self) -> float:
         return self.budget_spent_this_year / max(self.annual_budget, 1e-6)

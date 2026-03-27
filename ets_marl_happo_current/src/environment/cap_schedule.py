@@ -178,7 +178,8 @@ class CapSchedule:
         if tnac > self.tnac_upper:
             excess = tnac - self.tnac_upper
             withheld = self.withhold_rate * excess
-            withheld = min(withheld, auction_vol)
+            # Cap withdrawal at 50% of auction volume to prevent over-tightening
+            withheld = min(withheld, auction_vol * 0.50)
             self._msr_reserve += withheld
             auction_vol -= withheld
 

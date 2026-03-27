@@ -592,6 +592,19 @@ class ETSEnvironment(gym.Env):
             bid_qty_multipliers[i] = multiplier
             estimate_needs[i] = base_need
             bid_coverages[i] = bid_actions[i, 1] / max(base_need, 1e-6)
+
+            # Budget-aware bid cap: limit bid quantity so that the implied
+            # auction cost (qty × bid_price) does not exceed 150% of remaining
+            # annual budget.  This prevents agents from completely disregarding
+            # their budget while still allowing moderate over-commitment.
+            remaining_budget = max(0.0, company.annual_budget - company.budget_spent_this_year)
+            max_spend = remaining_budget * 1.5
+            bid_price_i = float(bid_actions[i, 0])
+            if bid_price_i > 1e-6:
+                max_qty = max_spend / bid_price_i
+                if bid_actions[i, 1] > max_qty:
+                    bid_actions[i, 1] = max(base_need * qty_mult_low, max_qty)
+
             # EU lot-size discretization: round to nearest multiple of lot_size
             if lot_size > 0:
                 bid_actions[i, 1] = max(lot_size, round(bid_actions[i, 1] / lot_size) * lot_size)

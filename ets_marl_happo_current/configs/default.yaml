@@ -48,7 +48,7 @@ ets:
     enabled: true
     tnac_upper: 33.3     # scaled 16/12 from 25.0
     tnac_lower: 16.0     # scaled 16/12 from 12.0
-    withhold_rate: 0.24
+    withhold_rate: 0.12
     release_amount: 0.55  # increased to ensure adequate supply release
     price_containment_trigger: 0.70   # at 70% of price_max, suppress MSR withdrawal
     price_release_trigger: 0.85       # at 85% of price_max, force emergency release

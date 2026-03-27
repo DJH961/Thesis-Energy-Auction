@@ -98,13 +98,9 @@ def auction_action(
     is_green = (company.agent_id % 2) == 1  # odd indices = green-objective
 
     # --- Penalty rate (valuation ceiling) ---
-    pen_cfg = config.get("penalty", {})
-    base_penalty = pen_cfg.get("rate", 100.0)
-    if inflation_factor is None:
-        infl = pen_cfg.get("inflation_rate", 0.0)
-        penalty_rate = base_penalty * (1.0 + infl) ** current_year
-    else:
-        penalty_rate = base_penalty * float(inflation_factor)
+    # Use the company's effective_penalty_rate which follows the same
+    # stochastic inflation path as the compliance penalty for learning agents.
+    penalty_rate = company.effective_penalty_rate(current_year)
 
     # --- Coverage ratio ---
     annual_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
