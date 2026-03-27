@@ -518,6 +518,19 @@ def test_unsold_volume_rolls_over_to_next_year():
     assert env.cap_schedule._unsold_rollover_pending == pytest.approx(0.0, abs=1e-9)
 
 
+def test_secondary_profit_ema_resets_each_episode():
+    """Secondary profit EMA must not leak state across episode resets."""
+    env = load_env()
+    env.reset(seed=42)
+
+    env._secondary_profit_ema[:] = 1.23
+    env.reset(seed=43)
+
+    assert np.allclose(env._secondary_profit_ema, 0.0), (
+        "secondary profit EMA should be zeroed on reset"
+    )
+
+
 def test_liquidity_pool_fills_at_reference_plus_spread():
     """External liquidity pool should fill unmatched buy flow at reference*(1+spread)."""
     env = load_env()

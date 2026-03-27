@@ -716,14 +716,17 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         else:
             current_epsilon = 0.0
 
-        obs1, _ = env.reset(seed=seed + episode * 1000)
+        episode_seed = seed + episode * 1000
+        episode_rng = np.random.default_rng(episode_seed)
+
+        obs1, _ = env.reset(seed=episode_seed)
         total_rewards = np.zeros(n_agents)
 
         # HPP: swap some agents to historical policies for this episode's rollout
         hpp_swapped = {}  # agent_idx → saved (auc_sd, sec_sd)
         if hpp_enabled and episode >= hpp_warmup:
             for i in range(n_agents):
-                if hpp_pools[i] and np.random.random() < hpp_swap_prob:
+                if hpp_pools[i] and episode_rng.random() < hpp_swap_prob:
                     # Save current actor weights
                     hpp_swapped[i] = (
                         copy.deepcopy(agents[i].auction_policy.state_dict()),
@@ -731,7 +734,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     )
                     # Load random historical policy for action selection
                     hist_auc, hist_sec = hpp_pools[i][
-                        np.random.randint(len(hpp_pools[i]))]
+                        int(episode_rng.integers(len(hpp_pools[i])))]
                     agents[i].auction_policy.load_state_dict(hist_auc)
                     agents[i].secondary_policy.load_state_dict(hist_sec)
 
@@ -902,7 +905,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     gae_data.append((adv, ret, buf))
 
                 # 2. Sequential update in random order
-                order = np.random.permutation(n_agents).tolist()
+                order = episode_rng.permutation(n_agents).tolist()
                 # Keep independent cumulative ratios per rollout length.
                 # Some agents may have shorter buffers when HPP swaps clear
                 # their trajectories, so a single shared ratio can mismatch.

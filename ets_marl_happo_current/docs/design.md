@@ -1,122 +1,290 @@
-# Design Document — ETS MARL
+# Design Document - ETS MARL (Current v6.0)
 
-## 1. Auction Mechanism
+## 1. Scope and Purpose
 
-### Why uniform-price sealed-bid?
-The EU ETS power sector uses a single-round, sealed-bid, uniform-price auction
-(Commission Regulation 1031/2010). Every winner pays the same clearing price —
-the marginal accepted bid. This is the opposite of the energy seller market in
-the base repo (ckrk/bidding_learning), where producers bid minimum acceptable
-prices ascending. Here companies are **buyers** bidding maximum willingness-to-pay,
-sorted descending.
+This document describes the active architecture in `ets_marl_happo_current`.
+It supersedes earlier DDPG-era notes and reflects the current HAPPO/PPO setup,
+two-phase decision process, technology-resolved companies, bot participants,
+and reward/economic mechanisms used in training and evaluation.
 
-### Clearing algorithm (adapted from ckrk/bidding_learning)
-1. Filter bids below reserve price.
-2. Sort descending by bid price (tie-break: ascending agent_id for determinism).
-3. Walk sorted bids, accumulating quantity until Q_cap is reached.
-4. Clearing price = price of the last accepted bid (marginal buyer).
-5. Tie-break at marginal price: pro-rata allocation by bid quantity.
-6. All winners pay the uniform clearing price.
+The model is a stylized EU ETS micro-market with 16 participants:
+- 8 learning agents (PPO with HAPPO-style sequential updates)
+- 8 heuristic bot agents (rule-based, not trained)
 
-## 2. Cap Trajectory
+Each episode simulates 12 years.
 
-### LRF
-`cap(t+1) = cap(t) * (1 - LRF_t)`
-- LRF = 4.3% for years 1–4 (EU ETS 2024–2027)
-- LRF = 4.4% for years 5+ (EU ETS 2028+)
+## 2. Market Architecture
 
-### MSR
-The MSR adjusts the **auction volume** (not the cap) based on TNAC:
-- TNAC > 8.33 Mt: withhold 24% of excess into MSR reserve
-- TNAC < 4.00 Mt: release 0.10 Mt/year from reserve into auction
-- TNAC in [4.00, 8.33]: no adjustment
+### 2.1 Auction type
 
-TNAC proxy: sum of all company banks. This approximates the EU definition
-(issued allowances minus surrendered allowances) under the simplifying
-assumption that all non-surrendered allowances are banked.
+The primary market is a uniform-price, sealed-bid, multi-unit buyer auction.
+Each participant submits one annual bid tuple:
+- bid price (EUR/t)
+- bid quantity (Mt)
 
-## 3. Company State
+Valid bids are sorted by descending price and accepted until auction supply is exhausted.
+All winners pay the same clearing price (the marginal accepted bid).
 
-### Emission factor choice
-All fossil generation modelled as gas CC (EF = 0.37 tCO₂/MWh, IPCC AR5 median).
-Rationale: EU power mix 2024 is predominantly gas as marginal fossil fuel.
-Coal is effectively being phased out. This is conservative but defensible.
-Extension: differentiate coal/gas within fossil% with separate EFs.
+### 2.2 Practical clearing details in code
 
-### Investment dynamics
-- Decision: continuous delta_green ∈ [0, max_delta_green] per year
-- Cost: convex, `C = a*Δg + b*Δg²` (M€), with a=50, b=10
-- Delay: 2 years (permitting + construction)
-- Stochastic failure: `p_fail = base_fail * fossil_frac * (1 - success_rate)`
-  - Brown companies fail more often (less green know-how)
-  - Success rate updated as rolling 10-year average of past investments
+- Bids below effective reserve are rejected.
+- Tie-breaks at identical prices are randomized (not pro-rata).
+- Optional per-agent holding limit is supported via `max_agent_share`.
+- If enabled, under-subscription can cancel the auction; default behavior is to clear partial demand.
+- Unsold volume is either:
+  - rolled into next year's auction supply, or
+  - absorbed into MSR reserve (configurable).
 
-### Risk factor
-`risk_factor = base_risk * fossil_frac * (1 - success_rate)`
+## 3. Cap and Supply Dynamics
 
-A company with risk_factor=0.45 bids for 45% more allowances than its estimated
-need, as a precautionary buffer against investment failures. As a company greens
-and builds success history, this buffer shrinks.
+### 3.1 Cap path
 
-## 4. Reward Function
+Annual cap follows an LRF schedule:
 
-`reward_i = -(w_cost_i * total_cost_i + w_green_i * fossil_frac_i * 100)`
+$$
+cap_{t+1} = cap_t (1 - LRF_t)
+$$
 
-- `total_cost_i` = auction payments + |trading costs| + penalties + switching costs (all M€)
-- `fossil_frac_i` ∈ [0,1], scaled by 100 to bring to comparable magnitude
-- Weights encode company orientation:
-  - A1 (90% fossil): cares mostly about cost (w_cost=0.80)
-  - A4 (10% fossil): cares mostly about greening (w_green=0.80)
+- Phase 1 LRF: 4.3%
+- Phase 2 LRF: 4.4%
 
-## 5. Multi-Agent Setup
+### 3.2 MSR logic
 
-Each company is an **independent DDPG agent** with its own:
-- Actor network: obs (8D) → action (4D)
-- Critic network: (obs, action) → Q-value
-- Replay buffer: 50,000 transitions
-- OU noise for exploration
+MSR operates on auction volume (not cap) using TNAC proxy (sum of all banks):
+- If TNAC > upper threshold: withhold share of excess into reserve.
+- If TNAC < lower threshold: release fixed volume from reserve.
 
-Independent learning (no parameter sharing, no communication) is the baseline
-following Wang et al. (2024) and ckrk/bidding_learning. This allows emergent
-strategic behaviour without coordination assumptions.
+Current implementation also includes price-responsive safeguards:
+- If price ratio reaches containment trigger: suppress normal withdrawal.
+- If price ratio reaches emergency trigger: force emergency release.
 
-## 6. Observation Space (per agent, 8D)
+This avoids a procyclical loop where high prices and high TNAC jointly reduce supply further.
 
-| Index | Feature | Normalisation |
-|-------|---------|--------------|
-| 0 | year / 10 | [0, 1] |
-| 1 | cap_t / output_twh | [0, ~1.5] |
-| 2 | last_clearing_price / 200 | [0, 1] |
-| 3 | green_frac | [0, 1] |
-| 4 | bank / output_twh | [0, ~1] |
-| 5 | estimate_need / output_twh | [0, ~2] |
-| 6 | success_rate | [0, 1] |
-| 7 | risk_factor | [0, ~0.5] |
+### 3.3 Reserve price mode
 
-## 7. Action Space (per agent, 4D)
+Auction reserve can be:
+- static (`reserve_price`), or
+- dynamic (`max(absolute_floor, discount * MA3_price)`) with fallback behavior when no valid clears exist.
 
-| Index | Feature | Range |
-|-------|---------|-------|
-| 0 | price_bid | [0, 200] €/t |
-| 1 | quantity_bid | [0, 5.0] Mt |
-| 2 | delta_green | [0, 0.03] p.p./year |
-| 3 | trade_qty | [-5.0, 5.0] Mt (buy/sell) |
+## 4. Participants and Company Model
 
-## 8. Known Simplifications and Future Extensions
+### 4.1 Agent population
 
-1. **Single bid per company per auction** — real ETS allows step-function bids.
-   Extension: K-step bid curve (as in Di Persio et al., I=3 steps).
+- Learning agents A1-A8: PPO/HAPPO-trained.
+- Bot agents B1-B8: heuristic policy for both auction and secondary market.
 
-2. **Secondary market** — simple bilateral clearing at clearing_price ± ε.
-   Extension: order book with price discovery.
+Archetypes are mirrored between learners and bots:
+- coal-heavy
+- gas-dominant
+- transitioner
+- green-leader
 
-3. **Homogeneous output** — all companies produce 10 TWh/year.
-   Extension: stochastic output, capacity expansion decisions.
+All participants produce 10 TWh/year.
 
-4. **No banking limits** — EU ETS has no quantitative banking cap.
-   This is correctly modelled (unlimited banking).
+### 4.2 Technology-resolved generation mix
 
-5. **No international linkage** — closed micro-ETS.
+Each company has a 5-technology portfolio:
+- coal
+- gas
+- onshore wind
+- offshore wind
+- solar
 
-6. **Carbon price expectation** — AR(1) process, not forward-looking.
-   Extension: rational expectations, futures market.
+Model tracks technology-specific:
+- emission factors
+- capex
+- capacity factors
+- deploy delays
+- operational costs
+- decommission costs
+
+### 4.3 Investment and queue dynamics
+
+Agents choose annual invest fraction and target green technology.
+Investment is queued and materializes with delay.
+
+Important mechanics:
+- Greening-only transition (fossil retired first, then green added).
+- Investment failure risk depends on fossil exposure and experience.
+- Construction jitter (Poisson delay), cancellation risk, and capex recovery on cancellation.
+- Capacity-factor noise can alter realized emissions each year.
+
+### 4.4 Compliance and carry-forward
+
+Compliance is settled against realized emissions plus prior carry-forward obligation:
+
+$$
+shortfall_i = \max(0, E_i^{realized} + CF_i^{old} - A_i^{held})
+$$
+
+Penalty paid:
+
+$$
+penalty_i = shortfall_i \cdot effectivePenaltyRate_t
+$$
+
+If enabled, shortfall carries to next year, with optional cap multiplier to prevent runaway debt spirals.
+
+### 4.5 MAC fuel-switching
+
+If carbon price exceeds MAC threshold, company can temporarily switch part of coal dispatch to gas.
+This lowers emissions in-year but adds MAC cost. It does not permanently alter long-run technology mix.
+
+## 5. Two-Phase Yearly Decision Process
+
+Each simulation year is split into two decisions.
+
+### Phase 1: Auction + Investment
+
+Action vector (6D):
+1. Bid price (EUR/t)
+2. Quantity multiplier on estimated need
+3. Invest fraction
+4. Onshore logit
+5. Offshore logit
+6. Solar logit
+
+Technology choice is `argmax(logits)`.
+
+### Phase 2: Secondary market
+
+Action vector (2D):
+1. Secondary price (absolute EUR/t)
+2. Secondary quantity (positive buy, negative sell)
+
+Secondary market uses bilateral double-auction matching with spread tolerance.
+Participants can sell from current allocation plus bank (no short selling beyond holdings).
+
+## 6. Observation Spaces
+
+### 6.1 Phase 1 observation
+
+Base dimension: 23.
+
+Includes:
+- time and cap
+- price signals (MA3, expected AR(1), last secondary)
+- full technology mix and emissions/need/risk indicators
+- queue state
+- carry-forward obligation
+- TNAC proxy
+- effective reserve signal
+- secondary volume and profit signal
+
+If opponent modeling is enabled:
+
+$$
+obsDimPhase1 = 23 + 5 (N_{total} - 1)
+$$
+
+Each opponent contributes public 5D tuple:
+- normalized emissions
+- normalized carry-forward
+- green fraction
+- fossil fraction
+- total queue size
+
+With 16 total participants:
+- phase 1 dimension = 98
+
+### 6.2 Phase 2 observation
+
+Phase 2 appends 7 auction-result features to phase 1:
+- allocation
+- clearing price
+- net compliance position
+- emission shock
+- auction savings proxy
+- coverage ratio
+- normalized carry-forward
+
+$$
+obsDimPhase2 = obsDimPhase1 + 7
+$$
+
+With 16 total participants:
+- phase 2 dimension = 105
+
+## 7. Reward Design (Current)
+
+Per-agent reward is:
+
+$$
+R_i = -\text{costNorm}_i + \text{greenBonus}_i + \text{queueBonus}_i + \text{esgSignal}_i + \text{terminalValues}_i
+$$
+
+Where:
+- `costNorm` is net cost after electricity revenue, scaled.
+- Costs include auction, secondary, investment, OPEX, budget penalties, capex throughput penalties, MAC cost, and compliance penalty.
+- `greenBonus` rewards positive green share change with shaping decay over training.
+- `queueBonus` rewards maintaining active construction pipeline.
+- `esgSignal` uses saved-carbon-years style term, gated by ESG weight.
+
+Terminal values in final year (configurable):
+- bank terminal value (bank * terminal price)
+- queue terminal value (discounted future emissions savings from queued projects)
+
+Terminal price anchor uses max of:
+- auction clearing
+- secondary clearing
+- 80% of inflation-adjusted penalty rate
+
+## 8. Learning System
+
+### 8.1 Policy/critic structure
+
+Each learning company has:
+- auction policy network
+- secondary policy network
+- value network
+
+Actors are decentralized; critic can be centralized (MAPPO mode) over concatenated multi-agent state.
+
+### 8.2 HAPPO/PPO training behavior
+
+- On-policy episode rollouts.
+- Sequential policy updates enabled by HAPPO option.
+- GAE + clipped PPO objective.
+- KL early-stopping and optional KL anchor to frozen BC policy.
+
+### 8.3 Stabilization features
+
+- Behavioral cloning warm-start from heuristic policy (optional).
+- Reward normalization per agent.
+- Entropy decay schedule.
+- Epsilon-greedy exploration in physical action space with anchored Gaussian sampling.
+- Historical Policy Pool (periodic snapshots and random swaps for opponent diversity).
+- Diagnostics for stuck-market or degenerate-policy regimes.
+
+## 9. Economic and Financial Layers
+
+### 9.1 Inflation path
+
+Inflation is sampled per episode (shared by all companies) and compounds annually.
+It scales penalty, capex, OPEX, decommissioning, MAC, and power price base.
+
+### 9.2 Electricity revenue channel
+
+Electricity revenue can be enabled:
+
+$$
+P_{elec} = P_{base} + \text{passthrough} \cdot P_{carbon} \cdot EF_{system}
+$$
+
+Revenue offsets cost signal and links carbon prices to generation margins.
+
+### 9.3 Unified budget envelope
+
+Each company has an annual spending envelope for all major outlays.
+Separate capex throughput constraint models physical delivery bottlenecks.
+
+## 10. Current Simplifications
+
+The model remains stylized despite expanded realism:
+- Single annual bid per participant (no multi-step bid curve).
+- Simplified secondary market matching (no full limit-order book dynamics).
+- Fixed annual output per company (10 TWh).
+- Closed system (no cross-market linkage or imports).
+- AR(1)-style expected price signal instead of full forward curve equilibrium.
+
+These are deliberate to keep MARL tractable while preserving key strategic channels.

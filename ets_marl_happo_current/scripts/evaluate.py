@@ -29,8 +29,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",     type=str, default="configs/default.yaml")
     parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Directory containing agent_0_best.pt ... agent_3_best.pt")
+                        help="Directory containing agent_<i>_best.pt for all learning agents")
     parser.add_argument("--seed",       type=int, default=0)
+    parser.add_argument(
+        "--allow-missing-checkpoints",
+        action="store_true",
+        help="Allow missing agent checkpoints and fall back to random policies for those agents",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -39,13 +44,24 @@ def main():
 
     # Build agents and load weights
     agents = build_agents(env, config, args.seed)
+    missing_agents = []
     for i, agent in enumerate(agents):
         ckpt_path = os.path.join(args.checkpoint, f"agent_{i}_best.pt")
         if os.path.exists(ckpt_path):
             agent.load(ckpt_path)
             print(f"Loaded agent {i} from {ckpt_path}")
         else:
-            print(f"WARNING: checkpoint not found for agent {i} — using random policy")
+            missing_agents.append(i)
+
+    if missing_agents and not args.allow_missing_checkpoints:
+        missing_list = ", ".join(str(i) for i in missing_agents)
+        raise FileNotFoundError(
+            f"Missing checkpoints for agents [{missing_list}] in '{args.checkpoint}'. "
+            "Re-run with --allow-missing-checkpoints to evaluate with random fallback."
+        )
+
+    for i in missing_agents:
+        print(f"WARNING: checkpoint not found for agent {i} - using random policy")
 
     # Run one evaluation episode (deterministic)
     obs1, _ = env.reset(seed=args.seed)

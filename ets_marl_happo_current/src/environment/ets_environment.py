@@ -301,6 +301,7 @@ class ETSEnvironment(gym.Env):
         self._last_terminal_bank_values = np.zeros(self.n_total)
         self._last_terminal_queue_values = np.zeros(self.n_total)
         self._last_terminal_liquidation_values = np.zeros(self.n_total)
+        self._secondary_profit_ema = np.zeros(self.n_total)
         self._consecutive_years_without_valid_auction_clear = 0
         self._liquidity_ref_ema = float(self.config["price"]["initial_expected"])
 
@@ -611,6 +612,7 @@ class ETSEnvironment(gym.Env):
             rng=self.rng,
             cancel_under_subscribed=self.config["auction"].get(
                 "cancel_under_subscribed", False),
+            n_agents=self.n_total,
         )
         # Unsold allowances: either absorbed into MSR or rolled over to next year's auction
         unsold = max(0.0, auction_volume - float(allocations.sum()))
@@ -1145,7 +1147,10 @@ class ETSEnvironment(gym.Env):
         inflation_factor = self._inflation_factor(self.current_year)
 
         if elec_enabled:
-            system_avg_ef = float(np.mean([c.weighted_emission_factor for c in self.companies]))
+            system_avg_ef = float(np.nanmean([c.weighted_emission_factor for c in self.companies]))
+            if not np.isfinite(system_avg_ef):
+                # Fallback prevents NaN/Inf reward contamination in edge-case states.
+                system_avg_ef = 0.5
             elec_price = base_elec_price * inflation_factor + carbon_passthrough * clearing_price * system_avg_ef
 
         if mac_costs is None:

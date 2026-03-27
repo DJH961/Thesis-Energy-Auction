@@ -376,3 +376,25 @@ def test_stats_fail_reason():
     _, _, _, stats = market_clearing_ets(bids, q_cap=3.0)
     assert stats["auction_failed"] is False
     assert "fail_reason" not in stats
+
+
+def test_explicit_n_agents_shapes_outputs():
+    """Explicit n_agents should control allocation/payment vector lengths."""
+    bids = make_bids([(80, 1.0), (70, 1.0), (60, 1.0)])
+    _, alloc, pay, _ = market_clearing_ets(bids, q_cap=2.0, n_agents=5)
+
+    assert alloc.shape == (5,)
+    assert pay.shape == (5,)
+    assert alloc[3] == pytest.approx(0.0)
+    assert alloc[4] == pytest.approx(0.0)
+
+
+def test_agent_id_out_of_range_raises_with_explicit_n_agents():
+    """Out-of-range agent IDs should fail fast when n_agents is explicit."""
+    bids = np.array([
+        [0, 1.0, 80.0],
+        [3, 1.0, 75.0],
+    ], dtype=float)
+
+    with pytest.raises(ValueError, match=r"outside \[0, n_agents\)"):
+        market_clearing_ets(bids, q_cap=1.0, n_agents=3)
