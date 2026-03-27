@@ -40,7 +40,8 @@ import numpy as np
 
 def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0.0,
                         max_agent_share: float = 1.0, rng=None,
-                        cancel_under_subscribed: bool = False):
+                        cancel_under_subscribed: bool = False,
+                        n_agents: int = None):
     """
     Uniform-price sealed-bid buyer auction clearing (EU ETS style).
 
@@ -93,7 +94,17 @@ def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0
         }
         return reserve_price, np.zeros(0, dtype=float), np.zeros(0, dtype=float), stats
 
-    n_agents = int(bids[:, 0].max()) + 1  # infer from max agent_id
+    if n_agents is None:
+        n_agents = int(bids[:, 0].max()) + 1
+    else:
+        n_agents = int(n_agents)
+        if n_agents <= 0:
+            raise ValueError("n_agents must be a positive integer")
+
+    # Validate IDs when an explicit participant count is provided.
+    if np.any(bids[:, 0] < 0) or np.any(bids[:, 0] >= n_agents):
+        raise ValueError("bids contain agent_id outside [0, n_agents)")
+
     allocations = np.zeros(n_agents, dtype=float)
     payments = np.zeros(n_agents, dtype=float)
 
