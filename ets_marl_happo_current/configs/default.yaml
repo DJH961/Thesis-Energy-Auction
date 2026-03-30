@@ -62,6 +62,12 @@ ets:
   reserve_price: 30.0              # auction bid floor (matches price_min)
   reserve_price_mode: "static"     # "static" or "dynamic" (= max(reserve_price, discount x MA3))
   unsold_to_msr: false             # unsold volume rolls over to next year (not absorbed into MSR)
+  # Price history anchor for MA3 calculation.
+  # "auction": only successful auction clearing prices enter the MA3 (stable, prevents
+  #            reserve-price pollution when auctions fail).
+  # "secondary": secondary clearing prices enter the MA3 (may include reserve-price
+  #              fallbacks when auctions fail, causing downward bid spirals).
+  price_history_anchor: "auction"
 
 # ----------------------------------------------------------
 # Companies — 8 learning agents (2x each of 4 archetypes)
@@ -116,6 +122,7 @@ companies:
 investment:
   max_invest_frac: 0.20
   convexity_alpha: 0.20
+  discount_rate: 0.05   # annual discount rate for heuristic NPV calculation (annuity formula)
 
 risk:
   p_fail_min: 0.08

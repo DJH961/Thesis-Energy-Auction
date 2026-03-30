@@ -138,7 +138,11 @@ class ETSEnvironment(gym.Env):
 
         # Dynamic reserve tracking
         self._last_effective_reserve = config["ets"].get("reserve_price", 0.0)
-        self._reserve_anchor = "secondary"  # price history fed by secondary clearing
+        # Price history anchor: "auction" appends only successful auction clearing prices;
+        # "secondary" appends secondary clearing prices (can include reserve-price fallbacks
+        # when auctions fail, which distorts the MA3 and causes erratic bid spirals).
+        # Default is "auction" to keep the MA3 stable and informative.
+        self._reserve_anchor = config["ets"].get("price_history_anchor", "auction")
         self._consecutive_years_without_valid_auction_clear = 0
 
         # Secondary liquidity pool EMA anchor state (only used when pool enabled)
@@ -975,7 +979,14 @@ class ETSEnvironment(gym.Env):
                         self.config["price"].get("price_floor", 50.0))
         vol_std = self.config["price"].get("volatility_std", 0.15)
 
-        if clearing_price > 0:
+        # Only update the AR(1) expected-price forecast from a meaningful (successful)
+        # auction clearing price.  If the auction failed, clearing_price equals the
+        # reserve price floor, which would snap expected_price to price_floor and give
+        # agents a misleading signal; in that case we keep the previous forecast.
+        auction_succeeded_this_step = not bool(
+            log.get("auction_stats", {}).get("auction_failed", False)
+        )
+        if auction_succeeded_this_step and clearing_price > 0:
             shock = self.rng.normal(0, vol_std) * clearing_price
             self.expected_price = max(
                 rho * clearing_price + (1.0 - rho) * price_floor + shock,

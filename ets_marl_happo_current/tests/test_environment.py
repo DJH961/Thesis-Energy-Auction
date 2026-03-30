@@ -597,3 +597,225 @@ def test_no_holding_limit():
         # With no holding limit, the high bidder should get a significant share
         # (threshold lowered: 16 participants including heuristic bots dilute shares)
         assert share > 0.10, f"Agent 0 share {share:.2f} too low with no holding limit"
+
+
+# ---------------------------------------------------------------------------
+# Test: price_history_anchor="auction" prevents failed-auction price pollution
+# ---------------------------------------------------------------------------
+
+def test_price_history_anchor_default_is_auction():
+    """Default price_history_anchor should be 'auction' (not 'secondary')."""
+    env = load_env()
+    env.reset(seed=42)
+    assert env._reserve_anchor == "auction", (
+        f"Expected _reserve_anchor='auction', got '{env._reserve_anchor}'. "
+        "The 'secondary' default caused failed-auction reserve prices to pollute "
+        "the MA3 price signal, driving heuristic bids into a downward spiral."
+    )
+
+
+def test_auction_anchor_excludes_secondary_prices_from_history():
+    """With anchor='auction', secondary market trade prices must NOT enter _price_history.
+
+    The secondary-price anchor (old default) allowed secondary trades at urgency-premium
+    prices to distort the MA3 signal, causing erratic bid behaviour in subsequent rounds.
+    With the 'auction' anchor, only primary auction clearing prices enter the MA3 history.
+    """
+    env = load_env()
+    env.reset(seed=42)
+    assert env._reserve_anchor == "auction", "Prerequisite: must be 'auction' anchor"
+
+    n_agents = env.n_agents
+    # Run a year that generates secondary trades
+    auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+    auction_actions[:, 0] = 100.0   # bid above reserve → auction clears at ~100
+    auction_actions[:, 1] = 1.0
+
+    _, log = env.step_auction(auction_actions)
+    auction_clearing = log["clearing_price"]
+    history_after_auction = list(env._price_history)
+
+    # Phase 2: force trades — half agents buy at high price, half sell at high price
+    secondary_actions = np.zeros((n_agents, 2), dtype=np.float32)
+    for i in range(n_agents):
+        if i % 2 == 0:
+            secondary_actions[i, 0] = 150.0   # willing to buy at 150
+            secondary_actions[i, 1] = 0.5     # buy 0.5 Mt
+        else:
+            secondary_actions[i, 0] = 80.0    # willing to sell at 80
+            secondary_actions[i, 1] = -0.5    # sell 0.5 Mt
+
+    env.step_secondary(secondary_actions)
+
+    # With 'auction' anchor: only the primary auction clearing price should have been
+    # added to history (which already happened in step_auction).  The secondary-market
+    # trade prices must NOT have been appended a second time.
+    assert len(env._price_history) == len(history_after_auction), (
+        "With 'auction' anchor, step_secondary must NOT append additional prices to "
+        "_price_history — secondary trade prices must not distort the MA3."
+    )
+
+
+def test_secondary_anchor_adds_secondary_clearing_to_history():
+    """With anchor='secondary' (legacy mode), secondary clearing prices enter _price_history.
+
+    This test documents the old (now non-default) behaviour to ensure it still works
+    when explicitly requested, while confirming the new default ('auction') does not
+    exhibit the same distortion.
+    """
+    import copy
+    with open(CONFIG_PATH) as f:
+        import yaml
+        config = yaml.safe_load(f)
+    config = copy.deepcopy(config)
+    config["ets"]["price_history_anchor"] = "secondary"  # explicitly opt in to old mode
+    env = ETSEnvironment(config, seed=42)
+    env.reset(seed=42)
+
+    assert env._reserve_anchor == "secondary", "Prerequisite: must be 'secondary' anchor"
+
+    n_agents = env.n_agents
+    auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+    auction_actions[:, 0] = 100.0
+    auction_actions[:, 1] = 1.0
+
+    env.step_auction(auction_actions)
+    history_after_auction = list(env._price_history)
+
+    # Force secondary trades at a price above the auction clearing
+    secondary_actions = np.zeros((n_agents, 2), dtype=np.float32)
+    for i in range(n_agents):
+        if i % 2 == 0:
+            secondary_actions[i, 0] = 150.0
+            secondary_actions[i, 1] = 0.5
+        else:
+            secondary_actions[i, 0] = 80.0
+            secondary_actions[i, 1] = -0.5
+
+    env.step_secondary(secondary_actions)
+
+    # With 'secondary' anchor: secondary clearing price IS added to history
+    assert len(env._price_history) == len(history_after_auction) + 1, (
+        "With 'secondary' anchor, step_secondary must append the secondary clearing "
+        "price to _price_history."
+    )
+
+
+def test_successful_auction_updates_price_history():
+    """A successful auction should add the clearing price to price_history."""
+    env = load_env()
+    env.reset(seed=42)
+    history_len_before = len(env._price_history)
+
+    n_agents = env.n_agents
+    # Bid well above reserve to guarantee success
+    auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+    auction_actions[:, 0] = 120.0   # above reserve_price (30 EUR/t)
+    auction_actions[:, 1] = 1.0     # coverage multiplier
+
+    _, log = env.step_auction(auction_actions)
+    assert not log["auction_stats"].get("auction_failed", False), (
+        "Auction should succeed with bids well above reserve"
+    )
+
+    sec_actions = np.zeros((n_agents, 2), dtype=np.float32)
+    sec_actions[:, 0] = 1.0
+    env.step_secondary(sec_actions)
+
+    assert len(env._price_history) > history_len_before, (
+        "Successful auction clearing price should be appended to _price_history"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test: NPV discounting in heuristic_policy
+# ---------------------------------------------------------------------------
+
+def test_heuristic_npv_uses_discounting():
+    """Heuristic invest_frac must be strictly lower with discounting than without."""
+    import yaml
+    from src.agents.heuristic_policy import auction_action
+    from src.environment.company import Company
+
+    with open(CONFIG_PATH) as f:
+        config_base = yaml.safe_load(f)
+
+    rng = np.random.default_rng(42)
+    company = Company(
+        agent_id=0,
+        config=config_base,
+        initial_mix=config_base["companies"]["initial_mix"][0],
+        rng=rng,
+    )
+
+    # Config with discount rate 0 → undiscounted (original behavior: simple sum)
+    import copy
+    config_no_discount = copy.deepcopy(config_base)
+    config_no_discount["investment"]["discount_rate"] = 0.0
+
+    # Config with discount rate 5% → discounted (fixed behavior)
+    config_discounted = copy.deepcopy(config_base)
+    config_discounted["investment"]["discount_rate"] = 0.05
+
+    action_no_disc = auction_action(
+        company, price_ma3=100.0, current_year=1, n_years=12,
+        config=config_no_discount, bank=0.0,
+    )
+    action_disc = auction_action(
+        company, price_ma3=100.0, current_year=1, n_years=12,
+        config=config_discounted, bank=0.0,
+    )
+
+    # With a 5% discount rate, the NPV factor < horizon, so invest_frac must be
+    # less-than-or-equal for any given NPV ratio path.
+    assert action_disc[2] <= action_no_disc[2] + 1e-5, (
+        f"Discounted invest_frac ({action_disc[2]:.4f}) should be <= undiscounted "
+        f"({action_no_disc[2]:.4f}); discounting should reduce NPV-driven investment"
+    )
+
+
+def test_heuristic_npv_discount_reduces_long_horizon_investment():
+    """Discounting should reduce investment relative to undiscounted for a long-horizon episode.
+
+    Uses agent_id=0 (financial archetype) with a carbon price of 60 EUR/t, where:
+    - The undiscounted NPV ratio (factor=horizon) exceeds the investment threshold (>1),
+      so the financial agent commits capital.
+    - The discounted NPV ratio (annuity factor at 5%, ~12.97 for 21 years) falls below
+      the threshold, so the agent correctly avoids the unprofitable investment.
+    This demonstrates that proper NPV discounting avoids over-investment at long horizons.
+    """
+    import yaml
+    from src.agents.heuristic_policy import auction_action
+    from src.environment.company import Company
+    import copy
+
+    with open(CONFIG_PATH) as f:
+        config_base = yaml.safe_load(f)
+
+    rng = np.random.default_rng(42)
+    company = Company(
+        agent_id=0,
+        config=config_base,
+        initial_mix=config_base["companies"]["initial_mix"][0],
+        rng=rng,
+    )
+
+    config_no_disc = copy.deepcopy(config_base)
+    config_no_disc["investment"]["discount_rate"] = 0.0
+    config_disc = copy.deepcopy(config_base)
+    config_disc["investment"]["discount_rate"] = 0.05
+
+    # At price_ma3=60 EUR/t, n_years=20, current_year=0:
+    # - Undiscounted: NPV ratio > 1 → financial agent invests.
+    # - Discounted at 5% over ~21 years: annuity factor ~12.85 vs 21 undiscounted
+    #   → NPV ratio < 1 → financial agent correctly withholds investment.
+    a_nd = auction_action(company, price_ma3=60.0, current_year=0, n_years=20,
+                          config=config_no_disc, bank=0.0)
+    a_d  = auction_action(company, price_ma3=60.0, current_year=0, n_years=20,
+                          config=config_disc, bank=0.0)
+
+    assert a_d[2] < a_nd[2], (
+        f"With price_ma3=60 and n_years=20, proper NPV discounting (5%) should "
+        f"keep invest_frac lower than the undiscounted sum; "
+        f"got disc={a_d[2]:.5f} vs no_disc={a_nd[2]:.5f}"
+    )

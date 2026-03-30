@@ -36,8 +36,9 @@ auction_action (fundamentals-based):
     - qty_mult: target-bank logic.
         target_bank = annual_need * min(remaining_years, 2) * 0.3
         qty_mult = clip((annual_need - bank + target_bank) / annual_need, low, high)
-    - invest_frac: NPV-gated.
-        avoided_carbon_npv = emission_reduction * price * effective_horizon
+    - invest_frac: NPV-gated (properly discounted).
+        annuity_factor = (1 - (1 + r)^-horizon) / r  where r = discount_rate
+        avoided_carbon_npv = emission_reduction * price * annuity_factor
         invest proportional to NPV (higher for green agents).
     - tech choice: maximize (remaining_years - delay + terminal_horizon)
         * capacity_factor / capex  (effective payoff metric).
@@ -156,12 +157,22 @@ def auction_action(
             best_score = score
             best_tech = t
 
-    # NPV of avoided carbon
+    # NPV of avoided carbon (properly discounted using annuity formula)
+    # Previously this was an undiscounted sum: `annual_reduction * price * horizon`.
+    # A discount rate converts that into a true NPV so long-horizon investments
+    # are not systematically over-valued relative to short-horizon ones.
     ef_saved = max(0.0, company.weighted_emission_factor - company.emission_factors[best_tech])
     effective_horizon = max(0, remaining_years - deploy_delays[best_tech] + terminal_horizon)
     frac_test = 0.07 if is_green else 0.03
     annual_emission_reduction = frac_test * company.output_mwh * ef_saved / 1e6  # Mt
-    avoided_carbon_npv = annual_emission_reduction * price_ma3 * effective_horizon  # M EUR
+
+    discount_rate = float(config.get("investment", {}).get("discount_rate", 0.05))
+    if discount_rate > 0.0 and effective_horizon > 0:
+        # Present value of an annuity: PV = PMT * (1 - (1+r)^-n) / r
+        npv_factor = (1.0 - (1.0 + discount_rate) ** -effective_horizon) / discount_rate
+    else:
+        npv_factor = float(effective_horizon)
+    avoided_carbon_npv = annual_emission_reduction * price_ma3 * npv_factor  # M EUR
     invest_cost = company.compute_investment_cost(best_tech, frac_test, current_year)  # M EUR
 
     if is_green:
