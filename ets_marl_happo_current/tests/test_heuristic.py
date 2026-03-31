@@ -43,7 +43,7 @@ class TestAuctionAction:
 
     def test_output_shape(self, config):
         c = make_company(config, agent_id=0)
-        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config, bank=0.0)
+        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=12, config=config, bank=0.0)
         assert action.shape == (6,)
         assert action.dtype == np.float32
 
@@ -51,7 +51,7 @@ class TestAuctionAction:
         """Bid price should be within [price_min, price_max]."""
         for i in range(8):
             c = make_company(config, agent_id=i)
-            action = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
+            action = auction_action(c, price_ma3=80.0, current_year=5, n_years=12, config=config, bank=0.0)
             assert action[0] >= config["auction"]["price_min"]
             assert action[0] <= config["auction"]["price_max"]
 
@@ -62,7 +62,7 @@ class TestAuctionAction:
         infl = config["penalty"].get("inflation_rate", 0.02)
         for i in range(8):
             c = make_company(config, agent_id=i)
-            action = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
+            action = auction_action(c, price_ma3=80.0, current_year=5, n_years=12, config=config, bank=0.0)
             inflated_penalty = pen_rate * (1 + infl) ** 5
             assert action[0] >= config["auction"]["price_min"], f"Agent {i} bid below price_min"
             assert action[0] <= min(config["auction"]["price_max"], 1.8 * inflated_penalty) + 1.0, (
@@ -76,29 +76,29 @@ class TestAuctionAction:
         low_bank = 0.0
         high_bank = 10.0  # large bank relative to annual need
         action_low = auction_action(c_low_bank, price_ma3=80.0, current_year=5,
-                                    n_years=20, config=config, bank=low_bank)
+                                    n_years=12, config=config, bank=low_bank)
         action_high = auction_action(c_high_bank, price_ma3=80.0, current_year=5,
-                                     n_years=20, config=config, bank=high_bank)
+                                     n_years=12, config=config, bank=high_bank)
         assert action_high[0] <= action_low[0], \
             "High bank coverage should produce lower bid"
 
     def test_qty_multiplier_within_bounds(self, config):
         c = make_company(config, agent_id=0)
-        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config, bank=0.0)
+        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=12, config=config, bank=0.0)
         assert action[1] >= config["auction"]["qty_mult_low"]
         assert action[1] <= config["auction"]["qty_mult_high"]
 
     def test_qty_increases_with_carry_forward(self, config):
         """Carry-forward > 0 should increase quantity multiplier."""
         c = make_company(config, agent_id=0)
-        action_no_cf = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
+        action_no_cf = auction_action(c, price_ma3=80.0, current_year=5, n_years=12, config=config, bank=0.0)
         c._carry_forward = 1.0  # 1 Mt carry-forward
-        action_cf = auction_action(c, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
+        action_cf = auction_action(c, price_ma3=80.0, current_year=5, n_years=12, config=config, bank=0.0)
         assert action_cf[1] >= action_no_cf[1], "Carry-forward should increase qty"
 
     def test_invest_frac_within_bounds(self, config):
         c = make_company(config, agent_id=0)
-        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config, bank=0.0)
+        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=12, config=config, bank=0.0)
         assert 0.0 <= action[2] <= config["investment"]["max_invest_frac"]
 
     def test_green_agent_invests_more(self, config):
@@ -108,23 +108,23 @@ class TestAuctionAction:
         # Set high capex throughput so the constraint doesn't bind
         c_financial.capex_throughput = 1e9
         c_green.capex_throughput = 1e9
-        a_fin = auction_action(c_financial, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
-        a_grn = auction_action(c_green, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=0.0)
+        a_fin = auction_action(c_financial, price_ma3=80.0, current_year=5, n_years=12, config=config, bank=0.0)
+        a_grn = auction_action(c_green, price_ma3=80.0, current_year=5, n_years=12, config=config, bank=0.0)
         assert a_grn[2] >= a_fin[2], "Green agent should invest >= financial agent"
 
     def test_npv_investment_gating(self, config):
         """Financial agent should invest less when carbon price is very low (bad NPV)."""
         c = make_company(config, agent_id=0)  # financial agent
         action_high_price = auction_action(c, price_ma3=200.0, current_year=2,
-                                           n_years=20, config=config, bank=0.0)
+                                           n_years=12, config=config, bank=0.0)
         action_low_price = auction_action(c, price_ma3=5.0, current_year=2,
-                                          n_years=20, config=config, bank=0.0)
+                                          n_years=12, config=config, bank=0.0)
         assert action_high_price[2] >= action_low_price[2], \
             "Higher carbon price (better NPV) should lead to more investment"
 
     def test_tech_logits_shape(self, config):
         c = make_company(config, agent_id=0)
-        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=20, config=config, bank=0.0)
+        action = auction_action(c, price_ma3=80.0, current_year=0, n_years=12, config=config, bank=0.0)
         logits = action[3:6]
         assert logits.shape == (3,)
 
@@ -132,7 +132,7 @@ class TestAuctionAction:
         """With very few years left, the fastest-deploying tech should win."""
         c = make_company(config, agent_id=0)
         # Near end: solar (delay=1) should beat onshore (delay=3) and offshore (delay=5)
-        action = auction_action(c, price_ma3=80.0, current_year=18, n_years=20, config=config, bank=0.0)
+        action = auction_action(c, price_ma3=80.0, current_year=18, n_years=12, config=config, bank=0.0)
         logits = action[3:6]  # [onshore, offshore, solar]
         assert np.argmax(logits) == 2, "Solar should be preferred near episode end"
 
@@ -141,8 +141,8 @@ class TestAuctionAction:
         c_fin = make_company(config, agent_id=0)
         c_grn = make_company(config, agent_id=1)
         bank = 1.0
-        a_fin = auction_action(c_fin, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=bank)
-        a_grn = auction_action(c_grn, price_ma3=80.0, current_year=5, n_years=20, config=config, bank=bank)
+        a_fin = auction_action(c_fin, price_ma3=80.0, current_year=5, n_years=12, config=config, bank=bank)
+        a_grn = auction_action(c_grn, price_ma3=80.0, current_year=5, n_years=12, config=config, bank=bank)
         assert a_grn[0] == pytest.approx(a_fin[0], abs=1e-6)
 
     def test_year0_avg_bid_in_realistic_band(self, config):

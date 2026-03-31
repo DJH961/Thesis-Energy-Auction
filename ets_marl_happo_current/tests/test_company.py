@@ -25,6 +25,7 @@ from src.environment.company import Company, N_TECHS, BUILDABLE_INDICES
 from src.environment.ets_environment import ETSEnvironment
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "configs", "default.yaml")
+pytestmark = pytest.mark.filterwarnings("ignore:.*Weak scarcity.*:UserWarning")
 
 
 # ---------------------------------------------------------------------------

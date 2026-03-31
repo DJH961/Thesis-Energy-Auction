@@ -1,4 +1,4 @@
-# ETS MARL — Current Version (HAPPO/PPO) v6.0
+# ETS MARL — Current Version (HAPPO/PPO) v6.1
 
 This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
 
@@ -22,7 +22,10 @@ Each "episode" simulates **12 years** of a carbon market. Every year:
 3. The auction uses a **uniform price** — everyone pays the same price, which is the lowest winning bid. This is how the real EU ETS works.
 4. Companies that don't have enough allowances to cover their emissions face a **penalty** (base **€138.75/t in 2026**, indexed from €132.06 in 2024; plus carry-forward obligations).
 5. Companies can **bank** (save) unused allowances for future years.
-6. A **Market Stability Reserve (MSR)** automatically adjusts the auction supply — if too many allowances are floating around, it pulls some out; if prices spike, it releases extras. Price-responsive triggers prevent procyclical hoarding.
+6. A **Market Stability Reserve (MSR)** automatically adjusts the auction supply based on the total number of allowances in circulation (TNAC). The MSR implements the EU ETS post-2023 reform including:
+   - **Cancellation mechanism**: MSR holdings exceeding the previous year's auction volume are permanently cancelled
+   - **Price-responsive triggers**: Containment trigger (70% of penalty / 200 EUR/t) suppresses withdrawal when prices are elevated; emergency release trigger (85% of penalty / 300 EUR/t) forces MSR release to prevent market cornering
+   - These triggers reference the inflation-adjusted penalty rate for more stable behavior over time
 
 ### Terminal Value Rewards
 
