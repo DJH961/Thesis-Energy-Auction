@@ -1,6 +1,19 @@
-# ETS MARL — Current Version (HAPPO/PPO) v6.0
+# ETS MARL — Current Version (HAPPO/PPO) v6.1
 
 This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
+
+## Recent Updates (v6.1)
+
+### MSR Enhancements
+- **MSR Cancellation Mechanism**: Implements the EU ETS post-2023 reform where MSR holdings exceeding the previous year's auction volume are permanently cancelled from the system.
+- **Price-Responsive MSR Triggers**: Enhanced MSR logic now references the inflation-adjusted penalty rate (instead of static price_max) for more stable behavior:
+  - Containment trigger (70% of penalty / 200 EUR/t): Suppresses withdrawal when prices are elevated
+  - Emergency release trigger (85% of penalty / 300 EUR/t): Forces MSR release to prevent market cornering
+
+### Enhanced Logging
+- Year-level CSV now tracks: `msr_total_cancelled`, `msr_withhold_this_year`, `msr_release_this_year`
+- Console output includes MSR reserve status and cumulative cancellations
+- Detailed bot behavior breakdown: green fraction progression, shortfall tracking, investment technology choices
 
 ## What Does This Code Do?
 

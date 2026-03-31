@@ -619,6 +619,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     yr_path = os.path.join(results_dir, f"year_log_s{seed}.csv")
     yr_fields = ["episode", "year", "cap", "auction_volume", "tnac",
                  "clearing_price", "secondary_price", "msr_reserve",
+                 "msr_total_cancelled", "msr_withhold_this_year", "msr_release_this_year",
                  "inflation_rate", "inflation_factor"]
     for i in range(n_total_agents):
         yr_fields += [f"bank_start_A{i+1}", f"alloc_A{i+1}", f"emissions_A{i+1}",
@@ -800,6 +801,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 "tnac": yl.get("tnac", 0), "clearing_price": yl.get("clearing_price", 0),
                 "secondary_price": yl.get("secondary_clearing", 0),
                 "msr_reserve": yl.get("msr_reserve", 0),
+                "msr_total_cancelled": yl.get("msr_total_cancelled", 0),
+                "msr_withhold_this_year": yl.get("msr_withhold_this_year", 0),
+                "msr_release_this_year": yl.get("msr_release_this_year", 0),
                 "inflation_rate": yl.get("inflation_rate", 0),
                 "inflation_factor": yl.get("inflation_factor", 1.0),
             }
@@ -1472,8 +1476,13 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             yr_auct_vol = [yl.get("auction_volume", yl.get("cap", 0.0)) for yl in env.episode_log]
             emiss_traj = "  ".join(f"{e:3.1f}" for e in yr_emiss)
             auct_traj  = "  ".join(f"{c:3.1f}" for c in yr_auct_vol)
+
+            # MSR status tracking
+            msr_cancelled_total = last_log.get("msr_total_cancelled", 0.0)
+            msr_status_str = f"  MSR: reserve={last_log.get('msr_reserve', 0.0):.1f} Mt  cancelled={msr_cancelled_total:.2f} Mt (total)" if msr_cancelled_total > 0.01 else ""
+
             print(f"  Emiss/yr:  {emiss_traj}   (avg {avg_annual_emiss:.1f} Mt/yr)")
-            print(f"  Auct/yr:   {auct_traj}   (TNAC={tnac:.1f} Mt)")
+            print(f"  Auct/yr:   {auct_traj}   (TNAC={tnac:.1f} Mt){msr_status_str}")
 
             # Market + secondary summary (merged into one compact block)
             print(f"  Market: comply={compliance_rate*100:.0f}%  green={avg_green_all*100:.0f}%"
@@ -1499,10 +1508,16 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 bot_inv_sol = float(np.mean([inv_solar_share[j] for j in bot_idxs]))
                 bot_buy_vol = float(np.sum([per_agent_sec_stats[j]["buy_vol"] for j in bot_idxs]))
                 bot_sell_vol = float(np.sum([per_agent_sec_stats[j]["sell_vol"] for j in bot_idxs]))
+                bot_avg_green_start = float(np.mean([ep_green_start[j] for j in bot_idxs]))
+                bot_avg_green_end = float(np.mean([ep_green_end[j] for j in bot_idxs]))
+                bot_avg_delta_green = bot_avg_green_end - bot_avg_green_start
                 print(f"      behavior: bid_mult={bot_bid_mult:.2f}x  cov={bot_bid_cov:.2f}x"
                     f"  intent(B/S/H)={bot_buy_int*100:.0f}/{bot_sell_int*100:.0f}/{bot_hold_int*100:.0f}%"
                     f"  inv(on/off/sol)={bot_inv_on*100:.0f}/{bot_inv_off*100:.0f}/{bot_inv_sol*100:.0f}%"
                     f"  flow(B/S)={bot_buy_vol:.1f}/{bot_sell_vol:.1f} Mt")
+                print(f"      green: {bot_avg_green_start*100:.0f}→{bot_avg_green_end*100:.0f}% "
+                    f"(Δ{bot_avg_delta_green*100:+.1f}pp)  |  "
+                    f"shortfalls: {sum(ep_shortfall_years[j] for j in bot_idxs)} agent-years")
 
             # Per-agent table with integrated secondary detail
             print(thin)

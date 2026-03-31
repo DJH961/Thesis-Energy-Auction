@@ -538,7 +538,15 @@ class ETSEnvironment(gym.Env):
         log["tnac"] = tnac
         log["auction_volume"] = auction_volume
         log["unsold_rollover_in"] = round(self._unsold_rollover, 4)
-        log["msr_reserve"] = self.cap_schedule.msr_reserve()
+
+        # MSR tracking: reserve level and cumulative cancellations
+        msr_reserve_before = self.cap_schedule.msr_reserve()
+        log["msr_reserve"] = msr_reserve_before
+        log["msr_total_cancelled"] = self.cap_schedule._total_cancelled
+
+        # Track MSR withholding/release this year (will be updated post-auction)
+        log["msr_withhold_this_year"] = 0.0
+        log["msr_release_this_year"] = 0.0
 
         # 4. P5: Generate correlated emission shocks
         # ε_it = ρ × η_t + √(1-ρ²) × ξ_it,  η_t ~ N(0,1),  ξ_it ~ N(0,1)

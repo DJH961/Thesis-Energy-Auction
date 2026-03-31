@@ -1,4 +1,4 @@
-# Design Document - ETS MARL (Current v6.0)
+# Design Document - ETS MARL (Current v6.1)
 
 ## 1. Scope and Purpose
 
@@ -54,11 +54,22 @@ MSR operates on auction volume (not cap) using TNAC proxy (sum of all banks):
 - If TNAC > upper threshold: withhold share of excess into reserve.
 - If TNAC < lower threshold: release fixed volume from reserve.
 
-Current implementation also includes price-responsive safeguards:
-- If price ratio reaches containment trigger: suppress normal withdrawal.
-- If price ratio reaches emergency trigger: force emergency release.
+**Price-responsive safeguards (P9):**
+Current implementation includes price-responsive triggers to prevent procyclical supply withdrawal:
+- **Containment trigger** (70% of penalty rate or 200 EUR/t absolute): When prices are elevated, suppress normal TNAC-triggered withdrawal even if TNAC > upper threshold.
+- **Emergency release trigger** (85% of penalty rate or 300 EUR/t absolute): When prices approach the penalty ceiling, force emergency release from MSR reserve to prevent market cornering.
 
-This avoids a procyclical loop where high prices and high TNAC jointly reduce supply further.
+These triggers reference the inflation-adjusted penalty rate (when available) rather than the auction price_max, providing more stable MSR behavior as penalty rates evolve over time.
+
+**MSR cancellation mechanism (EU ETS post-2023 reform):**
+At the start of each year, MSR holdings exceeding the previous year's auction volume are permanently cancelled. This implements the real EU ETS Directive cancellation rule:
+```
+excess = max(0, msr_reserve - prev_auction_volume)
+msr_reserve -= excess
+total_cancelled += excess  # cumulative tracker
+```
+
+In this micro-ETS, cancellation rarely triggers due to short 12-year episodes and moderate TNAC levels, but is included for regulatory completeness and long-run realism.
 
 ### 3.3 Reserve price mode
 
