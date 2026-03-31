@@ -55,6 +55,9 @@ class CapSchedule:
         # Unsold volume pending rollover to next year's auction
         self._unsold_rollover_pending = 0.0
 
+        # Total cancelled allowances (MSR cancellation mechanism)
+        self._total_cancelled = 0.0
+
         # History for logging
         self.cap_history = []
         self.volume_history = []
@@ -162,7 +165,19 @@ class CapSchedule:
           2. If price >= containment_trigger × price_max: suppress normal
              withdrawal even if TNAC > upper threshold.
           3. Normal TNAC-based rules otherwise.
+          4. MSR cancellation: Per EU ETS Directive post-2023: MSR holdings above
+             previous year's auction volume are permanently cancelled. In this
+             micro-ETS, cancellation rarely triggers due to short episodes and
+             moderate TNAC, but is included for regulatory completeness.
         """
+        # MSR cancellation: cancel holdings exceeding previous year's auction volume
+        # This implements the EU ETS post-2023 reform where excess MSR holdings
+        # are permanently removed from the system.
+        prev_auction_vol = self.volume_history[-1] if self.volume_history else auction_vol
+        excess = max(0, self._msr_reserve - prev_auction_vol)
+        self._msr_reserve -= excess
+        self._total_cancelled += excess
+
         price_ratio = clearing_price / max(price_max, 1.0)
 
         # P9: Emergency release when prices approach ceiling
@@ -200,5 +215,6 @@ class CapSchedule:
         self._msr_reserve = 0.0
         self._unsold_absorbed = 0.0
         self._unsold_rollover_pending = 0.0
+        self._total_cancelled = 0.0
         self.cap_history = []
         self.volume_history = []

@@ -627,7 +627,7 @@ class ETSEnvironment(gym.Env):
         unsold = max(0.0, auction_volume - float(allocations.sum()))
         self._unsold_rollover = unsold
         log["unsold_rollover_out"] = round(unsold, 4)
-        if self.config["ets"].get("unsold_to_msr", True):
+        if self.config["ets"].get("unsold_to_msr", False):
             self.cap_schedule.absorb_unsold(unsold)
         else:
             self.cap_schedule.rollover_unsold(unsold)
@@ -1168,16 +1168,17 @@ class ETSEnvironment(gym.Env):
                          old_carry_forward=None):
         """
         Reward (HAPPO-compliant, v6.0):
-                    R_i = w_cost * (-cost_norm) + w_green * (esg_scale * esg_raw)
-                                + green_bonus + queue_bonus
+            R_i = w_cost * (-cost_norm_ex_penalty) + w_green * (esg_scale * esg_raw)
+                  + green_bonus + queue_bonus - penalty_norm
 
         Core signals:
-          cost_norm:   (total_cost + penalty - revenue) / 1000
-          green_bonus: diminishing-returns bonus for green investment progress
-          queue_bonus: reward for active construction queue items (decays with shaping_weight)
-                    esg_raw:     saved-carbon-years formula before weighting
+          cost_norm_ex_penalty: (total_cost_ex_penalty + revenue) / 1000
+          penalty_norm:         penalty_cost / 1000 (applied at full strength for ALL agents)
+          green_bonus:          diminishing-returns bonus for green investment progress
+          queue_bonus:          reward for active construction queue items (decays with shaping_weight)
+          esg_raw:              saved-carbon-years formula before weighting
 
-        Penalty is folded into total_cost (recorded via company.record_spending).
+        Penalty is separated from cost and applied at full strength regardless of w_cost.
         Terminal bonuses: bank /1000 + ESG terminal queue.
         """
         rewards = np.zeros(self.n_total)
@@ -1225,17 +1226,19 @@ class ETSEnvironment(gym.Env):
             budget_penalty = company.compute_budget_penalty()
             capex_penalty = company.compute_capex_penalty()
 
-            # Penalty folded into total_cost (no separate penalty_norm)
-            total_cost = (auction_cost + secondary_cost + investment_cost
-                         + operational_cost + budget_penalty + capex_penalty
-                         + mac_cost_i + penalty_cost)
+            # Separate penalty from other costs
+            # Penalty applies at full strength to ALL agents regardless of w_cost
+            total_cost_ex_penalty = (auction_cost + secondary_cost + investment_cost
+                                     + operational_cost + budget_penalty + capex_penalty
+                                     + mac_cost_i)
 
             # Electricity revenue
             revenue = 0.0
             if elec_enabled:
                 revenue = company.output_mwh * elec_price / 1e6  # M€
 
-            cost_norm = (total_cost - revenue) / 1000.0
+            cost_norm_ex_penalty = (total_cost_ex_penalty - revenue) / 1000.0
+            penalty_norm = penalty_cost / 1000.0
 
             # Green investment bonus with diminishing returns
             # Scaled by (0.2 + w_green) so financial agents still get some signal
@@ -1256,10 +1259,11 @@ class ETSEnvironment(gym.Env):
                 esg_signal = esg_scale * esg_raw
 
             rewards[i] = float(
-                company.w_cost * (-cost_norm)
+                company.w_cost * (-cost_norm_ex_penalty)
                 + company.w_green * esg_signal
                 + green_bonus
                 + queue_bonus
+                - penalty_norm  # penalty at full strength for all agents
             )
 
         # Terminal value bonuses (final year only)

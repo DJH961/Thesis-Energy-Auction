@@ -207,6 +207,9 @@ def auction_action(
     prev = getattr(company, "prev_invest_frac", 0.0)
     invest_frac = float(np.clip(0.5 * invest_frac + 0.5 * prev, 0.0, inv["max_invest_frac"]))
 
+    # Write back to company for next iteration's EMA
+    company.prev_invest_frac = invest_frac
+
     # --- Technology choice (logits) ---
     # Use the best_tech selected by effective payoff metric
     logits = np.array([-1.0, -1.0, -1.0], dtype=np.float32)

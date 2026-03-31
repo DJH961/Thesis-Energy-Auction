@@ -153,3 +153,35 @@ def test_msr_reset():
     s.reset()
     assert s.msr_reserve() == 0.0
     assert s.cap_history == []
+
+
+def test_msr_cancellation():
+    """MSR cancellation: holdings above previous auction volume are cancelled."""
+    s = make_schedule(msr_enabled=True)
+    # Manually set reserve and volume history
+    s._msr_reserve = 20.0
+    s.volume_history = [10.0]
+
+    # Call get_auction_volume to trigger cancellation
+    vol = s.get_auction_volume(year=1, tnac=8.0)
+
+    # Reserve should be reduced to previous auction volume
+    assert s._msr_reserve == pytest.approx(10.0, rel=1e-5)
+    # Total cancelled should equal the excess
+    assert s._total_cancelled == pytest.approx(10.0, rel=1e-5)
+
+
+def test_msr_no_cancellation_when_below():
+    """No cancellation when MSR reserve is below previous auction volume."""
+    s = make_schedule(msr_enabled=True)
+    # Set reserve below previous auction volume
+    s._msr_reserve = 5.0
+    s.volume_history = [10.0]
+
+    # Call get_auction_volume
+    vol = s.get_auction_volume(year=1, tnac=8.0)
+
+    # Reserve should be unchanged by cancellation (may change due to MSR logic)
+    # But no cancellation should have occurred
+    assert s._total_cancelled == pytest.approx(0.0, rel=1e-5)
+

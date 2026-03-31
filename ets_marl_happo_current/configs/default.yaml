@@ -49,8 +49,8 @@ ets:
 
   msr:
     enabled: true
-    tnac_upper: 48.0
-    tnac_lower: 20.0
+    tnac_upper: 28.0     # Raised from 48.0 — tighter scarcity threshold
+    tnac_lower: 14.0     # Raised from 20.0 — earlier release trigger
     withhold_rate: 0.24
     release_amount: 0.80
     price_containment_trigger: 0.70   # at 70% of price_max, suppress MSR withdrawal
@@ -169,8 +169,8 @@ secondary:
 # Sources: Scope Ratings 2023, Enel/Iberdrola 2024-2027 strategic plans.
 # ----------------------------------------------------------
 budget:
-  annual_budgets: [750.0, 750.0, 800.0, 800.0, 850.0, 850.0, 850.0, 850.0]
-  bot_annual_budgets: [750.0, 750.0, 800.0, 800.0, 850.0, 850.0, 850.0, 850.0]
+  annual_budgets: [820.0, 820.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]  # Adjusted for tighter scarcity
+  bot_annual_budgets: [820.0, 820.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]  # Match learning agents
   overspend_penalty_coef: 0.5
   contingency_zone: 0.10
   hard_cap_multiplier: 1.20
@@ -238,7 +238,7 @@ electricity:
 reward:
   normalizer_alpha: 0.01
   clip_min: -10.0
-  clip_max: 5.0
+  clip_max: 10.0         # Increased from 5.0 — symmetric with clip_min to avoid asymmetric gradient compression
   shaping_beta: 7.0              # green_delta bonus weight
   shaping_gamma: 1.0             # queue bonus weight
   shaping_decay_episode: 0       # auto: 12% of n_episodes, clamped to [300, 8000]
@@ -311,6 +311,11 @@ ppo:
   target_kl: 0.02            # KL-based early stopping per PPO epoch
   kl_anchor_beta: 0.5        # KL penalty weight against frozen BC policy
   kl_anchor_decay_episodes: 0   # auto: 50% of n_episodes, clamped to [500, 40000]
+  critic_extra_epochs: 5     # extra critic-only training epochs before main PPO loop
+  critic_huber: true         # use Huber loss for critic instead of MSE
+  critic_huber_delta: 10.0   # delta parameter for Huber loss
+  clip_value: false          # value function clipping (disabled)
+  normalize_returns: true    # normalize returns before critic training
 
 # ----------------------------------------------------------
 # Curriculum learning (disabled — 12-year episodes train directly)
@@ -345,7 +350,7 @@ warm_start:
   enabled: true
   n_burnin_prices: 2
   bank_seed_min: 0.5
-  bank_seed_max: 2.0
+  bank_seed_max: 1.5     # Reduced from 2.0 — lower initial banking to tighten early scarcity
   queue_mu_onshore: 1.5
   queue_mu_offshore: 0.5
   queue_mu_solar: 2.0
