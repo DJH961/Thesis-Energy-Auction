@@ -206,6 +206,18 @@ class PPOAgent:
         self.actor_loss_history = []
         self.critic_loss_history = []
 
+        # Critic training enhancements
+        self.critic_extra_epochs = ppo.get("critic_extra_epochs", 0)
+        self.critic_huber = ppo.get("critic_huber", False)
+        self.critic_huber_delta = ppo.get("critic_huber_delta", 10.0)
+        self.normalize_returns = ppo.get("normalize_returns", True)
+
+        # Initialize critic loss function
+        if self.critic_huber:
+            self.critic_loss_fn = nn.SmoothL1Loss(beta=self.critic_huber_delta)
+        else:
+            self.critic_loss_fn = nn.MSELoss()
+
         # P3: per-agent reward normaliser
         reward_cfg = config.get("reward", {})
         norm_alpha = reward_cfg.get("normalizer_alpha", 0.01)
@@ -255,6 +267,24 @@ class PPOAgent:
         """
         r_norm = self._reward_normalizer.update_and_normalize(reward)
         return float(np.clip(r_norm, self._reward_clip_min, self._reward_clip_max))
+
+    def _critic_loss(self, v_pred, v_target):
+        """
+        Compute critic loss using Huber loss (if enabled) or MSE.
+
+        Parameters
+        ----------
+        v_pred : Tensor
+            Predicted values from critic.
+        v_target : Tensor
+            Target values (returns).
+
+        Returns
+        -------
+        loss : Tensor
+            Scalar loss value.
+        """
+        return self.critic_loss_fn(v_pred, v_target)
 
     # ------------------------------------------------------------------
     # Action selection
@@ -441,11 +471,40 @@ class PPOAgent:
         adv_t = torch.FloatTensor(advantages).to(self.device).unsqueeze(1)
         ret_t = torch.FloatTensor(returns).to(self.device).unsqueeze(1)
 
+        # Return normalization
+        if self.normalize_returns and T > 1:
+            ret_mean = ret_t.mean()
+            ret_std = ret_t.std()
+            if ret_std > 1e-8:
+                ret_t = (ret_t - ret_mean) / (ret_std + 1e-8)
+
         if self.normalize_advantages and T > 1:
             adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
         adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Critic extra epochs: warm up critic before main PPO loop
+        if self.critic_extra_epochs > 0:
+            for _extra_epoch in range(self.critic_extra_epochs):
+                idx = np.arange(T)
+                np.random.shuffle(idx)
+                for start in range(0, T, self.mini_batch_size):
+                    end = min(start + self.mini_batch_size, T)
+                    mb = idx[start:end]
+                    v_pred = self.value_net(critic_input[mb])
+                    critic_loss = self._critic_loss(v_pred, ret_t[mb])
+                    if not torch.isfinite(critic_loss):
+                        continue
+                    self.critic_optimizer.zero_grad()
+                    critic_loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        list(self.value_net.parameters()), self.max_grad_norm)
+                    bad_crit = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in self.value_net.parameters())
+                    if not bad_crit:
+                        self.critic_optimizer.step()
 
         # PPO epochs
         total_a_loss = 0.0
@@ -465,7 +524,7 @@ class PPOAgent:
                 mb = idx[start:end]
 
                 v_pred = self.value_net(critic_input[mb])
-                value_loss = nn.MSELoss()(v_pred, ret_t[mb])
+                value_loss = self._critic_loss(v_pred, ret_t[mb])
 
                 if actor_update:
                     # Re-evaluate current policy
@@ -531,7 +590,7 @@ class PPOAgent:
                 if not torch.isfinite(critic_loss_total):
                     continue
                 self.critic_optimizer.zero_grad()
-                critic_loss_total.backward(retain_graph=(actor_loss_total is not None))
+                critic_loss_total.backward()
                 nn.utils.clip_grad_norm_(
                     list(self.value_net.parameters()), self.max_grad_norm)
                 bad_crit = any(
@@ -641,6 +700,13 @@ class PPOAgent:
         adv_t = torch.FloatTensor(advantages).to(self.device).unsqueeze(1)
         ret_t = torch.FloatTensor(returns).to(self.device).unsqueeze(1)
 
+        # Return normalization
+        if self.normalize_returns and T > 1:
+            ret_mean = ret_t.mean()
+            ret_std = ret_t.std()
+            if ret_std > 1e-8:
+                ret_t = (ret_t - ret_mean) / (ret_std + 1e-8)
+
         if self.normalize_advantages and T > 1:
             adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
@@ -690,6 +756,10 @@ class PPOAgent:
         # Apply HAPPO advantage weighting
         if advantage_weights is not None:
             weighted_adv = adv_t * advantage_weights.to(self.device)
+            # HAPPO weighted-advantage re-normalization
+            w_std = weighted_adv.std()
+            if w_std > 1e-6:
+                weighted_adv = (weighted_adv - weighted_adv.mean()) / (w_std + 1e-8)
         else:
             weighted_adv = adv_t
 
@@ -709,7 +779,7 @@ class PPOAgent:
                 mb = idx[start:end]
 
                 v_pred = self.value_net(critic_input[mb])
-                value_loss = nn.MSELoss()(v_pred, ret_t[mb])
+                value_loss = self._critic_loss(v_pred, ret_t[mb])
 
                 if actor_update:
                     auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
@@ -763,7 +833,7 @@ class PPOAgent:
                 if not torch.isfinite(critic_loss_total):
                     continue
                 self.critic_optimizer.zero_grad()
-                critic_loss_total.backward(retain_graph=(actor_loss_total is not None))
+                critic_loss_total.backward()
                 nn.utils.clip_grad_norm_(
                     list(self.value_net.parameters()), self.max_grad_norm)
                 bad_crit = any(

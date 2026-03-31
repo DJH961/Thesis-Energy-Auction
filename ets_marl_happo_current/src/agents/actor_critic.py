@@ -192,25 +192,30 @@ class SecondaryPolicy(nn.Module):
 
 
 class ValueNetwork(nn.Module):
-    """V(s) for PPO. Two hidden layers: input→hidden_size→ReLU→hidden2→ReLU→1.
-    hidden2 defaults to hidden_size//2 (e.g. 512→256→1)."""
+    """V(s) for PPO. Three hidden layers with LayerNorm:
+    input→hidden_size→ReLU→LayerNorm→hidden2→ReLU→hidden3→ReLU→1.
+    hidden2 = hidden_size//2, hidden3 = max(hidden_size//4, 32)."""
 
     def __init__(self, obs_dim, hidden_size):
         super().__init__()
         hidden2 = max(hidden_size // 2, 64)
+        hidden3 = max(hidden_size // 4, 32)
         self.fc1 = nn.Linear(obs_dim, hidden_size)
+        self.ln1 = nn.LayerNorm(hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden2)
-        self.fc3 = nn.Linear(hidden2, 1)
+        self.fc3 = nn.Linear(hidden2, hidden3)
+        self.fc4 = nn.Linear(hidden3, 1)
         self._init_weights()
 
     def forward(self, obs):
-        x = F.relu(self.fc1(obs))
+        x = F.relu(self.ln1(self.fc1(obs)))
         x = F.relu(self.fc2(x))
-        return self.fc3(x)
+        x = F.relu(self.fc3(x))
+        return self.fc4(x)
 
     def _init_weights(self):
-        for layer in [self.fc1, self.fc2]:
+        for layer in [self.fc1, self.fc2, self.fc3]:
             nn.init.orthogonal_(layer.weight, gain=2**0.5)
             nn.init.zeros_(layer.bias)
-        nn.init.orthogonal_(self.fc3.weight, gain=1.0)
-        nn.init.zeros_(self.fc3.bias)
+        nn.init.orthogonal_(self.fc4.weight, gain=1.0)
+        nn.init.zeros_(self.fc4.bias)
