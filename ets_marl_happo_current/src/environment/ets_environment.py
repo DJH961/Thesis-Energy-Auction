@@ -528,8 +528,10 @@ class ETSEnvironment(gym.Env):
         cap_t = self.cap_schedule.get_cap(year)
         tnac = float(self.holdings.sum())
         price_max = float(self.config["auction"]["price_max"])
+        # Get current penalty rate for MSR price-responsive triggers
+        penalty_rate = self._inflation_factor(year) * self.config["penalty"]["rate"]
         base_auction_volume = self.cap_schedule.get_auction_volume(
-            year, tnac, self.last_clearing_price, price_max
+            year, tnac, self.last_clearing_price, price_max, penalty_rate
         )
         auction_volume = base_auction_volume
         log["cap"] = cap_t

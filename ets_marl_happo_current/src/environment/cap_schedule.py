@@ -45,6 +45,11 @@ class CapSchedule:
         self.price_release_trigger = msr.get("price_release_trigger", 0.85)
         self.emergency_release_amount = msr.get("emergency_release_amount", 0.50)
 
+        # Absolute price thresholds (EUR/t) as alternative to ratio-based triggers
+        # These provide more stable MSR behavior when penalty rates vary
+        self.price_containment_absolute = msr.get("price_containment_absolute", 200.0)
+        self.price_release_absolute = msr.get("price_release_absolute", 300.0)
+
         # Internal MSR reserve (starts empty)
         self._msr_reserve = 0.0
 
@@ -79,7 +84,8 @@ class CapSchedule:
 
     def get_auction_volume(self, year: int, tnac: float,
                           clearing_price: float = 0.0,
-                          price_max: float = 120.0) -> float:
+                          price_max: float = 120.0,
+                          penalty_rate: float = 0.0) -> float:
         """
         Return the actual volume put to auction after MSR adjustments.
 
@@ -94,6 +100,9 @@ class CapSchedule:
             MSR triggers that prevent procyclical supply withdrawal.
         price_max : float
             Maximum auction price (EUR/t). Used to compute price_ratio.
+        penalty_rate : float
+            Current non-compliance penalty rate (EUR/t). If provided and > 0,
+            used as reference for price-responsive triggers instead of price_max.
 
         Returns
         -------
@@ -105,7 +114,7 @@ class CapSchedule:
 
         if self.msr_enabled:
             auction_vol = self._apply_msr(auction_vol, tnac,
-                                          clearing_price, price_max)
+                                          clearing_price, price_max, penalty_rate)
 
         # Safety floor: no EU ETS equivalent but the Auctioning Regulation
         # (2023/2830) guarantees member state minimum volumes.
@@ -154,7 +163,8 @@ class CapSchedule:
 
     def _apply_msr(self, auction_vol: float, tnac: float,
                    clearing_price: float = 0.0,
-                   price_max: float = 120.0) -> float:
+                   price_max: float = 120.0,
+                   penalty_rate: float = 0.0) -> float:
         """
         Apply MSR rules to the auction volume.
 
@@ -169,6 +179,10 @@ class CapSchedule:
              previous year's auction volume are permanently cancelled. In this
              micro-ETS, cancellation rarely triggers due to short episodes and
              moderate TNAC, but is included for regulatory completeness.
+
+        If penalty_rate is provided (> 0), it is used as the reference for
+        price-responsive triggers instead of price_max. Otherwise, falls back
+        to absolute thresholds (price_containment_absolute, price_release_absolute).
         """
         # MSR cancellation: cancel holdings exceeding previous year's auction volume
         # This implements the EU ETS post-2023 reform where excess MSR holdings
@@ -178,17 +192,36 @@ class CapSchedule:
         self._msr_reserve -= excess
         self._total_cancelled += excess
 
-        price_ratio = clearing_price / max(price_max, 1.0)
+        # Determine reference price for triggers
+        if penalty_rate > 0:
+            # Use penalty rate as reference (more stable than price_max)
+            reference_price = penalty_rate
+        else:
+            # Fall back to price_max
+            reference_price = max(price_max, 1.0)
 
+        # Compute price ratio or use absolute thresholds
         # P9: Emergency release when prices approach ceiling
-        if price_ratio >= self.price_release_trigger:
+        if clearing_price >= self.price_release_absolute:
+            release = min(self.emergency_release_amount, self._msr_reserve)
+            self._msr_reserve -= release
+            auction_vol += release
+            return auction_vol
+        elif clearing_price >= reference_price * self.price_release_trigger:
             release = min(self.emergency_release_amount, self._msr_reserve)
             self._msr_reserve -= release
             auction_vol += release
             return auction_vol
 
         # P9: Suppress withdrawal when prices are already elevated
-        if price_ratio >= self.price_containment_trigger:
+        if clearing_price >= self.price_containment_absolute:
+            # No withdrawal even if TNAC > upper; only release if TNAC < lower
+            if tnac < self.tnac_lower:
+                release = min(self.release_amount, self._msr_reserve)
+                self._msr_reserve -= release
+                auction_vol += release
+            return auction_vol
+        elif clearing_price >= reference_price * self.price_containment_trigger:
             # No withdrawal even if TNAC > upper; only release if TNAC < lower
             if tnac < self.tnac_lower:
                 release = min(self.release_amount, self._msr_reserve)
