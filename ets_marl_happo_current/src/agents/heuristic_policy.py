@@ -31,10 +31,12 @@ auction_action (fundamentals-based):
     - market_anchor = max(mac_cost, price_ma3)
     - bid_price = market_anchor + urgency * (penalty_rate - market_anchor)
         where urgency = max(0.0, 1.0 - coverage_ratio / 1.5).
+        If supply is restricted (auction_volume/cap_t < 0.8), urgency is
+        boosted by max(0, 1 - supply_ratio) * 0.3.
         Covered agents bid near market anchor, desperate agents bid near penalty.
     - bid_price ceiling before clip: 1.8 * penalty_rate.
     - qty_mult: target-bank logic.
-        target_bank = annual_need * min(remaining_years, 2) * 0.3
+        target_bank = annual_need * min(remaining_years, 2) * 0.5
         qty_mult = clip((annual_need - bank + target_bank) / annual_need, low, high)
     - invest_frac: NPV-gated (properly discounted).
         annuity_factor = (1 - (1 + r)^-horizon) / r  where r = discount_rate
@@ -73,6 +75,8 @@ def auction_action(
     bank: float = 0.0,
     reserve_price: float = None,
     inflation_factor: float = None,
+    auction_volume: float = None,
+    cap_t: float = None,
 ) -> np.ndarray:
     """
     Heuristic Phase-1 (auction + investment) action.
@@ -93,6 +97,10 @@ def auction_action(
         Dynamic reserve price override.
     inflation_factor : float, optional
         Cumulative inflation factor override.
+    auction_volume : float, optional
+        Current auction supply (Mt) before clearing.
+    cap_t : float, optional
+        Current annual cap (Mt). Used with auction_volume for supply ratio.
 
     Returns
     -------
@@ -122,6 +130,12 @@ def auction_action(
     # --- Bid price (fundamentals-based: MAC→penalty gradient) ---
     mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
     urgency = max(0.0, 1.0 - coverage_ratio / 1.5)
+    urgency_boost = 0.0
+    if auction_volume is not None and cap_t is not None and cap_t > 0:
+        supply_ratio = float(auction_volume) / max(float(cap_t), 1e-6)
+        if supply_ratio < 0.8:
+            urgency_boost = max(0.0, 1.0 - supply_ratio) * 0.3
+    urgency = min(1.0, urgency + urgency_boost)
     market_anchor = max(mac_cost, price_ma3)
     bid_price = market_anchor + urgency * (penalty_rate - market_anchor)
     bid_price = min(bid_price, 1.8 * penalty_rate)
@@ -132,7 +146,7 @@ def auction_action(
 
     # --- Quantity multiplier (target-bank logic) ---
     remaining_years = max(1, n_years - current_year)
-    target_bank = annual_need * min(remaining_years, 2) * 0.3
+    target_bank = annual_need * min(remaining_years, 2) * 0.5
     qty_mult = (annual_need - bank + target_bank) / max(annual_need, 0.1)
     qty_mult = float(np.clip(
         qty_mult, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0),

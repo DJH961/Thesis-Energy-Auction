@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v6.0
+# ETS MARL — Configuration v6.2
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -49,10 +49,14 @@ ets:
 
   msr:
     enabled: true
-    tnac_upper: 28.0     # Raised from 48.0 — tighter scarcity threshold
+    tnac_upper: 28.0     # Calibration: sits between expected Y2 TNAC (~30 Mt)
+               # and post-spend-down Y4 TNAC (~24 Mt) in baseline runs
     tnac_lower: 14.0     # Raised from 20.0 — earlier release trigger
     withhold_rate: 0.24
     release_amount: 0.80
+    activation_year: 2   # MSR begins Year 2; mirrors EU ETS lagged TNAC observation
+                         # (Decision 2015/1814 Art 1(5))
+    msr_activation_year: 2  # Backward-compatible alias used by some analysis scripts
     price_containment_trigger: 0.70   # at 70% of price_max, suppress MSR withdrawal
     price_release_trigger: 0.85       # at 85% of price_max, force emergency release
     emergency_release_amount: 0.90    # Mt released per year in emergency
@@ -206,7 +210,7 @@ penalty:
 # NOT the auction floor — that is ets.reserve_price.
 # ----------------------------------------------------------
 price:
-  initial_expected: 80.0
+  initial_expected: 55.0
   ar1_floor: 65.0          # mean-reversion floor for AR(1) price simulation
   burnin_std: 10.0         # warm-start synthetic price history volatility
   ar1_persistence: 0.85
@@ -266,8 +270,8 @@ esg:
 
 # ----------------------------------------------------------
 # Opponent modeling — 5D public info per opponent.
-# obs_dim_phase1 = 23 + 5*(N_total-1) = 98 (for 16 agents)
-# obs_dim_phase2 = phase1 + 7 = 105
+# obs_dim_phase1 = 25 + 5*(N_total-1) = 100 (for 16 agents)
+# obs_dim_phase2 = phase1 + 7 = 107
 # ----------------------------------------------------------
 opponent_modeling:
   enabled: true
@@ -284,7 +288,7 @@ agent_cycling:
 # PPO / HAPPO
 # ----------------------------------------------------------
 ppo:
-  hidden_size: 256           # actor network width (obs: 98D phase1 / 105D phase2)
+  hidden_size: 256           # actor network width (obs: 100D phase1 / 107D phase2)
   lr: 0.0002
   gamma: 0.99
   gae_lambda: 0.97

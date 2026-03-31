@@ -32,6 +32,10 @@ class StateDiscretizer:
         3. compliance_gap    : obs[13] — auction_gap / 5              (surplus / balanced / deficit)
         4. carry_forward     : obs[20] — carry_forward / 5            (none / some / heavy)
 
+    Note: Phase-1 observation dims [23] and [24] were appended for
+    auction_volume_ratio and msr_reserve_norm. Existing indices used by
+    the discretizer (gap at 13 and carry-forward at 20) remain unchanged.
+
     Each feature is mapped to {0, 1, 2} via configurable bin edges.
     """
 

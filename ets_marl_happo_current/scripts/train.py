@@ -191,6 +191,8 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
         for _year in range(n_years):
             price_ma3 = env._compute_price_ma3()
             current_year = env.current_year
+            cap_t = env.cap_schedule.get_cap(current_year)
+            last_auction_volume = getattr(env, "_last_auction_volume", cap_t)
 
             auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
             for i in range(n_agents):
@@ -198,7 +200,10 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
                 h_auc = heuristic_policy.auction_action(
                     company, price_ma3, current_year, n_years, config,
                     bank=float(env.holdings[i]),
-                    reserve_price=env._compute_dynamic_reserve())
+                    reserve_price=env._compute_dynamic_reserve(),
+                    auction_volume=float(last_auction_volume),
+                    cap_t=float(cap_t),
+                )
                 auction_actions[i] = h_auc
 
                 auc_raw = _to_raw(h_auc, agents[i].auction_policy,
@@ -436,7 +441,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v6.0: MAC 48€ | Absolute-price secondary | ESG signal | Carry-forward{cf_str}")
+    print(f"v6.2: MAC 48€ | Absolute-price secondary | ESG signal | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(f"{'='*60}")
     _print_training_legend()

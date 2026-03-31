@@ -99,6 +99,7 @@ class ETSEnvironment(gym.Env):
         self._price_history: List[float] = []
         self.last_secondary_price = config["price"]["initial_expected"]
         self.last_secondary_volume = 0.0  # P8: track volume for phase1 obs
+        self._last_auction_volume = self.cap_schedule.get_cap(0)
         self._last_gaps = np.zeros(self.n_total)
         self.holdings = np.zeros(self.n_total)
         self.episode_done = False
@@ -293,6 +294,7 @@ class ETSEnvironment(gym.Env):
         self.expected_price = self.config["price"]["initial_expected"]
         self.last_secondary_price = self.config["price"]["initial_expected"]
         self.last_secondary_volume = 0.0
+        self._last_auction_volume = self.cap_schedule.get_cap(0)
         self._price_history = []
         self._last_gaps = np.zeros(self.n_total)
         self.holdings = np.zeros(self.n_total)
@@ -440,7 +442,8 @@ class ETSEnvironment(gym.Env):
     # Phase 1: Auction + Green Investment
     # ------------------------------------------------------------------
 
-    def _generate_bot_auction_actions(self) -> np.ndarray:
+    def _generate_bot_auction_actions(self, auction_volume: float = None,
+                                      cap_t: float = None) -> np.ndarray:
         """Generate Phase-1 actions for all bot agents using heuristic_policy."""
         if self.n_bots == 0:
             return np.zeros((0, 6), dtype=np.float32)
@@ -456,6 +459,8 @@ class ETSEnvironment(gym.Env):
                 bank=float(self.holdings[idx]),
                 reserve_price=reserve,
                 inflation_factor=infl_factor,
+                auction_volume=auction_volume,
+                cap_t=cap_t,
             )
         return actions
 
@@ -493,10 +498,6 @@ class ETSEnvironment(gym.Env):
         year_info : dict
         """
         assert not self.episode_done, "Episode done. Call reset()."
-
-        # Combine learning agent actions with bot actions
-        bot_auc = self._generate_bot_auction_actions()
-        auction_actions = np.concatenate([auction_actions, bot_auc], axis=0)
 
         year = self.current_year
         log = {"year": year}
@@ -537,6 +538,7 @@ class ETSEnvironment(gym.Env):
         log["cap"] = cap_t
         log["tnac"] = tnac
         log["auction_volume"] = auction_volume
+        self._last_auction_volume = float(auction_volume)
         log["unsold_rollover_in"] = round(self._unsold_rollover, 4)
 
         # MSR tracking: reserve level and cumulative cancellations
@@ -547,6 +549,14 @@ class ETSEnvironment(gym.Env):
         # Track MSR withholding/release this year (will be updated post-auction)
         log["msr_withhold_this_year"] = 0.0
         log["msr_release_this_year"] = 0.0
+
+        # Combine learning agent actions with bot actions after auction supply
+        # is known, so bot urgency can react to supply restrictions.
+        bot_auc = self._generate_bot_auction_actions(
+            auction_volume=auction_volume,
+            cap_t=cap_t,
+        )
+        auction_actions = np.concatenate([auction_actions, bot_auc], axis=0)
 
         # 4. P5: Generate correlated emission shocks
         # ε_it = ρ × η_t + √(1-ρ²) × ξ_it,  η_t ~ N(0,1),  ξ_it ~ N(0,1)
@@ -1177,7 +1187,7 @@ class ETSEnvironment(gym.Env):
                          mac_costs=None, precompliance_holdings=None,
                          old_carry_forward=None):
         """
-        Reward (HAPPO-compliant, v6.0):
+        Reward (HAPPO-compliant, v6.2):
             R_i = w_cost * (-cost_norm_ex_penalty) + w_green * (esg_scale * esg_raw)
                   + green_bonus + queue_bonus - penalty_norm
 
@@ -1189,7 +1199,7 @@ class ETSEnvironment(gym.Env):
           esg_raw:              saved-carbon-years formula before weighting
 
         Penalty is separated from cost and applied at full strength regardless of w_cost.
-        Terminal bonuses: bank /1000 + ESG terminal queue.
+        Terminal bonuses: log-scaled bank value /1000 + ESG terminal queue.
         """
         rewards = np.zeros(self.n_total)
         terminal_bank_values = np.zeros(self.n_total)
@@ -1291,9 +1301,14 @@ class ETSEnvironment(gym.Env):
             terminal_price = max(clearing_price, self.last_secondary_price, eff_penalty * 0.8)
 
             for i, company in enumerate(self.companies):
-                # Terminal bank value: banked allowances × terminal_price / 1000
+                # Diminishing-returns terminal bank valuation: log1p maps
+                # prudent hedging (~1yr need) to ~69% of linear value while
+                # excessive hoarding (3yr+) gets <50%, encouraging secondary
+                # market selling over speculative accumulation.
                 if terminal_bank:
-                    bank_value = self.holdings[i] * terminal_price / 1000.0
+                    annual_need = max(company.compute_estimate_need(), 0.1)
+                    ratio = self.holdings[i] / annual_need
+                    bank_value = np.log1p(ratio) * annual_need * terminal_price / 1000.0
                     rewards[i] += bank_value
                     terminal_bank_values[i] = bank_value
 
@@ -1340,7 +1355,7 @@ class ETSEnvironment(gym.Env):
 
     def _get_obs_phase1(self) -> np.ndarray:
         """Phase 1 observations for learning agents only.
-        Base: 23D. With opponent modeling: 23 + 5*(N_total-1) dims.
+        Base: 25D. With opponent modeling: 25 + 5*(N_total-1) dims.
         Opponent modeling includes ALL market participants (learning + bots).
         """
         cap_t = self.cap_schedule.get_cap(self.current_year)
@@ -1349,6 +1364,10 @@ class ETSEnvironment(gym.Env):
         # TNAC proxy: total banked allowances / cap (market-level scarcity signal)
         tnac = float(self.holdings.sum())
         tnac_proxy = tnac / max(cap_t, 1e-6)
+        last_auction_volume = (self._last_auction_volume
+                       if self._last_auction_volume > 0
+                       else cap_t)
+        msr_reserve = self.cap_schedule.msr_reserve()
 
         # Pre-compute 5D public info for ALL participants (learning + bots)
         if self._opponent_modeling and self.n_total > 1:
@@ -1386,6 +1405,8 @@ class ETSEnvironment(gym.Env):
                 last_secondary_volume=self.last_secondary_volume,
                 tnac_proxy=tnac_proxy,
                 effective_reserve=self._last_effective_reserve,
+                last_auction_volume=last_auction_volume,
+                msr_reserve=msr_reserve,
             )
             obs_list.append(obs_i)
 

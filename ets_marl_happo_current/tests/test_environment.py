@@ -388,14 +388,15 @@ def test_p7_price_history_seeded():
 # ---------------------------------------------------------------------------
 
 def test_p8_obs_dims():
-    """Phase 1 obs should be 23D base (+ 5*(N_total-1) opponent dims) with opponent modeling.
-    N_total = learning + bot agents. 23 = 22 previous dims + effective_reserve at [22]."""
+    """Phase 1 obs should be 25D base (+ 5*(N_total-1) opponent dims) with opponent modeling.
+    N_total = learning + bot agents. New dims append auction_volume_ratio [23]
+    and msr_reserve_norm [24]."""
     env = load_env()
     obs, _ = env.reset()
     n_agents = env.config["companies"]["n_agents"]
     n_total = n_agents + env.config["companies"].get("n_bot_agents", 0)
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
-    expected_p1 = 23 + (5 * (n_total - 1) if opp_enabled else 0)
+    expected_p1 = 25 + (5 * (n_total - 1) if opp_enabled else 0)
     expected_p2 = expected_p1 + 7  # +7: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
@@ -725,6 +726,14 @@ def test_successful_auction_updates_price_history():
     assert len(env._price_history) > history_len_before, (
         "Successful auction clearing price should be appended to _price_history"
     )
+
+
+def test_qlearning_state_discretizer_indices_stable():
+    """New Phase-1 dims are appended; gap/carry-forward indices remain unchanged."""
+    from src.agents.q_learning_agent import StateDiscretizer
+
+    assert StateDiscretizer._OBS_GAP == 13
+    assert StateDiscretizer._OBS_CF == 20
 
 
 # ---------------------------------------------------------------------------

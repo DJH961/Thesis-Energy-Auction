@@ -158,7 +158,7 @@ def test_green_bonus_with_investment():
 
 
 def test_terminal_bank_uses_1000_divisor():
-    """Terminal bank value should use /1000 divisor, not /100."""
+    """Terminal bank value should remain /1000-scaled under log terminal valuation."""
     config = load_config()
     config["reward"]["terminal_bank_value"] = True
     config["reward"]["terminal_queue_value"] = False
@@ -171,13 +171,85 @@ def test_terminal_bank_uses_1000_divisor():
     env.reset()
     # Run to final year with high qty to build up bank
     rewards, _ = _run_to_final_year(env, auction_price=80.0, qty_mult=1.5)
-    # Check the terminal bank values are scaled by /1000
+    # With log scaling, terminal value should stay below linear bank*price/1000,
+    # and far below an incorrect /100 scaling.
     for i in range(env.n_agents):
         if env.holdings[i] > 0.1:
-            # terminal_price is around 80-140, so bank_value = holdings * price / 1000
-            # With /100 it would be 10× larger
+            linear_upper = env.holdings[i] * 500 / 1000.0
+            assert env._last_terminal_bank_values[i] <= linear_upper + 1e-6
             assert env._last_terminal_bank_values[i] < env.holdings[i] * 500 / 100.0, (
                 f"Terminal bank value too large — likely using /100 instead of /1000")
+
+
+def test_terminal_bank_diminishing_returns():
+    """3x annual-need holdings should be worth less than 3x the 1x annual-need value."""
+    config = load_config()
+    config["reward"]["terminal_bank_value"] = True
+    config["reward"]["terminal_queue_value"] = False
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+    env.current_year = env.n_years - 1
+    env.last_secondary_price = 100.0
+
+    # Agents 0 and 1 share the same archetype, so annual_need is identical.
+    annual_need = max(env.companies[0].compute_estimate_need(), 0.1)
+    env.holdings[:] = 0.0
+    env.holdings[0] = annual_need
+    env.holdings[1] = 3.0 * annual_need
+
+    zeros = np.zeros(env.n_total)
+    env._compute_rewards(
+        payments=zeros,
+        trade_costs=zeros,
+        penalties=zeros,
+        invest_costs=zeros,
+        emissions=zeros,
+        clearing_price=100.0,
+        mac_costs=zeros,
+        precompliance_holdings=zeros,
+        old_carry_forward=zeros,
+    )
+
+    v1 = env._last_terminal_bank_values[0]
+    v3 = env._last_terminal_bank_values[1]
+    assert v3 > v1
+    assert v3 < 3.0 * v1
+
+
+def test_terminal_bank_zero_holdings():
+    """Zero holdings should produce zero terminal bank value."""
+    config = load_config()
+    config["reward"]["terminal_bank_value"] = True
+    config["reward"]["terminal_queue_value"] = False
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+    env.current_year = env.n_years - 1
+    env.holdings[:] = 0.0
+
+    zeros = np.zeros(env.n_total)
+    env._compute_rewards(
+        payments=zeros,
+        trade_costs=zeros,
+        penalties=zeros,
+        invest_costs=zeros,
+        emissions=zeros,
+        clearing_price=100.0,
+        mac_costs=zeros,
+        precompliance_holdings=zeros,
+        old_carry_forward=zeros,
+    )
+
+    assert env._last_terminal_bank_values.sum() == pytest.approx(0.0, abs=1e-9)
 
 
 def test_penalty_hits_budget():
@@ -324,7 +396,7 @@ class TestTerminalBankValue:
         np.testing.assert_allclose(rewards1, rewards2, atol=1e-6)
 
     def test_terminal_bank_value_proportional_to_holdings(self):
-        """Terminal bank value should be larger when agents hold more allowances."""
+        """Terminal bank value should increase with holdings (monotonic, not linear)."""
         config = load_config()
         config["reward"]["terminal_bank_value"] = True
         config["reward"]["terminal_queue_value"] = False
@@ -343,11 +415,11 @@ class TestTerminalBankValue:
         env_low.reset()
         rewards_low, _ = _run_to_final_year(env_low, auction_price=80.0, qty_mult=0.3)
 
-        # Higher quantity bidding should lead to >= terminal value
-        # (tolerance increased: with bot agents adding market demand, the delta is noisier)
-        assert rewards_high.sum() >= rewards_low.sum() - 3.0, (
-            f"Higher qty should lead to more banked allowances and higher terminal value: "
-            f"high={rewards_high.sum():.4f}, low={rewards_low.sum():.4f}")
+        total_bank_value_high = float(np.sum(env_high._last_terminal_bank_values))
+        total_bank_value_low = float(np.sum(env_low._last_terminal_bank_values))
+        assert total_bank_value_high >= total_bank_value_low - 1e-6, (
+            f"Higher holdings should yield at least as much terminal bank value: "
+            f"high={total_bank_value_high:.4f}, low={total_bank_value_low:.4f}")
 
 
 class TestTerminalQueueValue:

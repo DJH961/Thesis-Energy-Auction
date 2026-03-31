@@ -1,4 +1,4 @@
-# Design Document - ETS MARL (Current v6.1)
+# Design Document - ETS MARL (Current v6.2)
 
 ## 1. Scope and Purpose
 
@@ -53,6 +53,10 @@ $$
 MSR operates on auction volume (not cap) using TNAC proxy (sum of all banks):
 - If TNAC > upper threshold: withhold share of excess into reserve.
 - If TNAC < lower threshold: release fixed volume from reserve.
+- **Activation lag (policy realism):** MSR is inactive before `activation_year`
+  (default year 2). This mirrors the EU ETS lagged TNAC observation logic
+  (Decision 2015/1814, Art. 1(5)), avoiding immediate year-0 interventions
+  before any meaningful circulation signal exists.
 
 **Price-responsive safeguards (P9):**
 Current implementation includes price-responsive triggers to prevent procyclical supply withdrawal:
@@ -170,7 +174,7 @@ Participants can sell from current allocation plus bank (no short selling beyond
 
 ### 6.1 Phase 1 observation
 
-Base dimension: 23.
+Base dimension: 25.
 
 Includes:
 - time and cap
@@ -185,7 +189,7 @@ Includes:
 If opponent modeling is enabled:
 
 $$
-obsDimPhase1 = 23 + 5 (N_{total} - 1)
+obsDimPhase1 = 25 + 5 (N_{total} - 1)
 $$
 
 Each opponent contributes public 5D tuple:
@@ -196,7 +200,7 @@ Each opponent contributes public 5D tuple:
 - total queue size
 
 With 16 total participants:
-- phase 1 dimension = 98
+- phase 1 dimension = 100
 
 ### 6.2 Phase 2 observation
 
@@ -214,7 +218,7 @@ obsDimPhase2 = obsDimPhase1 + 7
 $$
 
 With 16 total participants:
-- phase 2 dimension = 105
+- phase 2 dimension = 107
 
 ## 7. Reward Design (Current)
 
@@ -239,8 +243,31 @@ This structure makes objective weights explicit:
   between financial and environmental reward channels (excluding transient shaping terms).
 
 Terminal values in final year (configurable):
-- bank terminal value (bank * terminal price)
+- bank terminal value with diminishing returns:
+
+$$
+V^{bank}_i = \log\left(1 + \frac{B_i}{\max(\hat{E}_i, 0.1)}\right)
+\cdot \hat{E}_i \cdot \frac{P_T}{1000}
+$$
+
+where $B_i$ is banked allowances, $\hat{E}_i$ is annual estimated need,
+and $P_T$ is the terminal price anchor.
+
+Thesis justification: this specification preserves monotonicity (more prudent
+banking still increases value) while imposing economically meaningful
+diminishing marginal value on very large stocks. A one-year hedge remains
+valuable, but speculative multi-year hoarding is discounted relative to a
+linear payoff, improving market realism by encouraging secondary-market release
+instead of end-horizon stockpile accumulation.
 - queue terminal value (discounted future emissions savings from queued projects)
+
+Policy-timing note for reward interpretation: the MSR activation lag (default
+year 2) is retained when reading early-episode rewards. This is intentional.
+It separates pre-observation market dynamics (years 0-1) from intervention
+dynamics (year 2 onward), matching the lagged TNAC governance logic in EU ETS.
+Thesis justification: this avoids attributing early reward effects to policy
+channels that would not yet be active in the real system, improving causal
+validity when comparing emergent strategy shifts before and after MSR onset.
 
 Terminal price anchor uses max of:
 - auction clearing

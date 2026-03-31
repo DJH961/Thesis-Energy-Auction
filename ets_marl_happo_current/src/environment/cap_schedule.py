@@ -32,11 +32,15 @@ class CapSchedule:
 
         msr = ets_cfg["msr"]
         self.msr_enabled = msr["enabled"]
+        # Threshold calibration rationale: tnac_upper set to ~60% of annual
+        # system emissions, consistent with EU ETS 833 Mt threshold relative
+        # to ~1.4 Gt annual emissions (Decision 2015/1814).
         self.tnac_upper = msr["tnac_upper"]               # Mt
         self.tnac_lower = msr["tnac_lower"]               # Mt
         self.withhold_rate = msr["withhold_rate"]         # fraction
         self.release_amount = msr["release_amount"]       # Mt/year
         self.min_auction_frac = msr.get("min_auction_frac", 0.10)
+        self.msr_activation_year = msr.get("activation_year", msr.get("msr_activation_year", 2))
 
         self.reserve_price = ets_cfg.get("reserve_price", 0.0)
 
@@ -113,7 +117,7 @@ class CapSchedule:
         auction_vol = cap_t  # baseline: 100% auctioning
 
         if self.msr_enabled:
-            auction_vol = self._apply_msr(auction_vol, tnac,
+            auction_vol = self._apply_msr(year, auction_vol, tnac,
                                           clearing_price, price_max, penalty_rate)
 
         # Safety floor: no EU ETS equivalent but the Auctioning Regulation
@@ -161,7 +165,7 @@ class CapSchedule:
     # Internal MSR logic
     # ------------------------------------------------------------------
 
-    def _apply_msr(self, auction_vol: float, tnac: float,
+    def _apply_msr(self, year: int, auction_vol: float, tnac: float,
                    clearing_price: float = 0.0,
                    price_max: float = 120.0,
                    penalty_rate: float = 0.0) -> float:
@@ -169,6 +173,8 @@ class CapSchedule:
         Apply MSR rules to the auction volume.
 
         Rules (scaled from EU ETS + P9 price-responsive triggers):
+             0. Before activation_year, MSR is inactive (no cancellation,
+                 withholding, release, or price-triggered intervention).
           1. If price >= release_trigger × price_max: emergency release from
              reserve (breaks procyclical loop where high prices + high TNAC
              cause further supply withdrawal).
@@ -184,6 +190,9 @@ class CapSchedule:
         price-responsive triggers instead of price_max. Otherwise, falls back
         to absolute thresholds (price_containment_absolute, price_release_absolute).
         """
+        if year < self.msr_activation_year:
+            return auction_vol  # MSR inactive during observation period
+
         # MSR cancellation: cancel holdings exceeding previous year's auction volume
         # This implements the EU ETS post-2023 reform where excess MSR holdings
         # are permanently removed from the system.
