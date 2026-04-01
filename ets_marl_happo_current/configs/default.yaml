@@ -56,12 +56,8 @@ ets:
     release_amount: 0.80
     activation_year: 2   # MSR begins Year 2; mirrors EU ETS lagged TNAC observation
                          # (Decision 2015/1814 Art 1(5))
-    msr_activation_year: 2  # Backward-compatible alias used by some analysis scripts
     price_containment_absolute: 350   # hard fallback for containment trigger (EUR/t)
     price_release_absolute: 450       # hard fallback for release trigger (EUR/t)
-    # Legacy ratio-based triggers (deprecated in v6.2 — replaced by dynamic absolute thresholds)
-    price_containment_trigger: 0.70   # deprecated: at 70% of price_max
-    price_release_trigger: 0.85       # deprecated: at 85% of price_max
     emergency_release_amount: 0.90    # Mt released per year in emergency
     min_auction_frac: 0.10            # safety floor for minimum auction volume
 
@@ -216,7 +212,6 @@ penalty:
   rate: 138.75                     # EUR/tCO2 base in 2026 (132.06 in 2024 indexed by 2.5% for 2 years)
   inflation_rate: 0.020            # μ = 2.0% annual inflation (historical average)
   inflation_random_std: 0.015      # σ = 1.5%-pt annual inflation volatility (normal sampling)
-  inflation_random_window: 0.0     # legacy fallback (uniform ±window) if inflation_random_std = 0
   carry_forward: true
   carry_forward_cap: 1.0           # max carry-forward as multiple of base annual emissions
 

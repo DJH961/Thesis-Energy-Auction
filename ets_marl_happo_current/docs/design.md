@@ -1,22 +1,20 @@
-# Design Document - ETS MARL (Current v6.2)
+# Design Document — ETS MARL
 
-## Version 6.2 Key Changes
+## Overview
 
-This version introduces several critical improvements:
+This document describes the **ETS MARL** simulation: a stylised multi-agent reinforcement-learning model of the EU Emissions Trading System (EU ETS). It is intended as a self-contained reference for new readers — no prior knowledge of the codebase is assumed.
 
-1. **Bot Stochastic Valuation**: Per-bot persistent noise and urgency multipliers sampled at episode start create more realistic market heterogeneity. Bots now have differentiated urgency denominators (1.3 vs 1.7) to create distinct behavior patterns within archetype pairs.
+**What the project models:** A simplified carbon allowance market in which energy companies bid for emission permits, invest in cleaner technology, trade allowances between themselves, and learn bidding and investment strategies over thousands of simulated years.
 
-2. **MSR Price-Containment Fix**: Dynamic absolute thresholds based on inflation-adjusted penalty rates (containment at 1.8×, release at 2.5× effective penalty) replace problematic ratio-based triggers. This ensures MSR withdraws allowances at moderate prices (~170-200 EUR/t) as intended, preventing the always-below-clearing threshold bug.
+**Why it exists:** To study emergent market behaviour (pricing dynamics, banking incentives, green-investment timing) under regulatory mechanisms (cap trajectory, Market Stability Reserve) using modern multi-agent RL.
 
-3. **Terminal Bank Value Cap**: Effective bank capped at min(holdings, 2.0 × annual_need) before terminal valuation. Holdings beyond 2-year reserves get zero additional credit, making secondary selling rational.
+**Who participates:** 16 market participants — 8 learning agents trained with PPO/HAPPO and 8 heuristic rule-based bots. Agents span four archetypes (coal-heavy, gas-dominant, transitioner, green-leader), each paired into one financially-motivated and one ESG-balanced company.
 
-4. **Secondary Revenue as Budget Credit**: Negative secondary_cost (revenue from selling) now reduces budget spending, freeing headroom for investment.
+**How an episode works:** Each episode simulates 12 years. Every year, participants bid in a sealed-bid uniform-price auction for CO2 allowances, then trade in a bilateral secondary market, and choose how much to invest in renewable capacity. Penalties fall on those without enough allowances to cover emissions. The government cap shrinks by ~4.3–4.4 % annually, creating increasing scarcity that forces decarbonisation.
 
-5. **Permanent Efficiency Bonus**: Cost-efficiency improvement bonus (0.3 × ef_improvement_ratio × time_weight × price_weight) applies to ALL agents regardless of w_green, giving coal agents a gradient for early investment.
+**Learning objective:** Learning agents maximise a reward signal combining net financial cost (after compliance, trading, investment, and operations) with an optional ESG component (saved-carbon-years). Over 70,000 episodes, agents converge on market strategies.
 
-6. **Value Function Clipping**: PPO critic loss now implements value clipping (v_pred clamped to old_values ± clip_eps) when clip_value=true, stabilizing training.
-
-7. **Config Updates**: carry_forward_cap reduced from 2.0 to 1.0 for tighter debt control; clip_value enabled by default.
+---
 
 ## 1. Scope and Purpose
 
