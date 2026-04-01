@@ -70,7 +70,7 @@ Every year, each AI agent makes **6 decisions** (Phase 1) plus **2 more** (Phase
 
 **Phase 1 — Auction & Investment:**
 - **Bid price**: How much to offer per allowance (€/tonne, range: 5-500)
-- **Bid quantity**: Coverage multiplier on estimated annual need (0.3-1.3x)
+- **Bid quantity**: Coverage multiplier on estimated annual need (0.3-2.0x)
 - **Investment fraction**: What share of capacity to convert to green (0-20%, subject to capex throughput cap)
 - **Technology choice**: Where to invest — onshore wind (4yr delay), offshore wind (7yr delay), or solar (2yr delay)
 
