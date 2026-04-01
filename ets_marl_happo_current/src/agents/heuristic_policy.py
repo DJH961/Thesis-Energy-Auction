@@ -77,6 +77,9 @@ def auction_action(
     inflation_factor: float = None,
     auction_volume: float = None,
     cap_t: float = None,
+    valuation_noise: float = 0.0,
+    urgency_multiplier: float = 1.0,
+    urgency_denom: float = 1.5,
 ) -> np.ndarray:
     """
     Heuristic Phase-1 (auction + investment) action.
@@ -101,6 +104,12 @@ def auction_action(
         Current auction supply (Mt) before clearing.
     cap_t : float, optional
         Current annual cap (Mt). Used with auction_volume for supply ratio.
+    valuation_noise : float, optional
+        Per-bot persistent valuation noise (EUR/t), added to market_anchor. Default: 0.0.
+    urgency_multiplier : float, optional
+        Per-bot persistent urgency multiplier. Default: 1.0.
+    urgency_denom : float, optional
+        Urgency denominator (replaces hardcoded 1.5 in coverage_ratio / 1.5). Default: 1.5.
 
     Returns
     -------
@@ -129,14 +138,14 @@ def auction_action(
 
     # --- Bid price (fundamentals-based: MAC→penalty gradient) ---
     mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
-    urgency = max(0.0, 1.0 - coverage_ratio / 1.5)
+    urgency = max(0.0, 1.0 - coverage_ratio / urgency_denom)
     urgency_boost = 0.0
     if auction_volume is not None and cap_t is not None and cap_t > 0:
         supply_ratio = float(auction_volume) / max(float(cap_t), 1e-6)
         if supply_ratio < 0.8:
             urgency_boost = max(0.0, 1.0 - supply_ratio) * 0.3
-    urgency = min(1.0, urgency + urgency_boost)
-    market_anchor = max(mac_cost, price_ma3)
+    urgency = min(1.0, (urgency + urgency_boost) * urgency_multiplier)
+    market_anchor = max(mac_cost, price_ma3) + valuation_noise
     bid_price = market_anchor + urgency * (penalty_rate - market_anchor)
     bid_price = min(bid_price, 1.8 * penalty_rate)
     bid_price = float(np.clip(
@@ -241,6 +250,9 @@ def secondary_action(
     config: dict,
     current_year: int = 0,
     n_years: int = 12,
+    valuation_noise: float = 0.0,
+    urgency_multiplier: float = 1.0,
+    urgency_denom: float = 1.5,
 ) -> np.ndarray:
     """
     Heuristic Phase-2 (secondary market) action.
@@ -261,6 +273,12 @@ def secondary_action(
         Current year index (0-based).
     n_years : int
         Total episode length.
+    valuation_noise : float, optional
+        Per-bot persistent valuation noise (EUR/t), added to market_anchor. Default: 0.0.
+    urgency_multiplier : float, optional
+        Per-bot persistent urgency multiplier. Default: 1.0.
+    urgency_denom : float, optional
+        Urgency denominator (replaces hardcoded 1.5 in coverage_ratio / 1.5). Default: 1.5.
 
     Returns
     -------
@@ -292,8 +310,8 @@ def secondary_action(
 
     # Coverage ratio for urgency
     coverage_ratio = max((bank + allocation) / need, 0.0)
-    urgency = max(0.0, 1.0 - coverage_ratio / 1.5)
-    market_anchor = max(mac_cost, clearing_price)
+    urgency = max(0.0, (1.0 - coverage_ratio / urgency_denom) * urgency_multiplier)
+    market_anchor = max(mac_cost, clearing_price) + valuation_noise
 
     severity = abs(trade_target) / max(need, 0.1)  # normalized severity
 

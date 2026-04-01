@@ -89,7 +89,8 @@ class CapSchedule:
     def get_auction_volume(self, year: int, tnac: float,
                           clearing_price: float = 0.0,
                           price_max: float = 120.0,
-                          penalty_rate: float = 0.0) -> float:
+                          penalty_rate: float = 0.0,
+                          inflation_rate: float = 0.0) -> float:
         """
         Return the actual volume put to auction after MSR adjustments.
 
@@ -105,8 +106,12 @@ class CapSchedule:
         price_max : float
             Maximum auction price (EUR/t). Used to compute price_ratio.
         penalty_rate : float
-            Current non-compliance penalty rate (EUR/t). If provided and > 0,
-            used as reference for price-responsive triggers instead of price_max.
+            Base non-compliance penalty rate (EUR/t) at year 0. This should
+            be the base rate from config (not inflation-adjusted). The MSR
+            logic computes the inflation-adjusted rate internally.
+        inflation_rate : float
+            Annual inflation rate (e.g., 0.020 for 2%). Used to compute
+            the inflation-adjusted penalty rate.
 
         Returns
         -------
@@ -118,7 +123,8 @@ class CapSchedule:
 
         if self.msr_enabled:
             auction_vol = self._apply_msr(year, auction_vol, tnac,
-                                          clearing_price, price_max, penalty_rate)
+                                          clearing_price, price_max,
+                                          penalty_rate, inflation_rate)
 
         # Safety floor: no EU ETS equivalent but the Auctioning Regulation
         # (2023/2830) guarantees member state minimum volumes.
@@ -168,17 +174,18 @@ class CapSchedule:
     def _apply_msr(self, year: int, auction_vol: float, tnac: float,
                    clearing_price: float = 0.0,
                    price_max: float = 120.0,
-                   penalty_rate: float = 0.0) -> float:
+                   penalty_rate: float = 0.0,
+                   inflation_rate: float = 0.0) -> float:
         """
         Apply MSR rules to the auction volume.
 
         Rules (scaled from EU ETS + P9 price-responsive triggers):
              0. Before activation_year, MSR is inactive (no cancellation,
                  withholding, release, or price-triggered intervention).
-          1. If price >= release_trigger × price_max: emergency release from
+          1. If price >= release_threshold: emergency release from
              reserve (breaks procyclical loop where high prices + high TNAC
              cause further supply withdrawal).
-          2. If price >= containment_trigger × price_max: suppress normal
+          2. If price >= containment_threshold: suppress normal
              withdrawal even if TNAC > upper threshold.
           3. Normal TNAC-based rules otherwise.
           4. MSR cancellation: Per EU ETS Directive post-2023: MSR holdings above
@@ -186,9 +193,28 @@ class CapSchedule:
              micro-ETS, cancellation rarely triggers due to short episodes and
              moderate TNAC, but is included for regulatory completeness.
 
-        If penalty_rate is provided (> 0), it is used as the reference for
-        price-responsive triggers instead of price_max. Otherwise, falls back
-        to absolute thresholds (price_containment_absolute, price_release_absolute).
+        Parameters
+        ----------
+        year : int
+            Current simulation year (0-indexed).
+        auction_vol : float
+            Baseline auction volume before MSR adjustments (Mt).
+        tnac : float
+            Total Number of Allowances in Circulation (Mt).
+        clearing_price : float
+            Last auction clearing price (EUR/t).
+        price_max : float
+            Maximum auction price (EUR/t).
+        penalty_rate : float
+            Base penalty rate at year 0 (EUR/t). This is the base rate from
+            config, not inflation-adjusted.
+        inflation_rate : float
+            Annual inflation rate (e.g., 0.020 for 2%).
+
+        Returns
+        -------
+        float
+            Adjusted auction volume after MSR interventions (Mt).
         """
         if year < self.msr_activation_year:
             return auction_vol  # MSR inactive during observation period
@@ -201,41 +227,42 @@ class CapSchedule:
         self._msr_reserve -= excess
         self._total_cancelled += excess
 
-        # Determine reference price for triggers
-        if penalty_rate > 0:
-            # Use penalty rate as reference (more stable than price_max)
-            reference_price = penalty_rate
+        # Compute inflation-adjusted penalty rate (effective penalty at this year)
+        if penalty_rate > 0 and inflation_rate >= 0:
+            eff_penalty = penalty_rate * ((1.0 + inflation_rate) ** year)
         else:
-            # Fall back to price_max
-            reference_price = max(price_max, 1.0)
+            eff_penalty = penalty_rate if penalty_rate > 0 else 138.75  # fallback base rate
 
-        # Compute price ratio or use absolute thresholds
+        # Dynamic absolute thresholds based on inflation-adjusted penalty
+        # Containment threshold: ~1.8× effective penalty (~250 EUR/t at year 0, rising with inflation)
+        # Release threshold: ~2.5× effective penalty (~347 EUR/t at year 0), hard ceiling 450 EUR/t
+        containment_threshold = eff_penalty * 1.8
+        release_threshold = min(eff_penalty * 2.5, 450.0)
+
         # P9: Emergency release when prices approach ceiling
-        if clearing_price >= self.price_release_absolute:
+        if clearing_price >= release_threshold:
             release = min(self.emergency_release_amount, self._msr_reserve)
             self._msr_reserve -= release
             auction_vol += release
-            return auction_vol
-        elif clearing_price >= reference_price * self.price_release_trigger:
-            release = min(self.emergency_release_amount, self._msr_reserve)
-            self._msr_reserve -= release
-            auction_vol += release
+            print(f"[MSR] Year {year}: Emergency release triggered "
+                  f"(clearing={clearing_price:.1f} >= threshold={release_threshold:.1f}, "
+                  f"eff_penalty={eff_penalty:.1f}, TNAC={tnac:.1f}, release={release:.2f} Mt)")
             return auction_vol
 
         # P9: Suppress withdrawal when prices are already elevated
-        if clearing_price >= self.price_containment_absolute:
+        if clearing_price >= containment_threshold:
             # No withdrawal even if TNAC > upper; only release if TNAC < lower
             if tnac < self.tnac_lower:
                 release = min(self.release_amount, self._msr_reserve)
                 self._msr_reserve -= release
                 auction_vol += release
-            return auction_vol
-        elif clearing_price >= reference_price * self.price_containment_trigger:
-            # No withdrawal even if TNAC > upper; only release if TNAC < lower
-            if tnac < self.tnac_lower:
-                release = min(self.release_amount, self._msr_reserve)
-                self._msr_reserve -= release
-                auction_vol += release
+                print(f"[MSR] Year {year}: Containment release "
+                      f"(clearing={clearing_price:.1f} >= threshold={containment_threshold:.1f}, "
+                      f"eff_penalty={eff_penalty:.1f}, TNAC={tnac:.1f}, release={release:.2f} Mt)")
+            else:
+                print(f"[MSR] Year {year}: Withdrawal suppressed by containment trigger "
+                      f"(clearing={clearing_price:.1f} >= threshold={containment_threshold:.1f}, "
+                      f"eff_penalty={eff_penalty:.1f}, TNAC={tnac:.1f})")
             return auction_vol
 
         # Normal MSR logic
