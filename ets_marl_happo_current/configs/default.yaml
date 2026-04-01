@@ -56,9 +56,8 @@ ets:
     release_amount: 0.80
     activation_year: 2   # MSR begins Year 2; mirrors EU ETS lagged TNAC observation
                          # (Decision 2015/1814 Art 1(5))
-    msr_activation_year: 2  # Backward-compatible alias used by some analysis scripts
-    price_containment_trigger: 0.70   # at 70% of price_max, suppress MSR withdrawal
-    price_release_trigger: 0.85       # at 85% of price_max, force emergency release
+    price_containment_absolute: 350   # hard fallback for containment trigger (EUR/t)
+    price_release_absolute: 450       # hard fallback for release trigger (EUR/t)
     emergency_release_amount: 0.90    # Mt released per year in emergency
     min_auction_frac: 0.10            # safety floor for minimum auction volume
 
@@ -192,6 +191,19 @@ budget:
   capex_overspend_coef: 1.0
 
 # ----------------------------------------------------------
+# Bot stochastic valuation & differentiation
+# Per-bot persistent noise/multipliers sampled at episode start.
+# urgency_denominators: controls the /1.5 in coverage_ratio / 1.5.
+# ----------------------------------------------------------
+bots:
+  valuation_noise_std: 5.0         # σ for N(0, σ) valuation noise (EUR/t)
+  urgency_mult_low: 0.8            # lower bound for uniform urgency multiplier
+  urgency_mult_high: 1.2           # upper bound for uniform urgency multiplier
+  # Per-bot urgency denominators: B1=1.3, B2=1.7, B3=1.3, B4=1.7, B5=1.3, B6=1.7, B7=1.3, B8=1.7
+  # This differentiates bot pairs: even bots more urgent (1.3), odd bots less urgent (1.7)
+  urgency_denominators: [1.3, 1.7, 1.3, 1.7, 1.3, 1.7, 1.3, 1.7]
+
+# ----------------------------------------------------------
 # Non-compliance penalty & general inflation
 # inflation_rate applies economy-wide: penalty, CapEx, OpEx,
 # decommission costs, MAC switching cost, electricity base price.
@@ -200,9 +212,8 @@ penalty:
   rate: 138.75                     # EUR/tCO2 base in 2026 (132.06 in 2024 indexed by 2.5% for 2 years)
   inflation_rate: 0.020            # μ = 2.0% annual inflation (historical average)
   inflation_random_std: 0.015      # σ = 1.5%-pt annual inflation volatility (normal sampling)
-  inflation_random_window: 0.0     # legacy fallback (uniform ±window) if inflation_random_std = 0
   carry_forward: true
-  carry_forward_cap: 2.0           # max carry-forward as multiple of base annual emissions
+  carry_forward_cap: 1.0           # max carry-forward as multiple of base annual emissions
 
 # ----------------------------------------------------------
 # AR(1) expected price model
@@ -318,7 +329,7 @@ ppo:
   critic_extra_epochs: 5     # extra critic-only training epochs before main PPO loop
   critic_huber: true         # use Huber loss for critic instead of MSE
   critic_huber_delta: 10.0   # delta parameter for Huber loss
-  clip_value: false          # value function clipping (disabled)
+  clip_value: true           # value function clipping (enabled for v6.2)
   normalize_returns: true    # normalize returns before critic training
 
 # ----------------------------------------------------------

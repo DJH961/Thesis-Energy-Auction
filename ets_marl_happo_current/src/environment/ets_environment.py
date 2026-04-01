@@ -154,6 +154,10 @@ class ETSEnvironment(gym.Env):
         self._inflation_factors: List[float] = [1.0]
         self._build_episode_inflation_path()
 
+        # Per-bot persistent stochastic valuation parameters (sampled at episode start)
+        self._bot_valuation_noise = np.zeros(self.n_bots)  # EUR/t, added to market_anchor
+        self._bot_urgency_mult = np.ones(self.n_bots)  # multiplier on urgency
+
         # Opponent modeling (5D public info per opponent)
         opp_enabled = config.get("opponent_modeling", {}).get("enabled", False)
         self._opponent_modeling = opp_enabled
@@ -315,6 +319,16 @@ class ETSEnvironment(gym.Env):
         self._unsold_rollover = 0.0
         self._build_episode_inflation_path()
 
+        # Sample per-bot persistent noise at episode start
+        if self.n_bots > 0:
+            bot_cfg = self.config.get("bots", {})
+            noise_std = bot_cfg.get("valuation_noise_std", 5.0)
+            mult_low = bot_cfg.get("urgency_mult_low", 0.8)
+            mult_high = bot_cfg.get("urgency_mult_high", 1.2)
+            for b in range(self.n_bots):
+                self._bot_valuation_noise[b] = self.rng.normal(0, noise_std)
+                self._bot_urgency_mult[b] = self.rng.uniform(mult_low, mult_high)
+
         # Episode-level warning counters — reset each episode
         self._warnings = {
             "low_alloc": 0, "price_floor": 0, "price_ceil": 0,
@@ -450,9 +464,12 @@ class ETSEnvironment(gym.Env):
         price_ma3 = self._compute_price_ma3()
         reserve = self._compute_dynamic_reserve()
         infl_factor = self._inflation_factor(self.current_year)
+        bot_cfg = self.config.get("bots", {})
+        urgency_denoms = bot_cfg.get("urgency_denominators", [1.5] * self.n_bots)
         actions = np.zeros((self.n_bots, 6), dtype=np.float32)
         for b in range(self.n_bots):
             idx = self.n_agents + b  # bots indexed after learning agents
+            urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
             actions[b] = heuristic_policy.auction_action(
                 self.companies[idx], price_ma3, self.current_year,
                 self.n_years, self.config,
@@ -461,6 +478,9 @@ class ETSEnvironment(gym.Env):
                 inflation_factor=infl_factor,
                 auction_volume=auction_volume,
                 cap_t=cap_t,
+                valuation_noise=float(self._bot_valuation_noise[b]),
+                urgency_multiplier=float(self._bot_urgency_mult[b]),
+                urgency_denom=urgency_denom,
             )
         return actions
 
@@ -468,9 +488,12 @@ class ETSEnvironment(gym.Env):
         """Generate Phase-2 actions for all bot agents using heuristic_policy."""
         if self.n_bots == 0:
             return np.zeros((0, 2), dtype=np.float32)
+        bot_cfg = self.config.get("bots", {})
+        urgency_denoms = bot_cfg.get("urgency_denominators", [1.5] * self.n_bots)
         actions = np.zeros((self.n_bots, 2), dtype=np.float32)
         for b in range(self.n_bots):
             idx = self.n_agents + b  # bots indexed after learning agents
+            urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
             actions[b] = heuristic_policy.secondary_action(
                 self.companies[idx],
                 bank=float(self.holdings[idx]),
@@ -478,7 +501,11 @@ class ETSEnvironment(gym.Env):
                 clearing_price=clearing_price,
                 config=self.config,
                 current_year=self.current_year,
-                n_years=self.n_years)
+                n_years=self.n_years,
+                valuation_noise=float(self._bot_valuation_noise[b]),
+                urgency_multiplier=float(self._bot_urgency_mult[b]),
+                urgency_denom=urgency_denom,
+            )
         return actions
 
     def step_auction(self, auction_actions: np.ndarray):
@@ -529,10 +556,12 @@ class ETSEnvironment(gym.Env):
         cap_t = self.cap_schedule.get_cap(year)
         tnac = float(self.holdings.sum())
         price_max = float(self.config["auction"]["price_max"])
-        # Get current penalty rate for MSR price-responsive triggers
-        penalty_rate = self._inflation_factor(year) * self.config["penalty"]["rate"]
+        # Pass base penalty rate (not inflation-adjusted) and inflation rate to MSR
+        base_penalty_rate = float(self.config["penalty"]["rate"])
+        inflation_rate = float(self._inflation_rate(year))
         base_auction_volume = self.cap_schedule.get_auction_volume(
-            year, tnac, self.last_clearing_price, price_max, penalty_rate
+            year, tnac, self.last_clearing_price, price_max,
+            base_penalty_rate, inflation_rate
         )
         auction_volume = base_auction_volume
         log["cap"] = cap_t
@@ -1240,7 +1269,8 @@ class ETSEnvironment(gym.Env):
             mac_cost_i = float(mac_costs[i])
 
             # Record spending: penalty now included in budget tracking
-            company.record_spending(auction_cost + max(0.0, secondary_cost)
+            # Secondary revenue (negative cost) reduces spending, freeing up budget headroom
+            company.record_spending(auction_cost + secondary_cost
                                     + investment_cost + mac_cost_i + penalty_cost)
             company.record_capex_spending(investment_cost)
             budget_penalty = company.compute_budget_penalty()
@@ -1278,11 +1308,23 @@ class ETSEnvironment(gym.Env):
                 esg_raw = ef_ratio * time_ratio * (company.annual_budget / 1000.0)
                 esg_signal = esg_scale * esg_raw
 
+            # Permanent cost-efficiency improvement bonus (Priority 5):
+            # Rewards emission factor improvement regardless of w_green, proportional to
+            # remaining time and carbon price. This gives coal agents a gradient to invest early.
+            efficiency_bonus = 0.0
+            if company.initial_ef > 0.01:
+                ef_improvement = max(0.0, company.initial_ef - company.weighted_emission_factor)
+                ef_improvement_ratio = ef_improvement / company.initial_ef
+                time_weight = remaining_years / self.n_years
+                price_weight = clearing_price / 1000.0
+                efficiency_bonus = 0.3 * ef_improvement_ratio * time_weight * price_weight
+
             rewards[i] = float(
                 company.w_cost * (-cost_norm_ex_penalty)
                 + company.w_green * esg_signal
                 + green_bonus
                 + queue_bonus
+                + efficiency_bonus  # permanent bonus, applies to ALL agents
                 - penalty_norm  # penalty at full strength for all agents
             )
 
@@ -1301,13 +1343,15 @@ class ETSEnvironment(gym.Env):
             terminal_price = max(clearing_price, self.last_secondary_price, eff_penalty * 0.8)
 
             for i, company in enumerate(self.companies):
-                # Diminishing-returns terminal bank valuation: log1p maps
-                # prudent hedging (~1yr need) to ~69% of linear value while
-                # excessive hoarding (3yr+) gets <50%, encouraging secondary
-                # market selling over speculative accumulation.
+                # Terminal bank value with 2× annual_need cap:
+                # Bank beyond 2yr of reserves gets ZERO additional terminal credit,
+                # making secondary selling immediately rational. Diminishing-returns
+                # log1p formula maps prudent hedging (~1yr need) to ~69% of linear value.
                 if terminal_bank:
                     annual_need = max(company.compute_estimate_need(), 0.1)
-                    ratio = self.holdings[i] / annual_need
+                    # Cap effective bank at 2× annual need
+                    capped_holdings = min(self.holdings[i], 2.0 * annual_need)
+                    ratio = capped_holdings / annual_need
                     bank_value = np.log1p(ratio) * annual_need * terminal_price / 1000.0
                     rewards[i] += bank_value
                     terminal_bank_values[i] = bank_value

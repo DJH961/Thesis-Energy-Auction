@@ -211,6 +211,7 @@ class PPOAgent:
         self.critic_huber = ppo.get("critic_huber", False)
         self.critic_huber_delta = ppo.get("critic_huber_delta", 10.0)
         self.normalize_returns = ppo.get("normalize_returns", True)
+        self.clip_value = ppo.get("clip_value", False)  # v6.2: value function clipping
 
         # Initialize critic loss function
         if self.critic_huber:
@@ -268,9 +269,10 @@ class PPOAgent:
         r_norm = self._reward_normalizer.update_and_normalize(reward)
         return float(np.clip(r_norm, self._reward_clip_min, self._reward_clip_max))
 
-    def _critic_loss(self, v_pred, v_target):
+    def _critic_loss(self, v_pred, v_target, old_values=None):
         """
         Compute critic loss using Huber loss (if enabled) or MSE.
+        If clip_value is enabled, implements value function clipping.
 
         Parameters
         ----------
@@ -278,13 +280,25 @@ class PPOAgent:
             Predicted values from critic.
         v_target : Tensor
             Target values (returns).
+        old_values : Tensor, optional
+            Old value predictions (for value clipping). Required if clip_value=True.
 
         Returns
         -------
         loss : Tensor
             Scalar loss value.
         """
-        return self.critic_loss_fn(v_pred, v_target)
+        if self.clip_value and old_values is not None:
+            # Clip value predictions to old_values ± clip_eps
+            v_pred_clipped = old_values + torch.clamp(
+                v_pred - old_values, -self.clip_eps, self.clip_eps
+            )
+            # Compute loss for both clipped and unclipped, take max
+            loss_unclipped = self.critic_loss_fn(v_pred, v_target)
+            loss_clipped = self.critic_loss_fn(v_pred_clipped, v_target)
+            return torch.max(loss_unclipped, loss_clipped)
+        else:
+            return self.critic_loss_fn(v_pred, v_target)
 
     # ------------------------------------------------------------------
     # Action selection
@@ -484,6 +498,9 @@ class PPOAgent:
         adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # Convert old values to tensor for value clipping
+        old_values_t = torch.FloatTensor(values).to(self.device).unsqueeze(1) if self.clip_value else None
+
         # Critic extra epochs: warm up critic before main PPO loop
         if self.critic_extra_epochs > 0:
             for _extra_epoch in range(self.critic_extra_epochs):
@@ -493,7 +510,10 @@ class PPOAgent:
                     end = min(start + self.mini_batch_size, T)
                     mb = idx[start:end]
                     v_pred = self.value_net(critic_input[mb])
-                    critic_loss = self._critic_loss(v_pred, ret_t[mb])
+                    critic_loss = self._critic_loss(
+                        v_pred, ret_t[mb],
+                        old_values_t[mb] if self.clip_value else None
+                    )
                     if not torch.isfinite(critic_loss):
                         continue
                     self.critic_optimizer.zero_grad()
@@ -524,7 +544,10 @@ class PPOAgent:
                 mb = idx[start:end]
 
                 v_pred = self.value_net(critic_input[mb])
-                value_loss = self._critic_loss(v_pred, ret_t[mb])
+                value_loss = self._critic_loss(
+                    v_pred, ret_t[mb],
+                    old_values_t[mb] if self.clip_value else None
+                )
 
                 if actor_update:
                     # Re-evaluate current policy
@@ -713,10 +736,14 @@ class PPOAgent:
         adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # Convert old values to tensor for value clipping
+        old_values_t = torch.FloatTensor(values).to(self.device).unsqueeze(1) if self.clip_value else None
+
         buf_tensors = {
             "obs1": obs1, "obs2": obs2, "critic_input": critic_input,
             "auc_raw": auc_raw, "sec_raw": sec_raw,
             "old_auc_lp": old_auc_lp, "old_sec_lp": old_sec_lp,
+            "old_values": old_values_t,  # for value clipping in update_happo
             "T": T,
         }
         return adv_t, ret_t, buf_tensors
@@ -751,6 +778,7 @@ class PPOAgent:
         sec_raw = buf_tensors["sec_raw"]
         old_auc_lp = buf_tensors["old_auc_lp"]
         old_sec_lp = buf_tensors["old_sec_lp"]
+        old_values_t = buf_tensors.get("old_values", None)  # for value clipping
         T = buf_tensors["T"]
 
         # Apply HAPPO advantage weighting
@@ -779,7 +807,10 @@ class PPOAgent:
                 mb = idx[start:end]
 
                 v_pred = self.value_net(critic_input[mb])
-                value_loss = self._critic_loss(v_pred, ret_t[mb])
+                value_loss = self._critic_loss(
+                    v_pred, ret_t[mb],
+                    old_values_t[mb] if self.clip_value else None
+                )
 
                 if actor_update:
                     auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])

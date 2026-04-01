@@ -1,4 +1,20 @@
-# Design Document - ETS MARL (Current v6.2)
+# Design Document — ETS MARL
+
+## Overview
+
+This document describes the **ETS MARL** simulation: a stylised multi-agent reinforcement-learning model of the EU Emissions Trading System (EU ETS). It is intended as a self-contained reference for new readers — no prior knowledge of the codebase is assumed.
+
+**What the project models:** A simplified carbon allowance market in which energy companies bid for emission permits, invest in cleaner technology, trade allowances between themselves, and learn bidding and investment strategies over thousands of simulated years.
+
+**Why it exists:** To study emergent market behaviour (pricing dynamics, banking incentives, green-investment timing) under regulatory mechanisms (cap trajectory, Market Stability Reserve) using modern multi-agent RL.
+
+**Who participates:** 16 market participants — 8 learning agents trained with PPO/HAPPO and 8 heuristic rule-based bots. Agents span four archetypes (coal-heavy, gas-dominant, transitioner, green-leader), each paired into one financially-motivated and one ESG-balanced company.
+
+**How an episode works:** Each episode simulates 12 years. Every year, participants bid in a sealed-bid uniform-price auction for CO2 allowances, then trade in a bilateral secondary market, and choose how much to invest in renewable capacity. Penalties fall on those without enough allowances to cover emissions. The government cap shrinks by ~4.3–4.4 % annually, creating increasing scarcity that forces decarbonisation.
+
+**Learning objective:** Learning agents maximise a reward signal combining net financial cost (after compliance, trading, investment, and operations) with an optional ESG component (saved-carbon-years). Over 70,000 episodes, agents converge on market strategies.
+
+---
 
 ## 1. Scope and Purpose
 
