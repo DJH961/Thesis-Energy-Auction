@@ -17,7 +17,6 @@ Usage:
 
 import argparse
 import os
-import pickle
 import sys
 
 import numpy as np
@@ -43,14 +42,13 @@ GREEN_AGENTS = [1, 3, 5, 7]       # odd indices
 
 
 def load_qtables(results_dir: str, seed: int, episode: str = "final") -> dict:
-    """Load Q-tables from pickle file."""
+    """Load Q-tables from numpy archive file."""
     if episode == "final":
-        path = os.path.join(results_dir, f"qtables_s{seed}_final.pkl")
+        path = os.path.join(results_dir, f"qtables_s{seed}_final.npz")
     else:
         path = os.path.join(results_dir, "checkpoints",
-                            f"qtables_s{seed}_ep{episode}.pkl")
-    with open(path, "rb") as f:
-        return pickle.load(f)
+                            f"qtables_s{seed}_ep{episode}.npz")
+    return dict(np.load(path))
 
 
 def load_training_log(results_dir: str, seed: int, prefix: str = "ql") -> pd.DataFrame:

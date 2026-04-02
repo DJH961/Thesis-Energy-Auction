@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v7.2
+# ETS MARL — Configuration v7.2.1
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -392,7 +392,7 @@ ppo:
   critic_huber: true         # use Huber loss for critic instead of MSE
   critic_huber_delta: 10.0   # delta parameter for Huber loss
   clip_value: true           # value function clipping (enabled by default)
-  normalize_returns: true    # normalize returns before critic training
+  normalize_returns: false   # disabled: per-agent RewardNormalizer already stabilizes scale
 
 # ----------------------------------------------------------
 # Curriculum learning (disabled — 12-year episodes train directly)

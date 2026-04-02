@@ -15,7 +15,6 @@ Usage:
 import argparse
 import csv
 import os
-import pickle
 import sys
 import io
 import yaml
@@ -68,8 +67,7 @@ def main():
 
     # Load Q-tables
     print(f"Loading Q-tables from {args.qtable_path}")
-    with open(args.qtable_path, "rb") as f:
-        qtables = pickle.load(f)
+    qtables = dict(np.load(args.qtable_path))
 
     agents = [
         QLearningAgent(agent_id=i,

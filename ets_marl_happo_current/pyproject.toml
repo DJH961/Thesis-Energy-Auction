@@ -1,6 +1,6 @@
 [project]
 name = "ets-marl"
-version = "7.2.0"
+version = "7.2.1"
 description = "EU ETS carbon market simulation with multi-agent reinforcement learning (PPO/HAPPO)"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -5,6 +5,73 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.2.1
+
+**Bug Fixes, Security Hardening, and Code Quality**
+
+### Critical Fixes
+- **EMA variance bias**: `RewardNormalizer.update_and_normalize()` now saves `old_mu` before
+  updating the mean, then uses `old_mu` in the variance update. Eliminates systematic
+  variance underestimation that biased early-training reward normalization.
+- **Return normalization removed**: Set `normalize_returns: false` in config. The per-agent
+  `RewardNormalizer` already stabilizes reward scale; double-normalizing returns distorted
+  the critic's value targets.
+- **Phase-specific credit assignment**: Auction policy loss is now weighted by a phase-1-only
+  advantage proxy derived from `obs2[base+4]` (auction_savings). This provides the auction
+  policy with a gradient signal specific to auction performance rather than the blended
+  year-level advantage.
+- **Efficiency bonus amplified**: Coefficient increased from 0.3 to 1.5, price_weight
+  changed from `clearing_price / 1000` to `clearing_price / 100`. Financial agents now
+  receive a meaningful gradient for emission-factor improvement.
+
+### Significant Fixes
+- **HAPPO cumulative ratio**: Replaced `cumulative_ratio_by_T` dict with a single tensor
+  sized to the expected trajectory length. Agents with mismatched T (e.g. HPP-cleared
+  buffers) are excluded from the M-factor chain entirely, preventing ratio dimension
+  mismatches and preserving sequential dependency.
+- **Opportunity cost**: Added explicit documentation that `self.holdings[i]` is already
+  the post-compliance bank when `_compute_rewards` is called.
+- **No-short-selling**: `max_sell` in secondary market now subtracts expected compliance
+  need (`realized_emissions + carry_forward`), preventing agents from selling allowances
+  they need for compliance.
+
+### Moderate Fixes
+- **Burn-in double apply_matured_investments**: Removed the redundant call at the top of
+  the burn-in loop. Only the bottom-of-loop call (year + 1) is retained.
+- **Price history fallback**: `_compute_price_ma3()` now returns `self.expected_price`
+  (AR(1) forecast, ~80€) when price history is empty, instead of falling back to
+  `last_clearing_price` which may be the reserve price after a failed auction.
+- **weights_only=True**: `torch.load()` now uses `weights_only=True` for security.
+- **Action space dead zone fixed**: `invest_frac` now uses continuous linear mapping
+  `((action + 1) / 2) * max_invest_frac` instead of `np.clip`, eliminating the dead
+  zone where negative policy outputs all mapped to zero investment.
+- **Terminal debt liquidation**: Final-year carry-forward debt is now aggressively
+  penalized: `rewards -= carry_forward * terminal_price * 1.5 / 1000`.
+
+### Security
+- Replaced `pickle.load` for Q-tables with `np.load`/`np.savez` in `train_qlearning.py`,
+  `evaluate_qlearning.py`, and `qlearning_analysis.py`.
+- CSV file handles in `train.py` registered with `atexit` for cleanup on crash.
+
+### Reproducibility
+- `np.random.seed(seed)` and `torch.manual_seed(seed)` set at start of `train_one_seed()`.
+- `np.random.shuffle` in PPO agent replaced with per-agent seeded `numpy.random.Generator`.
+
+### Environment / Portability
+- `requirements.txt` aligned with `pyproject.toml` exact pins.
+- `install.bat` updated to use `==` pins matching `pyproject.toml`.
+
+### Code Quality
+- Removed dead legacy `logger.py` and `replay_buffer.py`.
+- Removed stub `main.py` (real entry point is `scripts/train.py`).
+- Added `OBS1_EXPECTED_PRICE_IDX` named constant replacing magic `obs1[3]`.
+- Added obs-dim assertion in `evaluate.py`; config saved alongside checkpoints.
+- Added `.github/workflows/test.yml` for CI (runs pytest on push/PR).
+
+### Documentation
+- Documented the "one reward per year-step for two decision phases" design choice
+  (see phase-specific credit assignment above).
+
 ## v7.2.0
 
 **Budget-Aware Collateral Affordability + Observation Headroom**

@@ -21,6 +21,7 @@ Roadmap improvements wired here:
       update() each episode; others collect experience.
 """
 
+import atexit
 import argparse
 import collections
 import copy
@@ -443,6 +444,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # so earlier short runs do not mutate config used by later long runs.
     config = copy.deepcopy(config)
 
+    # Reproducibility: seed all RNGs before any stochastic operation
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     tr_cfg = config.get("tabula_rasa", {})
     if tr_cfg.get("enabled", False):
         n_ep = config["simulation"]["n_episodes"]
@@ -520,7 +527,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v7.2: Dynamic calibration | Collateral affordability clip | Budget-headroom obs | Tabula-rasa 80€ fallback | Carry-forward{cf_str}")
+    print(f"v7.2.1: Dynamic calibration | Collateral affordability clip | Budget-headroom obs | Tabula-rasa 80€ fallback | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(
         f"PPO profile: {run_profile['profile']} "
@@ -740,6 +747,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
+
+    # Register CSV cleanup so files are closed even on crash
+    def _close_csvs():
+        if not ep_csv.closed:
+            ep_csv.close()
+        if not yr_csv.closed:
+            yr_csv.close()
+    atexit.register(_close_csvs)
 
     log_interval = config["logging"]["log_interval"]
     save_interval = config["logging"]["save_interval"]
@@ -1013,10 +1028,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
                 # 2. Sequential update in random order
                 order = episode_rng.permutation(n_agents).tolist()
-                # Keep independent cumulative ratios per rollout length.
-                # Some agents may have shorter buffers when HPP swaps clear
-                # their trajectories, so a single shared ratio can mismatch.
-                cumulative_ratio_by_T = {}
+                # Determine expected trajectory length for HAPPO ratio chain.
+                # Agents with mismatched T (e.g. HPP-cleared buffers) are
+                # excluded from the M-factor accumulation chain entirely.
+                expected_T = episodes_per_update * n_years
+                cumulative_ratio = torch.ones(expected_T, 1)
 
                 for j in order:
                     adv_j, ret_j, buf_j = gae_data[j]
@@ -1025,9 +1041,19 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                         continue
 
                     T_j = int(buf_j["T"])
-                    if T_j not in cumulative_ratio_by_T:
-                        cumulative_ratio_by_T[T_j] = torch.ones(T_j, 1)
-                    ratio_weight_j = cumulative_ratio_by_T[T_j]
+                    # Skip agents with mismatched T from HAPPO ratio chain
+                    # (e.g. HPP-cleared buffers give shorter trajectories)
+                    if T_j != expected_T:
+                        loss = agents[j].update_happo(
+                            adv_t=adv_j,
+                            ret_t=ret_j,
+                            buf_tensors=buf_j,
+                            advantage_weights=None,  # standard PPO, no M-factor
+                            actor_update=actor_update,
+                        )
+                        latest_losses.append(loss)
+                        continue
+                    ratio_weight_j = cumulative_ratio
 
                     loss = agents[j].update_happo(
                         adv_t=adv_j,
@@ -1039,14 +1065,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     latest_losses.append(loss)
 
                     # Compute post-update importance ratio for this agent
-                    if actor_update:
+                    if actor_update and T_j == expected_T:
                         ratio_j = agents[j].compute_post_update_ratio(buf_j)
-                        clipped_j = torch.min(
-                            ratio_j,
-                            torch.clamp(ratio_j, 1 - clip_eps, 1 + clip_eps)
-                        )
-                        cumulative_ratio_by_T[T_j] = (
-                            cumulative_ratio_by_T[T_j] * clipped_j.detach().cpu()
+                        clipped_j = torch.clamp(ratio_j, 1 - clip_eps, 1 + clip_eps)
+                        cumulative_ratio = (
+                            cumulative_ratio * clipped_j.detach().cpu()
                         )
 
                 # Reorder losses to match agent index (not update order)
