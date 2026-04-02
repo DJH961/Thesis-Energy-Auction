@@ -5,5 +5,11 @@
       "Bash(python3 -c \"import json; json.load\\(open\\(''ets_marl_happo_current/notebooks/ets_marl_colab.ipynb'', encoding=''utf-8''\\)\\); print\\(''Valid JSON''\\)\")",
       "Bash(python -c \":*)"
     ]
+  },
+    "model": "sonnet",
+  "env": {
+    "MAX_THINKING_TOKENS": "10000",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "haiku"
   }
 }

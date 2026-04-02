@@ -667,6 +667,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     train_t0 = time.time()
     recent_ep_durations = collections.deque(maxlen=200)
+    msr_event_totals = {
+        "emergency_release": 0,
+        "containment_release": 0,
+        "withdrawal_suppressed": 0,
+    }
 
     def _flush_csv_logs(current_episode: int, force: bool = False) -> None:
         if force or ((current_episode + 1) % csv_flush_interval == 0):
@@ -1353,6 +1358,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         ep_writer.writerow(ep_row)
 
+        # Aggregate MSR intervention frequencies for a single run-level summary.
+        ep_msr_events = env.cap_schedule.msr_event_counts()
+        for k in msr_event_totals:
+            msr_event_totals[k] += int(ep_msr_events.get(k, 0))
+
         # Track runtime and flush logs periodically for crash resilience.
         recent_ep_durations.append(time.time() - episode_t0)
         _flush_csv_logs(episode)
@@ -1579,6 +1589,13 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             os.makedirs(ckpt_dir, exist_ok=True)
             for i, agent in enumerate(agents):
                 agent.save(os.path.join(ckpt_dir, f"agent_{i}_best.pt"))
+
+    print(
+        "MSR summary (run total): "
+        f"emergency_release={msr_event_totals['emergency_release']}  "
+        f"containment_release={msr_event_totals['containment_release']}  "
+        f"withdrawal_suppressed={msr_event_totals['withdrawal_suppressed']}"
+    )
 
     ep_csv.close()
     yr_csv.close()

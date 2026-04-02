@@ -71,6 +71,13 @@ class CapSchedule:
         self.cap_history = []
         self.volume_history = []
 
+        # Per-episode MSR trigger counters for compact training summaries.
+        self._msr_event_counts = {
+            "emergency_release": 0,
+            "containment_release": 0,
+            "withdrawal_suppressed": 0,
+        }
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -146,6 +153,10 @@ class CapSchedule:
     def msr_reserve(self) -> float:
         """Return current MSR reserve level (Mt)."""
         return self._msr_reserve
+
+    def msr_event_counts(self) -> dict:
+        """Return per-episode counts of price-triggered MSR interventions."""
+        return dict(self._msr_event_counts)
 
     def absorb_unsold(self, amount: float):
         """
@@ -244,9 +255,7 @@ class CapSchedule:
             release = min(self.emergency_release_amount, self._msr_reserve)
             self._msr_reserve -= release
             auction_vol += release
-            print(f"[MSR] Year {year}: Emergency release triggered "
-                  f"(clearing={clearing_price:.1f} >= threshold={release_threshold:.1f}, "
-                  f"eff_penalty={eff_penalty:.1f}, TNAC={tnac:.1f}, release={release:.2f} Mt)")
+            self._msr_event_counts["emergency_release"] += 1
             return auction_vol
 
         # P9: Suppress withdrawal when prices are already elevated
@@ -256,13 +265,9 @@ class CapSchedule:
                 release = min(self.release_amount, self._msr_reserve)
                 self._msr_reserve -= release
                 auction_vol += release
-                print(f"[MSR] Year {year}: Containment release "
-                      f"(clearing={clearing_price:.1f} >= threshold={containment_threshold:.1f}, "
-                      f"eff_penalty={eff_penalty:.1f}, TNAC={tnac:.1f}, release={release:.2f} Mt)")
+                self._msr_event_counts["containment_release"] += 1
             else:
-                print(f"[MSR] Year {year}: Withdrawal suppressed by containment trigger "
-                      f"(clearing={clearing_price:.1f} >= threshold={containment_threshold:.1f}, "
-                      f"eff_penalty={eff_penalty:.1f}, TNAC={tnac:.1f})")
+                self._msr_event_counts["withdrawal_suppressed"] += 1
             return auction_vol
 
         # Normal MSR logic
@@ -285,5 +290,10 @@ class CapSchedule:
         self._unsold_absorbed = 0.0
         self._unsold_rollover_pending = 0.0
         self._total_cancelled = 0.0
+        self._msr_event_counts = {
+            "emergency_release": 0,
+            "containment_release": 0,
+            "withdrawal_suppressed": 0,
+        }
         self.cap_history = []
         self.volume_history = []
