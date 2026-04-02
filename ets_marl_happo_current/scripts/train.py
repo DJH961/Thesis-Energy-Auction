@@ -476,7 +476,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         explore_cfg["auction_anchors"] = None
         explore_cfg["secondary_anchors"] = None
         print(
-            "TABULA RASA: BC off, KL off, anchors off, uniform exploration, "
+            "TABULA RASA: BC off, KL off, anchors off, side-balanced price exploration, "
             f"ε={tr_cfg['epsilon_start']}→{tr_cfg['epsilon_final']}, "
             f"entropy={tr_cfg['entropy_coef']}"
         )
@@ -519,7 +519,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v7.0: Dynamic calibration | Green finance | Tabula-rasa mode | Carry-forward{cf_str}")
+    print(f"v7.1: Dynamic calibration | Green finance | Collateral cost | Tabula-rasa mode | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(
         f"PPO profile: {run_profile['profile']} "
@@ -718,6 +718,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"delta_green_A{i+1}", f"shortfall_A{i+1}", f"penalty_A{i+1}",
                       f"reward_A{i+1}", f"reward_base_A{i+1}", f"reward_shaping_A{i+1}",
                       f"holdings_A{i+1}", f"invest_cost_A{i+1}",
+                      f"collateral_cost_A{i+1}",
                       f"bid_price_A{i+1}", f"queue_size_A{i+1}",
                       f"emission_shock_A{i+1}", f"cf_shock_A{i+1}",  # P5/P6
                       f"cancellation_A{i+1}",  # P6
@@ -922,6 +923,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 yr_row[f"reward_shaping_A{i+1}"] = _get("rewards_shaping")
                 yr_row[f"holdings_A{i+1}"] = _get("holdings")
                 yr_row[f"invest_cost_A{i+1}"] = _get("invest_costs")
+                yr_row[f"collateral_cost_A{i+1}"] = _get("collateral_costs")
                 yr_row[f"bid_price_A{i+1}"] = _get("bid_prices")
                 yr_row[f"queue_size_A{i+1}"] = _get("queue_sizes")
                 yr_row[f"emission_shock_A{i+1}"] = _get("emission_shocks")   # P5

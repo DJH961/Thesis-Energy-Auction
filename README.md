@@ -32,7 +32,7 @@ This repo currently contains **three versions** of the project, reflecting how i
 
 | Folder | What It Is | Status |
 |--------|-----------|--------|
-| [ets_marl_happo_current](ets_marl_happo_current) | **The main, current version (v7.0).** Uses PPO/HAPPO agents, 8 learning + 8 bot companies, hidden burn-in warm-start, dynamic emission-weighted cap/MSR calibration, optional tabula-rasa training mode, optional green-finance budget/capex relief, and bot enhanced-noise/fade controls. This is where all active development happens. | **Active** |
+| [ets_marl_happo_current](ets_marl_happo_current) | **The main, current version (v7.1).** Uses PPO/HAPPO agents, 8 learning + 8 bot companies, hidden burn-in warm-start, dynamic emission-weighted cap/MSR calibration, EU ETS-style bid collateral costs, side-balanced tabula-rasa start-price exploration, optional green-finance budget/capex relief, and bot enhanced-noise/fade controls. This is where all active development happens. | **Active** |
 | [ets_marl_legacy_ppo](ets_marl_legacy_ppo) | An earlier version that used PPO agents. Kept for reference only. | Archived |
 | [ets_marl_legacy_test](ets_marl_legacy_test) | The original prototype using DDPG agents (4 companies, simpler setup). Kept for historical comparison. | Archived |
 

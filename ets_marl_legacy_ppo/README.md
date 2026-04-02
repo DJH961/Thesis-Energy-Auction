@@ -1,6 +1,6 @@
 # ETS MARL — Legacy PPO Version
 
-> **Status: Archived.** This was an intermediate version. For the current version, go to [ets_marl_happo_current](../ets_marl_happo_current).
+> **Status: Archived.** This was an intermediate version. For the current active version (v7.1), go to [ets_marl_happo_current](../ets_marl_happo_current).
 
 ## What Is This?
 

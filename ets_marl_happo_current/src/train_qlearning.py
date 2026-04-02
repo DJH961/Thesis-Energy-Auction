@@ -114,7 +114,8 @@ def train_qlearning(config: dict, ql_config: dict, seed: int):
         yr_fields += [f"alloc_A{i+1}", f"emissions_A{i+1}",
                       f"green_frac_A{i+1}", f"shortfall_A{i+1}",
                       f"penalty_A{i+1}", f"reward_A{i+1}",
-                      f"bid_price_A{i+1}", f"holdings_A{i+1}"]
+                      f"bid_price_A{i+1}", f"holdings_A{i+1}",
+                      f"collateral_cost_A{i+1}"]
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -236,6 +237,7 @@ def train_qlearning(config: dict, ql_config: dict, seed: int):
                 yr_row[f"reward_A{i+1}"] = _get("rewards")
                 yr_row[f"bid_price_A{i+1}"] = _get("bid_prices")
                 yr_row[f"holdings_A{i+1}"] = _get("holdings")
+                yr_row[f"collateral_cost_A{i+1}"] = _get("collateral_costs")
             yr_writer.writerow(yr_row)
 
             obs1 = obs1_next

@@ -145,15 +145,26 @@ def test_tabula_rasa_uniform_exploration():
 
     obs1 = np.zeros(22, dtype=np.float32)
     obs1[3] = 0.156  # anchored path would target ~78 if used
+    np.random.seed(42)
 
     prices = []
-    for _ in range(200):
+    for _ in range(1000):
         action, _, _ = agent.select_auction_action(obs1, deterministic=False, epsilon=1.0)
         prices.append(float(action[0]))
 
-    mean_price = float(np.mean(prices))
-    assert 215.0 <= mean_price <= 315.0
-    assert abs(mean_price - 78.0) > 80.0
+    reference_price = float(obs1[3]) * config["auction"]["price_max"]
+    under = sum(p < reference_price for p in prices)
+    over = sum(p > reference_price for p in prices)
+    non_equal = under + over
+
+    assert min(prices) >= 30.0
+    assert max(prices) <= 500.0
+    assert non_equal > 0
+
+    # Uniform mode keeps side-balanced bid-price sampling around the expected price,
+    # so overbids and underbids are equally likely even with asymmetric price ranges.
+    under_share = under / non_equal
+    assert 0.40 <= under_share <= 0.60
 
 
 def test_tabula_rasa_disabled_no_effect(monkeypatch):

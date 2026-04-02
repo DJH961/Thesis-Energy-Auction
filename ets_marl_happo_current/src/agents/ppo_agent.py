@@ -310,7 +310,7 @@ class PPOAgent:
         """Phase 1: obs(18) → (action[6], raw[6], logp[1]).
 
         When ``epsilon > 0`` and not deterministic, with probability *epsilon*
-        a uniform random action in physical space replaces the policy sample.
+        an epsilon-random action in physical space replaces the policy sample.
         The raw action and log_prob are still computed under the current policy
         so that the PPO importance ratio remains correct.
         """
@@ -324,6 +324,29 @@ class PPOAgent:
                 high = self.auction_policy.action_bias + self.auction_policy.action_scale
                 if self.exploration_mode == "uniform":
                     rand_action = low + (high - low) * torch.rand_like(action)
+
+                    # Keep under/overbid directions balanced around expected price.
+                    # Uniform-in-range sampling overweights overbids because [expected, max]
+                    # is much wider than [min, expected] in ETS price bounds.
+                    price_min = float(low[0].item())
+                    price_max = float(high[0].item())
+                    expected_price = (
+                        float(obs1[3]) * price_max if len(obs1) > 3
+                        else 0.5 * (price_min + price_max)
+                    )
+                    if not np.isfinite(expected_price):
+                        expected_price = 0.5 * (price_min + price_max)
+                    expected_price = float(np.clip(expected_price, price_min, price_max))
+
+                    if expected_price <= price_min + 1e-9:
+                        sampled_price = np.random.uniform(expected_price, price_max)
+                    elif expected_price >= price_max - 1e-9:
+                        sampled_price = np.random.uniform(price_min, expected_price)
+                    elif np.random.random() < 0.5:
+                        sampled_price = np.random.uniform(price_min, expected_price)
+                    else:
+                        sampled_price = np.random.uniform(expected_price, price_max)
+                    rand_action[0, 0] = float(sampled_price)
                 else:
                     # Anchored exploration: sample each dim from Gaussian around
                     # realistic company expectations instead of uniform.

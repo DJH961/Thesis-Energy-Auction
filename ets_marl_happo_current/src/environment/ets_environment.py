@@ -1071,7 +1071,7 @@ class ETSEnvironment(gym.Env):
             if lot_size > 0:
                 bid_actions[i, 1] = max(lot_size, round(bid_actions[i, 1] / lot_size) * lot_size)
 
-        self._phase1_bid_prices = bid_actions[:, 0].copy()
+        self._phase1_bid_prices = auction_actions[:, 0].copy()
         self._phase1_bid_quantities = bid_actions[:, 1].copy()  # Mt after multiplier expansion
 
         # Compute effective reserve price (dynamic or static)
@@ -1393,6 +1393,17 @@ class ETSEnvironment(gym.Env):
         # Holdings after secondary market
         holdings = self.holdings + allocations + trade_qtys
 
+        # Bid collateral opportunity cost (EU ETS-style overbidding deterrent).
+        collateral_costs = np.zeros(self.n_total)
+        collateral_cfg = self.config.get("auction", {}).get("collateral", {})
+        if collateral_cfg.get("enabled", False):
+            rate = float(collateral_cfg.get("opportunity_cost_rate", 0.0))
+            hold = float(collateral_cfg.get("hold_fraction", 0.0))
+            if self._phase1_bid_prices is not None:
+                spreads = np.maximum(0.0, self._phase1_bid_prices - clearing_price)
+                collateral_costs = rate * hold * spreads * np.maximum(allocations, 0.0)
+                collateral_costs[~active_mask] = 0.0
+
         # Use P5-shocked realized emissions for compliance
         #realized_emissions = self._current_emissions
 
@@ -1438,6 +1449,7 @@ class ETSEnvironment(gym.Env):
             realized_emissions,
             clearing_price,
             mac_costs,
+            collateral_costs=collateral_costs,
             precompliance_holdings=pretrade_holdings,
             old_carry_forward=old_carry_forward,
             active_mask=active_mask,
@@ -1480,6 +1492,7 @@ class ETSEnvironment(gym.Env):
             "emissions": realized_emissions.tolist(),
             "trade_costs": trade_costs.tolist(),
             "trade_qtys": trade_qtys.tolist(),
+            "collateral_costs": collateral_costs.tolist(),
             "secondary_clearing": secondary_clearing,
             "secondary_volume": secondary_volume,
             "raw_secondary_qtys": raw_secondary_qtys.tolist(),
@@ -1703,7 +1716,8 @@ class ETSEnvironment(gym.Env):
 
     def _compute_rewards(self, payments, trade_costs, penalties,
                          invest_costs, emissions, clearing_price,
-                         mac_costs=None, precompliance_holdings=None,
+                         mac_costs=None, collateral_costs=None,
+                         precompliance_holdings=None,
                          old_carry_forward=None, active_mask=None):
         """
         Reward (HAPPO-compliant, v6.4):
@@ -1750,6 +1764,8 @@ class ETSEnvironment(gym.Env):
 
         if mac_costs is None:
             mac_costs = np.zeros(self.n_total)
+        if collateral_costs is None:
+            collateral_costs = np.zeros(self.n_total)
 
         remaining_years = max(1, self.n_years - self.current_year)
 
@@ -1763,12 +1779,14 @@ class ETSEnvironment(gym.Env):
             investment_cost = float(invest_costs[i])
             operational_cost = company.compute_operational_cost(self.current_year)
             mac_cost_i = float(mac_costs[i])
+            collateral_cost_i = float(collateral_costs[i])
             loan_interest_cost = company.compute_green_loan_cost()
 
             # Record spending: penalty now included in budget tracking
             # Secondary revenue (negative cost) reduces spending, freeing up budget headroom
             company.record_spending(auction_cost + secondary_cost
-                                    + investment_cost + mac_cost_i + penalty_cost)
+                                    + investment_cost + mac_cost_i
+                                    + collateral_cost_i + penalty_cost)
             company.record_capex_spending(investment_cost)
             budget_penalty = company.compute_budget_penalty()
             capex_penalty = company.compute_capex_penalty()
@@ -1777,7 +1795,7 @@ class ETSEnvironment(gym.Env):
             # Penalty applies at full strength to ALL agents regardless of w_cost
             total_cost_ex_penalty = (auction_cost + secondary_cost + investment_cost
                                      + operational_cost + budget_penalty + capex_penalty
-                                     + mac_cost_i + loan_interest_cost)
+                                     + mac_cost_i + collateral_cost_i + loan_interest_cost)
 
             # Electricity revenue
             revenue = 0.0

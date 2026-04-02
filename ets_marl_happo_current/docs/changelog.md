@@ -5,6 +5,30 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.1.0
+
+**EU ETS Bid Collateral Cost + Tabula-Rasa Price-Side Balancing**
+
+- Added `auction.collateral` config block in `configs/default.yaml`:
+	- `enabled`
+	- `opportunity_cost_rate`
+	- `hold_fraction`
+- Corrected `auction.collateral.hold_fraction` from `0.08` to `0.02` (weekly-cycle annualized proxy), with updated cost examples.
+- `ETSEnvironment.step_secondary` now computes per-agent collateral opportunity cost using
+	`rate * hold_fraction * max(0, bid_price - clearing_price) * allocation`.
+- Collateral costs are passed into `_compute_rewards(...)` and included in
+	`total_cost_ex_penalty` as a real financial cost channel (not penalty shaping).
+- Year-level environment logs now include `collateral_costs`.
+- Year-level CSV outputs now include per-agent collateral columns:
+	- PPO/HAPPO training: `collateral_cost_A*` in `year_log_s*.csv`
+	- Q-learning training: `collateral_cost_A*` in `ql_year_log_s*.csv`
+- Tabula-rasa `exploration.mode="uniform"` auction-price sampling is now side-balanced:
+	- 50/50 underbid vs overbid around expected price,
+	- uniform sampling within each side range,
+	- prevents structural overbid bias from asymmetric price bounds.
+- Updated tabula-rasa exploration tests to validate over/under side balance.
+- Version metadata updated to v7.1 (`configs/default.yaml`, `pyproject.toml`, banners/docs).
+
 ## v7.0.0
 
 **Tabula-Rasa Training Mode**

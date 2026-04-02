@@ -1,6 +1,6 @@
-# ETS MARL — Current Version (HAPPO/PPO) v7.0
+# ETS MARL — Current Version (HAPPO/PPO) v7.1
 
-This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand, plus v7.0 features for tabula-rasa training, green finance, and dynamic emission-weighted market calibration.
+This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand, plus v7.1 additions for **EU ETS-style bid collateral cost** and **side-balanced tabula-rasa start-price exploration** (alongside v7.0 tabula-rasa, green finance, and dynamic emission-weighted market calibration).
 
 ## What Does This Code Do?
 
@@ -93,6 +93,7 @@ The agents use **HAPPO (Heterogeneous-Agent PPO)**, a multi-agent reinforcement 
 The reward signal balances:
 - **Revenue** from selling electricity (including carbon cost passthrough)
 - **Total costs** including allowances, trading, investing, operations, MAC, and penalties (folded into one cost signal)
+- **Bid collateral opportunity cost** on overbidding spread (`auction.collateral`): `rate × hold_fraction × max(0, bid - clearing) × qty_won`
 - **Opportunity cost of capital** on post-compliance banked allowances (`reward.opportunity_cost_rate`)
 - **Green investment shaping** — bonus for increasing green fraction (decays over training), scaled by (0.2 + w_green)
 - **ESG signal** — saved-carbon-years formula: `w_green × ef_ratio × time_ratio × (budget/1000)`, rewarding early emission reductions more than late ones
@@ -106,11 +107,13 @@ The reward signal balances:
 - **Unified financial envelope**: Each company has a single annual budget covering all spending (compliance + capex + MAC), calibrated to realistic revenue retention (~€724M for 10 TWh). Coal-heavy companies have the tightest budgets due to higher fuel OPEX.
 - **Capex throughput cap**: Organizational constraint on annual construction spend (M€), modelling permitting pipeline capacity, EPC contractor access, and management bandwidth. Independent of the financial budget — a company can afford more investment than it can physically deliver.
 - **Static reserve price**: Auction floor price at €30/t (matching price_min)
+- **Auction bid collateral**: overbids above clearing incur a real capital lock-up cost on awarded quantity (`auction.collateral.enabled`)
 - **Carry-forward**: Non-compliance shortfall is added to next year's obligation (capped at 2.0x, allowing larger debt accumulation)
 - **Hidden burn-in warm-start**: A configurable pre-period (`warm_start.burnin_enabled`) seeds realistic bank holdings, MSR reserve, and MA3 history before year 0
 - **Fundamentals-based heuristic**: Bot bidding uses MAC→penalty gradient (`mac_cost + urgency × (penalty - mac_cost)`), removing dependence on price moving average
 - **Absolute-price secondary market**: Secondary prices are expressed in €/t (not as multipliers), clipped to [sec_price_min, 2× effective penalty rate]
 - **ESG signal**: Saved-carbon-years formula rewards emission factor improvements proportional to remaining time, gated by w_green
+- **Tabula-rasa balanced price-side exploration**: epsilon-random auction prices in `uniform` mode are sampled 50/50 under vs over expected price (uniform within each side), preventing bias from asymmetric price bounds
 
 ## Project Structure
 
@@ -137,7 +140,7 @@ ets_marl_happo_current/
 │       └── replay_buffer.py      # Stores past experiences for learning
 │
 ├── configs/
-│   └── default.yaml              # All simulation parameters (v7.0)
+│   └── default.yaml              # All simulation parameters (v7.1)
 │
 ├── scripts/
 │   ├── train.py                  # Starts a training run
@@ -249,7 +252,10 @@ The most important settings you might want to change:
 | `ets.cap_year_0_override` | `null` | Optional hard override for year-0 cap |
 | `auction.price_max` | 500 | Maximum bid price (€/tonne) |
 | `penalty.rate` | 138.75 | Fine per excess tonne of CO2 (€), base level at simulation year-0 (2026) |
-| `tabula_rasa.enabled` | false | Enables no-anchor, uniform-exploration tabula-rasa training overrides |
+| `tabula_rasa.enabled` | false | Enables no-anchor tabula-rasa overrides with side-balanced under/over expected-price exploration |
+| `auction.collateral.enabled` | true | Enables EU ETS-style bid collateral opportunity-cost term on overbids |
+| `auction.collateral.opportunity_cost_rate` | 0.05 | Annualized cost-of-capital rate applied to locked collateral |
+| `auction.collateral.hold_fraction` | 0.02 | Fraction of year collateral lock-up used in annualized model (~7 days) |
 | `green_finance.enabled` | false | Enables green-only loan/capex throughput boost during investment clipping |
 | `bots.fade_schedule.enabled` | false | Enables episode-based bot retirement and automatic market recalibration |
 | `penalty.inflation_rate` | 0.020 | Mean annual inflation for nominal indexing (μ) |

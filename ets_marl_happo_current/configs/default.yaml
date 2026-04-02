@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v7.0
+# ETS MARL — Configuration v7.1
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -30,7 +30,7 @@ tabula_rasa:
   critic_warmup_frac: 0.10
   shaping_decay_frac: 0.20
   hpp_warmup_frac: 0.25
-  exploration_mode: "uniform"        # "uniform" replaces anchored Gaussian
+  exploration_mode: "uniform"        # side-balanced uniform auction-price sampling around expected price
 
 # ----------------------------------------------------------
 # Technology parameters (5 technologies)
@@ -166,6 +166,26 @@ auction:
   max_agent_share: 1.0
   cancel_under_subscribed: false   # disabled — under-subscription handled by unsold rollover
   lot_size: 0.0005                 # EU lot-size: 500 EUAs = 0.0005 Mt
+  # Bid collateral: opportunity cost of capital locked during auction.
+  # Real EU ETS: bidders must post collateral with clearing house (ECC)
+  # covering their max potential payment before auction closes.
+  # collateral_cost = rate × max(0, bid_price - clearing_price)
+  #                   × qty_won × hold_fraction
+  collateral:
+    enabled: true
+    opportunity_cost_rate: 0.05
+    # CORRECTION: hold_fraction changed from 0.08 -> 0.02
+    # Rationale: Real EU ETS settles at T+2 (~2 days, hold=0.0055). A yearly
+    # simulation compresses ~52 real auctions into one; the mathematically
+    # equivalent annual hold is still ~0.0055, but this produces a signal too
+    # weak to influence agent learning. 0.02 (~7 days = one weekly auction
+    # cycle) is the empirically grounded balance between T+2 reality and the
+    # annual model's compressed auction structure.
+    hold_fraction: 0.02  # ~7 days; was 0.08 (incorrect - overstated by 4x)
+
+    # Effective cost: 0.05 x 0.02 = 0.10% of overbid spread per tonne
+    # Bidding 100EUR above clearing on 3 Mt = 3,000,000 x 100 x 0.001 = 300,000 EUR
+    # Bidding 400EUR above clearing on 3 Mt = 3,000,000 x 400 x 0.001 = 1,200,000 EUR
 
 # ----------------------------------------------------------
 # Secondary market (agent-to-agent double auction)
@@ -373,7 +393,7 @@ ppo:
   critic_extra_epochs: 5     # extra critic-only training epochs before main PPO loop
   critic_huber: true         # use Huber loss for critic instead of MSE
   critic_huber_delta: 10.0   # delta parameter for Huber loss
-  clip_value: true           # value function clipping (enabled for v7.0)
+  clip_value: true           # value function clipping (enabled by default)
   normalize_returns: true    # normalize returns before critic training
 
 # ----------------------------------------------------------

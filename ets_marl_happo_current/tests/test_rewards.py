@@ -139,6 +139,51 @@ def test_rewards_differ_with_different_bids():
         "Different bidding strategies should produce different rewards")
 
 
+def test_collateral_cost_logged_matches_formula():
+    """Year log collateral costs should match configured rate*hold*spread*allocation."""
+    config = load_config()
+    config["companies"]["n_bot_agents"] = 0
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    config["auction"]["collateral"]["enabled"] = True
+
+    env = ETSEnvironment(config, seed=123)
+    env.reset(seed=123)
+
+    n = env.n_agents
+    auction_actions = np.zeros((n, 6), dtype=np.float32)
+    auction_actions[:, 0] = 80.0
+    auction_actions[:, 1] = 0.3
+    auction_actions[:, 2] = 0.0
+    auction_actions[:, 3:] = [0.0, 0.0, 1.0]
+
+    # One deliberate overbid with high coverage to force positive collateral.
+    auction_actions[0, 0] = 260.0
+    auction_actions[0, 1] = 2.0
+
+    env.step_auction(auction_actions)
+
+    secondary_actions = np.zeros((n, 2), dtype=np.float32)
+    secondary_actions[:, 0] = env._phase1_clearing_price
+    secondary_actions[:, 1] = 0.0
+    _, _, _, _, info = env.step_secondary(secondary_actions)
+
+    yl = info.get("year_log", {})
+    collateral = np.array(yl.get("collateral_costs", []), dtype=float)
+    bids = np.array(yl.get("bid_prices", []), dtype=float)
+    alloc = np.array(yl.get("allocations", []), dtype=float)
+    clearing = float(yl.get("clearing_price", 0.0))
+
+    rate = float(config["auction"]["collateral"]["opportunity_cost_rate"])
+    hold = float(config["auction"]["collateral"]["hold_fraction"])
+    expected = rate * hold * np.maximum(0.0, bids - clearing) * alloc
+
+    assert collateral.shape[0] == env.n_total
+    np.testing.assert_allclose(collateral, expected, atol=1e-6)
+    assert collateral.sum() > 0.0
+
+
 def test_green_bonus_with_investment():
     """Investing in green tech should add a positive green bonus."""
     env = load_env(seed=1)
