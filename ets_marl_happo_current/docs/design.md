@@ -55,6 +55,17 @@ All winners pay the same clearing price (the marginal accepted bid).
 
 ### 3.1 Cap path
 
+From v7.0 onward, year-0 cap is calibrated dynamically from active participant
+emissions instead of being manually hardcoded in the default config:
+
+$$
+cap_{0} = E_{system} \cdot (1 + overhead)
+$$
+
+where $E_{system}$ is the sum of initial emissions across all learning agents
+and currently active bots. A manual override (`cap_year_0_override`) is still
+supported for controlled experiments.
+
 Annual cap follows an LRF schedule:
 
 $$
@@ -69,6 +80,9 @@ $$
 MSR operates on auction volume (not cap) using TNAC proxy (sum of all banks):
 - If TNAC > upper threshold: withhold share of excess into reserve.
 - If TNAC < lower threshold: release fixed volume from reserve.
+- In v7.0 default config, TNAC bounds and release amounts are specified as
+  ratios of calibrated year-0 cap (`tnac_*_ratio`, `release_frac`,
+  `emergency_release_frac`) and materialized at environment init/reset.
 - **Activation lag (policy realism):** MSR is inactive before `activation_year`
   (default year 2). This mirrors the EU ETS lagged TNAC observation logic
   (Decision 2015/1814, Art. 1(5)), avoiding immediate year-0 interventions
@@ -103,6 +117,11 @@ Auction reserve can be:
 
 - Learning agents A1-A8: PPO/HAPPO-trained.
 - Bot agents B1-B8: heuristic policy for both auction and secondary market.
+
+From v7.0, bot behavior also supports:
+- `enhanced_noise` (higher valuation/urgency variance plus optional budget-stress quantity cuts),
+- `fade_schedule` (episode-based retirement of bots in reverse index order),
+- dynamic cap/MSR recalibration when active bot count changes.
 
 Archetypes are mirrored between learners and bots:
 - coal-heavy
@@ -139,6 +158,12 @@ Important mechanics:
 - Investment failure risk depends on fossil exposure and experience.
 - Construction jitter (Poisson delay), cancellation risk, and capex recovery on cancellation.
 - Capacity-factor noise can alter realized emissions each year.
+
+v7.0 adds optional **green finance** support:
+- extra green-only annual loan headroom,
+- extra green-only capex-throughput headroom,
+- annual interest cost on utilized green loan,
+- interest charged in reward cost accounting (not budget-spent accounting).
 
 ### 4.4 Compliance and carry-forward
 
@@ -321,6 +346,12 @@ Actors are decentralized; critic can be centralized (MAPPO mode) over concatenat
 - Epsilon-greedy exploration in physical action space with anchored Gaussian sampling.
 - Historical Policy Pool (periodic snapshots and random swaps for opponent diversity).
 - Diagnostics for stuck-market or degenerate-policy regimes.
+
+v7.0 adds a configurable **tabula-rasa mode** for ablation:
+- disables BC pretraining and KL anchor,
+- removes action anchors,
+- switches epsilon exploration to uniform,
+- overrides warmup/decay schedules from `n_episodes` fractions.
 
 ## 9. Economic and Financial Layers
 

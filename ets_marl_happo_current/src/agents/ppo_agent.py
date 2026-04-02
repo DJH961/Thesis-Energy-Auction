@@ -166,6 +166,7 @@ class PPOAgent:
         # plausible actions, giving agents a sensible starting point without
         # limiting what they can learn.  None = use midpoint (legacy behavior).
         explore_cfg = config.get("exploration", {})
+        self.exploration_mode = explore_cfg.get("mode", "anchored")
         auction_anchors = explore_cfg.get("auction_anchors", None)
         secondary_anchors = explore_cfg.get("secondary_anchors", None)
 
@@ -321,35 +322,38 @@ class PPOAgent:
             with torch.no_grad():
                 low = self.auction_policy.action_bias - self.auction_policy.action_scale
                 high = self.auction_policy.action_bias + self.auction_policy.action_scale
-                # Anchored exploration: sample each dim from Gaussian around
-                # realistic company expectations instead of uniform.
-                # This gives exploration a sensible starting distribution that
-                # reflects how real companies would initially behave.
-                rand_action = torch.zeros_like(action)
-                price_max = high[0].item()
-                price_min = low[0].item()
+                if self.exploration_mode == "uniform":
+                    rand_action = low + (high - low) * torch.rand_like(action)
+                else:
+                    # Anchored exploration: sample each dim from Gaussian around
+                    # realistic company expectations instead of uniform.
+                    # This gives exploration a sensible starting distribution that
+                    # reflects how real companies would initially behave.
+                    rand_action = torch.zeros_like(action)
+                    price_max = high[0].item()
+                    price_min = low[0].item()
 
-                # [0] bid_price: Gaussian around expected_price (obs[3] × price_max)
-                expected_price = float(obs1[3]) * price_max
-                rand_action[0, 0] = np.clip(
-                    np.random.normal(expected_price, max(expected_price * 0.3, 15.0)),
-                    price_min, price_max)
+                    # [0] bid_price: Gaussian around expected_price (obs[3] × price_max)
+                    expected_price = float(obs1[3]) * price_max
+                    rand_action[0, 0] = np.clip(
+                        np.random.normal(expected_price, max(expected_price * 0.3, 15.0)),
+                        price_min, price_max)
 
-                # [1] qty_multiplier: Gaussian around 1.0 (cover full need)
-                rand_action[0, 1] = np.clip(
-                    np.random.normal(1.0, 0.15),
-                    low[1].item(), high[1].item())
+                    # [1] qty_multiplier: Gaussian around 1.0 (cover full need)
+                    rand_action[0, 1] = np.clip(
+                        np.random.normal(1.0, 0.15),
+                        low[1].item(), high[1].item())
 
-                # [2] invest_frac: Gaussian around 0.03 (moderate investment)
-                rand_action[0, 2] = np.clip(
-                    np.random.normal(0.03, 0.02),
-                    low[2].item(), high[2].item())
+                    # [2] invest_frac: Gaussian around 0.03 (moderate investment)
+                    rand_action[0, 2] = np.clip(
+                        np.random.normal(0.03, 0.02),
+                        low[2].item(), high[2].item())
 
-                # [3-5] tech logits: slight solar/onshore preference, moderate spread
-                # onshore=0.3, offshore=-0.5, solar=0.5 (reflects cost/speed reality)
-                rand_action[0, 3] = np.clip(np.random.normal( 0.3, 0.5), -1.0, 1.0)
-                rand_action[0, 4] = np.clip(np.random.normal(-0.5, 0.5), -1.0, 1.0)
-                rand_action[0, 5] = np.clip(np.random.normal( 0.5, 0.5), -1.0, 1.0)
+                    # [3-5] tech logits: slight solar/onshore preference, moderate spread
+                    # onshore=0.3, offshore=-0.5, solar=0.5 (reflects cost/speed reality)
+                    rand_action[0, 3] = np.clip(np.random.normal(0.3, 0.5), -1.0, 1.0)
+                    rand_action[0, 4] = np.clip(np.random.normal(-0.5, 0.5), -1.0, 1.0)
+                    rand_action[0, 5] = np.clip(np.random.normal(0.5, 0.5), -1.0, 1.0)
 
                 # Convert to raw (normalised) space
                 rand_raw = torch.clamp(
@@ -380,18 +384,21 @@ class PPOAgent:
             with torch.no_grad():
                 low = self.secondary_policy.action_bias - self.secondary_policy.action_scale
                 high = self.secondary_policy.action_bias + self.secondary_policy.action_scale
-                rand_action = torch.zeros_like(action)
+                if self.exploration_mode == "uniform":
+                    rand_action = low + (high - low) * torch.rand_like(action)
+                else:
+                    rand_action = torch.zeros_like(action)
 
-                # [0] sec_price_mult: Gaussian around 1.05 (trade near clearing price)
-                rand_action[0, 0] = np.clip(
-                    np.random.normal(1.05, 0.10),
-                    low[0].item(), high[0].item())
+                    # [0] sec_price_mult: Gaussian around 1.05 (trade near clearing price)
+                    rand_action[0, 0] = np.clip(
+                        np.random.normal(1.05, 0.10),
+                        low[0].item(), high[0].item())
 
-                # [1] sec_qty: Gaussian around 0 with moderate spread.
-                # Positive = buy, negative = sell; neutral center lets both be explored.
-                rand_action[0, 1] = np.clip(
-                    np.random.normal(0.0, 1.0),
-                    low[1].item(), high[1].item())
+                    # [1] sec_qty: Gaussian around 0 with moderate spread.
+                    # Positive = buy, negative = sell; neutral center lets both be explored.
+                    rand_action[0, 1] = np.clip(
+                        np.random.normal(0.0, 1.0),
+                        low[1].item(), high[1].item())
 
                 rand_raw = torch.clamp(
                     (rand_action - self.secondary_policy.action_bias) /

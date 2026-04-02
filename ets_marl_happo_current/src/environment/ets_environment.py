@@ -36,6 +36,8 @@ Roadmap improvements (P5-P8):
       secondary price/volume in Phase 1 observation.
 """
 
+import copy
+
 import numpy as np
 import gymnasium as gym
 from typing import List, Optional
@@ -43,6 +45,7 @@ from typing import List, Optional
 from src.auction.market_clearing_ets import market_clearing_ets, build_bids
 from src.environment.cap_schedule import CapSchedule
 from src.environment.company import Company
+from src.environment.market_calibration import compute_market_params
 from src.agents import heuristic_policy
 
 
@@ -53,39 +56,63 @@ class ETSEnvironment(gym.Env):
     def __init__(self, config: dict, seed: Optional[int] = None):
         super().__init__()
 
-        self.config = config
-        self.n_agents = config["companies"]["n_agents"]           # PPO learning agents (external interface)
-        self.n_bots = config["companies"].get("n_bot_agents", 0)  # heuristic bot agents
+        # Keep environment-local mutable config to avoid caller side effects.
+        self.config = copy.deepcopy(config)
+        cfg = self.config
+
+        self.n_agents = cfg["companies"]["n_agents"]           # PPO learning agents (external interface)
+        self.n_bots = cfg["companies"].get("n_bot_agents", 0)  # heuristic bot agents
         self.n_total = self.n_agents + self.n_bots                # total market participants
-        self.n_years = config["simulation"]["n_years"]
+        self.n_years = cfg["simulation"]["n_years"]
 
         self._seed = seed
         self.rng = np.random.default_rng(seed)
 
-        self.cap_schedule = CapSchedule(config)
+        # Keep a pristine calibration config (pre-extension arrays) so re-calibration
+        # does not accidentally count appended bot entries.
+        self._calibration_config = copy.deepcopy(cfg)
+
+        params = compute_market_params(self._calibration_config, n_active_bots=self.n_bots)
+        self._apply_market_params_to_config(cfg, params)
+        self._market_params = params
+
+        print(
+            f"Market calibration: {params['n_active_participants']} participants, "
+            f"emissions={params['total_emissions']:.1f} Mt, cap={params['cap_year_0']:.1f} Mt"
+        )
+
+        self.cap_schedule = CapSchedule(cfg)
+
+        bot_cfg = cfg.get("bots", {})
+        self._enhanced_noise_cfg = bot_cfg.get("enhanced_noise", {})
+        self._enhanced_noise_enabled = bool(self._enhanced_noise_cfg.get("enabled", False))
+        self._fade_cfg = bot_cfg.get("fade_schedule", {})
+        self._fade_enabled = bool(self._fade_cfg.get("enabled", False))
+        self._fade_schedule = self._fade_cfg.get("schedule", [[0, self.n_bots]])
+        self._n_active_bots = self.n_bots
+        self._bot_budget_stressed = np.zeros(self.n_bots, dtype=bool)
 
         # Extend config arrays to include bot entries (so Company can index by agent_id)
         if self.n_bots > 0:
-            bot_mixes = config["companies"].get("bot_initial_mix", [])
-            bot_rw = config["companies"].get("bot_reward_weights",
-                                              [[0.5, 0.5]] * self.n_bots)
-            config["companies"]["initial_mix"] = (
-                config["companies"]["initial_mix"] + bot_mixes)
-            config["companies"]["reward_weights"] = (
-                config["companies"]["reward_weights"] + bot_rw)
-            bot_budgets = config["budget"].get("bot_annual_budgets",
-                                                [1200.0] * self.n_bots)
-            config["budget"]["annual_budgets"] = (
-                config["budget"]["annual_budgets"] + bot_budgets)
-            bot_capex_tp = config["budget"].get("bot_capex_throughputs",
-                                                 [130.0] * self.n_bots)
-            config["budget"]["capex_throughputs"] = (
-                config["budget"].get("capex_throughputs", []) + bot_capex_tp)
+            bot_mixes = cfg["companies"].get("bot_initial_mix", [])[: self.n_bots]
+            bot_rw = cfg["companies"].get("bot_reward_weights", [[0.5, 0.5]] * self.n_bots)
+            bot_rw = bot_rw[: self.n_bots]
 
-        initial_mixes = config["companies"]["initial_mix"]
+            cfg["companies"]["initial_mix"] = cfg["companies"]["initial_mix"] + bot_mixes
+            cfg["companies"]["reward_weights"] = cfg["companies"]["reward_weights"] + bot_rw
+
+            bot_budgets = cfg["budget"].get("bot_annual_budgets", [1200.0] * self.n_bots)
+            bot_budgets = bot_budgets[: self.n_bots]
+            cfg["budget"]["annual_budgets"] = cfg["budget"].get("annual_budgets", []) + bot_budgets
+
+            bot_capex_tp = cfg["budget"].get("bot_capex_throughputs", [130.0] * self.n_bots)
+            bot_capex_tp = bot_capex_tp[: self.n_bots]
+            cfg["budget"]["capex_throughputs"] = cfg["budget"].get("capex_throughputs", []) + bot_capex_tp
+
+        initial_mixes = cfg["companies"]["initial_mix"]
         self.companies: List[Company] = [
             Company(
-                agent_id=i, config=config,
+                agent_id=i, config=cfg,
                 initial_mix=initial_mixes[i], rng=self.rng,
             )
             for i in range(self.n_total)
@@ -217,6 +244,46 @@ class ETSEnvironment(gym.Env):
         floor = reward_cfg.get("shaping_weight_floor", 0.0)
         self.shaping_weight = max(floor, 1.0 - episode / max(decay_ep, 1))
 
+    @staticmethod
+    def _apply_market_params_to_config(config: dict, params: dict):
+        """Write derived calibration values into ETS config for downstream readers."""
+        config.setdefault("ets", {})["cap_year_0"] = float(params["cap_year_0"])
+        config.setdefault("ets", {}).setdefault("msr", {})["tnac_upper"] = float(params["tnac_upper"])
+        config.setdefault("ets", {}).setdefault("msr", {})["tnac_lower"] = float(params["tnac_lower"])
+        config.setdefault("ets", {}).setdefault("msr", {})["release_amount"] = float(params["release_amount"])
+        config.setdefault("ets", {}).setdefault("msr", {})["emergency_release_amount"] = float(
+            params["emergency_release_amount"]
+        )
+
+    def _resolve_fade_active_bots(self, episode: int) -> int:
+        """Resolve active bot count for the given episode from fade schedule."""
+        if not self._fade_enabled:
+            return self.n_bots
+
+        n_active = self.n_bots
+        schedule = sorted(self._fade_schedule, key=lambda x: int(x[0]))
+        for threshold, count in schedule:
+            if int(episode) >= int(threshold):
+                n_active = int(count)
+            else:
+                break
+        return max(0, min(self.n_bots, n_active))
+
+    def _is_agent_active(self, idx: int) -> bool:
+        """Return whether an internal participant index is active this episode."""
+        if idx < self.n_agents:
+            return True
+        bot_idx = idx - self.n_agents
+        return bot_idx < self._n_active_bots
+
+    def _active_mask(self) -> np.ndarray:
+        """Boolean mask of currently active participants across learning+bot arrays."""
+        mask = np.ones(self.n_total, dtype=bool)
+        if self.n_bots > 0 and self._n_active_bots < self.n_bots:
+            start = self.n_agents + self._n_active_bots
+            mask[start:] = False
+        return mask
+
     # ------------------------------------------------------------------
     # Dynamic reserve price
     # ------------------------------------------------------------------
@@ -323,15 +390,55 @@ class ETSEnvironment(gym.Env):
         self._unsold_rollover = 0.0
         self._build_episode_inflation_path()
 
+        if self._fade_enabled:
+            n_active_bots = self._resolve_fade_active_bots(self.current_episode)
+            if n_active_bots != self._n_active_bots:
+                params = compute_market_params(self._calibration_config, n_active_bots=n_active_bots)
+                self._apply_market_params_to_config(self.config, params)
+                if hasattr(self.cap_schedule, "update_calibration"):
+                    self.cap_schedule.update_calibration(
+                        cap_year_0=params["cap_year_0"],
+                        tnac_upper=params["tnac_upper"],
+                        tnac_lower=params["tnac_lower"],
+                        release_amount=params["release_amount"],
+                        emergency_release_amount=params["emergency_release_amount"],
+                    )
+                else:
+                    self.cap_schedule.cap_year_0 = float(params["cap_year_0"])
+                    self.cap_schedule.tnac_upper = float(params["tnac_upper"])
+                    self.cap_schedule.tnac_lower = float(params["tnac_lower"])
+                    self.cap_schedule.release_amount = float(params["release_amount"])
+                    self.cap_schedule.emergency_release_amount = float(params["emergency_release_amount"])
+                self._market_params = params
+                print(
+                    f"Market recalibration: {params['n_active_participants']} participants, "
+                    f"emissions={params['total_emissions']:.1f} Mt, cap={params['cap_year_0']:.1f} Mt"
+                )
+            self._n_active_bots = n_active_bots
+        else:
+            self._n_active_bots = self.n_bots
+
         # Sample per-bot persistent noise at episode start
         if self.n_bots > 0:
             bot_cfg = self.config.get("bots", {})
-            noise_std = bot_cfg.get("valuation_noise_std", 5.0)
-            mult_low = bot_cfg.get("urgency_mult_low", 0.8)
-            mult_high = bot_cfg.get("urgency_mult_high", 1.2)
+            if self._enhanced_noise_enabled:
+                enh = self._enhanced_noise_cfg
+                noise_std = enh.get("valuation_noise_std", bot_cfg.get("valuation_noise_std", 5.0))
+                mult_low = enh.get("urgency_mult_low", bot_cfg.get("urgency_mult_low", 0.8))
+                mult_high = enh.get("urgency_mult_high", bot_cfg.get("urgency_mult_high", 1.2))
+            else:
+                noise_std = bot_cfg.get("valuation_noise_std", 5.0)
+                mult_low = bot_cfg.get("urgency_mult_low", 0.8)
+                mult_high = bot_cfg.get("urgency_mult_high", 1.2)
             for b in range(self.n_bots):
                 self._bot_valuation_noise[b] = self.rng.normal(0, noise_std)
                 self._bot_urgency_mult[b] = self.rng.uniform(mult_low, mult_high)
+
+            if self._enhanced_noise_enabled:
+                stress_prob = float(self._enhanced_noise_cfg.get("budget_stress_prob", 0.0))
+                self._bot_budget_stressed = self.rng.random(self.n_bots) < stress_prob
+            else:
+                self._bot_budget_stressed[:] = False
 
         # Episode-level warning counters — reset each episode
         self._warnings = {
@@ -361,8 +468,8 @@ class ETSEnvironment(gym.Env):
             # Seed initial bank near 0.3x annual need, but keep aggregate TNAC
             # inside the MSR band to avoid immediate year-0 intervention.
             annual_needs = np.array([
-                max(company.compute_estimate_need(), 0.1)
-                for company in self.companies
+                (max(company.compute_estimate_need(), 0.1) if self._is_agent_active(i) else 0.0)
+                for i, company in enumerate(self.companies)
             ], dtype=float)
             total_need = float(annual_needs.sum())
             desired_tnac = 0.3 * total_need
@@ -374,7 +481,13 @@ class ETSEnvironment(gym.Env):
             else:
                 seed_multiple = 0.3
             for i, annual_need in enumerate(annual_needs):
-                self.holdings[i] = float(seed_multiple * annual_need)
+                self.holdings[i] = float(seed_multiple * annual_need) if self._is_agent_active(i) else 0.0
+
+        # Fully retired bots: no banks, no carry-forward debt.
+        for i in range(self.n_total):
+            if not self._is_agent_active(i):
+                self.holdings[i] = 0.0
+                self.companies[i]._carry_forward = 0.0
 
         # Validate post-warmup TNAC position against the MSR band.
         total_tnac = float(self.holdings.sum())
@@ -481,6 +594,9 @@ class ETSEnvironment(gym.Env):
 
         # (A) Seed initial bank at strategic reserve range.
         for i, company in enumerate(self.companies):
+            if not self._is_agent_active(i):
+                self.holdings[i] = 0.0
+                continue
             annual_need = max(company.compute_estimate_need(), 0.1)
             bank_frac = float(self.rng.uniform(bank_min, bank_max))
             self.holdings[i] = bank_frac * annual_need
@@ -521,6 +637,10 @@ class ETSEnvironment(gym.Env):
 
             bid_actions = np.zeros((self.n_total, 2), dtype=np.float32)
             for i, company in enumerate(self.companies):
+                if not self._is_agent_active(i):
+                    bid_actions[i, 0] = reserve_price
+                    bid_actions[i, 1] = 0.0
+                    continue
                 infl_factor = (1.0 + inflation_rate) ** burnin_year if inflation_rate > -0.99 else 1.0
 
                 valuation_noise = 0.0
@@ -579,6 +699,10 @@ class ETSEnvironment(gym.Env):
 
             self.holdings += allocations
             for i, company in enumerate(self.companies):
+                if not self._is_agent_active(i):
+                    self.holdings[i] = 0.0
+                    company._carry_forward = 0.0
+                    continue
                 emissions = company.compute_emissions()
                 self.holdings[i] = max(0.0, float(self.holdings[i]) - float(emissions))
 
@@ -587,7 +711,9 @@ class ETSEnvironment(gym.Env):
                 self._price_history.append(clipped_price)
                 self.last_clearing_price = clipped_price
 
-            for company in self.companies:
+            for i, company in enumerate(self.companies):
+                if not self._is_agent_active(i):
+                    continue
                 if self.rng.random() < 0.3:
                     invest_frac = float(self.rng.uniform(0.01, 0.03))
                     tech_choice = int(self.rng.integers(0, 3))
@@ -624,6 +750,7 @@ class ETSEnvironment(gym.Env):
 
     def _calibrate_post_init_bank(self, ws_cfg: dict):
         """Calibrate post-initialization holdings to the configured TNAC band."""
+        active_mask = self._active_mask()
         tnac_lower = float(self.cap_schedule.tnac_lower)
         tnac_upper = float(self.cap_schedule.tnac_upper)
         tnac_target = float(ws_cfg.get("burnin_tnac_target", 0.5 * (tnac_lower + tnac_upper)))
@@ -632,23 +759,28 @@ class ETSEnvironment(gym.Env):
         # Keep all agents strictly positive at year 0 while preserving heterogeneity.
         min_bank_frac = float(ws_cfg.get("bank_min_floor_frac", 0.02))
         min_banks = np.array([
-            max(1e-6, min_bank_frac * max(company.compute_estimate_need(), 0.1))
-            for company in self.companies
+            (max(1e-6, min_bank_frac * max(company.compute_estimate_need(), 0.1))
+             if active_mask[i] else 0.0)
+            for i, company in enumerate(self.companies)
         ])
 
-        holdings = np.maximum(self.holdings.astype(float), min_banks)
+        holdings = self.holdings.astype(float).copy()
+        holdings[~active_mask] = 0.0
+        holdings = np.maximum(holdings, min_banks)
         min_total = float(min_banks.sum())
         if min_total >= tnac_target:
             self.holdings = min_banks
+            self.holdings[~active_mask] = 0.0
             return
 
         weights = np.array([
-            max(company.compute_estimate_need(), 0.1)
-            for company in self.companies
+            (max(company.compute_estimate_need(), 0.1) if active_mask[i] else 0.0)
+            for i, company in enumerate(self.companies)
         ], dtype=float)
         wsum = float(weights.sum())
         if wsum <= 0.0:
-            weights = np.full(self.n_total, 1.0 / max(self.n_total, 1))
+            self.holdings = np.zeros(self.n_total, dtype=float)
+            return
         else:
             weights /= wsum
 
@@ -662,6 +794,7 @@ class ETSEnvironment(gym.Env):
             calibrated = min_banks + excess * (target_excess / excess_total)
 
         self.holdings = np.maximum(calibrated, min_banks)
+        self.holdings[~active_mask] = 0.0
 
     def _apply_warm_start(self, ws_cfg: dict):
         """
@@ -679,9 +812,12 @@ class ETSEnvironment(gym.Env):
 
         # (B) Seed initial bank
         for i, company in enumerate(self.companies):
-            annual_need = company.compute_estimate_need()  # Mt
-            seed_multiple = float(self.rng.uniform(bank_min, bank_max))
-            self.holdings[i] = annual_need * seed_multiple
+            if self._is_agent_active(i):
+                annual_need = company.compute_estimate_need()  # Mt
+                seed_multiple = float(self.rng.uniform(bank_min, bank_max))
+                self.holdings[i] = annual_need * seed_multiple
+            else:
+                self.holdings[i] = 0.0
 
         # (C) Seed price history with synthetic burn-in prices
         burnin_mean = float(ws_cfg.get("burnin_price_seed_mean",
@@ -719,14 +855,22 @@ class ETSEnvironment(gym.Env):
             return np.zeros((0, 6), dtype=np.float32)
         price_ma3 = self._compute_price_ma3()
         reserve = self._compute_dynamic_reserve()
+        price_min = float(self.config["auction"]["price_min"])
         infl_factor = self._inflation_factor(self.current_year)
         bot_cfg = self.config.get("bots", {})
         urgency_denoms = bot_cfg.get("urgency_denominators", [1.5] * self.n_bots)
+        budget_stress_qty_mult = float(self._enhanced_noise_cfg.get("budget_stress_qty_mult", 0.65))
+        qty_low = float(self.config["auction"].get("qty_mult_low", 0.3))
+        qty_high = float(self.config["auction"].get("qty_mult_high", 2.0))
         actions = np.zeros((self.n_bots, 6), dtype=np.float32)
         for b in range(self.n_bots):
+            if b >= self._n_active_bots:
+                actions[b] = np.array([price_min, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                continue
+
             idx = self.n_agents + b  # bots indexed after learning agents
             urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
-            actions[b] = heuristic_policy.auction_action(
+            action = heuristic_policy.auction_action(
                 self.companies[idx], price_ma3, self.current_year,
                 self.n_years, self.config,
                 bank=float(self.holdings[idx]),
@@ -738,6 +882,9 @@ class ETSEnvironment(gym.Env):
                 urgency_multiplier=float(self._bot_urgency_mult[b]),
                 urgency_denom=urgency_denom,
             )
+            if self._enhanced_noise_enabled and bool(self._bot_budget_stressed[b]):
+                action[1] = float(np.clip(action[1] * budget_stress_qty_mult, qty_low, qty_high))
+            actions[b] = action
         return actions
 
     def _generate_bot_secondary_actions(self, clearing_price: float) -> np.ndarray:
@@ -748,6 +895,10 @@ class ETSEnvironment(gym.Env):
         urgency_denoms = bot_cfg.get("urgency_denominators", [1.5] * self.n_bots)
         actions = np.zeros((self.n_bots, 2), dtype=np.float32)
         for b in range(self.n_bots):
+            if b >= self._n_active_bots:
+                actions[b] = np.array([0.0, 0.0], dtype=np.float32)
+                continue
+
             idx = self.n_agents + b  # bots indexed after learning agents
             urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
             actions[b] = heuristic_policy.secondary_action(
@@ -870,6 +1021,9 @@ class ETSEnvironment(gym.Env):
         # 6. Compute realized emissions (CF noise → P6, demand shock → P5)
         realized_emissions = np.zeros(self.n_total)
         for i, company in enumerate(self.companies):
+            if not self._is_agent_active(i):
+                realized_emissions[i] = 0.0
+                continue
             e_cf = company.compute_emissions_with_cf_noise(cf_noise[i])
             e_shocked = e_cf * (1.0 + epsilons[i])
             realized_emissions[i] = max(0.0, e_shocked)
@@ -900,6 +1054,13 @@ class ETSEnvironment(gym.Env):
         estimate_needs = np.zeros(self.n_total)
         bid_coverages = np.zeros(self.n_total)
         for i, company in enumerate(self.companies):
+            if not self._is_agent_active(i):
+                bid_actions[i, 1] = 0.0
+                bid_qty_multipliers[i] = 0.0
+                estimate_needs[i] = 0.0
+                bid_coverages[i] = 0.0
+                continue
+
             multiplier = float(np.clip(auction_actions[i, 1], qty_mult_low, qty_mult_high))
             base_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
             bid_actions[i, 1] = multiplier * base_need
@@ -954,6 +1115,8 @@ class ETSEnvironment(gym.Env):
         mac_reductions = np.zeros(self.n_total)
         mac_costs = np.zeros(self.n_total)
         for i, company in enumerate(self.companies):
+            if not self._is_agent_active(i):
+                continue
             reduction, cost = company.apply_mac_switching(clearing_price, current_year=year)
             mac_reductions[i] = reduction
             mac_costs[i] = cost
@@ -980,8 +1143,32 @@ class ETSEnvironment(gym.Env):
                     frac_to_retire -= retire_this
             return float(decom_cost)
 
+        def _find_recovered_invest_frac(company: Company, tech_idx: int,
+                                        lo_frac: float, hi_frac: float,
+                                        max_total_cost: float, max_capex_cost: float) -> float:
+            """Bisection solve for max feasible invest_frac under boosted limits."""
+            best = lo_frac
+            for _ in range(24):
+                mid = 0.5 * (lo_frac + hi_frac)
+                capex_mid = company.compute_investment_cost(tech_idx, mid, year)
+                total_mid = capex_mid + _estimate_decommission_cost(company, mid)
+                feasible = (total_mid <= max_total_cost + 1e-9) and (capex_mid <= max_capex_cost + 1e-9)
+                if feasible:
+                    best = mid
+                    lo_frac = mid
+                else:
+                    hi_frac = mid
+            return best
+
         for i, company in enumerate(self.companies):
+            if not self._is_agent_active(i):
+                invest_fracs[i] = 0.0
+                invest_costs[i] = 0.0
+                company.prev_invest_frac = 0.0
+                continue
+
             invest_frac = float(np.clip(auction_actions[i, 2], 0.0, company.max_invest_frac))
+            requested_invest_frac = invest_frac
             tech_logits = auction_actions[i, 3:6]
             tech_choice = int(np.argmax(tech_logits))
             invest_tech_choices[i] = tech_choice
@@ -992,13 +1179,36 @@ class ETSEnvironment(gym.Env):
             budget_remaining = max(0.0, budget_ceiling - company.budget_spent_this_year)
             capex_cost = company.compute_investment_cost(tech_idx, invest_frac, year)
             total_proj_cost = capex_cost + _estimate_decommission_cost(company, invest_frac)
+            budget_clipped = False
+            capex_clipped = False
             if total_proj_cost > budget_remaining and total_proj_cost > 1e-6:
                 invest_frac *= budget_remaining / total_proj_cost
                 capex_cost = company.compute_investment_cost(tech_idx, invest_frac, year)
+                budget_clipped = True
 
             capex_remaining = max(0.0, company.capex_throughput - company.capex_spent_this_year)
             if capex_cost > capex_remaining and capex_cost > 1e-6:
                 invest_frac *= capex_remaining / capex_cost
+                capex_clipped = True
+
+            # Optional green-finance boost can recover clipped investment.
+            if (budget_clipped or capex_clipped) and company._gf_enabled and requested_invest_frac > invest_frac:
+                max_total_with_loan = budget_remaining + company.green_loan_headroom
+                max_capex_with_boost = capex_remaining + company.green_capex_headroom
+                recovered_frac = _find_recovered_invest_frac(
+                    company=company,
+                    tech_idx=tech_idx,
+                    lo_frac=invest_frac,
+                    hi_frac=requested_invest_frac,
+                    max_total_cost=max_total_with_loan,
+                    max_capex_cost=max_capex_with_boost,
+                )
+                if recovered_frac > invest_frac + 1e-9:
+                    recovered_total = company.compute_investment_cost(tech_idx, recovered_frac, year)
+                    recovered_total += _estimate_decommission_cost(company, recovered_frac)
+                    extra_invest_cost = max(0.0, recovered_total - budget_remaining)
+                    company.record_green_loan(extra_invest_cost)
+                    invest_frac = recovered_frac
 
             invest_frac = float(np.clip(invest_frac, 0.0, company.max_invest_frac))
             invest_frac = min(invest_frac, company.fossil_frac)
@@ -1123,10 +1333,14 @@ class ETSEnvironment(gym.Env):
 
         realized_emissions = self._current_emissions
         old_carry_forward = np.array([c._carry_forward for c in self.companies], dtype=float)
+        active_mask = self._active_mask()
 
         # Per-agent secondary price cap = 2.0 × effective_penalty_rate
         secondary_prices = np.zeros(self.n_total)
         for i in range(self.n_total):
+            if not active_mask[i]:
+                secondary_prices[i] = float(sec_price_min)
+                continue
             agent_sec_max = sec_price_max_mult * self.companies[i].effective_penalty_rate(self.current_year)
             secondary_prices[i] = float(np.clip(
                 secondary_actions[i, 0], sec_price_min, agent_sec_max))
@@ -1136,6 +1350,7 @@ class ETSEnvironment(gym.Env):
             -self.config["auction"]["quantity_max"],
             self.config["auction"]["quantity_max"],
         )
+        raw_secondary_qtys[~active_mask] = 0.0
 
         # No sell gating — agents sell whatever they choose, up to what they hold
         # (no short selling enforced in _settle_double_auction via max_sell = alloc + bank)
@@ -1157,6 +1372,9 @@ class ETSEnvironment(gym.Env):
 
         # Update secondary profit EMA
         for i in range(self.n_total):
+            if not active_mask[i]:
+                self._secondary_profit_ema[i] = 0.0
+                continue
             if trade_qtys[i] < -1e-6:
                 profit_per_mt = -trade_costs[i] / abs(trade_qtys[i])
                 margin = profit_per_mt - clearing_price
@@ -1183,6 +1401,10 @@ class ETSEnvironment(gym.Env):
         #old_carry_forward = np.array([c._carry_forward for c in self.companies])
         penalties = np.zeros(self.n_total)
         for i, company in enumerate(self.companies):
+            if not active_mask[i]:
+                penalties[i] = 0.0
+                company._carry_forward = 0.0
+                continue
             penalties[i] = company.settle_compliance_realized(
                 allowances_held=holdings[i],
                 realized_emissions=realized_emissions[i],
@@ -1191,12 +1413,18 @@ class ETSEnvironment(gym.Env):
 
         # Banking: surplus after surrendering for emissions + old carry-forward
         for i in range(self.n_total):
+            if not active_mask[i]:
+                self.holdings[i] = 0.0
+                continue
             total_obligation = realized_emissions[i] + old_carry_forward[i]
             self.holdings[i] = max(0.0, holdings[i] - total_obligation)
         self._last_gaps = self.holdings.copy()
 
         # P4: Update fossil fraction history (for lock-in penalty)
         for i, company in enumerate(self.companies):
+            if not active_mask[i]:
+                self._fossil_frac_history[i] = []
+                continue
             self._fossil_frac_history[i].append(company.fossil_frac)
             if len(self._fossil_frac_history[i]) > 3:
                 self._fossil_frac_history[i].pop(0)
@@ -1212,13 +1440,14 @@ class ETSEnvironment(gym.Env):
             mac_costs,
             precompliance_holdings=pretrade_holdings,
             old_carry_forward=old_carry_forward,
+            active_mask=active_mask,
         )
 
         # Compute per-agent shortfall for diagnostics.
         # Total obligation = realized emissions + carry-forward from prior years.
         # Uses local `holdings` (pre-compliance: prev_bank + alloc + secondary).
         shortfalls = np.array([
-            max(0.0, realized_emissions[i] + old_carry_forward[i] - holdings[i])
+            (max(0.0, realized_emissions[i] + old_carry_forward[i] - holdings[i]) if active_mask[i] else 0.0)
             for i in range(self.n_total)
         ])
 
@@ -1229,6 +1458,9 @@ class ETSEnvironment(gym.Env):
         if np.all(sec_qty_raw > 0) or np.all(sec_qty_raw < 0):
             self._warnings["one_side_sec"] += 1
         for _i in range(self.n_total):
+            if not active_mask[_i]:
+                self._consecutive_shortfall[_i] = 0
+                continue
             if shortfalls[_i] > 1e-6:
                 self._consecutive_shortfall[_i] += 1
                 if self._consecutive_shortfall[_i] >= 3 and self.current_year >= 3:
@@ -1472,7 +1704,7 @@ class ETSEnvironment(gym.Env):
     def _compute_rewards(self, payments, trade_costs, penalties,
                          invest_costs, emissions, clearing_price,
                          mac_costs=None, precompliance_holdings=None,
-                         old_carry_forward=None):
+                         old_carry_forward=None, active_mask=None):
         """
         Reward (HAPPO-compliant, v6.4):
             R_i = w_cost * (-cost_norm_ex_penalty) + w_green * (esg_scale * esg_raw)
@@ -1522,12 +1754,16 @@ class ETSEnvironment(gym.Env):
         remaining_years = max(1, self.n_years - self.current_year)
 
         for i, company in enumerate(self.companies):
+            if active_mask is not None and not bool(active_mask[i]):
+                continue
+
             auction_cost = float(payments[i])
             secondary_cost = float(trade_costs[i])
             penalty_cost = float(penalties[i])
             investment_cost = float(invest_costs[i])
             operational_cost = company.compute_operational_cost(self.current_year)
             mac_cost_i = float(mac_costs[i])
+            loan_interest_cost = company.compute_green_loan_cost()
 
             # Record spending: penalty now included in budget tracking
             # Secondary revenue (negative cost) reduces spending, freeing up budget headroom
@@ -1541,7 +1777,7 @@ class ETSEnvironment(gym.Env):
             # Penalty applies at full strength to ALL agents regardless of w_cost
             total_cost_ex_penalty = (auction_cost + secondary_cost + investment_cost
                                      + operational_cost + budget_penalty + capex_penalty
-                                     + mac_cost_i)
+                                     + mac_cost_i + loan_interest_cost)
 
             # Electricity revenue
             revenue = 0.0
@@ -1611,6 +1847,8 @@ class ETSEnvironment(gym.Env):
             terminal_price = max(clearing_price, self.last_secondary_price, eff_penalty * 0.8)
 
             for i, company in enumerate(self.companies):
+                if active_mask is not None and not bool(active_mask[i]):
+                    continue
                 # Terminal bank value with 2× annual_need cap:
                 # Bank beyond 2yr of reserves gets ZERO additional terminal credit,
                 # making secondary selling immediately rational. Diminishing-returns
@@ -1687,7 +1925,18 @@ class ETSEnvironment(gym.Env):
 
         # Pre-compute 5D public info for ALL participants (learning + bots)
         if self._opponent_modeling and self.n_total > 1:
-            public_infos = [c.get_public_info() for c in self.companies]
+            public_infos = []
+            for i, company in enumerate(self.companies):
+                if self._is_agent_active(i):
+                    public_infos.append(company.get_public_info())
+                else:
+                    public_infos.append({
+                        "emissions": 0.0,
+                        "carry_forward": 0.0,
+                        "green_frac": 0.0,
+                        "fossil_frac": 0.0,
+                        "queue_total": 0.0,
+                    })
 
         obs_list = []
         for i in range(self.n_agents):  # only learning agents get observations

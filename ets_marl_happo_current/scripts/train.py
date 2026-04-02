@@ -443,6 +443,44 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # so earlier short runs do not mutate config used by later long runs.
     config = copy.deepcopy(config)
 
+    tr_cfg = config.get("tabula_rasa", {})
+    if tr_cfg.get("enabled", False):
+        n_ep = config["simulation"]["n_episodes"]
+        # Disable BC and KL anchor
+        config.setdefault("pretrain", {})["enabled"] = False
+        config.setdefault("ppo", {})["kl_anchor_beta"] = 0.0
+
+        # Override exploration
+        explore_cfg = config.setdefault("exploration", {})
+        explore_cfg["epsilon_start"] = tr_cfg["epsilon_start"]
+        explore_cfg["epsilon_final"] = tr_cfg["epsilon_final"]
+        explore_cfg["epsilon_decay_episodes"] = int(tr_cfg["epsilon_decay_frac"] * n_ep)
+        explore_cfg["mode"] = tr_cfg.get("exploration_mode", "uniform")
+
+        # Override entropy + critic warmup
+        ppo_cfg = config.setdefault("ppo", {})
+        ppo_cfg["entropy_coef"] = tr_cfg["entropy_coef"]
+        ppo_cfg["entropy_decay_start"] = int(tr_cfg["entropy_decay_start_frac"] * n_ep)
+        ppo_cfg["entropy_decay_window"] = int(tr_cfg["entropy_decay_window_frac"] * n_ep)
+        ppo_cfg["critic_warmup_episodes"] = int(tr_cfg["critic_warmup_frac"] * n_ep)
+
+        # Override shaping and HPP
+        config.setdefault("reward", {})["shaping_decay_episode"] = int(
+            tr_cfg["shaping_decay_frac"] * n_ep
+        )
+        config.setdefault("hpp", {})["warmup_episodes"] = int(
+            tr_cfg["hpp_warmup_frac"] * n_ep
+        )
+
+        # Remove action anchors (fallback = midpoint initialization)
+        explore_cfg["auction_anchors"] = None
+        explore_cfg["secondary_anchors"] = None
+        print(
+            "TABULA RASA: BC off, KL off, anchors off, uniform exploration, "
+            f"ε={tr_cfg['epsilon_start']}→{tr_cfg['epsilon_final']}, "
+            f"entropy={tr_cfg['entropy_coef']}"
+        )
+
     n_agents = config["companies"]["n_agents"]
     n_episodes = config["simulation"]["n_episodes"]
     n_years = config["simulation"]["n_years"]
@@ -481,7 +519,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v6.4: MAC 48€ | Absolute-price secondary | ESG signal | Carry-forward{cf_str}")
+    print(f"v7.0: Dynamic calibration | Green finance | Tabula-rasa mode | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(
         f"PPO profile: {run_profile['profile']} "

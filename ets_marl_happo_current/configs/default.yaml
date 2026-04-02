@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v6.4
+# ETS MARL — Configuration v7.0
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -16,6 +16,21 @@ simulation:
   n_years: 12
   n_episodes: 100000
   seeds: [42, 123, 456]
+
+tabula_rasa:
+  enabled: false
+  # When enabled, these OVERRIDE the corresponding values elsewhere.
+  # All fractions are relative to n_episodes.
+  epsilon_start: 0.50
+  epsilon_final: 0.05
+  epsilon_decay_frac: 0.50
+  entropy_coef: 0.08
+  entropy_decay_start_frac: 0.0     # no plateau — decay from ep 0
+  entropy_decay_window_frac: 0.85
+  critic_warmup_frac: 0.10
+  shaping_decay_frac: 0.20
+  hpp_warmup_frac: 0.25
+  exploration_mode: "uniform"        # "uniform" replaces anchored Gaussian
 
 # ----------------------------------------------------------
 # Technology parameters (5 technologies)
@@ -37,27 +52,32 @@ technologies:
 
 # ----------------------------------------------------------
 # ETS parameters
-# Cap starts ~11% above total emissions (~45.0 Mt for 16 participants),
-# providing a slight surplus that transitions to scarcity within 2-3 years.
-# Tightened from 57.0 Mt (26% surplus) to ensure scarcity binds early.
+# Core market values are calibrated at environment init based on active
+# participants and their emissions profile.
 # ----------------------------------------------------------
 ets:
-  cap_year_0: 50.0       # Mt — ~11% surplus vs ~45.0 Mt initial emissions (16 agents)
+  # --- Computed at init (DO NOT set manually) ---
+  # cap_year_0, msr.tnac_upper, msr.tnac_lower are now DERIVED from:
+  #   total_system_emissions × (1 + cap_overhead_pct)
+  # To override with a manual value, set cap_year_0_override to a number.
+  cap_year_0_override: null     # set to e.g. 50.0 to force manual cap
+  cap_overhead_pct: 0.11        # 11% surplus over total initial emissions
+
   lrf_phase1: 0.043
   lrf_phase2: 0.044
   lrf_phase_switch: 4
 
   msr:
     enabled: true
-    tnac_upper: 18.0     # 0.36× cap (tighter micro-ETS calibration for 12-year episodes)
-    tnac_lower: 9.0      # 0.18× cap (paired with upper threshold for faster response)
+    tnac_upper_ratio: 0.36     # fraction of computed cap_year_0
+    tnac_lower_ratio: 0.18     # fraction of computed cap_year_0
     withhold_rate: 0.24
-    release_amount: 0.80
+    release_frac: 0.016        # fraction of cap (was 0.80 Mt / 50.0 Mt)
     activation_year: 2   # MSR begins Year 2; mirrors EU ETS lagged TNAC observation
                          # (Decision 2015/1814 Art 1(5))
     price_containment_absolute: 350   # hard fallback for containment trigger (EUR/t)
     price_release_absolute: 450       # hard fallback for release trigger (EUR/t)
-    emergency_release_amount: 4.0     # Mt released per year in emergency (~10% of year-0 cap)
+    emergency_release_frac: 0.08  # fraction of cap (was 4.0 Mt / 50.0 Mt)
     min_auction_frac: 0.10            # safety floor for minimum auction volume
 
   banking: true
@@ -171,8 +191,8 @@ secondary:
 # Sources: Scope Ratings 2023, Enel/Iberdrola 2024-2027 strategic plans.
 # ----------------------------------------------------------
 budget:
-  annual_budgets: [820.0, 820.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]  # Adjusted for tighter scarcity
-  bot_annual_budgets: [820.0, 820.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]  # Match learning agents
+  annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
+  bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   overspend_penalty_coef: 0.5
   contingency_zone: 0.10
   hard_cap_multiplier: 1.20
@@ -185,9 +205,15 @@ budget:
   # constraint — permitting pipeline, EPC capacity, mgmt bandwidth.
   # NOT a financial constraint (that's the unified budget).
   # Scaled from Iberdrola/Enel RE capex per unit output.
-  capex_throughputs: [100.0, 100.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
-  bot_capex_throughputs: [100.0, 100.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
+  capex_throughputs: [130.0, 130.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
+  bot_capex_throughputs: [130.0, 130.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
   capex_overspend_coef: 1.0
+
+green_finance:
+  enabled: false
+  loan_budget_boost: 200.0       # extra M€ for green capex only
+  loan_interest_rate: 0.05       # annual interest on utilized amount
+  capex_throughput_boost: 80.0   # extra M€/yr capex for green only
 
 # ----------------------------------------------------------
 # Bot stochastic valuation & differentiation
@@ -201,6 +227,19 @@ bots:
   # Per-bot urgency denominators: B1=1.3, B2=1.7, B3=1.3, B4=1.7, B5=1.3, B6=1.7, B7=1.3, B8=1.7
   # This differentiates bot pairs: even bots more urgent (1.3), odd bots less urgent (1.7)
   urgency_denominators: [1.3, 1.7, 1.3, 1.7, 1.3, 1.7, 1.3, 1.7]
+  # --- Enhanced noise (off by default, easily toggled) ---
+  enhanced_noise:
+    enabled: false
+    valuation_noise_std: 15.0
+    urgency_mult_low: 0.6
+    urgency_mult_high: 1.5
+    budget_stress_prob: 0.15
+    budget_stress_qty_mult: 0.65
+  # --- Bot fade schedule (off by default, easily toggled) ---
+  fade_schedule:
+    enabled: false
+    # [episode_threshold, n_active_bots] — bots retire in reverse order
+    schedule: [[0, 8], [30000, 6], [60000, 4], [80000, 2]]
 
 # ----------------------------------------------------------
 # Non-compliance penalty & general inflation
@@ -334,7 +373,7 @@ ppo:
   critic_extra_epochs: 5     # extra critic-only training epochs before main PPO loop
   critic_huber: true         # use Huber loss for critic instead of MSE
   critic_huber_delta: 10.0   # delta parameter for Huber loss
-  clip_value: true           # value function clipping (enabled for v6.4)
+  clip_value: true           # value function clipping (enabled for v7.0)
   normalize_returns: true    # normalize returns before critic training
 
 # ----------------------------------------------------------
@@ -428,6 +467,7 @@ hpp:
 # Decays linearly over training.
 # ----------------------------------------------------------
 exploration:
+  mode: "anchored"            # "anchored" (default) or "uniform"
   epsilon_start: 0.25
   epsilon_final: 0.05
   epsilon_decay_episodes: 0   # auto: 35% of n_episodes, clamped to [300, 12000]

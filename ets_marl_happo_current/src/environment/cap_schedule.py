@@ -294,6 +294,28 @@ class CapSchedule:
 
         return auction_vol
 
+    def update_calibration(self, cap_year_0, tnac_upper, tnac_lower,
+                           release_amount, emergency_release_amount):
+        """Update runtime calibration values and reset MSR internal state."""
+        self.cap_year_0 = float(cap_year_0)
+        self.tnac_upper = float(tnac_upper)
+        self.tnac_lower = float(tnac_lower)
+        self.release_amount = float(release_amount)
+        self.emergency_release_amount = float(emergency_release_amount)
+
+        # Reset MSR internals to avoid mixing reserves between calibrations.
+        self._msr_reserve = 0.0
+        self._unsold_absorbed = 0.0
+        self._unsold_rollover_pending = 0.0
+        self._total_cancelled = 0.0
+        self._msr_event_counts = {
+            "emergency_release": 0,
+            "containment_release": 0,
+            "withdrawal_suppressed": 0,
+        }
+        self.cap_history.clear()
+        self.volume_history.clear()
+
     def reset(self):
         """Reset schedule to initial state (call at episode start)."""
         self._msr_reserve = 0.0

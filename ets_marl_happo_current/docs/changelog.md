@@ -5,6 +5,61 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.0.0
+
+**Tabula-Rasa Training Mode**
+
+- Added `tabula_rasa` config block for cold-start ablation mode with explicit fraction-based overrides.
+- `scripts/train.py` now applies tabula-rasa overrides right after per-seed config deep-copy and before any auto-schedule resolution.
+- Enabling tabula-rasa now:
+	- disables BC pretraining and KL anchor,
+	- switches exploration mode to uniform,
+	- removes auction/secondary action anchors,
+	- overrides epsilon, entropy, critic warmup, shaping decay, and HPP warmup schedules from `n_episodes` fractions.
+- `PPOAgent` now supports `exploration.mode` and switches epsilon-random actions between `anchored` and `uniform` sampling.
+
+**Budget Relaxation + Green Finance**
+
+- Coal-heavy budgets and capex-throughput values were relaxed in `configs/default.yaml`.
+- Added `green_finance` config section (`enabled`, `loan_budget_boost`, `loan_interest_rate`, `capex_throughput_boost`).
+- `Company` now tracks green-loan utilization with:
+	- `record_green_loan`,
+	- `compute_green_loan_cost`,
+	- `green_loan_headroom`,
+	- `green_capex_headroom`.
+- `ETSEnvironment.step_auction` now supports green-finance recovery after normal budget/capex clipping.
+- Reward computation now includes annual green-loan interest in `total_cost_ex_penalty` (reward cost channel only; not budget spending).
+
+**Dynamic Market Calibration (Emission-Weighted) + Bot Features**
+
+- Added `src/environment/market_calibration.py`:
+	- `compute_system_emissions(...)`
+	- `compute_market_params(...)`
+- Cap/MSR calibration is now derived from active-participant emissions using ratio-based config keys.
+- Environment init now writes derived values into runtime config and prints calibration summary.
+- Added backward-compat deprecation path for old-style hardcoded cap/MSR configs.
+- `CapSchedule` gained runtime `update_calibration(...)` support for fade-triggered recalibration.
+- Added bot `enhanced_noise` and `fade_schedule` controls in config and runtime behavior.
+- Fade now supports reducing active bots by schedule and recalibrating cap/MSR accordingly.
+- Retired bots are fully removed from market dynamics (zero auction demand, no secondary activity, zero emissions/compliance contribution).
+
+**Configuration Refactor**
+
+- ETS config moved to ratio-based inputs:
+	- `cap_year_0_override`, `cap_overhead_pct`
+	- `msr.tnac_upper_ratio`, `msr.tnac_lower_ratio`
+	- `msr.release_frac`, `msr.emergency_release_frac`
+- Added exploration mode key: `exploration.mode` (`anchored` or `uniform`).
+
+**Tests**
+
+- Added:
+	- `tests/test_tabula_rasa.py`
+	- `tests/test_green_finance.py`
+	- `tests/test_market_calibration.py`
+	- `tests/test_bot_features.py`
+- Existing core integration and cap schedule tests remain valid under both new ratio-based and backward-compatible paths.
+
 ## v6.4.0
 
 **Reward Decomposition for Post-Hoc Analysis**
@@ -17,10 +72,6 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 - Training pipeline writes the new base/shaping reward columns to both `year_log_s*.csv` and `training_log_s*.csv`.
 - Training convergence diagnostics cell (D6) now visualizes system base-vs-shaping-vs-total reward trajectories and uses base rewards for per-agent constant trajectory plots when available.
 
-**Versioning and Documentation**
-
-- Version bumped to `6.4.0` in `pyproject.toml`.
-- `configs/default.yaml` header and active docs updated to `v6.4`.
 
 ## v6.3.0
 
@@ -57,11 +108,6 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 	- long-run values apply when `n_episodes > 20000`
 	- short-run overrides restore prior values (`lr=0.0002`, `entropy_coef_final=0.03`, `episodes_per_update=8`) for shorter runs.
 
-**Versioning and Documentation**
-
-- Version bumped to `6.3.0` in `pyproject.toml`.
-- `configs/default.yaml` header and active docs updated to `v6.3`.
-- Root repository README active-version reference updated to `v6.3`.
 
 ## v6.2.0
 

@@ -103,6 +103,14 @@ class Company:
         self.capex_overspend_coef = budget_cfg.get("capex_overspend_coef", 1.0)
         self.capex_spent_this_year = 0.0
 
+        # Green finance (optional): annual loan headroom for green capex only.
+        gf_cfg = config.get("green_finance", {})
+        self._gf_enabled = bool(gf_cfg.get("enabled", False))
+        self._gf_loan_budget = float(gf_cfg.get("loan_budget_boost", 0.0))
+        self._gf_interest_rate = float(gf_cfg.get("loan_interest_rate", 0.05))
+        self._gf_capex_boost = float(gf_cfg.get("capex_throughput_boost", 0.0))
+        self.green_loan_utilized = 0.0
+
         # P6: Construction jitter config
         jitter_cfg = config.get("construction_jitter", {})
         self._jitter_enabled = jitter_cfg.get("enabled", False)
@@ -472,9 +480,29 @@ class Company:
 
     def reset_budget(self):
         self.budget_spent_this_year = 0.0
+        self.green_loan_utilized = 0.0
 
     def record_spending(self, amount: float):
         self.budget_spent_this_year += float(amount)
+
+    def record_green_loan(self, amount: float):
+        self.green_loan_utilized += float(amount)
+
+    def compute_green_loan_cost(self) -> float:
+        return self._gf_interest_rate * self.green_loan_utilized
+
+    @property
+    def green_loan_headroom(self) -> float:
+        if not self._gf_enabled:
+            return 0.0
+        return max(0.0, self._gf_loan_budget - self.green_loan_utilized)
+
+    @property
+    def green_capex_headroom(self) -> float:
+        if not self._gf_enabled:
+            return 0.0
+        # Capex boost is annual headroom, not a cumulative state variable.
+        return self._gf_capex_boost
 
     def compute_budget_penalty(self) -> float:
         budget_cfg = self.config.get("budget", {})
@@ -743,6 +771,7 @@ class Company:
         self.year_cost = 0.0
         self.budget_spent_this_year = 0.0
         self.capex_spent_this_year = 0.0
+        self.green_loan_utilized = 0.0
         self.prev_invest_frac = 0.0
         self._carry_forward = 0.0
         self._inflation_rates_by_year = {}

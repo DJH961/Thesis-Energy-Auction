@@ -1,6 +1,6 @@
-# ETS MARL — Current Version (HAPPO/PPO) v6.4
+# ETS MARL — Current Version (HAPPO/PPO) v7.0
 
-This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
+This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand, plus v7.0 features for tabula-rasa training, green finance, and dynamic emission-weighted market calibration.
 
 ## What Does This Code Do?
 
@@ -137,7 +137,7 @@ ets_marl_happo_current/
 │       └── replay_buffer.py      # Stores past experiences for learning
 │
 ├── configs/
-│   └── default.yaml              # All simulation parameters (v6.4)
+│   └── default.yaml              # All simulation parameters (v7.0)
 │
 ├── scripts/
 │   ├── train.py                  # Starts a training run
@@ -245,9 +245,13 @@ The most important settings you might want to change:
 | `simulation.n_years` | 12 | How many years each episode simulates |
 | `companies.n_agents` | 8 | Number of learning agents (PPO) |
 | `companies.n_bot_agents` | 8 | Number of heuristic bot agents |
-| `ets.cap_year_0` | 50.0 Mt | Starting emission cap (~11% surplus for 16 participants) |
+| `ets.cap_overhead_pct` | 0.11 | Year-0 cap overhead over total initial emissions (dynamic calibration) |
+| `ets.cap_year_0_override` | `null` | Optional hard override for year-0 cap |
 | `auction.price_max` | 500 | Maximum bid price (€/tonne) |
 | `penalty.rate` | 138.75 | Fine per excess tonne of CO2 (€), base level at simulation year-0 (2026) |
+| `tabula_rasa.enabled` | false | Enables no-anchor, uniform-exploration tabula-rasa training overrides |
+| `green_finance.enabled` | false | Enables green-only loan/capex throughput boost during investment clipping |
+| `bots.fade_schedule.enabled` | false | Enables episode-based bot retirement and automatic market recalibration |
 | `penalty.inflation_rate` | 0.020 | Mean annual inflation for nominal indexing (μ) |
 | `penalty.inflation_random_std` | 0.015 | Annual inflation standard deviation (σ), sampled with a normal distribution |
 | `penalty.inflation_random_window` | 0.0 | Legacy fallback: uniform ±window (used only if `inflation_random_std = 0`) |
