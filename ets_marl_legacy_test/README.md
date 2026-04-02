@@ -1,6 +1,6 @@
 # ETS MARL — Legacy Test Version (DDPG, 4 Agents)
 
-> **Status: Archived.** This was the original prototype. For the current active version (v7.1), go to [ets_marl_happo_current](../ets_marl_happo_current).
+> **Status: Archived.** This was the original prototype. For the current active version (v7.2), go to [ets_marl_happo_current](../ets_marl_happo_current).
 
 ## What Is This?
 

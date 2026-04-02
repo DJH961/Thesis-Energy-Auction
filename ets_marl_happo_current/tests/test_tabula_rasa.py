@@ -88,9 +88,10 @@ def test_tabula_rasa_no_anchors(monkeypatch):
         action, _, _ = agent.auction_policy.act(obs, deterministic=True)
 
     price = float(action[0, 0].item())
-    # midpoint between 30 and 500 is 265; anchors-off should initialize near midpoint.
-    assert abs(price - 265.0) < 60.0
-    assert abs(price - 80.0) > 60.0
+    # With no explicit anchors, tabula-rasa now starts near expected price
+    # rather than the midpoint of the full auction range.
+    assert abs(price - 80.0) < 50.0
+    assert abs(price - 265.0) > 50.0
 
 
 def test_tabula_rasa_uniform_exploration():
@@ -163,6 +164,81 @@ def test_tabula_rasa_uniform_exploration():
 
     # Uniform mode keeps side-balanced bid-price sampling around the expected price,
     # so overbids and underbids are equally likely even with asymmetric price ranges.
+    under_share = under / non_equal
+    assert 0.40 <= under_share <= 0.60
+
+
+def test_tabula_rasa_uniform_exploration_fallback_expected_price():
+    """Fallback expected-price anchor should default near 80 EUR/t, not midpoint."""
+    config = {
+        "ppo": {
+            "hidden_size": 64,
+            "lr": 0.0003,
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+            "clip_eps": 0.2,
+            "entropy_coef": 0.02,
+            "value_coef": 0.5,
+            "max_grad_norm": 0.5,
+            "n_epochs": 2,
+            "mini_batch_size": 4,
+            "log_std_min": -1.5,
+            "log_std_max": 0.0,
+            "centralized_critic": False,
+            "critic_hidden_size": 64,
+        },
+        "auction": {
+            "price_min": 30.0,
+            "price_max": 500.0,
+            "quantity_max": 3.0,
+            "qty_mult_low": 0.3,
+            "qty_mult_high": 2.0,
+        },
+        "investment": {"max_invest_frac": 0.2},
+        "trading": {"sec_price_min": 30.0, "sec_price_max_mult": 2.0},
+        "penalty": {"rate": 138.75, "inflation_rate": 0.02},
+        "simulation": {"n_years": 12},
+        "reward": {"normalizer_alpha": 0.01, "clip_min": -10.0, "clip_max": 2.0},
+        "companies": {"n_agents": 1},
+        "price": {"initial_expected": 80.0},
+        "exploration": {
+            "mode": "uniform",
+            "auction_anchors": None,
+            "secondary_anchors": None,
+        },
+    }
+
+    agent = PPOAgent(
+        agent_id=0,
+        obs_dim_phase1=3,  # intentionally omit expected-price feature index [3]
+        obs_dim_phase2=6,
+        auction_action_low=np.array([30.0, 0.3, 0.0, -1, -1, -1], dtype=np.float32),
+        auction_action_high=np.array([500.0, 2.0, 0.2, 1, 1, 1], dtype=np.float32),
+        secondary_action_low=np.array([30.0, -3.0], dtype=np.float32),
+        secondary_action_high=np.array([350.0, 3.0], dtype=np.float32),
+        config=config,
+        seed=7,
+    )
+
+    obs1 = np.zeros(3, dtype=np.float32)
+    np.random.seed(7)
+
+    prices = []
+    for _ in range(1000):
+        action, _, _ = agent.select_auction_action(obs1, deterministic=False, epsilon=1.0)
+        prices.append(float(action[0]))
+
+    reference_price = float(config["price"]["initial_expected"])
+    under = sum(p < reference_price for p in prices)
+    over = sum(p > reference_price for p in prices)
+    non_equal = under + over
+
+    assert min(prices) >= 30.0
+    assert max(prices) <= 500.0
+    assert non_equal > 0
+
+    # If midpoint fallback (265 EUR/t) sneaks back in, under-share vs 80 EUR/t
+    # collapses far below this range.
     under_share = under / non_equal
     assert 0.40 <= under_share <= 0.60
 

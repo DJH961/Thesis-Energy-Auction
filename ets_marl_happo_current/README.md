@@ -1,6 +1,6 @@
-# ETS MARL — Current Version (HAPPO/PPO) v7.1
+# ETS MARL — Current Version (HAPPO/PPO) v7.2
 
-This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand, plus v7.1 additions for **EU ETS-style bid collateral cost** and **side-balanced tabula-rasa start-price exploration** (alongside v7.0 tabula-rasa, green finance, and dynamic emission-weighted market calibration).
+This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand. v7.2 adds **budget-aware pre-auction collateral affordability clipping**, a **budget-headroom signal in Phase-1 observations**, and packages the tabula-rasa **80 EUR/t expected-price fallback** updates.
 
 ## What Does This Code Do?
 
@@ -108,6 +108,8 @@ The reward signal balances:
 - **Capex throughput cap**: Organizational constraint on annual construction spend (M€), modelling permitting pipeline capacity, EPC contractor access, and management bandwidth. Independent of the financial budget — a company can afford more investment than it can physically deliver.
 - **Static reserve price**: Auction floor price at €30/t (matching price_min)
 - **Auction bid collateral**: overbids above clearing incur a real capital lock-up cost on awarded quantity (`auction.collateral.enabled`)
+- **Collateral affordability guardrail**: if collateral lock-up is unaffordable, bids are clipped in two steps (quantity first, then price if needed) to preserve feasible participation
+- **Budget headroom observation**: Phase-1 dim `[27]` reports current annual budget headroom (`1.0` fresh, `0.0` at limit, negative overspend)
 - **Carry-forward**: Non-compliance shortfall is added to next year's obligation (capped at 2.0x, allowing larger debt accumulation)
 - **Hidden burn-in warm-start**: A configurable pre-period (`warm_start.burnin_enabled`) seeds realistic bank holdings, MSR reserve, and MA3 history before year 0
 - **Fundamentals-based heuristic**: Bot bidding uses MAC→penalty gradient (`mac_cost + urgency × (penalty - mac_cost)`), removing dependence on price moving average
@@ -140,7 +142,7 @@ ets_marl_happo_current/
 │       └── replay_buffer.py      # Stores past experiences for learning
 │
 ├── configs/
-│   └── default.yaml              # All simulation parameters (v7.1)
+│   └── default.yaml              # All simulation parameters (v7.2)
 │
 ├── scripts/
 │   ├── train.py                  # Starts a training run
@@ -256,6 +258,7 @@ The most important settings you might want to change:
 | `auction.collateral.enabled` | true | Enables EU ETS-style bid collateral opportunity-cost term on overbids |
 | `auction.collateral.opportunity_cost_rate` | 0.05 | Annualized cost-of-capital rate applied to locked collateral |
 | `auction.collateral.hold_fraction` | 0.02 | Fraction of year collateral lock-up used in annualized model (~7 days) |
+| `auction.collateral.min_qty_floor_frac` | 0.5 | Minimum coverage floor used by pre-auction collateral affordability clip |
 | `green_finance.enabled` | false | Enables green-only loan/capex throughput boost during investment clipping |
 | `bots.fade_schedule.enabled` | false | Enables episode-based bot retirement and automatic market recalibration |
 | `penalty.inflation_rate` | 0.020 | Mean annual inflation for nominal indexing (μ) |

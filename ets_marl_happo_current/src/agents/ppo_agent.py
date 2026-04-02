@@ -164,16 +164,45 @@ class PPOAgent:
         # Action anchors: realistic initial targets in physical space.
         # These shift the policy's initial mean output toward historically
         # plausible actions, giving agents a sensible starting point without
-        # limiting what they can learn.  None = use midpoint (legacy behavior).
+        # limiting what they can learn.
         explore_cfg = config.get("exploration", {})
         self.exploration_mode = explore_cfg.get("mode", "anchored")
         auction_anchors = explore_cfg.get("auction_anchors", None)
         secondary_anchors = explore_cfg.get("secondary_anchors", None)
 
+        # Market-based fallback for expected-price anchors in exploration.
+        # If the expected-price feature is unavailable or invalid, use a
+        # calibrated default (EU ETS recent auction level ~80 EUR/t) instead
+        # of midpoint-of-range behavior.
+        price_cfg = config.get("price", {})
+        fallback_expected = price_cfg.get("initial_expected", None)
+        if fallback_expected is None:
+            if isinstance(auction_anchors, (list, tuple)) and len(auction_anchors) > 0:
+                fallback_expected = auction_anchors[0]
+            else:
+                fallback_expected = 80.0
+        try:
+            self.expected_price_fallback = float(fallback_expected)
+        except (TypeError, ValueError):
+            self.expected_price_fallback = 80.0
+
+        # No explicit anchors: keep neutral defaults for non-price dimensions,
+        # but initialize bid-price near the expected market level.
+        if auction_anchors is None:
+            auction_init_anchors_t = 0.5 * (a_low + a_high)
+            auction_init_anchors_t[0] = float(np.clip(
+                self.expected_price_fallback,
+                float(a_low[0].item()),
+                float(a_high[0].item()),
+            ))
+            auction_init_anchors = auction_init_anchors_t.detach().cpu().tolist()
+        else:
+            auction_init_anchors = auction_anchors
+
         self.auction_policy = AuctionPolicy(
             obs_dim_phase1, auction_dim, hidden, a_low, a_high,
             log_std_min=log_std_min, log_std_max=log_std_max,
-            action_anchors=auction_anchors,
+            action_anchors=auction_init_anchors,
         ).to(self.device)
 
         self.secondary_policy = SecondaryPolicy(
@@ -330,12 +359,14 @@ class PPOAgent:
                     # is much wider than [min, expected] in ETS price bounds.
                     price_min = float(low[0].item())
                     price_max = float(high[0].item())
+                    fallback_expected = float(np.clip(
+                        self.expected_price_fallback, price_min, price_max))
                     expected_price = (
                         float(obs1[3]) * price_max if len(obs1) > 3
-                        else 0.5 * (price_min + price_max)
+                        else fallback_expected
                     )
                     if not np.isfinite(expected_price):
-                        expected_price = 0.5 * (price_min + price_max)
+                        expected_price = fallback_expected
                     expected_price = float(np.clip(expected_price, price_min, price_max))
 
                     if expected_price <= price_min + 1e-9:

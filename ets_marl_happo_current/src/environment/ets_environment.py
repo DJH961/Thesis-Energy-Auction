@@ -1071,7 +1071,51 @@ class ETSEnvironment(gym.Env):
             if lot_size > 0:
                 bid_actions[i, 1] = max(lot_size, round(bid_actions[i, 1] / lot_size) * lot_size)
 
-        self._phase1_bid_prices = auction_actions[:, 0].copy()
+        # Pre-auction collateral affordability clip
+        # Mirrors real EU ETS: insufficient collateral -> bid rejected -> rebid allowed.
+        # Step 1: clip qty at current price if that keeps qty >= min_qty_floor x need.
+        # Step 2: if qty clip would starve the agent, reduce price instead to preserve qty.
+        coll_cfg = self.config.get("auction", {}).get("collateral", {})
+        if coll_cfg.get("enabled", True):
+            _rate = float(coll_cfg.get("interest_rate", coll_cfg.get("opportunity_cost_rate", 0.05)))
+            _hold = float(coll_cfg.get("hold_fraction", 0.02))
+            _floor = float(coll_cfg.get("min_qty_floor_frac", 0.5))
+
+            if _rate > 0.0 and _hold > 0.0:
+                for i, company in enumerate(self.companies):
+                    if not self._is_agent_active(i):
+                        continue
+
+                    bid_p = float(bid_actions[i, 0])
+                    bid_q = float(bid_actions[i, 1])
+                    need_i = float(company.compute_emissions())
+
+                    budget_remaining = max(
+                        0.0,
+                        float(company.annual_budget - company.budget_spent_this_year),
+                    )
+
+                    worst_case = _rate * _hold * bid_p * bid_q
+
+                    if worst_case > budget_remaining and bid_p > 1e-6:
+                        qty_max = budget_remaining / (_rate * _hold * bid_p)
+
+                        if qty_max >= _floor * need_i:
+                            # Step 1: qty clip sufficient -> preserve price for discovery
+                            bid_actions[i, 1] = max(qty_max, 0.0)
+                        else:
+                            if bid_q > 1e-6:
+                                # Step 2: qty clip would starve agent -> reduce price, keep qty
+                                p_affordable = budget_remaining / (_rate * _hold * bid_q)
+                                p_affordable = max(
+                                    p_affordable,
+                                    self.config["auction"]["price_min"],
+                                )
+                                bid_actions[i, 0] = min(bid_p, p_affordable)
+                            else:
+                                bid_actions[i, 1] = 0.0  # budget = 0, sit out
+
+        self._phase1_bid_prices = bid_actions[:, 0].copy()
         self._phase1_bid_quantities = bid_actions[:, 1].copy()  # Mt after multiplier expansion
 
         # Compute effective reserve price (dynamic or static)
@@ -1779,6 +1823,8 @@ class ETSEnvironment(gym.Env):
             investment_cost = float(invest_costs[i])
             operational_cost = company.compute_operational_cost(self.current_year)
             mac_cost_i = float(mac_costs[i])
+            # NOTE: hold_fraction=0.02 (~7 days). Real EU ETS settles T+2 (~0.0055)
+            # but one annual step represents ~52 real auctions; 0.02 is the balance.
             collateral_cost_i = float(collateral_costs[i])
             loan_interest_cost = company.compute_green_loan_cost()
 
@@ -1993,6 +2039,8 @@ class ETSEnvironment(gym.Env):
                 bank=float(self.holdings[i]),
                 tnac_upper=float(self.cap_schedule.tnac_upper),
                 withhold_rate=float(self.cap_schedule.withhold_rate),
+                budget_spent=float(c.budget_spent_this_year),
+                annual_budget=float(c.annual_budget),
             )
             obs_list.append(obs_i)
 

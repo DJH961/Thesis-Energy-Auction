@@ -5,6 +5,27 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.2.0
+
+**Budget-Aware Collateral Affordability + Observation Headroom**
+
+- `configs/default.yaml`:
+	- Version header bumped to `v7.2`.
+	- Added `auction.collateral.min_qty_floor_frac: 0.5`.
+	- Updated collateral rationale comments for `hold_fraction: 0.02` (~7 days annual-step proxy balancing T+2 realism and yearly simulation granularity).
+- `ETSEnvironment.step_auction` now applies a pre-auction two-step collateral affordability clip after quantity expansion:
+	- Step 1: clip quantity at current bid price if affordability still preserves at least `min_qty_floor_frac × emissions_need`.
+	- Step 2: if quantity clipping would starve coverage, reduce bid price instead to keep quantity.
+- Added an explicit note above reward collateral-cost usage clarifying the `hold_fraction=0.02` interpretation.
+- `Company.get_observation_phase1` gained optional inputs `budget_spent` and `annual_budget` and now computes:
+	- `budget_headroom = clip(1 - budget_spent / annual_budget, -0.5, 1.0)`.
+	- Observation dim `[27]` now carries `budget_headroom` (replacing auction-volume-change signal).
+- `ETSEnvironment._get_obs_phase1()` now passes each agent's `budget_spent_this_year` and `annual_budget` into `get_observation_phase1(...)`.
+
+**Tabula-Rasa 80 EUR Anchor Integration**
+
+- Includes the tabula-rasa expected-price fallback updates around **80 EUR/t** from the current branch work (agent fallback + related tests), packaged with this release as `v7.2.0`.
+
 ## v7.1.0
 
 **EU ETS Bid Collateral Cost + Tabula-Rasa Price-Side Balancing**

@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v7.1
+# ETS MARL — Configuration v7.2
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -10,6 +10,7 @@
 #   - Fundamentals-based heuristic bidding (MAC→penalty gradient)
 #   - Absolute-price secondary market (no multiplier)
 #   - ESG reward signal (saved-carbon-years formula)
+#   - Pre-auction collateral affordability clip + budget-headroom phase-1 signal
 # ============================================================
 
 simulation:
@@ -174,14 +175,11 @@ auction:
   collateral:
     enabled: true
     opportunity_cost_rate: 0.05
-    # CORRECTION: hold_fraction changed from 0.08 -> 0.02
-    # Rationale: Real EU ETS settles at T+2 (~2 days, hold=0.0055). A yearly
-    # simulation compresses ~52 real auctions into one; the mathematically
-    # equivalent annual hold is still ~0.0055, but this produces a signal too
-    # weak to influence agent learning. 0.02 (~7 days = one weekly auction
-    # cycle) is the empirically grounded balance between T+2 reality and the
-    # annual model's compressed auction structure.
-    hold_fraction: 0.02  # ~7 days; was 0.08 (incorrect - overstated by 4x)
+    # hold_fraction=0.02 (~7 days). Real EU ETS settles T+2 (~0.0055) but one
+    # annual auction step represents ~52 real auctions; 0.02 balances real
+    # settlement mechanics with yearly simulation granularity.
+    hold_fraction: 0.02
+    min_qty_floor_frac: 0.5
 
     # Effective cost: 0.05 x 0.02 = 0.10% of overbid spread per tonne
     # Bidding 100EUR above clearing on 3 Mt = 3,000,000 x 100 x 0.001 = 300,000 EUR
@@ -279,7 +277,7 @@ penalty:
 # NOT the auction floor — that is ets.reserve_price.
 # ----------------------------------------------------------
 price:
-  initial_expected: 55.0
+  initial_expected: 80.0   # calibrated near recent EU ETS auction levels
   ar1_floor: 65.0          # mean-reversion floor for AR(1) price simulation
   burnin_std: 10.0         # warm-start synthetic price history volatility
   ar1_persistence: 0.85

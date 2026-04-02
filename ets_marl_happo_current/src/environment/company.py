@@ -626,7 +626,9 @@ class Company:
                                msr_reserve=0.0,
                                bank=0.0,
                                tnac_upper=28.0,
-                               withhold_rate=0.24):
+                               withhold_rate=0.24,
+                               budget_spent: float = 0.0,
+                               annual_budget: float = 1e9):
         """
         Phase 1 observation (pre-auction): 28D base + 5*(N-1) opponent dims.
 
@@ -652,7 +654,7 @@ class Company:
         [24] MSR reserve normalized = msr_reserve / cap_t
         [25] own bank ratio (clipped [0, 5], normalized by /5)
         [26] predicted MSR withholding fraction of cap
-        [27] auction volume change vs cap (clipped [-1, 1])
+        [27] budget_headroom (1.0=fresh, 0.0=at limit, negative=overspent)
 
         Opponent dims (if opponent_modeling enabled, 5D per opponent):
         [28..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
@@ -664,7 +666,11 @@ class Company:
         own_bank_ratio = float(np.clip(float(bank) / own_need, 0.0, 5.0)) / 5.0
         predicted_withhold = max(0.0, tnac_proxy * cap_t - tnac_upper) * withhold_rate / max(cap_t, 1e-6)
         predicted_withhold = float(np.clip(predicted_withhold, 0.0, 1.0))
-        auction_volume_change = float(np.clip((last_auction_volume - cap_t) / max(cap_t, 1e-6), -1.0, 1.0))
+        budget_headroom = float(np.clip(
+            1.0 - (budget_spent / max(annual_budget, 1e-6)),
+            -0.5,
+            1.0,
+        ))
 
         base = np.array([
             year / 12.0,                          # [0] normalized by n_years
@@ -694,7 +700,7 @@ class Company:
             msr_reserve / max(cap_t, 1e-6),          # [24] MSR reserve signal
             own_bank_ratio,                          # [25] own bank ratio
             predicted_withhold,                      # [26] predicted MSR withhold share
-            auction_volume_change,                   # [27] auction volume change signal
+            budget_headroom,                         # [27] budget headroom signal
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
