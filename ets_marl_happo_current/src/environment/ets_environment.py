@@ -172,6 +172,8 @@ class ETSEnvironment(gym.Env):
         self._last_terminal_bank_values = np.zeros(self.n_total)
         self._last_terminal_queue_values = np.zeros(self.n_total)
         self._last_terminal_liquidation_values = np.zeros(self.n_total)
+        self._last_reward_base_values = np.zeros(self.n_total)
+        self._last_reward_shaping_values = np.zeros(self.n_total)
 
         # Price normalization constant
         self._price_norm = config["auction"]["price_max"]
@@ -311,6 +313,8 @@ class ETSEnvironment(gym.Env):
         self._last_terminal_bank_values = np.zeros(self.n_total)
         self._last_terminal_queue_values = np.zeros(self.n_total)
         self._last_terminal_liquidation_values = np.zeros(self.n_total)
+        self._last_reward_base_values = np.zeros(self.n_total)
+        self._last_reward_shaping_values = np.zeros(self.n_total)
         self._secondary_profit_ema = np.zeros(self.n_total)
         self._consecutive_years_without_valid_auction_clear = 0
         self._liquidity_ref_ema = float(self.config["price"]["initial_expected"])
@@ -1251,6 +1255,8 @@ class ETSEnvironment(gym.Env):
             "penalties": penalties.tolist(),
             "invest_costs": invest_costs.tolist(),
             "rewards": rewards.tolist(),
+            "rewards_base": self._last_reward_base_values.tolist(),
+            "rewards_shaping": self._last_reward_shaping_values.tolist(),
             "inflation_rate": self._inflation_rate(self.current_year),
             "inflation_factor": self._inflation_factor(self.current_year),
             "green_fracs": [c.green_frac for c in self.companies],
@@ -1468,7 +1474,7 @@ class ETSEnvironment(gym.Env):
                          mac_costs=None, precompliance_holdings=None,
                          old_carry_forward=None):
         """
-        Reward (HAPPO-compliant, v6.3):
+        Reward (HAPPO-compliant, v6.4):
             R_i = w_cost * (-cost_norm_ex_penalty) + w_green * (esg_scale * esg_raw)
                   + green_bonus + queue_bonus - penalty_norm - opportunity_cost
 
@@ -1483,6 +1489,8 @@ class ETSEnvironment(gym.Env):
         Terminal bonuses: log-scaled bank value /1000 + ESG terminal queue.
         """
         rewards = np.zeros(self.n_total)
+        base_rewards = np.zeros(self.n_total)
+        shaping_rewards = np.zeros(self.n_total)
         terminal_bank_values = np.zeros(self.n_total)
         terminal_queue_values = np.zeros(self.n_total)
         reward_cfg = self.config.get("reward", {})
@@ -1575,15 +1583,18 @@ class ETSEnvironment(gym.Env):
             # Cost-of-capital on allowances carried after compliance settlement.
             opp_cost = float(self.holdings[i]) * float(clearing_price) * opp_cost_rate / 1000.0
 
-            rewards[i] = float(
+            base_reward = float(
                 company.w_cost * (-cost_norm_ex_penalty)
                 + company.w_green * esg_signal
-                + green_bonus
-                + queue_bonus
                 + efficiency_bonus  # permanent bonus, applies to ALL agents
                 - penalty_norm  # penalty at full strength for all agents
                 - opp_cost
             )
+            shaping_reward = float(green_bonus + queue_bonus)
+
+            base_rewards[i] = base_reward
+            shaping_rewards[i] = shaping_reward
+            rewards[i] = base_reward + shaping_reward
 
         # Terminal value bonuses (final year only)
         is_final_year = self.current_year >= self.n_years - 1
@@ -1611,6 +1622,7 @@ class ETSEnvironment(gym.Env):
                     ratio = capped_holdings / annual_need
                     bank_value = np.log1p(ratio) * annual_need * terminal_price / 1000.0
                     rewards[i] += bank_value
+                    base_rewards[i] += bank_value
                     terminal_bank_values[i] = bank_value
 
                 # Terminal queue value: ESG from queue items with γ^years_late discount
@@ -1633,11 +1645,14 @@ class ETSEnvironment(gym.Env):
                                         * terminal_price / max(normalizer, 1e-6))
                     queue_term = queue_value
                     rewards[i] += queue_term
+                    base_rewards[i] += queue_term
                     terminal_queue_values[i] = queue_term
 
         self._last_terminal_bank_values = terminal_bank_values
         self._last_terminal_queue_values = terminal_queue_values
         self._last_terminal_liquidation_values = terminal_bank_values + terminal_queue_values
+        self._last_reward_base_values = base_rewards
+        self._last_reward_shaping_values = shaping_rewards
 
         return rewards
 

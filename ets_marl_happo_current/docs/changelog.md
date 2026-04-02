@@ -5,6 +5,23 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v6.4.0
+
+**Reward Decomposition for Post-Hoc Analysis**
+
+- Separated reward logging into two explicit components while keeping learning behavior unchanged:
+	- `reward_base_A*`: constant reward terms (cost/revenue, ESG, penalties, opportunity cost, efficiency, and terminal values)
+	- `reward_shaping_A*`: decaying shaping bonuses (`green_bonus + queue_bonus`)
+	- `reward_A*`: unchanged total reward used for optimization (`base + shaping`)
+- Environment year logs now emit `rewards_base` and `rewards_shaping` arrays alongside total rewards.
+- Training pipeline writes the new base/shaping reward columns to both `year_log_s*.csv` and `training_log_s*.csv`.
+- Training convergence diagnostics cell (D6) now visualizes system base-vs-shaping-vs-total reward trajectories and uses base rewards for per-agent constant trajectory plots when available.
+
+**Versioning and Documentation**
+
+- Version bumped to `6.4.0` in `pyproject.toml`.
+- `configs/default.yaml` header and active docs updated to `v6.4`.
+
 ## v6.3.0
 
 **Burn-In Calibration and Warm-Start Upgrade**

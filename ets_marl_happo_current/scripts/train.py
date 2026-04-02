@@ -481,7 +481,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v6.3: MAC 48€ | Absolute-price secondary | ESG signal | Carry-forward{cf_str}")
+    print(f"v6.4: MAC 48€ | Absolute-price secondary | ESG signal | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(
         f"PPO profile: {run_profile['profile']} "
@@ -635,7 +635,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                  "shaping_weight", "entropy_decay_triggered", "active_agent",
                  "epsilon"]
     for i in range(n_total_agents):
-        ep_fields += [f"reward_A{i+1}", f"green_frac_A{i+1}", f"delta_green_A{i+1}",
+        ep_fields += [f"reward_A{i+1}", f"reward_base_A{i+1}", f"reward_shaping_A{i+1}",
+                  f"green_frac_A{i+1}", f"delta_green_A{i+1}",
                       f"penalty_A{i+1}", f"shortfall_A{i+1}", f"queue_size_A{i+1}",
                       f"actor_loss_A{i+1}", f"critic_loss_A{i+1}", f"bid_price_A{i+1}"]
     ep_fields += ["secondary_volume", "secondary_avg_price", "secondary_match_rate"]
@@ -677,7 +678,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         yr_fields += [f"bank_start_A{i+1}", f"alloc_A{i+1}", f"emissions_A{i+1}",
                       f"trade_qty_A{i+1}", f"trade_cost_A{i+1}", f"green_frac_A{i+1}",
                       f"delta_green_A{i+1}", f"shortfall_A{i+1}", f"penalty_A{i+1}",
-                      f"reward_A{i+1}", f"holdings_A{i+1}", f"invest_cost_A{i+1}",
+                      f"reward_A{i+1}", f"reward_base_A{i+1}", f"reward_shaping_A{i+1}",
+                      f"holdings_A{i+1}", f"invest_cost_A{i+1}",
                       f"bid_price_A{i+1}", f"queue_size_A{i+1}",
                       f"emission_shock_A{i+1}", f"cf_shock_A{i+1}",  # P5/P6
                       f"cancellation_A{i+1}",  # P6
@@ -878,6 +880,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 yr_row[f"shortfall_A{i+1}"] = _get("shortfalls")
                 yr_row[f"penalty_A{i+1}"] = _get("penalties")
                 yr_row[f"reward_A{i+1}"] = _get("rewards")
+                yr_row[f"reward_base_A{i+1}"] = _get("rewards_base")
+                yr_row[f"reward_shaping_A{i+1}"] = _get("rewards_shaping")
                 yr_row[f"holdings_A{i+1}"] = _get("holdings")
                 yr_row[f"invest_cost_A{i+1}"] = _get("invest_costs")
                 yr_row[f"bid_price_A{i+1}"] = _get("bid_prices")
@@ -1297,6 +1301,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             sum(yl.get("rewards", [0.0] * n_total_agents)[i] for yl in env.episode_log)
             for i in range(n_total_agents)
         ]
+        ep_total_rewards_base_all = [
+            sum(yl.get("rewards_base", [0.0] * n_total_agents)[i] for yl in env.episode_log)
+            for i in range(n_total_agents)
+        ]
+        ep_total_rewards_shaping_all = [
+            sum(yl.get("rewards_shaping", [0.0] * n_total_agents)[i] for yl in env.episode_log)
+            for i in range(n_total_agents)
+        ]
 
         # Episode trajectory stats (across all years) — used in console only
         first_log   = env.episode_log[0] if env.episode_log else {}
@@ -1346,6 +1358,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         }
         for i in range(n_total_agents):
             ep_row[f"reward_A{i+1}"] = round(ep_total_rewards_all[i], 4)
+            ep_row[f"reward_base_A{i+1}"] = round(ep_total_rewards_base_all[i], 4)
+            ep_row[f"reward_shaping_A{i+1}"] = round(ep_total_rewards_shaping_all[i], 4)
             ep_row[f"green_frac_A{i+1}"] = round(
                 last_log.get("green_fracs", [0] * n_total_agents)[i], 4)
             ep_row[f"delta_green_A{i+1}"] = round(ep_delta_greens[i], 5)

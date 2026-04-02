@@ -1,4 +1,4 @@
-# ETS MARL — Current Version (HAPPO/PPO) v6.3
+# ETS MARL — Current Version (HAPPO/PPO) v6.4
 
 This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
 
@@ -137,7 +137,7 @@ ets_marl_happo_current/
 │       └── replay_buffer.py      # Stores past experiences for learning
 │
 ├── configs/
-│   └── default.yaml              # All simulation parameters (v6.3)
+│   └── default.yaml              # All simulation parameters (v6.4)
 │
 ├── scripts/
 │   ├── train.py                  # Starts a training run
