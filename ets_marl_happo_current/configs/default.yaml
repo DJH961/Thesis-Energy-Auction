@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v6.2
+# ETS MARL — Configuration v6.3
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -14,7 +14,7 @@
 
 simulation:
   n_years: 12
-  n_episodes: 70000
+  n_episodes: 100000
   seeds: [42, 123, 456]
 
 # ----------------------------------------------------------
@@ -49,16 +49,15 @@ ets:
 
   msr:
     enabled: true
-    tnac_upper: 28.0     # Calibration: sits between expected Y2 TNAC (~30 Mt)
-               # and post-spend-down Y4 TNAC (~24 Mt) in baseline runs
-    tnac_lower: 14.0     # Raised from 20.0 — earlier release trigger
+    tnac_upper: 18.0     # 0.36× cap (tighter micro-ETS calibration for 12-year episodes)
+    tnac_lower: 9.0      # 0.18× cap (paired with upper threshold for faster response)
     withhold_rate: 0.24
     release_amount: 0.80
     activation_year: 2   # MSR begins Year 2; mirrors EU ETS lagged TNAC observation
                          # (Decision 2015/1814 Art 1(5))
     price_containment_absolute: 350   # hard fallback for containment trigger (EUR/t)
     price_release_absolute: 450       # hard fallback for release trigger (EUR/t)
-    emergency_release_amount: 0.90    # Mt released per year in emergency
+    emergency_release_amount: 4.0     # Mt released per year in emergency (~10% of year-0 cap)
     min_auction_frac: 0.10            # safety floor for minimum auction volume
 
   banking: true
@@ -252,6 +251,7 @@ electricity:
 # ----------------------------------------------------------
 reward:
   normalizer_alpha: 0.01
+  opportunity_cost_rate: 0.05  # cost-of-capital on banked allowances (not a storage holding fee)
   clip_min: -10.0
   clip_max: 10.0         # Increased from 5.0 — symmetric with clip_min to avoid asymmetric gradient compression
   shaping_beta: 7.0              # green_delta bonus weight
@@ -281,8 +281,8 @@ esg:
 
 # ----------------------------------------------------------
 # Opponent modeling — 5D public info per opponent.
-# obs_dim_phase1 = 25 + 5*(N_total-1) = 100 (for 16 agents)
-# obs_dim_phase2 = phase1 + 7 = 107
+# obs_dim_phase1 = 28 + 5*(N_total-1) = 103 (for 16 agents)
+# obs_dim_phase2 = phase1 + 7 = 110
 # ----------------------------------------------------------
 opponent_modeling:
   enabled: true
@@ -299,20 +299,25 @@ agent_cycling:
 # PPO / HAPPO
 # ----------------------------------------------------------
 ppo:
-  hidden_size: 256           # actor network width (obs: 100D phase1 / 107D phase2)
-  lr: 0.0002
+  hidden_size: 256           # actor network width (obs: 103D phase1 / 110D phase2)
+  lr: 0.0003
   gamma: 0.99
   gae_lambda: 0.97
   clip_eps: 0.2
   entropy_coef: 0.05
-  entropy_coef_final: 0.03
+  entropy_coef_final: 0.015
   entropy_decay_start: 0     # auto: 5% of n_episodes
   entropy_decay_window: 0    # 0 = auto (80% of n_episodes)
   value_coef: 0.5
   max_grad_norm: 0.5         # relaxed from 0.3 — less conservative with larger batches
   n_epochs: 5                # increased from 3 — extract more signal from larger batch
   mini_batch_size: 32        # increased from 6 — reasonable with 96 transitions per batch
-  episodes_per_update: 8     # batch accumulation: collect 8 episodes before PPO update
+  episodes_per_update: 16    # long-run default (>20k episodes)
+  long_run_episode_threshold: 20000
+  short_run_overrides:
+    lr: 0.0002
+    entropy_coef_final: 0.03
+    episodes_per_update: 8
   normalize_advantages: true
   log_std_min: -2.5          # e^-2.5 ~ 0.08 — allows tighter final convergence
   log_std_max: 0.0           # e^0 = 1.0
@@ -329,7 +334,7 @@ ppo:
   critic_extra_epochs: 5     # extra critic-only training epochs before main PPO loop
   critic_huber: true         # use Huber loss for critic instead of MSE
   critic_huber_delta: 10.0   # delta parameter for Huber loss
-  clip_value: true           # value function clipping (enabled for v6.2)
+  clip_value: true           # value function clipping (enabled for v6.3)
   normalize_returns: true    # normalize returns before critic training
 
 # ----------------------------------------------------------
@@ -363,9 +368,13 @@ construction_jitter:
 # ----------------------------------------------------------
 warm_start:
   enabled: true
+  burnin_enabled: true
+  n_burnin_years: 4
+  burnin_price_seed_mean: 70.0
+  burnin_price_seed_std: 10.0
   n_burnin_prices: 2
-  bank_seed_min: 0.5
-  bank_seed_max: 1.5     # Reduced from 2.0 — lower initial banking to tighten early scarcity
+  bank_seed_min: 0.2
+  bank_seed_max: 0.4
   queue_mu_onshore: 1.5
   queue_mu_offshore: 0.5
   queue_mu_solar: 2.0

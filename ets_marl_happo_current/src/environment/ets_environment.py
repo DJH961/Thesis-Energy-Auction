@@ -32,7 +32,7 @@ Roadmap improvements (P5-P8):
   P5: Stochastic annual emission shocks (correlated across agents); shock in Phase 2 obs.
   P6: Construction delay jitter + cancellation risk + capacity factor noise.
   P7: Warm-start — queue seeding + bank seeding + price history seeding at reset.
-  P8: Wider secondary spread tolerance; selling from bank; banking holding cost;
+    P8: Wider secondary spread tolerance; selling from bank; cost-of-capital signal;
       secondary price/volume in Phase 1 observation.
 """
 
@@ -349,13 +349,47 @@ class ETSEnvironment(gym.Env):
         # P7: Warm-start — seed construction queue, holdings, price history
         ws_cfg = self.config.get("warm_start", {})
         if ws_cfg.get("enabled", False):
-            self._apply_warm_start(ws_cfg)
+            if ws_cfg.get("burnin_enabled", False):
+                self._run_burnin(ws_cfg)
+            else:
+                self._apply_warm_start(ws_cfg)
         else:
-            # Seed initial bank: ~0.3× annual need so year-0 coverage_ratio > 0,
-            # pushing initial bids down from penalty ceiling toward realistic levels.
-            for i, company in enumerate(self.companies):
-                initial_bank = 0.3 * company.compute_estimate_need()
-                self.holdings[i] = initial_bank
+            # Seed initial bank near 0.3x annual need, but keep aggregate TNAC
+            # inside the MSR band to avoid immediate year-0 intervention.
+            annual_needs = np.array([
+                max(company.compute_estimate_need(), 0.1)
+                for company in self.companies
+            ], dtype=float)
+            total_need = float(annual_needs.sum())
+            desired_tnac = 0.3 * total_need
+            tnac_lower = float(self.cap_schedule.tnac_lower)
+            tnac_upper = float(self.cap_schedule.tnac_upper)
+            if total_need > 1e-9 and tnac_upper > tnac_lower:
+                target_tnac = float(np.clip(desired_tnac, tnac_lower * 1.05, tnac_upper * 0.95))
+                seed_multiple = target_tnac / total_need
+            else:
+                seed_multiple = 0.3
+            for i, annual_need in enumerate(annual_needs):
+                self.holdings[i] = float(seed_multiple * annual_need)
+
+        # Validate post-warmup TNAC position against the MSR band.
+        total_tnac = float(self.holdings.sum())
+        if total_tnac > self.cap_schedule.tnac_upper:
+            import warnings
+            warnings.warn(
+                f"[ETSEnvironment] Post-warmup TNAC ({total_tnac:.2f} Mt) exceeds "
+                f"tnac_upper ({self.cap_schedule.tnac_upper:.1f} Mt). "
+                "MSR will actively drain from year 0. Consider lowering bank_seed_max.",
+                stacklevel=2,
+            )
+        elif total_tnac < self.cap_schedule.tnac_lower:
+            import warnings
+            warnings.warn(
+                f"[ETSEnvironment] Post-warmup TNAC ({total_tnac:.2f} Mt) below "
+                f"tnac_lower ({self.cap_schedule.tnac_lower:.1f} Mt). "
+                "MSR will release from year 0. Consider raising bank_seed_min.",
+                stacklevel=2,
+            )
 
         # Scarcity check: warn if cap trajectory doesn't tighten enough over the episode
         cap_year_0 = self.cap_schedule.get_cap(0)
@@ -373,37 +407,24 @@ class ETSEnvironment(gym.Env):
         obs_phase1 = self._get_obs_phase1()   # shape (n_agents, obs_dim)
         return obs_phase1, {}
 
-    def _apply_warm_start(self, ws_cfg: dict):
-        """
-        P7: Warm-start seeding.
-
-        (A) Seed construction queues: each agent gets a random number of in-flight
-            renewable projects sampled from Poisson distributions per technology.
-        (B) Seed initial bank: sample from Uniform(bank_min, bank_max) × annual_need.
-        (C) Seed price history: sample 2 synthetic prices from N(60, 15) to initialise
-            the MA3 price signal.
-        """
+    def _seed_construction_queues(self, ws_cfg: dict):
+        """Seed in-flight renewable projects for each company."""
         mu_onshore = ws_cfg.get("queue_mu_onshore", 1.5)
         mu_offshore = ws_cfg.get("queue_mu_offshore", 0.5)
         mu_solar = ws_cfg.get("queue_mu_solar", 2.0)
-        bank_min = ws_cfg.get("bank_seed_min", 0.5)
-        bank_max = ws_cfg.get("bank_seed_max", 2.0)
-        n_burnin = ws_cfg.get("n_burnin_prices", 2)
 
-        # Tech → (mu, completion_year_range_max, deploy_index_in_BUILDABLE)
         green_specs = [
-            (2, mu_onshore),   # onshore_wind: tech_idx=2
-            (3, mu_offshore),  # offshore_wind: tech_idx=3
-            (4, mu_solar),     # solar:         tech_idx=4
+            (2, mu_onshore),
+            (3, mu_offshore),
+            (4, mu_solar),
         ]
 
         jitter_cfg = self.config.get("construction_jitter", {})
         poisson_lambdas = jitter_cfg.get("poisson_lambdas", [1.0, 1.0, 2.0, 3.0, 1.5])
 
-        for i, company in enumerate(self.companies):
-            # (A) Seed construction queue
+        for company in self.companies:
             total_seeded_frac = 0.0
-            max_seedable = company.fossil_frac * 0.5  # don't seed more than half fossil
+            max_seedable = company.fossil_frac * 0.5
 
             for tech_idx, mu in green_specs:
                 lam = float(poisson_lambdas[tech_idx])
@@ -411,10 +432,9 @@ class ETSEnvironment(gym.Env):
                 for _ in range(n_projects):
                     frac_delta = float(self.rng.uniform(0.005, 0.025))
                     if total_seeded_frac + frac_delta > max_seedable:
-                        frac_delta = max(0, max_seedable - total_seeded_frac)
+                        frac_delta = max(0.0, max_seedable - total_seeded_frac)
                     if frac_delta < 1e-4:
                         continue
-                    # Completion year uniformly distributed within [0, λ+1]
                     completion_year = int(self.rng.integers(0, max(1, int(lam) + 2)))
                     company._construction_queue.append({
                         "tech_idx": tech_idx,
@@ -425,14 +445,245 @@ class ETSEnvironment(gym.Env):
                     })
                     total_seeded_frac += frac_delta
 
-            # (B) Seed initial bank
-            annual_need = company.compute_emissions()  # Mt
+    def _run_burnin(self, ws_cfg: dict):
+        """
+        Run a hidden heuristic pre-period to jointly initialize holdings,
+        MSR reserve, price history, and construction queues.
+        """
+        n_burnin = max(1, int(ws_cfg.get("n_burnin_years", 4)))
+        price_mean = float(ws_cfg.get("burnin_price_seed_mean", 70.0))
+        price_std = float(ws_cfg.get("burnin_price_seed_std", 10.0))
+        n_seed_prices = max(0, int(ws_cfg.get("n_burnin_prices", 2)))
+        bank_min = float(ws_cfg.get("bank_seed_min", 0.2))
+        bank_max = float(ws_cfg.get("bank_seed_max", 0.4))
+
+        price_min = float(self.config["auction"]["price_min"])
+        price_max = float(self.config["auction"]["price_max"])
+        reserve_price = float(self.config["ets"].get("reserve_price", 0.0))
+        qty_mult_low = float(self.config["auction"].get("qty_mult_low", 0.3))
+        qty_mult_high = float(self.config["auction"].get("qty_mult_high", 2.0))
+        lot_size = float(self.config["auction"].get("lot_size", 0.0))
+        max_agent_share = float(self.config["auction"].get("max_agent_share", 1.0))
+        cancel_under_subscribed = bool(
+            self.config["auction"].get("cancel_under_subscribed", False)
+        )
+
+        pen_cfg = self.config.get("penalty", {})
+        base_penalty_rate = float(pen_cfg.get("rate", 0.0))
+        inflation_rate = float(pen_cfg.get("inflation_rate", 0.02))
+
+        bot_cfg = self.config.get("bots", {})
+        urgency_denoms = bot_cfg.get("urgency_denominators", [1.5] * self.n_bots)
+
+        # (A) Seed initial bank at strategic reserve range.
+        for i, company in enumerate(self.companies):
+            annual_need = max(company.compute_estimate_need(), 0.1)
+            bank_frac = float(self.rng.uniform(bank_min, bank_max))
+            self.holdings[i] = bank_frac * annual_need
+
+        # (B) Seed in-flight construction queues.
+        self._seed_construction_queues(ws_cfg)
+
+        # (C) Seed price history with synthetic starting prices.
+        self._price_history = []
+        for _ in range(n_seed_prices):
+            seed_price = float(np.clip(
+                self.rng.normal(price_mean, price_std),
+                price_min,
+                price_max,
+            ))
+            self._price_history.append(seed_price)
+
+        # (D) Hidden burn-in years.
+        for burnin_year in range(-n_burnin, 0):
+            for company in self.companies:
+                company.apply_matured_investments(current_year=burnin_year)
+                company.reset_budget()
+                company.reset_capex_budget()
+
+            cap_t = self.cap_schedule.get_cap(burnin_year)
+            tnac = float(self.holdings.sum())
+            last_price = self._price_history[-1] if self._price_history else price_mean
+            auction_volume = self.cap_schedule.get_auction_volume(
+                year=burnin_year,
+                tnac=tnac,
+                clearing_price=last_price,
+                price_max=price_max,
+                penalty_rate=base_penalty_rate,
+                inflation_rate=inflation_rate,
+                force_msr=True,
+            )
+            self._last_auction_volume = float(auction_volume)
+
+            bid_actions = np.zeros((self.n_total, 2), dtype=np.float32)
+            for i, company in enumerate(self.companies):
+                infl_factor = (1.0 + inflation_rate) ** burnin_year if inflation_rate > -0.99 else 1.0
+
+                valuation_noise = 0.0
+                urgency_multiplier = 1.0
+                urgency_denom = 1.5
+                if i >= self.n_agents and self.n_bots > 0:
+                    b = i - self.n_agents
+                    if b < self.n_bots:
+                        valuation_noise = float(self._bot_valuation_noise[b])
+                        urgency_multiplier = float(self._bot_urgency_mult[b])
+                        urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
+
+                action = heuristic_policy.auction_action(
+                    company,
+                    price_ma3=float(last_price),
+                    current_year=burnin_year,
+                    n_years=self.n_years,
+                    config=self.config,
+                    bank=float(self.holdings[i]),
+                    reserve_price=reserve_price,
+                    inflation_factor=infl_factor,
+                    auction_volume=float(auction_volume),
+                    cap_t=float(cap_t),
+                    valuation_noise=valuation_noise,
+                    urgency_multiplier=urgency_multiplier,
+                    urgency_denom=urgency_denom,
+                )
+
+                bid_price = float(np.clip(action[0], price_min, price_max))
+                qty_mult = float(np.clip(action[1], qty_mult_low, qty_mult_high))
+                annual_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
+                bid_qty = qty_mult * annual_need
+                if lot_size > 0:
+                    bid_qty = max(lot_size, round(bid_qty / lot_size) * lot_size)
+
+                bid_actions[i, 0] = bid_price
+                bid_actions[i, 1] = max(0.0, float(bid_qty))
+
+            bids = build_bids(bid_actions)
+            clearing_price, allocations, _, _ = market_clearing_ets(
+                bids=bids,
+                q_cap=float(auction_volume),
+                reserve_price=reserve_price,
+                max_agent_share=max_agent_share,
+                rng=self.rng,
+                cancel_under_subscribed=cancel_under_subscribed,
+                n_agents=self.n_total,
+            )
+
+            unsold = max(0.0, float(auction_volume) - float(allocations.sum()))
+            self._unsold_rollover = unsold
+            if self.config["ets"].get("unsold_to_msr", False):
+                self.cap_schedule.absorb_unsold(unsold)
+            else:
+                self.cap_schedule.rollover_unsold(unsold)
+
+            self.holdings += allocations
+            for i, company in enumerate(self.companies):
+                emissions = company.compute_emissions()
+                self.holdings[i] = max(0.0, float(self.holdings[i]) - float(emissions))
+
+            if clearing_price > 0:
+                clipped_price = float(np.clip(clearing_price, price_min, price_max))
+                self._price_history.append(clipped_price)
+                self.last_clearing_price = clipped_price
+
+            for company in self.companies:
+                if self.rng.random() < 0.3:
+                    invest_frac = float(self.rng.uniform(0.01, 0.03))
+                    tech_choice = int(self.rng.integers(0, 3))
+                    company.plan_investment(
+                        tech_choice=tech_choice,
+                        invest_frac=invest_frac,
+                        current_year=burnin_year,
+                    )
+
+            for company in self.companies:
+                company.apply_matured_investments(current_year=burnin_year + 1)
+
+        # (E) Keep only MA3-relevant history.
+        if len(self._price_history) > 3:
+            self._price_history = self._price_history[-3:]
+
+        if self._price_history:
+            self.last_clearing_price = float(self._price_history[-1])
+
+        rho = self.config["price"].get("ar1_persistence", 0.85)
+        price_floor = self.config["price"].get(
+            "ar1_floor",
+            self.config["price"].get("price_floor", 50.0),
+        )
+        vol_std = self.config["price"].get("volatility_std", 0.15)
+        base_price = self.last_clearing_price if self._price_history else price_mean
+        shock = self.rng.normal(0, vol_std) * base_price
+        self.expected_price = max(
+            rho * base_price + (1.0 - rho) * price_floor + shock,
+            price_floor,
+        )
+        self.last_secondary_price = self.last_clearing_price
+        self._calibrate_post_init_bank(ws_cfg)
+
+    def _calibrate_post_init_bank(self, ws_cfg: dict):
+        """Calibrate post-initialization holdings to the configured TNAC band."""
+        tnac_lower = float(self.cap_schedule.tnac_lower)
+        tnac_upper = float(self.cap_schedule.tnac_upper)
+        tnac_target = float(ws_cfg.get("burnin_tnac_target", 0.5 * (tnac_lower + tnac_upper)))
+        tnac_target = float(np.clip(tnac_target, tnac_lower, tnac_upper))
+
+        # Keep all agents strictly positive at year 0 while preserving heterogeneity.
+        min_bank_frac = float(ws_cfg.get("bank_min_floor_frac", 0.02))
+        min_banks = np.array([
+            max(1e-6, min_bank_frac * max(company.compute_estimate_need(), 0.1))
+            for company in self.companies
+        ])
+
+        holdings = np.maximum(self.holdings.astype(float), min_banks)
+        min_total = float(min_banks.sum())
+        if min_total >= tnac_target:
+            self.holdings = min_banks
+            return
+
+        weights = np.array([
+            max(company.compute_estimate_need(), 0.1)
+            for company in self.companies
+        ], dtype=float)
+        wsum = float(weights.sum())
+        if wsum <= 0.0:
+            weights = np.full(self.n_total, 1.0 / max(self.n_total, 1))
+        else:
+            weights /= wsum
+
+        excess = holdings - min_banks
+        excess_total = float(excess.sum())
+        target_excess = tnac_target - min_total
+
+        if excess_total <= 1e-9:
+            calibrated = min_banks + target_excess * weights
+        else:
+            calibrated = min_banks + excess * (target_excess / excess_total)
+
+        self.holdings = np.maximum(calibrated, min_banks)
+
+    def _apply_warm_start(self, ws_cfg: dict):
+        """
+        P7 fallback warm-start seeding (when burn-in is disabled).
+
+        (A) Seed construction queues.
+        (B) Seed initial bank: sample from Uniform(bank_min, bank_max) × annual_need.
+        (C) Seed synthetic price history for MA3 bootstrap.
+        """
+        bank_min = ws_cfg.get("bank_seed_min", 0.2)
+        bank_max = ws_cfg.get("bank_seed_max", 0.4)
+        n_burnin = ws_cfg.get("n_burnin_prices", 2)
+
+        self._seed_construction_queues(ws_cfg)
+
+        # (B) Seed initial bank
+        for i, company in enumerate(self.companies):
+            annual_need = company.compute_estimate_need()  # Mt
             seed_multiple = float(self.rng.uniform(bank_min, bank_max))
             self.holdings[i] = annual_need * seed_multiple
 
         # (C) Seed price history with synthetic burn-in prices
-        burnin_mean = float(self.config["price"].get("initial_expected", 80.0))
-        burnin_std = float(self.config["price"].get("burnin_std", 10.0))
+        burnin_mean = float(ws_cfg.get("burnin_price_seed_mean",
+                                       self.config["price"].get("initial_expected", 80.0)))
+        burnin_std = float(ws_cfg.get("burnin_price_seed_std",
+                                      self.config["price"].get("burnin_std", 10.0)))
         for _ in range(n_burnin):
             synthetic_price = float(np.clip(
                 self.rng.normal(burnin_mean, burnin_std),
@@ -451,6 +702,7 @@ class ETSEnvironment(gym.Env):
                 price_floor,
             )
         self.last_secondary_price = self.last_clearing_price
+        self._calibrate_post_init_bank(ws_cfg)
 
     # ------------------------------------------------------------------
     # Phase 1: Auction + Green Investment
@@ -1216,9 +1468,9 @@ class ETSEnvironment(gym.Env):
                          mac_costs=None, precompliance_holdings=None,
                          old_carry_forward=None):
         """
-        Reward (HAPPO-compliant, v6.2):
+        Reward (HAPPO-compliant, v6.3):
             R_i = w_cost * (-cost_norm_ex_penalty) + w_green * (esg_scale * esg_raw)
-                  + green_bonus + queue_bonus - penalty_norm
+                  + green_bonus + queue_bonus - penalty_norm - opportunity_cost
 
         Core signals:
           cost_norm_ex_penalty: (total_cost_ex_penalty + revenue) / 1000
@@ -1241,6 +1493,7 @@ class ETSEnvironment(gym.Env):
 
         beta_shaping = reward_cfg.get("shaping_beta", 10.0)
         gamma_shaping = reward_cfg.get("shaping_gamma", 1.0)
+        opp_cost_rate = float(reward_cfg.get("opportunity_cost_rate", 0.05))
 
         # Electricity revenue parameters (base price inflation-indexed)
         elec_enabled = elec_cfg.get("enabled", False)
@@ -1319,6 +1572,9 @@ class ETSEnvironment(gym.Env):
                 price_weight = clearing_price / 1000.0
                 efficiency_bonus = 0.3 * ef_improvement_ratio * time_weight * price_weight
 
+            # Cost-of-capital on allowances carried after compliance settlement.
+            opp_cost = float(self.holdings[i]) * float(clearing_price) * opp_cost_rate / 1000.0
+
             rewards[i] = float(
                 company.w_cost * (-cost_norm_ex_penalty)
                 + company.w_green * esg_signal
@@ -1326,6 +1582,7 @@ class ETSEnvironment(gym.Env):
                 + queue_bonus
                 + efficiency_bonus  # permanent bonus, applies to ALL agents
                 - penalty_norm  # penalty at full strength for all agents
+                - opp_cost
             )
 
         # Terminal value bonuses (final year only)
@@ -1399,7 +1656,7 @@ class ETSEnvironment(gym.Env):
 
     def _get_obs_phase1(self) -> np.ndarray:
         """Phase 1 observations for learning agents only.
-        Base: 25D. With opponent modeling: 25 + 5*(N_total-1) dims.
+        Base: 28D. With opponent modeling: 28 + 5*(N_total-1) dims.
         Opponent modeling includes ALL market participants (learning + bots).
         """
         cap_t = self.cap_schedule.get_cap(self.current_year)
@@ -1451,6 +1708,9 @@ class ETSEnvironment(gym.Env):
                 effective_reserve=self._last_effective_reserve,
                 last_auction_volume=last_auction_volume,
                 msr_reserve=msr_reserve,
+                bank=float(self.holdings[i]),
+                tnac_upper=float(self.cap_schedule.tnac_upper),
+                withhold_rate=float(self.cap_schedule.withhold_rate),
             )
             obs_list.append(obs_i)
 

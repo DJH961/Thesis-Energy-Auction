@@ -383,20 +383,52 @@ def test_p7_price_history_seeded():
     assert len(env._price_history) > 0, "Price history empty after warm-start reset"
 
 
+def test_burnin_tnac_in_band():
+    """After burn-in, median TNAC over multiple seeds should be inside MSR band."""
+    tnacs = []
+    env = None
+    for seed in range(10):
+        env = load_env(seed=seed)
+        env.reset(seed=seed)
+        tnacs.append(float(env.holdings.sum()))
+
+    median_tnac = sorted(tnacs)[len(tnacs) // 2]
+    cfg = env.config["ets"]["msr"]
+    assert cfg["tnac_lower"] <= median_tnac <= cfg["tnac_upper"], (
+        f"Median TNAC {median_tnac:.2f} outside MSR band "
+        f"[{cfg['tnac_lower']}, {cfg['tnac_upper']}]"
+    )
+
+
+def test_burnin_price_history_realistic():
+    """After burn-in, price history should contain realistic values."""
+    env = load_env()
+    env.reset(seed=42)
+    assert len(env._price_history) >= 2
+    for p in env._price_history:
+        assert 5.0 < p < 300.0, f"Unrealistic burn-in price: {p}"
+
+
+def test_burnin_msr_reserve():
+    """After burn-in, MSR reserve should be non-negative."""
+    env = load_env()
+    env.reset(seed=42)
+    assert env.cap_schedule._msr_reserve >= 0
+
+
 # ---------------------------------------------------------------------------
 # Test 17: P8 — obs dims updated correctly (20 base, +2*(N-1) opp)
 # ---------------------------------------------------------------------------
 
 def test_p8_obs_dims():
-    """Phase 1 obs should be 25D base (+ 5*(N_total-1) opponent dims) with opponent modeling.
-    N_total = learning + bot agents. New dims append auction_volume_ratio [23]
-    and msr_reserve_norm [24]."""
+    """Phase 1 obs should be 28D base (+ 5*(N_total-1) opponent dims) with opponent modeling.
+    N_total = learning + bot agents."""
     env = load_env()
     obs, _ = env.reset()
     n_agents = env.config["companies"]["n_agents"]
     n_total = n_agents + env.config["companies"].get("n_bot_agents", 0)
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
-    expected_p1 = 25 + (5 * (n_total - 1) if opp_enabled else 0)
+    expected_p1 = 28 + (5 * (n_total - 1) if opp_enabled else 0)
     expected_p2 = expected_p1 + 7  # +7: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"

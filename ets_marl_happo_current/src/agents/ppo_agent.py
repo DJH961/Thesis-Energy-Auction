@@ -211,7 +211,7 @@ class PPOAgent:
         self.critic_huber = ppo.get("critic_huber", False)
         self.critic_huber_delta = ppo.get("critic_huber_delta", 10.0)
         self.normalize_returns = ppo.get("normalize_returns", True)
-        self.clip_value = ppo.get("clip_value", False)  # v6.2: value function clipping
+        self.clip_value = ppo.get("clip_value", False)  # v6.3: value function clipping
 
         # Initialize critic loss function
         if self.critic_huber:

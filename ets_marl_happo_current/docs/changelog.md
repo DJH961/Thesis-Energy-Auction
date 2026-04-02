@@ -5,6 +5,47 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v6.3.0
+
+**Burn-In Calibration and Warm-Start Upgrade**
+
+- Warm-start now supports a hidden heuristic burn-in pre-period (`warm_start.burnin_enabled`) that initializes holdings, MSR reserve, construction queues, and price history jointly before visible year 0.
+- Added new warm-start controls: `n_burnin_years`, `burnin_price_seed_mean`, and `burnin_price_seed_std`.
+- Warm-start bank seeding recalibrated from `[0.5, 1.5]` to `[0.2, 0.4]`.
+
+**MSR and Cap Calibration**
+
+- MSR TNAC thresholds recalibrated to `tnac_upper=18.0` and `tnac_lower=9.0`.
+- MSR emergency release amount increased from `0.90` to `4.0` Mt.
+- `CapSchedule.get_cap()` now supports negative years (used by burn-in) via backward LRF extrapolation.
+- `CapSchedule.get_auction_volume()` adds `force_msr` to bypass activation-year gating for hidden burn-in years.
+
+**Reward and Observation Extensions**
+
+- Added `reward.opportunity_cost_rate` (default `0.05`) and applied a cost-of-capital term on post-compliance banked allowances in reward computation.
+- Phase-1 observation base expanded from 25 to 28 dimensions:
+	- own bank ratio,
+	- predicted MSR withholding signal,
+	- auction volume change vs cap.
+- Derived dimensions update: with 16 participants and opponent modeling, phase-1 is now 103D and phase-2 is 110D.
+
+**Training Profile Infrastructure**
+
+- Default long-run training config updated to:
+	- `simulation.n_episodes=100000`
+	- `ppo.lr=0.0003`
+	- `ppo.entropy_coef_final=0.015`
+	- `ppo.episodes_per_update=16`
+- Added long-vs-short profile resolution in training:
+	- long-run values apply when `n_episodes > 20000`
+	- short-run overrides restore prior values (`lr=0.0002`, `entropy_coef_final=0.03`, `episodes_per_update=8`) for shorter runs.
+
+**Versioning and Documentation**
+
+- Version bumped to `6.3.0` in `pyproject.toml`.
+- `configs/default.yaml` header and active docs updated to `v6.3`.
+- Root repository README active-version reference updated to `v6.3`.
+
 ## v6.2.0
 
 **Bot Stochastic Valuation and Differentiation**

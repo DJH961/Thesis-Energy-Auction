@@ -582,7 +582,7 @@ class Company:
         return shortfall * self.effective_penalty_rate(current_year)
 
     # ------------------------------------------------------------------
-    # Observations — Phase 1: 25D base (+5*(N-1) opponent) | Phase 2: +7
+    # Observations — Phase 1: 28D base (+5*(N-1) opponent) | Phase 2: +7
     # ------------------------------------------------------------------
 
     def get_observation_phase1(self, year, cap_t, last_clearing_price,
@@ -595,11 +595,14 @@ class Company:
                                tnac_proxy=0.0,
                                effective_reserve=0.0,
                                last_auction_volume=0.0,
-                               msr_reserve=0.0):
+                               msr_reserve=0.0,
+                               bank=0.0,
+                               tnac_upper=28.0,
+                               withhold_rate=0.24):
         """
-        Phase 1 observation (pre-auction): 25D base + 5*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 28D base + 5*(N-1) opponent dims.
 
-        Base 25 dims:
+        Base 28 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
@@ -619,13 +622,22 @@ class Company:
         [22] effective reserve price / price_max
         [23] auction volume ratio = last_auction_volume / cap_t
         [24] MSR reserve normalized = msr_reserve / cap_t
+        [25] own bank ratio (clipped [0, 5], normalized by /5)
+        [26] predicted MSR withholding fraction of cap
+        [27] auction volume change vs cap (clipped [-1, 1])
 
         Opponent dims (if opponent_modeling enabled, 5D per opponent):
-        [25..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
+        [28..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
         pn = self._price_norm  # normalization constant (= price_max)
+        own_need = max(self.compute_estimate_need(), 0.1)
+        own_bank_ratio = float(np.clip(float(bank) / own_need, 0.0, 5.0)) / 5.0
+        predicted_withhold = max(0.0, tnac_proxy * cap_t - tnac_upper) * withhold_rate / max(cap_t, 1e-6)
+        predicted_withhold = float(np.clip(predicted_withhold, 0.0, 1.0))
+        auction_volume_change = float(np.clip((last_auction_volume - cap_t) / max(cap_t, 1e-6), -1.0, 1.0))
+
         base = np.array([
             year / 12.0,                          # [0] normalized by n_years
             cap_t / 30.0,                         # [1] normalized for 8-agent cap
@@ -652,6 +664,9 @@ class Company:
             effective_reserve / pn,               # [22] effective reserve signal
             last_auction_volume / max(cap_t, 1e-6),  # [23] auction volume ratio
             msr_reserve / max(cap_t, 1e-6),          # [24] MSR reserve signal
+            own_bank_ratio,                          # [25] own bank ratio
+            predicted_withhold,                      # [26] predicted MSR withhold share
+            auction_volume_change,                   # [27] auction volume change signal
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -700,14 +715,15 @@ class Company:
 
     @property
     def obs_dim_phase1(self) -> int:
-        """25 base dims + 5*(N_total-1) opponent dims when opponent modeling is enabled.
+        """28 base dims + 5*(N_total-1) opponent dims when opponent modeling is enabled.
         N_total = learning agents + bot agents (all market participants).
         Base dims include carry-forward at [20], TNAC proxy at [21],
         effective reserve at [22], auction volume ratio at [23], and
-        MSR reserve signal at [24]."""
+        MSR reserve signal at [24], own bank ratio at [25], predicted
+        MSR withholding at [26], and auction volume change at [27]."""
         if self._opponent_modeling and self._n_total > 1:
-            return 25 + 5 * (self._n_total - 1)
-        return 25
+            return 28 + 5 * (self._n_total - 1)
+        return 28
 
     @property
     def obs_dim_phase2(self) -> int:

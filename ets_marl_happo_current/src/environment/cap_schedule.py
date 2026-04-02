@@ -87,6 +87,10 @@ class CapSchedule:
         Return the total cap for a given year (LRF applied, no MSR).
         Year 0 = initial year (no reduction yet).
         """
+        if year < 0:
+            # Burn-in support: extrapolate backward so caps are higher pre-year-0.
+            return self.cap_year_0 / ((1.0 - self.lrf_phase1) ** abs(year))
+
         cap = self.cap_year_0
         for t in range(1, year + 1):
             lrf = self.lrf_phase1 if t < self.lrf_switch else self.lrf_phase2
@@ -97,7 +101,8 @@ class CapSchedule:
                           clearing_price: float = 0.0,
                           price_max: float = 120.0,
                           penalty_rate: float = 0.0,
-                          inflation_rate: float = 0.0) -> float:
+                          inflation_rate: float = 0.0,
+                          force_msr: bool = False) -> float:
         """
         Return the actual volume put to auction after MSR adjustments.
 
@@ -119,6 +124,9 @@ class CapSchedule:
         inflation_rate : float
             Annual inflation rate (e.g., 0.020 for 2%). Used to compute
             the inflation-adjusted penalty rate.
+        force_msr : bool
+            If True, applies MSR logic regardless of activation_year.
+            Used by hidden burn-in years.
 
         Returns
         -------
@@ -131,7 +139,8 @@ class CapSchedule:
         if self.msr_enabled:
             auction_vol = self._apply_msr(year, auction_vol, tnac,
                                           clearing_price, price_max,
-                                          penalty_rate, inflation_rate)
+                                          penalty_rate, inflation_rate,
+                                          force_msr=force_msr)
 
         # Safety floor: no EU ETS equivalent but the Auctioning Regulation
         # (2023/2830) guarantees member state minimum volumes.
@@ -186,7 +195,8 @@ class CapSchedule:
                    clearing_price: float = 0.0,
                    price_max: float = 120.0,
                    penalty_rate: float = 0.0,
-                   inflation_rate: float = 0.0) -> float:
+                   inflation_rate: float = 0.0,
+                   force_msr: bool = False) -> float:
         """
         Apply MSR rules to the auction volume.
 
@@ -227,7 +237,7 @@ class CapSchedule:
         float
             Adjusted auction volume after MSR interventions (Mt).
         """
-        if year < self.msr_activation_year:
+        if not force_msr and year < self.msr_activation_year:
             return auction_vol  # MSR inactive during observation period
 
         # MSR cancellation: cancel holdings exceeding previous year's auction volume

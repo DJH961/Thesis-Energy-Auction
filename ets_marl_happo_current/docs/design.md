@@ -12,7 +12,7 @@ This document describes the **ETS MARL** simulation: a stylised multi-agent rein
 
 **How an episode works:** Each episode simulates 12 years. Every year, participants bid in a sealed-bid uniform-price auction for CO2 allowances, then trade in a bilateral secondary market, and choose how much to invest in renewable capacity. Penalties fall on those without enough allowances to cover emissions. The government cap shrinks by ~4.3–4.4 % annually, creating increasing scarcity that forces decarbonisation.
 
-**Learning objective:** Learning agents maximise a reward signal combining net financial cost (after compliance, trading, investment, and operations) with an optional ESG component (saved-carbon-years). Over 70,000 episodes, agents converge on market strategies.
+**Learning objective:** Learning agents maximise a reward signal combining net financial cost (after compliance, trading, investment, and operations) with an optional ESG component (saved-carbon-years). Over 100,000 episodes, agents converge on market strategies.
 
 ---
 
@@ -190,7 +190,7 @@ Participants can sell from current allocation plus bank (no short selling beyond
 
 ### 6.1 Phase 1 observation
 
-Base dimension: 25.
+Base dimension: 28.
 
 Includes:
 - time and cap
@@ -205,7 +205,7 @@ Includes:
 If opponent modeling is enabled:
 
 $$
-obsDimPhase1 = 25 + 5 (N_{total} - 1)
+obsDimPhase1 = 28 + 5 (N_{total} - 1)
 $$
 
 Each opponent contributes public 5D tuple:
@@ -216,7 +216,7 @@ Each opponent contributes public 5D tuple:
 - total queue size
 
 With 16 total participants:
-- phase 1 dimension = 100
+- phase 1 dimension = 103
 
 ### 6.2 Phase 2 observation
 
@@ -234,7 +234,7 @@ obsDimPhase2 = obsDimPhase1 + 7
 $$
 
 With 16 total participants:
-- phase 2 dimension = 107
+- phase 2 dimension = 110
 
 ## 7. Reward Design (Current)
 
@@ -242,7 +242,8 @@ Per-agent reward is:
 
 $$
 R_i = w_{cost,i}(-\text{costNorm}_i) + w_{green,i}(\text{esgScale}\cdot \text{esgRaw}_i)
-      + \text{greenBonus}_i + \text{queueBonus}_i + \text{terminalValues}_i
+  + \text{greenBonus}_i + \text{queueBonus}_i + \text{terminalValues}_i
+  - \text{oppCost}_i
 $$
 
 Where:
@@ -252,6 +253,8 @@ Where:
 - `queueBonus` rewards maintaining active construction pipeline.
 - `esgRaw` uses saved-carbon-years style term before weighting.
 - `esgScale` calibrates ESG magnitude to the same range as `costNorm`.
+- `oppCost` is a cost-of-capital term on post-compliance banked allowances:
+  $\text{oppCost}_i = holdings_i \cdot price_t \cdot r_{opp} / 1000$.
 
 This structure makes objective weights explicit:
 - Financial agents (`w_cost=1.0`, `w_green=0.0`) optimize pure cost.
@@ -311,6 +314,8 @@ Actors are decentralized; critic can be centralized (MAPPO mode) over concatenat
 ### 8.3 Stabilization features
 
 - Behavioral cloning warm-start from heuristic policy (optional).
+- Hidden heuristic burn-in warm-start (optional) to initialize banks, MSR reserve,
+  and MA3 price history before visible year 0.
 - Reward normalization per agent.
 - Entropy decay schedule.
 - Epsilon-greedy exploration in physical action space with anchored Gaussian sampling.

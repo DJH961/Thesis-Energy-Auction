@@ -399,6 +399,45 @@ def _resolve_auto_episode_count(raw_value, n_episodes: int,
     return int(raw_value), False
 
 
+def _apply_ppo_run_profile(config: dict, n_episodes: int) -> dict:
+    """
+    Resolve PPO settings by run length.
+
+    Long runs (n_episodes > threshold) keep configured long-run PPO values.
+    Short runs (n_episodes <= threshold) apply short_run_overrides when provided.
+    """
+    ppo_cfg = config.setdefault("ppo", {})
+    threshold = int(ppo_cfg.get("long_run_episode_threshold", 20000))
+    short_cfg = ppo_cfg.get("short_run_overrides", {}) or {}
+
+    long_lr = float(ppo_cfg.get("lr", 0.0002))
+    long_entropy_final = float(ppo_cfg.get("entropy_coef_final", 0.03))
+    long_epu = int(ppo_cfg.get("episodes_per_update", 1))
+
+    profile = "long-run" if n_episodes > threshold else "short-run"
+    if profile == "short-run":
+        ppo_cfg["lr"] = float(short_cfg.get("lr", long_lr))
+        ppo_cfg["entropy_coef_final"] = float(
+            short_cfg.get("entropy_coef_final", long_entropy_final)
+        )
+        ppo_cfg["episodes_per_update"] = int(
+            short_cfg.get("episodes_per_update", long_epu)
+        )
+
+    return {
+        "profile": profile,
+        "threshold": threshold,
+        "lr": float(ppo_cfg["lr"]),
+        "entropy_coef_final": float(ppo_cfg["entropy_coef_final"]),
+        "episodes_per_update": int(ppo_cfg["episodes_per_update"]),
+        "long_defaults": {
+            "lr": long_lr,
+            "entropy_coef_final": long_entropy_final,
+            "episodes_per_update": long_epu,
+        },
+    }
+
+
 def train_one_seed(config: dict, seed: int, on_log=None):
     # Isolate per-run auto-resolved schedule values (e.g. shaping decay)
     # so earlier short runs do not mutate config used by later long runs.
@@ -407,6 +446,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     n_agents = config["companies"]["n_agents"]
     n_episodes = config["simulation"]["n_episodes"]
     n_years = config["simulation"]["n_years"]
+    run_profile = _apply_ppo_run_profile(config, n_episodes)
 
     # Reward shaping decay schedule: allow auto-scaling from n_episodes.
     reward_cfg = config.setdefault("reward", {})
@@ -441,8 +481,15 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v6.2: MAC 48€ | Absolute-price secondary | ESG signal | Carry-forward{cf_str}")
+    print(f"v6.3: MAC 48€ | Absolute-price secondary | ESG signal | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
+    print(
+        f"PPO profile: {run_profile['profile']} "
+        f"(threshold>{run_profile['threshold']} episodes) "
+        f"| lr={run_profile['lr']} "
+        f"| entropy_final={run_profile['entropy_coef_final']} "
+        f"| episodes_per_update={run_profile['episodes_per_update']}"
+    )
     print(f"{'='*60}")
     _print_training_legend()
 

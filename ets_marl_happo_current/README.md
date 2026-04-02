@@ -1,4 +1,4 @@
-# ETS MARL — Current Version (HAPPO/PPO) v6.2
+# ETS MARL — Current Version (HAPPO/PPO) v6.3
 
 This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
 
@@ -87,11 +87,13 @@ The agents use **HAPPO (Heterogeneous-Agent PPO)**, a multi-agent reinforcement 
 - **Epsilon-greedy exploration** decays from 25% to 5% over training, preventing policy collapse
 - **Historical Policy Pool** maintains past policy snapshots for opponent diversity
 - **Auto-scaled schedules**: warmup, pretraining, exploration decay, and HPP timing can scale automatically with `n_episodes`
-- Over 70,000 episodes, agents converge on sophisticated market strategies
+- Hidden burn-in warm-start initializes banks, MSR reserve, and price history before visible year 0
+- Over 100,000 episodes, agents converge on sophisticated market strategies
 
 The reward signal balances:
 - **Revenue** from selling electricity (including carbon cost passthrough)
 - **Total costs** including allowances, trading, investing, operations, MAC, and penalties (folded into one cost signal)
+- **Opportunity cost of capital** on post-compliance banked allowances (`reward.opportunity_cost_rate`)
 - **Green investment shaping** — bonus for increasing green fraction (decays over training), scaled by (0.2 + w_green)
 - **ESG signal** — saved-carbon-years formula: `w_green × ef_ratio × time_ratio × (budget/1000)`, rewarding early emission reductions more than late ones
 - **Terminal values** — bank value (/1000 scaling) and ESG terminal queue value with γ^years_late discount
@@ -105,7 +107,7 @@ The reward signal balances:
 - **Capex throughput cap**: Organizational constraint on annual construction spend (M€), modelling permitting pipeline capacity, EPC contractor access, and management bandwidth. Independent of the financial budget — a company can afford more investment than it can physically deliver.
 - **Static reserve price**: Auction floor price at €30/t (matching price_min)
 - **Carry-forward**: Non-compliance shortfall is added to next year's obligation (capped at 2.0x, allowing larger debt accumulation)
-- **Initial bank seeding**: Each agent starts with ~30% of annual need as banked allowances (real EU ETS companies always hold some reserves), preventing year-0 bid prices from saturating at the penalty ceiling
+- **Hidden burn-in warm-start**: A configurable pre-period (`warm_start.burnin_enabled`) seeds realistic bank holdings, MSR reserve, and MA3 history before year 0
 - **Fundamentals-based heuristic**: Bot bidding uses MAC→penalty gradient (`mac_cost + urgency × (penalty - mac_cost)`), removing dependence on price moving average
 - **Absolute-price secondary market**: Secondary prices are expressed in €/t (not as multipliers), clipped to [sec_price_min, 2× effective penalty rate]
 - **ESG signal**: Saved-carbon-years formula rewards emission factor improvements proportional to remaining time, gated by w_green
@@ -135,7 +137,7 @@ ets_marl_happo_current/
 │       └── replay_buffer.py      # Stores past experiences for learning
 │
 ├── configs/
-│   └── default.yaml              # All simulation parameters (v6.2)
+│   └── default.yaml              # All simulation parameters (v6.3)
 │
 ├── scripts/
 │   ├── train.py                  # Starts a training run
@@ -218,7 +220,7 @@ python scripts/train.py --config configs/default.yaml --seed 123
 python scripts/train.py --config configs/default.yaml --seed 456
 ```
 
-Training runs 70,000 episodes of 12-year simulations. Results are saved to a `results/` folder.
+Training runs 100,000 episodes of 12-year simulations by default. Results are saved to a `results/` folder.
 
 ### Running Tests
 
@@ -239,7 +241,7 @@ The most important settings you might want to change:
 
 | Setting | Default | What It Controls |
 |---------|---------|-----------------|
-| `simulation.n_episodes` | 70,000 | How many episodes to train for (more = better but slower) |
+| `simulation.n_episodes` | 100,000 | How many episodes to train for (more = better but slower) |
 | `simulation.n_years` | 12 | How many years each episode simulates |
 | `companies.n_agents` | 8 | Number of learning agents (PPO) |
 | `companies.n_bot_agents` | 8 | Number of heuristic bot agents |
