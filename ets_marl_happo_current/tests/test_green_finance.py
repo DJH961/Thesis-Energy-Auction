@@ -27,7 +27,10 @@ def _base_env_config():
     cfg["warm_start"]["enabled"] = False
     cfg["uncertainty"]["enabled"] = False
     cfg["construction_jitter"]["enabled"] = False
-    cfg["simulation"]["n_years"] = 1
+    # Keep short tests but ensure cap-tightening check is meaningful.
+    cfg["simulation"]["n_years"] = 3
+    cfg["ets"]["lrf_phase1"] = 0.20
+    cfg["ets"]["lrf_phase2"] = 0.20
     return cfg
 
 

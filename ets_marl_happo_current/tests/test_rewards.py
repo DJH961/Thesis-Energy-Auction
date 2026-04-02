@@ -12,15 +12,11 @@ Covers:
 
 import sys
 import os
-import warnings
 import numpy as np
 import pytest
 import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-# Suppress weak-scarcity warnings from short test episodes (n_years=3)
-pytestmark = pytest.mark.filterwarnings("ignore:.*Weak scarcity.*:UserWarning")
 
 from src.environment.ets_environment import ETSEnvironment
 from src.agents.ppo_agent import RewardNormalizer
@@ -30,7 +26,11 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "configs", "default.
 
 def load_config():
     with open(CONFIG_PATH) as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    # Keep short-horizon reward tests warning-free without suppressing warnings.
+    config["ets"]["lrf_phase1"] = 0.20
+    config["ets"]["lrf_phase2"] = 0.20
+    return config
 
 
 def load_env(seed=42):

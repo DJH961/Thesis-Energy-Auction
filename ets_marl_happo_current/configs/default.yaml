@@ -18,7 +18,7 @@ simulation:
   seeds: [42, 123, 456]
 
 tabula_rasa:
-  enabled: false
+  enabled: true
   # When enabled, these OVERRIDE the corresponding values elsewhere.
   # All fractions are relative to n_episodes.
   epsilon_start: 0.50
@@ -229,7 +229,7 @@ bots:
   urgency_denominators: [1.3, 1.7, 1.3, 1.7, 1.3, 1.7, 1.3, 1.7]
   # --- Enhanced noise (off by default, easily toggled) ---
   enhanced_noise:
-    enabled: false
+    enabled: true
     valuation_noise_std: 15.0
     urgency_mult_low: 0.6
     urgency_mult_high: 1.5

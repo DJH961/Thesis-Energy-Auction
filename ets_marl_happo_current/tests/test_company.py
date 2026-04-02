@@ -25,7 +25,6 @@ from src.environment.company import Company, N_TECHS, BUILDABLE_INDICES
 from src.environment.ets_environment import ETSEnvironment
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "configs", "default.yaml")
-pytestmark = pytest.mark.filterwarnings("ignore:.*Weak scarcity.*:UserWarning")
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +91,9 @@ def make_company(config, agent_id=0, seed=42):
 def load_env_config(seed=42):
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
-    cfg["simulation"]["n_years"] = 1
+    cfg["simulation"]["n_years"] = 3
+    cfg["ets"]["lrf_phase1"] = 0.20
+    cfg["ets"]["lrf_phase2"] = 0.20
     cfg["companies"]["n_bot_agents"] = 0
     cfg["warm_start"]["enabled"] = False
     cfg["uncertainty"]["enabled"] = False
