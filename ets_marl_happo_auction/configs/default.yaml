@@ -66,15 +66,15 @@ ets:
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044
-  lrf_phase_switch: 4
+  lrf_phase_switch: 2              # 2026–27 use 4.3%; 2028+ use 4.4% (EU ETS linear LRF)
 
   msr:
     enabled: true
-    tnac_upper_ratio: 0.36     # fraction of computed cap_year_0
-    tnac_lower_ratio: 0.18     # fraction of computed cap_year_0
+    tnac_upper_ratio: 0.36     # fraction of computed cap_year_0 (calibrated for micro-ETS)
+    tnac_lower_ratio: 0.22     # raised from 0.18 → 0.22 (closer to CMW guide's 25%)
     withhold_rate: 0.24
-    release_frac: 0.016        # fraction of cap (was 0.80 Mt / 50.0 Mt)
-    activation_year: 2   # MSR begins Year 2; mirrors EU ETS lagged TNAC observation
+    release_frac: 0.064        # raised from 0.016 → 0.064 (6.4% of cap, scales EU 100 Mt)
+    activation_year: 1   # legacy field; 1-year TNAC lag now enforced via _prev_tnac
                          # (Decision 2015/1814 Art 1(5))
     price_containment_absolute: 350   # hard fallback for containment trigger (EUR/t)
     price_release_absolute: 450       # hard fallback for release trigger (EUR/t)

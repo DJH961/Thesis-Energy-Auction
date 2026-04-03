@@ -631,6 +631,10 @@ class ETSEnvironment(gym.Env):
             cap_t = self.cap_schedule.get_cap(burnin_year)
             tnac = float(self.holdings.sum())
             last_price = self._price_history[-1] if self._price_history else price_mean
+            burnin_price_ma3 = (
+                float(sum(self._price_history[-3:]) / len(self._price_history[-3:]))
+                if self._price_history else price_mean
+            )
             auction_volume = self.cap_schedule.get_auction_volume(
                 year=burnin_year,
                 tnac=tnac,
@@ -639,6 +643,7 @@ class ETSEnvironment(gym.Env):
                 penalty_rate=base_penalty_rate,
                 inflation_rate=inflation_rate,
                 force_msr=True,
+                price_ma3=burnin_price_ma3,
             )
             self._last_auction_volume = float(auction_volume)
 
@@ -988,9 +993,11 @@ class ETSEnvironment(gym.Env):
         # Pass base penalty rate (not inflation-adjusted) and inflation rate to MSR
         base_penalty_rate = float(self.config["penalty"]["rate"])
         inflation_rate = float(self._inflation_rate(year))
+        price_ma3 = self._compute_price_ma3()
         base_auction_volume = self.cap_schedule.get_auction_volume(
             year, tnac, self.last_clearing_price, price_max,
-            base_penalty_rate, inflation_rate
+            base_penalty_rate, inflation_rate,
+            price_ma3=price_ma3,
         )
         auction_volume = base_auction_volume
         log["cap"] = cap_t
