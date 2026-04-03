@@ -35,11 +35,17 @@ def _base_env_config():
 
 
 def _max_invest_actions(n_agents: int):
+    """Generate 10D auction actions with reasonable bids and max investment in solar."""
     actions = np.zeros((n_agents, 10), dtype=np.float32)
-    actions[:, 0] = 100.0
-    actions[:, 1] = 1.0
-    actions[:, 2] = 0.20
-    actions[:, 3:] = [0.0, 0.0, 1.0]  # solar
+    # 3-tranche bid: same price, equal qty across tranches
+    actions[:, 0] = 100.0   # p1
+    actions[:, 1] = 0.33    # q1 (coverage ~1.0 total)
+    actions[:, 2] = 100.0   # p2
+    actions[:, 3] = 0.33    # q2
+    actions[:, 4] = 100.0   # p3
+    actions[:, 5] = 0.33    # q3
+    actions[:, 6] = 0.20    # invest_frac (raw action; mapped through (a+1)/2 * max)
+    actions[:, 9] = 1.0     # solar logit highest
     return actions
 
 

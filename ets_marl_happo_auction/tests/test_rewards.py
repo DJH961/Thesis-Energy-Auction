@@ -385,14 +385,17 @@ def _run_to_final_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.0):
     info = None
     for year in range(env.n_years):
         auction_actions = np.zeros((n, 10), dtype=np.float32)
-        auction_actions[:, 0] = auction_price
-        auction_actions[:, 1] = qty_mult
-        # With v7.2.1: invest_frac = ((action + 1) / 2) * max_invest_frac
-        # To get invest_frac=0: action = -1.0
-        # To get desired invest_frac: action = 2 * invest_frac / max_invest_frac - 1
+        # 3-tranche bid: same price, split qty across tranches
+        auction_actions[:, 0] = auction_price   # p1
+        auction_actions[:, 1] = qty_mult / 3.0  # q1
+        auction_actions[:, 2] = auction_price   # p2
+        auction_actions[:, 3] = qty_mult / 3.0  # q2
+        auction_actions[:, 4] = auction_price   # p3
+        auction_actions[:, 5] = qty_mult / 3.0  # q3
+        # invest_frac = ((action + 1) / 2) * max_invest_frac
         max_invest_frac = env.companies[0].max_invest_frac
-        auction_actions[:, 2] = 2.0 * invest_frac / max_invest_frac - 1.0
-        auction_actions[:, 3:] = [0.0, 0.0, 1.0]  # solar logits
+        auction_actions[:, 6] = 2.0 * invest_frac / max_invest_frac - 1.0
+        auction_actions[:, 9] = 1.0  # solar logit highest
         env.step_auction(auction_actions)
 
         secondary_actions = np.zeros((n, 2), dtype=np.float32)
@@ -470,18 +473,38 @@ class TestTerminalBankValue:
         config["uncertainty"]["enabled"] = False
         config["construction_jitter"]["enabled"] = False
 
-        # High qty → more allowances purchased → more likely to have bank
-        env_high = ETSEnvironment(config, seed=42)
-        env_high.reset()
-        rewards_high, _ = _run_to_final_year(env_high, auction_price=80.0, qty_mult=1.3)
+        # Run both envs, then directly set holdings for comparison
+        env = ETSEnvironment(config, seed=42)
+        env.reset()
+        # Run to final year with reasonable bids
+        _run_to_final_year(env, auction_price=80.0, qty_mult=1.0)
 
-        # Low qty → fewer allowances → smaller or zero bank
-        env_low = ETSEnvironment(config, seed=42)
-        env_low.reset()
-        rewards_low, _ = _run_to_final_year(env_low, auction_price=80.0, qty_mult=0.3)
+        # Directly check: terminal bank value is monotonic in holdings
+        # by manipulating holdings before reward computation
+        env2 = ETSEnvironment(config, seed=42)
+        env2.reset()
+        _run_to_final_year(env2, auction_price=80.0, qty_mult=1.0)
 
-        total_bank_value_high = float(np.sum(env_high._last_terminal_bank_values))
-        total_bank_value_low = float(np.sum(env_low._last_terminal_bank_values))
+        # Set holdings directly: env_high has 10× more holdings
+        env.holdings[:] = 5.0   # 5 Mt per agent
+        env2.holdings[:] = 0.5  # 0.5 Mt per agent
+        env.current_year = env.n_years - 1
+        env2.current_year = env2.n_years - 1
+
+        zeros = np.zeros(env.n_total)
+        env._compute_rewards(
+            payments=zeros, trade_costs=zeros, penalties=zeros,
+            invest_costs=zeros, emissions=zeros, clearing_price=80.0,
+            mac_costs=zeros, precompliance_holdings=zeros, old_carry_forward=zeros,
+        )
+        env2._compute_rewards(
+            payments=zeros, trade_costs=zeros, penalties=zeros,
+            invest_costs=zeros, emissions=zeros, clearing_price=80.0,
+            mac_costs=zeros, precompliance_holdings=zeros, old_carry_forward=zeros,
+        )
+
+        total_bank_value_high = float(np.sum(env._last_terminal_bank_values))
+        total_bank_value_low = float(np.sum(env2._last_terminal_bank_values))
         assert total_bank_value_high >= total_bank_value_low - 1e-6, (
             f"Higher holdings should yield at least as much terminal bank value: "
             f"high={total_bank_value_high:.4f}, low={total_bank_value_low:.4f}")

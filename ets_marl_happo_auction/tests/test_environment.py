@@ -106,8 +106,8 @@ def test_cap_decreases():
 
     for _ in range(env.n_years):
         auction_actions = np.random.uniform(
-            [20.0, 0.0, 20.0, 0.0, 20.0, 0.0, 0.0, -1.0, -1.0, -1.0],
-            [200.0, 5.0, 0.0, 1.0, 1.0, 1.0],
+            [20.0, 0.3, 20.0, 0.3, 20.0, 0.3, 0.0, -1.0, -1.0, -1.0],
+            [200.0, 2.0, 200.0, 2.0, 200.0, 2.0, 0.05, 1.0, 1.0, 1.0],
             size=(n_agents, 10)
         ).astype(np.float32)
         obs2, _ = env.step_auction(auction_actions)
@@ -334,8 +334,8 @@ def test_p5_emission_variance():
         env.reset(seed=ep * 999)
         n_agents = env.n_agents
         auction_actions = np.random.uniform(
-            [20.0, 0.0, 20.0, 0.0, 20.0, 0.0, 0.0, -1.0, -1.0, -1.0],
-            [200.0, 5.0, 0.0, 1.0, 1.0, 1.0],
+            [20.0, 0.3, 20.0, 0.3, 20.0, 0.3, 0.0, -1.0, -1.0, -1.0],
+            [200.0, 2.0, 200.0, 2.0, 200.0, 2.0, 0.05, 1.0, 1.0, 1.0],
             size=(n_agents, 10)
         ).astype(np.float32)
         _, log = env.step_auction(auction_actions)
@@ -439,10 +439,10 @@ def test_p8_obs_dims():
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
     )
 
-    # Auction actions: action[1] is now a COVERAGE MULTIPLIER on estimated need
+    # Auction actions: 3-tranche bid ladder (10D)
     auction_actions = np.random.uniform(
-        [5.0, 0.3, 0.0, -1.0, -1.0, -1.0],
-        [200.0, 2.0, 0.05, 1.0, 1.0, 1.0],
+        [5.0, 0.3, 5.0, 0.3, 5.0, 0.3, 0.0, -1.0, -1.0, -1.0],
+        [200.0, 2.0, 200.0, 2.0, 200.0, 2.0, 0.05, 1.0, 1.0, 1.0],
         size=(n_agents, 10)
     ).astype(np.float32)
     obs2, _ = env.step_auction(auction_actions)
@@ -569,41 +569,44 @@ def test_secondary_profit_ema_resets_each_episode():
     )
 
 
-def test_liquidity_pool_fills_at_reference_plus_spread():
-    """External liquidity pool should fill unmatched buy flow at reference*(1+spread)."""
+def test_call_auction_clears_at_equilibrium():
+    """Uniform-price call auction should clear at the intersection of supply and demand."""
     env = load_env()
     env.reset(seed=42)
 
-    env.config.setdefault("secondary", {}).setdefault("liquidity_pool", {})["enabled"] = True
-    env.config["secondary"]["liquidity_pool"]["spread"] = 0.05
-    env.config["secondary"]["liquidity_pool"]["penalty_anchor_weight"] = 0.30
-    env._liquidity_ref_ema = 100.0
-
     n_total = env.n_total
-    allocations = np.zeros(n_total)
+    allocations = np.ones(n_total) * 5.0  # Give everyone 5 Mt to allow selling
     secondary_prices = np.full(n_total, 90.0)
     secondary_qtys = np.zeros(n_total)
 
-    # One buyer with no internal seller counterpart -> pool should fill.
+    # Set up overlapping buy/sell orders: buyer bids 120, seller asks 80
+    # → clearing price should be between 80 and 120
     secondary_prices[0] = 120.0
-    secondary_qtys[0] = 1.0
+    secondary_qtys[0] = 1.0   # buy 1 Mt
 
-    trade_costs, trade_qtys, _, total_volume, pool_info = env._settle_double_auction(
+    secondary_prices[1] = 80.0
+    secondary_qtys[1] = -1.0  # sell 1 Mt
+
+    # Need positive emissions and holdings for seller to actually sell
+    env._current_emissions = np.ones(n_total) * 0.5
+    env.holdings = np.ones(n_total) * 10.0  # plenty of bank to sell from
+
+    trade_costs, trade_qtys, sec_price, total_volume, pool_info = env._settle_double_auction(
         allocations=allocations,
         secondary_prices=secondary_prices,
         secondary_qtys=secondary_qtys,
         clearing_price=100.0,
     )
 
-    assert pool_info["enabled"] is True
-    assert pool_info["reference_price"] == pytest.approx(100.0, abs=1e-6)
-    assert pool_info["sell_price"] == pytest.approx(105.0, abs=1e-6)
-    assert trade_qtys[0] == pytest.approx(1.0, abs=1e-6)
-    assert pool_info["sell_volume"] == pytest.approx(1.0, abs=1e-6)
-    assert total_volume == pytest.approx(1.0, abs=1e-6)
-    # Buyer pays pool sell price plus transaction cost.
-    expected_cost = 1.0 * (105.0 + env.config["trading"]["transaction_cost"])
-    assert trade_costs[0] == pytest.approx(expected_cost, abs=1e-6)
+    # Pool should be disabled (call auction has no external pool)
+    assert pool_info["enabled"] is False
+    # Trades should have occurred
+    assert total_volume > 0.0, "Call auction should clear overlapping orders"
+    # Buyer should have bought, seller should have sold
+    assert trade_qtys[0] > 0.0, "Buyer should receive allowances"
+    assert trade_qtys[1] < 0.0, "Seller should give up allowances"
+    # Clearing price should be within the bid-ask range
+    assert 80.0 <= sec_price <= 120.0, f"Clearing price {sec_price} not in [80, 120]"
 
 
 # ---------------------------------------------------------------------------
