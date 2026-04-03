@@ -28,11 +28,12 @@ The agents learn through trial and error over thousands of simulated years, even
 
 ## Repository Structure
 
-This repo currently contains **three versions** of the project, reflecting how it evolved over time:
+This repo currently contains **four versions** of the project, reflecting how it evolved over time:
 
 | Folder | What It Is | Status |
 |--------|-----------|--------|
-| [ets_marl_happo_current](ets_marl_happo_current) | **The main, current version (v7.2).** Uses PPO/HAPPO agents, 8 learning + 8 bot companies, hidden burn-in warm-start, dynamic emission-weighted cap/MSR calibration, EU ETS-style collateral costs plus pre-auction affordability clipping, side-balanced tabula-rasa exploration with an 80 EUR/t fallback expected-price anchor, budget-headroom phase-1 observation, optional green-finance budget/capex relief, and bot enhanced-noise/fade controls. This is where all active development happens. | **Active** |
+| [ets_marl_happo_current](ets_marl_happo_current) | **The main, current version (v7.3).** Uses PPO/HAPPO agents, 8 learning + 8 bot companies, hidden burn-in warm-start, dynamic emission-weighted cap/MSR calibration, EU ETS-style collateral costs plus pre-auction affordability clipping, side-balanced tabula-rasa exploration with an 80 EUR/t fallback expected-price anchor, budget-headroom phase-1 observation, optional green-finance budget/capex relief, and bot enhanced-noise/fade controls. v7.3 removes electricity revenue from cost normalisation and prunes the queue_bonus shaping reward. | **Active** |
+| [ets_marl_happo_auction](ets_marl_happo_auction) | **Auction-focused variant (v8.0).** Forked from v7.3 with drastic market mechanism changes: **3-tranche bid ladder** for primary auctions (10D action space) and **Uniform-Price Call Auction** (clearinghouse) for the secondary market, mirroring real EEX/ICE daily fixing. Maximises social surplus and finds exact market equilibrium. | **Active (experimental)** |
 | [ets_marl_legacy_ppo](ets_marl_legacy_ppo) | An earlier version that used PPO agents. Kept for reference only. | Archived |
 | [ets_marl_legacy_test](ets_marl_legacy_test) | The original prototype using DDPG agents (4 companies, simpler setup). Kept for historical comparison. | Archived |
 

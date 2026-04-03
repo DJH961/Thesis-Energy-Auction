@@ -68,14 +68,19 @@ def build_agents(env: ETSEnvironment, config: dict, seed: int):
     aq = config["auction"]
     inv = config["investment"]
 
-    # Phase 1: [bid_price, qty_multiplier, invest_frac, tech_logit0, tech_logit1, tech_logit2]
-    # bid_price is direct in [price_min, price_max] €/t (no markup mechanism).
-    # qty_multiplier is a coverage ratio on estimated need.
+    # Phase 1: 3-tranche bid ladder
+    # [p1, q1, p2, q2, p3, q3, invest_frac, tech_logit0, tech_logit1, tech_logit2]
+    # Each (p_k, q_k) pair: price in [price_min, price_max], qty_multiplier on need.
+    p_lo, p_hi = aq["price_min"], aq["price_max"]
+    q_lo = aq.get("qty_mult_low", 0.3)
+    q_hi = aq.get("qty_mult_high", 1.3)
     auction_low = np.array([
-        aq["price_min"], aq.get("qty_mult_low", 0.3), 0.0, -1.0, -1.0, -1.0
+        p_lo, q_lo, p_lo, q_lo, p_lo, q_lo,
+        0.0, -1.0, -1.0, -1.0
     ], dtype=np.float32)
     auction_high = np.array([
-        aq["price_max"], aq.get("qty_mult_high", 1.3), inv["max_invest_frac"], 1.0, 1.0, 1.0
+        p_hi, q_hi, p_hi, q_hi, p_hi, q_hi,
+        inv["max_invest_frac"], 1.0, 1.0, 1.0
     ], dtype=np.float32)
 
     # Phase 2: [sec_price (absolute EUR/t), sec_qty]
@@ -195,7 +200,7 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
             cap_t = env.cap_schedule.get_cap(current_year)
             last_auction_volume = getattr(env, "_last_auction_volume", cap_t)
 
-            auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+            auction_actions = np.zeros((n_agents, 10), dtype=np.float32)
             for i in range(n_agents):
                 company = env.companies[i]
                 h_auc = heuristic_policy.auction_action(
@@ -205,7 +210,11 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
                     auction_volume=float(last_auction_volume),
                     cap_t=float(cap_t),
                 )
-                auction_actions[i] = h_auc
+                # Expand 6D heuristic -> 10D 3-tranche: split bid into 3 equal tranches
+                p, q = h_auc[0], h_auc[1] / 3.0
+                auction_actions[i] = np.array([p, q, p, q, p, q,
+                                               h_auc[2], h_auc[3], h_auc[4], h_auc[5]],
+                                              dtype=np.float32)
 
                 auc_raw = _to_raw(h_auc, agents[i].auction_policy,
                                       agents[i].device)
@@ -527,7 +536,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v7.3: Remove revenue from cost norm | Prune queue_bonus shaping | Carry-forward{cf_str}")
+    print(f"v8.0: 3-tranche bid ladder | Call-auction secondary clearing | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(
         f"PPO profile: {run_profile['profile']} "
@@ -856,7 +865,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         for year in range(effective_n_years):
             # === PHASE 1: Auction + Investment ===
-            auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+            auction_actions = np.zeros((n_agents, 10), dtype=np.float32)
             auction_raws = []
             auction_logps = []
 

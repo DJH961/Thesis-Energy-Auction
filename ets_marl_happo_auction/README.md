@@ -1,6 +1,6 @@
-# ETS MARL — Current Version (HAPPO/PPO) v7.3
+# ETS MARL — Auction Version (HAPPO/PPO) v8.0
 
-This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand. v7.3 removes electricity revenue from cost normalisation and prunes the queue_bonus shaping reward, retaining only the green_bonus signal.
+This is the **auction-focused version** of the carbon market simulation (forked from v7.3). It introduces a **3-tranche bid ladder** for the primary auction and replaces the bilateral secondary market with a **Uniform-Price Call Auction** (clearinghouse mechanism), mirroring how real EEX/ICE daily fixing works. This mathematically guarantees maximum social surplus and finds the exact market equilibrium a Continuous Double Auction would discover over a longer time horizon.
 
 ## What Does This Code Do?
 
@@ -142,7 +142,7 @@ ets_marl_happo_current/
 │       └── replay_buffer.py      # Stores past experiences for learning
 │
 ├── configs/
-│   └── default.yaml              # All simulation parameters (v7.3)
+│   └── default.yaml              # All simulation parameters (v8.0)
 │
 ├── scripts/
 │   ├── train.py                  # Starts a training run

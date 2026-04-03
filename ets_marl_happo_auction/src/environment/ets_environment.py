@@ -7,22 +7,28 @@ energy mix, real-data-grounded investment costs, and construction queues.
 Each year is split into two decision phases:
   Phase 1 (Auction + Investment):
     - Agents observe market state (20+2*(N-1) dim with opponent modeling)
-    - Decide: [bid_price, quantity, invest_frac, tech_choice_logit0..2]
+    - Decide: [p1, q1, p2, q2, p3, q3, invest_frac, tech_choice_logit0..2]
+    - 3-tranche bid ladder: each (p, q) pair is an independent price/coverage
+      bid submitted to the uniform-price auction. This mirrors the demand
+      curves used in real EEX/ICE call auctions.
     - Auction clears, investments are planned
     - Returns enriched observation (phase1_dim+4) with auction results
 
-  Phase 2 (Secondary Market):
+  Phase 2 (Secondary Market — Uniform-Price Call Auction):
     - Agents observe auction results (phase1_dim+4 dim)
     - Decide: [secondary_price, secondary_quantity]
-    - Secondary market clears, compliance is checked
+    - All bids/offers are collected and cleared at a single uniform price
+      (call-auction / clearinghouse mechanism), maximising social surplus.
     - Returns reward and next year's Phase 1 observation
 
-Action space (Phase 1): 6D continuous
-  [bid_price, quantity, invest_frac, tech_logit_onshore, tech_logit_offshore, tech_logit_solar]
+Action space (Phase 1): 10D continuous
+  [p1, q1, p2, q2, p3, q3, invest_frac, tech_logit_onshore, tech_logit_offshore, tech_logit_solar]
+  Each (p_k, q_k) tranche: p_k is bid price, q_k is coverage multiplier on need.
   tech_choice is derived by argmax of the 3 logits (discrete from continuous)
 
 Action space (Phase 2): 2D continuous
-  [price_multiplier, quantity]
+  [price, quantity]  — positive qty = buy, negative = sell
+  Cleared via uniform-price call auction (aggregate supply/demand intersection).
 
 Roadmap improvements (P1-P4): price MA, entropy, reward normalisation, green shaping.
 Opponent modeling: Phase 1 obs augmented with last-episode (bid/200, green_frac) for N-1 agents.
@@ -851,9 +857,15 @@ class ETSEnvironment(gym.Env):
 
     def _generate_bot_auction_actions(self, auction_volume: float = None,
                                       cap_t: float = None) -> np.ndarray:
-        """Generate Phase-1 actions for all bot agents using heuristic_policy."""
+        """Generate Phase-1 actions for all bot agents using heuristic_policy.
+
+        Bot heuristic produces 6D [price, qty_mult, invest_frac, t0, t1, t2].
+        We expand to 10D 3-tranche format by splitting the single bid into
+        three equal tranches at the same price:
+          [p, q/3, p, q/3, p, q/3, invest_frac, t0, t1, t2]
+        """
         if self.n_bots == 0:
-            return np.zeros((0, 6), dtype=np.float32)
+            return np.zeros((0, 10), dtype=np.float32)
         price_ma3 = self._compute_price_ma3()
         reserve = self._compute_dynamic_reserve()
         price_min = float(self.config["auction"]["price_min"])
@@ -863,15 +875,16 @@ class ETSEnvironment(gym.Env):
         budget_stress_qty_mult = float(self._enhanced_noise_cfg.get("budget_stress_qty_mult", 0.65))
         qty_low = float(self.config["auction"].get("qty_mult_low", 0.3))
         qty_high = float(self.config["auction"].get("qty_mult_high", 2.0))
-        actions = np.zeros((self.n_bots, 6), dtype=np.float32)
+        actions = np.zeros((self.n_bots, 10), dtype=np.float32)
         for b in range(self.n_bots):
             if b >= self._n_active_bots:
-                actions[b] = np.array([price_min, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                actions[b] = np.array([price_min, 0.0, price_min, 0.0, price_min, 0.0,
+                                       0.0, 0.0, 0.0, 0.0], dtype=np.float32)
                 continue
 
             idx = self.n_agents + b  # bots indexed after learning agents
             urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
-            action = heuristic_policy.auction_action(
+            action6 = heuristic_policy.auction_action(
                 self.companies[idx], price_ma3, self.current_year,
                 self.n_years, self.config,
                 bank=float(self.holdings[idx]),
@@ -884,8 +897,14 @@ class ETSEnvironment(gym.Env):
                 urgency_denom=urgency_denom,
             )
             if self._enhanced_noise_enabled and bool(self._bot_budget_stressed[b]):
-                action[1] = float(np.clip(action[1] * budget_stress_qty_mult, qty_low, qty_high))
-            actions[b] = action
+                action6[1] = float(np.clip(action6[1] * budget_stress_qty_mult, qty_low, qty_high))
+            # Expand 6D → 10D: split single bid into 3 equal tranches
+            p = action6[0]
+            q = action6[1]
+            q_third = q / 3.0
+            actions[b] = np.array([p, q_third, p, q_third, p, q_third,
+                                   action6[2], action6[3], action6[4], action6[5]],
+                                  dtype=np.float32)
         return actions
 
     def _generate_bot_secondary_actions(self, clearing_price: float) -> np.ndarray:
@@ -922,10 +941,12 @@ class ETSEnvironment(gym.Env):
 
         Parameters
         ----------
-        auction_actions : np.ndarray, shape (n_learning, 6)
+        auction_actions : np.ndarray, shape (n_learning, 10)
             Actions for learning agents only.
-            [bid_price, quantity, invest_frac, tech_logit0, tech_logit1, tech_logit2]
-            Bot actions are generated internally via heuristic_policy.
+            [p1, q1, p2, q2, p3, q3, invest_frac, tech_logit0, tech_logit1, tech_logit2]
+            3-tranche bid ladder: each (p_k, q_k) pair is an independent
+            price/coverage bid. Bot actions are generated internally via
+            heuristic_policy (still 6D, expanded to 3 identical tranches).
 
         Returns
         -------
@@ -1036,46 +1057,60 @@ class ETSEnvironment(gym.Env):
             for i in range(self.n_total)
         ])
 
-        # 7. Auction
-        bid_actions = auction_actions[:, :2].copy()
-
+        # 7. Auction — 3-tranche bid ladder
+        # Each agent submits 3 (price, qty_multiplier) pairs.
+        # These are expanded into separate bid rows for the clearing engine.
         price_min = self.config["auction"]["price_min"]
         price_max = self.config["auction"]["price_max"]
-
-        # Direct bid price: agent action[0] is the bid price in [price_min, price_max]
-        bid_actions[:, 0] = np.clip(bid_actions[:, 0], price_min, price_max)
-        # Quantity reparameterization: action[1] is a coverage MULTIPLIER on estimated need.
-        # actual_qty = multiplier × (compute_estimate_need + carry_forward)
-        # This keeps the strategic decision centred on compliance coverage ratio rather
-        # than an absolute volume, avoiding the zero-quantity collapse.
         qty_mult_low = self.config["auction"].get("qty_mult_low", 0.3)
         qty_mult_high = self.config["auction"].get("qty_mult_high", 1.3)
         lot_size = self.config["auction"].get("lot_size", 0.0)
+
+        N_TRANCHES = 3
+        # Collect per-tranche bids: list of [agent_id, quantity, price]
+        all_bid_rows = []
         bid_qty_multipliers = np.zeros(self.n_total)
         estimate_needs = np.zeros(self.n_total)
         bid_coverages = np.zeros(self.n_total)
+        # Store aggregate (weighted-average) price and total qty per agent for logging
+        agent_total_qty = np.zeros(self.n_total)
+        agent_wavg_price = np.zeros(self.n_total)
+
         for i, company in enumerate(self.companies):
             if not self._is_agent_active(i):
-                bid_actions[i, 1] = 0.0
                 bid_qty_multipliers[i] = 0.0
                 estimate_needs[i] = 0.0
                 bid_coverages[i] = 0.0
                 continue
 
-            multiplier = float(np.clip(auction_actions[i, 1], qty_mult_low, qty_mult_high))
             base_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
-            bid_actions[i, 1] = multiplier * base_need
-            bid_qty_multipliers[i] = multiplier
             estimate_needs[i] = base_need
-            bid_coverages[i] = bid_actions[i, 1] / max(base_need, 1e-6)
-            # EU lot-size discretization: round to nearest multiple of lot_size
-            if lot_size > 0:
-                bid_actions[i, 1] = max(lot_size, round(bid_actions[i, 1] / lot_size) * lot_size)
 
-        # Pre-auction collateral affordability clip
-        # Mirrors real EU ETS: insufficient collateral -> bid rejected -> rebid allowed.
-        # Step 1: clip qty at current price if that keeps qty >= min_qty_floor x need.
-        # Step 2: if qty clip would starve the agent, reduce price instead to preserve qty.
+            total_qty_i = 0.0
+            price_qty_sum = 0.0
+            for t in range(N_TRANCHES):
+                p_raw = float(auction_actions[i, 2 * t])
+                q_raw = float(auction_actions[i, 2 * t + 1])
+                p_clipped = float(np.clip(p_raw, price_min, price_max))
+                q_mult = float(np.clip(q_raw, qty_mult_low, qty_mult_high))
+                q_abs = q_mult * base_need
+                if lot_size > 0:
+                    q_abs = max(lot_size, round(q_abs / lot_size) * lot_size)
+                q_abs = max(0.0, q_abs)
+                if q_abs > 1e-6:
+                    all_bid_rows.append([float(i), q_abs, p_clipped])
+                    total_qty_i += q_abs
+                    price_qty_sum += p_clipped * q_abs
+
+            agent_total_qty[i] = total_qty_i
+            if total_qty_i > 1e-6:
+                agent_wavg_price[i] = price_qty_sum / total_qty_i
+                bid_coverages[i] = total_qty_i / max(base_need, 1e-6)
+                bid_qty_multipliers[i] = total_qty_i / base_need
+            else:
+                agent_wavg_price[i] = price_min
+
+        # Pre-auction collateral affordability clip (applied to total agent bid)
         coll_cfg = self.config.get("auction", {}).get("collateral", {})
         if coll_cfg.get("enabled", True):
             _rate = float(coll_cfg.get("interest_rate", coll_cfg.get("opportunity_cost_rate", 0.05)))
@@ -1086,44 +1121,39 @@ class ETSEnvironment(gym.Env):
                 for i, company in enumerate(self.companies):
                     if not self._is_agent_active(i):
                         continue
-
-                    bid_p = float(bid_actions[i, 0])
-                    bid_q = float(bid_actions[i, 1])
+                    total_q = agent_total_qty[i]
+                    avg_p = agent_wavg_price[i]
+                    if total_q < 1e-6 or avg_p < 1e-6:
+                        continue
                     need_i = float(company.compute_emissions())
-
                     budget_remaining = max(
                         0.0,
                         float(company.annual_budget - company.budget_spent_this_year),
                     )
+                    worst_case = _rate * _hold * avg_p * total_q
+                    if worst_case > budget_remaining:
+                        # Scale down all tranches for this agent proportionally
+                        if total_q > 1e-6:
+                            scale = max(0.0, budget_remaining / (_rate * _hold * avg_p * total_q))
+                            scale = min(scale, 1.0)
+                            for row in all_bid_rows:
+                                if int(row[0]) == i:
+                                    row[1] *= scale
+                            agent_total_qty[i] *= scale
 
-                    worst_case = _rate * _hold * bid_p * bid_q
-
-                    if worst_case > budget_remaining and bid_p > 1e-6:
-                        qty_max = budget_remaining / (_rate * _hold * bid_p)
-
-                        if qty_max >= _floor * need_i:
-                            # Step 1: qty clip sufficient -> preserve price for discovery
-                            bid_actions[i, 1] = max(qty_max, 0.0)
-                        else:
-                            if bid_q > 1e-6:
-                                # Step 2: qty clip would starve agent -> reduce price, keep qty
-                                p_affordable = budget_remaining / (_rate * _hold * bid_q)
-                                p_affordable = max(
-                                    p_affordable,
-                                    self.config["auction"]["price_min"],
-                                )
-                                bid_actions[i, 0] = min(bid_p, p_affordable)
-                            else:
-                                bid_actions[i, 1] = 0.0  # budget = 0, sit out
-
-        self._phase1_bid_prices = bid_actions[:, 0].copy()
-        self._phase1_bid_quantities = bid_actions[:, 1].copy()  # Mt after multiplier expansion
+        # Store aggregate per-agent bid info for logging (backward-compatible)
+        self._phase1_bid_prices = agent_wavg_price.copy()
+        self._phase1_bid_quantities = agent_total_qty.copy()
 
         # Compute effective reserve price (dynamic or static)
         effective_reserve = self._compute_dynamic_reserve()
         self._last_effective_reserve = effective_reserve
 
-        bids = build_bids(bid_actions)
+        # Build bids array from collected tranche rows
+        if all_bid_rows:
+            bids = np.array(all_bid_rows, dtype=float)
+        else:
+            bids = np.zeros((0, 3), dtype=float)
         clearing_price, allocations, payments, auction_stats = market_clearing_ets(
             bids=bids,
             q_cap=auction_volume,
@@ -1214,10 +1244,10 @@ class ETSEnvironment(gym.Env):
 
             # Continuous linear mapping: [-1, 1] → [0, max_invest_frac]
             # Eliminates the dead zone where negative actions all map to 0.
-            invest_frac = float((auction_actions[i, 2] + 1.0) / 2.0) * company.max_invest_frac
+            invest_frac = float((auction_actions[i, 6] + 1.0) / 2.0) * company.max_invest_frac
             invest_frac = float(np.clip(invest_frac, 0.0, company.max_invest_frac))
             requested_invest_frac = invest_frac
-            tech_logits = auction_actions[i, 3:6]
+            tech_logits = auction_actions[i, 7:10]
             tech_choice = int(np.argmax(tech_logits))
             invest_tech_choices[i] = tech_choice
 
@@ -1605,21 +1635,26 @@ class ETSEnvironment(gym.Env):
     # ------------------------------------------------------------------
 
     def step(self, actions: np.ndarray):
-        """Single-call step for backward compat. actions shape (n_learning, 8)."""
-        obs2, _ = self.step_auction(actions[:, :6])
-        return self.step_secondary(actions[:, 6:])
+        """Single-call step for backward compat. actions shape (n_learning, 12)."""
+        obs2, _ = self.step_auction(actions[:, :10])
+        return self.step_secondary(actions[:, 10:])
 
     # ------------------------------------------------------------------
-    # Secondary market — double auction (P8 improvements)
+    # Secondary market — Uniform-Price Call Auction (Clearinghouse)
     # ------------------------------------------------------------------
 
     def _settle_double_auction(self, allocations, secondary_prices,
                                 secondary_qtys, clearing_price):
         """
-        Double auction with P8 improvements:
-          - Spread tolerance: trades clear if buyer_price + tol >= seller_price
-          - Short positions: agents can sell from banked holdings (not only allocation)
-          - Returns (trade_costs, trade_qtys, secondary_clearing_price, total_volume)
+        Uniform-Price Call Auction (v8.0):
+        All agent bids/offers are aggregated into supply and demand curves.
+        The intersection determines a single uniform clearing price at which
+        all overlapping volume clears. This is how real EEX/ICE daily call
+        auctions (spot fixing) work — it maximises social surplus and finds
+        the exact market equilibrium a CDA would discover over time.
+
+        Returns (trade_costs, trade_qtys, secondary_clearing_price, total_volume,
+                 liquidity_pool_info)
         """
         cfg = self.config["trading"]
         trade_costs = np.zeros(self.n_total)
@@ -1638,17 +1673,16 @@ class ETSEnvironment(gym.Env):
             return trade_costs, trade_qtys, clearing_price, 0.0, liquidity_pool_info
 
         tx_cost = cfg["transaction_cost"]
-        # P8: spread tolerance as fraction of clearing price
-        spread_tol = cfg.get("spread_tolerance", 0.0) * max(clearing_price, 1.0)
 
-        buyers = []
-        sellers = []
+        # ── Collect buy and sell orders ───────────────────────────────
+        buy_orders = []   # (agent_id, price, qty)
+        sell_orders = []  # (agent_id, price, qty)
 
         for i in range(self.n_total):
             qty = float(secondary_qtys[i])
             price = float(secondary_prices[i])
             if qty > 1e-6:
-                buyers.append([i, price, qty])
+                buy_orders.append((i, price, qty))
             elif qty < -1e-6:
                 # Enforce no-short-selling: subtract expected compliance need
                 max_sell = max(0.0, float(allocations[i]) + float(max(0.0, self.holdings[i]))
@@ -1656,109 +1690,79 @@ class ETSEnvironment(gym.Env):
                               - float(self.companies[i]._carry_forward))
                 sell_qty = min(abs(qty), max_sell)
                 if sell_qty > 1e-6:
-                    sellers.append([i, price, sell_qty])
+                    sell_orders.append((i, price, sell_qty))
 
-        total_value = 0.0
-        total_qty = 0.0
+        if not buy_orders or not sell_orders:
+            return trade_costs, trade_qtys, clearing_price, 0.0, liquidity_pool_info
 
-        # 1) Internal matching between agents
-        if buyers and sellers:
-            buyers.sort(key=lambda x: -x[1])
-            sellers.sort(key=lambda x: x[1])
+        # ── Build aggregate demand curve (sorted descending by price) ──
+        # and aggregate supply curve (sorted ascending by price)
+        demand = sorted(buy_orders, key=lambda x: -x[1])   # highest WTP first
+        supply = sorted(sell_orders, key=lambda x: x[1])     # lowest ask first
 
-            executed_trades = []
-            b_idx, s_idx = 0, 0
-            while b_idx < len(buyers) and s_idx < len(sellers):
-                buyer_id, buyer_price, buy_qty_rem = buyers[b_idx]
-                seller_id, seller_price, sell_qty_rem = sellers[s_idx]
+        # ── Find intersection: uniform clearing price ─────────────────
+        # Walk both curves simultaneously. The clearing price is the price
+        # at which cumulative demand >= cumulative supply cross.
+        # We step through all price levels and find where demand = supply.
 
-                # P8: trade if buyer_price + spread_tol >= seller_price
-                if buyer_price + spread_tol < seller_price:
-                    break
+        # Gather all unique price levels from both sides
+        all_prices = sorted(set([d[1] for d in demand] + [s[1] for s in supply]))
 
-                trade_price = (buyer_price + seller_price) / 2.0
-                trade_qty = min(buy_qty_rem, sell_qty_rem)
-                executed_trades.append((buyer_id, seller_id, trade_price, trade_qty))
+        best_volume = 0.0
+        best_price = clearing_price  # fallback
 
-                buyers[b_idx][2] -= trade_qty
-                sellers[s_idx][2] -= trade_qty
-                if buyers[b_idx][2] < 1e-6:
-                    b_idx += 1
-                if sellers[s_idx][2] < 1e-6:
-                    s_idx += 1
+        for p in all_prices:
+            # Demand at price p: all buy orders with price >= p
+            d_vol = sum(qty for _, bp, qty in demand if bp >= p)
+            # Supply at price p: all sell orders with price <= p
+            s_vol = sum(qty for _, sp, qty in supply if sp <= p)
+            # Cleared volume is the minimum
+            cleared = min(d_vol, s_vol)
+            if cleared > best_volume:
+                best_volume = cleared
+                best_price = p
 
-            for buyer_id, seller_id, trade_price, trade_qty in executed_trades:
-                cost_buyer = trade_qty * (trade_price + tx_cost)
-                revenue_seller = trade_qty * (trade_price - tx_cost)
+        if best_volume < 1e-9:
+            return trade_costs, trade_qtys, clearing_price, 0.0, liquidity_pool_info
 
-                trade_costs[buyer_id] += cost_buyer
-                trade_costs[seller_id] -= revenue_seller
+        uniform_price = best_price
 
-                trade_qtys[buyer_id] += trade_qty
-                trade_qtys[seller_id] -= trade_qty
+        # ── Allocate cleared volume to agents at uniform price ────────
+        # Buyers: fill orders with price >= uniform_price (pro-rata if excess demand)
+        eligible_buys = [(i, price, qty) for i, price, qty in demand if price >= uniform_price]
+        eligible_sells = [(i, price, qty) for i, price, qty in supply if price <= uniform_price]
 
-                total_value += trade_price * trade_qty
-                total_qty += trade_qty
+        total_buy_qty = sum(qty for _, _, qty in eligible_buys)
+        total_sell_qty = sum(qty for _, _, qty in eligible_sells)
 
-        # 2) External liquidity pool for unmatched flow
-        sec_cfg = self.config.get("secondary", {})
-        pool_cfg = sec_cfg.get("liquidity_pool", {})
-        pool_enabled = bool(pool_cfg.get("enabled", False))
-        if pool_enabled:
-            ema_alpha = float(pool_cfg.get("ema_alpha", 0.30))
-            penalty_weight = float(pool_cfg.get("penalty_anchor_weight", 0.30))
-            penalty_weight = float(np.clip(penalty_weight, 0.0, 1.0))
-            spread = float(pool_cfg.get("spread", 0.05))
-            spread = max(0.0, spread)
+        # The cleared volume is limited by the smaller side
+        cleared_volume = min(total_buy_qty, total_sell_qty, best_volume)
 
-            self._liquidity_ref_ema = (
-                ema_alpha * float(clearing_price) +
-                (1.0 - ema_alpha) * self._liquidity_ref_ema
-            )
-            # Keep pool pricing anchored to market reference by default.
-            # Optional override allows explicit anchor experiments.
-            penalty_anchor_price = float(pool_cfg.get("penalty_anchor_price", clearing_price))
-            ref_price = (
-                (1.0 - penalty_weight) * self._liquidity_ref_ema
-                + penalty_weight * penalty_anchor_price
-            )
-            pool_buy_price = ref_price * (1.0 - spread)   # pool buys from agents
-            pool_sell_price = ref_price * (1.0 + spread)  # pool sells to agents
+        # Pro-rata allocation on the excess side
+        if total_buy_qty > cleared_volume and total_buy_qty > 1e-9:
+            buy_scale = cleared_volume / total_buy_qty
+        else:
+            buy_scale = 1.0
 
-            pool_buy_volume = 0.0
-            pool_sell_volume = 0.0
+        if total_sell_qty > cleared_volume and total_sell_qty > 1e-9:
+            sell_scale = cleared_volume / total_sell_qty
+        else:
+            sell_scale = 1.0
 
-            for buyer_id, buyer_price, buy_qty_rem in buyers:
-                rem = float(buy_qty_rem)
-                if rem > 1e-6 and buyer_price >= pool_sell_price:
-                    cost_buyer = rem * (pool_sell_price + tx_cost)
-                    trade_costs[buyer_id] += cost_buyer
-                    trade_qtys[buyer_id] += rem
-                    total_value += pool_sell_price * rem
-                    total_qty += rem
-                    pool_sell_volume += rem
+        # Execute at uniform clearing price
+        for agent_id, _, qty in eligible_buys:
+            filled = qty * buy_scale
+            cost = filled * (uniform_price + tx_cost)
+            trade_costs[agent_id] += cost
+            trade_qtys[agent_id] += filled
 
-            for seller_id, seller_price, sell_qty_rem in sellers:
-                rem = float(sell_qty_rem)
-                if rem > 1e-6 and seller_price <= pool_buy_price:
-                    revenue_seller = rem * (pool_buy_price - tx_cost)
-                    trade_costs[seller_id] -= revenue_seller
-                    trade_qtys[seller_id] -= rem
-                    total_value += pool_buy_price * rem
-                    total_qty += rem
-                    pool_buy_volume += rem
+        for agent_id, _, qty in eligible_sells:
+            filled = qty * sell_scale
+            revenue = filled * (uniform_price - tx_cost)
+            trade_costs[agent_id] -= revenue
+            trade_qtys[agent_id] -= filled
 
-            liquidity_pool_info = {
-                "enabled": True,
-                "reference_price": float(ref_price),
-                "buy_price": float(pool_buy_price),
-                "sell_price": float(pool_sell_price),
-                "buy_volume": float(pool_buy_volume),
-                "sell_volume": float(pool_sell_volume),
-            }
-
-        sec_clearing = total_value / total_qty if total_qty > 0 else clearing_price
-        return trade_costs, trade_qtys, sec_clearing, total_qty, liquidity_pool_info
+        return trade_costs, trade_qtys, uniform_price, cleared_volume, liquidity_pool_info
 
     # ------------------------------------------------------------------
     # Reward function (P3 + P4 + P8 improvements)

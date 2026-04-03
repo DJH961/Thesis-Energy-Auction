@@ -1,0 +1,41 @@
+# ============================================================
+# ETS MARL — Q-Learning Baseline Configuration
+# Inherits environment settings from default.yaml (loaded first),
+# then overrides RL-specific parameters for tabular Q-learning.
+# ============================================================
+
+# --- Q-Learning hyperparameters ---
+qlearning:
+  n_episodes: 5000
+  alpha: 0.1             # learning rate
+  gamma: 0.95            # discount factor
+  epsilon_start: 1.0     # initial exploration rate
+  epsilon_end: 0.05      # final exploration rate
+  epsilon_decay_frac: 0.7  # fraction of episodes over which epsilon decays
+
+# --- Disable reward shaping (baseline uses raw economic reward only) ---
+reward:
+  shaping_beta: 0.0           # no green delta bonus
+  shaping_gamma: 0.0          # no queue bonus
+  price_anchor_delta: 0.0     # no price-proximity bonus
+  shaping_decay_episode: 1    # instant decay (irrelevant since all 0)
+  shaping_weight_floor: 0.0
+  # Keep core reward components from default.yaml:
+  normalizer_alpha: 0.01
+  clip_min: -10.0
+  clip_max: 5.0
+  terminal_bank_value: true
+  terminal_queue_value: true
+  terminal_payoff_years: 5
+
+# --- Evaluation ---
+evaluation:
+  n_episodes: 100         # greedy eval episodes after training
+  epsilon: 0.0            # fully greedy
+
+# --- Logging ---
+logging:
+  log_interval: 50
+  save_interval: 500
+  csv_flush_interval: 500
+  results_dir: "results/qlearning/"

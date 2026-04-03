@@ -1,0 +1,1053 @@
+"""
+ppo_agent.py
+============
+PPO agent with two-phase decision making for EU ETS:
+  Phase 1 (Auction):   obs(18) → [bid_price, qty, invest_frac, tech_logits×3]
+  Phase 2 (Secondary): obs(21) → [sec_price_mult, sec_qty]
+
+On-policy: collects full episode rollout, then updates via
+clipped surrogate objective with GAE advantage estimation.
+
+Supports **MAPPO** (Multi-Agent PPO) via centralized critic:
+  When `ppo.centralized_critic = true`, the value network V(s) receives the
+  global state (concatenation of all agents' phase-2 observations) instead of
+  the local observation.  Actors remain decentralized (CTDE paradigm).
+
+Roadmap improvements:
+  P2: entropy_coef is updated externally via set_entropy_coef() (decay schedule
+      lives in train.py so the agent stays stateless w.r.t. episode count).
+  P3: RewardNormalizer tracks per-agent running mean/std with EMA.
+      normalize_reward() normalises and clips before storing in buffer.
+"""
+
+import copy
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import kl_divergence
+from typing import Optional
+
+from src.agents.actor_critic import AuctionPolicy, SecondaryPolicy, ValueNetwork
+
+
+# ---------------------------------------------------------------------------
+# P3: Per-agent running reward normaliser
+# ---------------------------------------------------------------------------
+
+class RewardNormalizer:
+    """
+    Online running mean/std normaliser with adaptive warmup.
+
+    reward_norm = (reward - mu) / (std + eps)
+
+    Uses an adaptive alpha schedule: alpha_eff = max(alpha, 1/(n+1)).
+    This gives alpha=1.0 on the first sample (mu = reward exactly),
+    alpha=0.1 after 10 samples, converging to the steady-state alpha
+    after ~1/alpha samples.  Eliminates the cold-start bias that causes
+    wild normalised values in early training.
+
+    Parameters
+    ----------
+    alpha : float
+        Steady-state EMA decay rate. alpha=0.01 ≈ window of 100 samples.
+    eps : float
+        Numerical stability floor for std.
+    """
+
+    def __init__(self, alpha: float = 0.01, eps: float = 1e-8):
+        self.alpha = alpha
+        self.eps = eps
+        self.mu = 0.0
+        self.var = 1.0     # initialise to 1 so first normalised value ≈ raw reward
+        self._n_samples = 0
+
+    def update_and_normalize(self, reward: float) -> float:
+        """Update running stats and return normalised reward (NOT clipped)."""
+        # Adaptive alpha: fast warmup, stable long-term
+        self._n_samples += 1
+        effective_alpha = max(self.alpha, 1.0 / self._n_samples)
+
+        # EMA mean (save old mean for unbiased variance update)
+        old_mu = self.mu
+        self.mu = (1.0 - effective_alpha) * old_mu + effective_alpha * reward
+        # EMA variance (use old_mu to avoid double-counting the mean shift)
+        self.var = (1.0 - effective_alpha) * self.var + effective_alpha * (reward - old_mu) ** 2
+        std = max(self.var ** 0.5, self.eps)
+        return (reward - self.mu) / std
+
+    def reset(self):
+        """Optionally reset stats (not called by default — stats persist across episodes)."""
+        self.mu = 0.0
+        self.var = 1.0
+        self._n_samples = 0
+
+
+# ---------------------------------------------------------------------------
+# Observation index constants
+# ---------------------------------------------------------------------------
+OBS1_EXPECTED_PRICE_IDX = 3  # Phase-1 obs dim 3: normalized expected price (×price_max)
+
+# ---------------------------------------------------------------------------
+# Rollout buffer
+# ---------------------------------------------------------------------------
+
+class RolloutBuffer:
+    """Stores one episode of transitions for on-policy update."""
+
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        self.obs1 = []
+        self.obs2 = []
+        self.global_states = []  # MAPPO: centralized critic input
+        self.auction_raw = []
+        self.secondary_raw = []
+        self.auction_logp = []
+        self.secondary_logp = []
+        self.rewards = []
+        self.dones = []
+        self.values = []
+
+    def push(self, obs1, obs2, auc_raw, sec_raw, auc_lp, sec_lp, reward, done, value,
+             global_state=None):
+        self.obs1.append(obs1)
+        self.obs2.append(obs2)
+        if global_state is not None:
+            self.global_states.append(global_state)
+        self.auction_raw.append(auc_raw)
+        self.secondary_raw.append(sec_raw)
+        self.auction_logp.append(auc_lp)
+        self.secondary_logp.append(sec_lp)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.values.append(value)
+
+    def __len__(self):
+        return len(self.rewards)
+
+
+# ---------------------------------------------------------------------------
+# PPO Agent
+# ---------------------------------------------------------------------------
+
+class PPOAgent:
+
+    def __init__(self, agent_id, obs_dim_phase1, obs_dim_phase2,
+                 auction_action_low, auction_action_high,
+                 secondary_action_low, secondary_action_high,
+                 config, seed=None, global_state_dim=0):
+        self.agent_id = agent_id
+        self.config = config
+        self.obs_dim_phase1 = obs_dim_phase1
+        # Seeded RNG for reproducible mini-batch shuffling
+        self._rng = np.random.default_rng(seed if seed is not None else 0 + agent_id)
+        ppo = config["ppo"]
+
+        self.gamma = ppo["gamma"]
+        self.gae_lambda = ppo["gae_lambda"]
+        self.clip_eps = ppo["clip_eps"]
+        self.entropy_coef = ppo["entropy_coef"]  # P2: updated per-episode by train.py
+        self.value_coef = ppo["value_coef"]
+        self.max_grad_norm = ppo["max_grad_norm"]
+        self.n_epochs = ppo["n_epochs"]
+        self.mini_batch_size = ppo["mini_batch_size"]
+        self.normalize_advantages = ppo.get("normalize_advantages", True)
+        # P11: KL-based early stopping — abort PPO epochs if policy drifts too far
+        self.target_kl = ppo.get("target_kl", 0.0)  # 0 = disabled
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        hidden = ppo["hidden_size"]
+        log_std_min = ppo.get("log_std_min", -2.0)
+        log_std_max = ppo.get("log_std_max", 1.0)
+
+        auction_dim = len(auction_action_low)
+        secondary_dim = len(secondary_action_low)
+
+        a_low = torch.FloatTensor(auction_action_low).to(self.device)
+        a_high = torch.FloatTensor(auction_action_high).to(self.device)
+        s_low = torch.FloatTensor(secondary_action_low).to(self.device)
+        s_high = torch.FloatTensor(secondary_action_high).to(self.device)
+
+        # Action anchors: realistic initial targets in physical space.
+        # These shift the policy's initial mean output toward historically
+        # plausible actions, giving agents a sensible starting point without
+        # limiting what they can learn.
+        explore_cfg = config.get("exploration", {})
+        self.exploration_mode = explore_cfg.get("mode", "anchored")
+        auction_anchors = explore_cfg.get("auction_anchors", None)
+        secondary_anchors = explore_cfg.get("secondary_anchors", None)
+
+        # Market-based fallback for expected-price anchors in exploration.
+        # If the expected-price feature is unavailable or invalid, use a
+        # calibrated default (EU ETS recent auction level ~80 EUR/t) instead
+        # of midpoint-of-range behavior.
+        price_cfg = config.get("price", {})
+        fallback_expected = price_cfg.get("initial_expected", None)
+        if fallback_expected is None:
+            if isinstance(auction_anchors, (list, tuple)) and len(auction_anchors) > 0:
+                fallback_expected = auction_anchors[0]
+            else:
+                fallback_expected = 80.0
+        try:
+            self.expected_price_fallback = float(fallback_expected)
+        except (TypeError, ValueError):
+            self.expected_price_fallback = 80.0
+
+        # No explicit anchors: keep neutral defaults for non-price dimensions,
+        # but initialize bid-price near the expected market level.
+        if auction_anchors is None:
+            auction_init_anchors_t = 0.5 * (a_low + a_high)
+            auction_init_anchors_t[0] = float(np.clip(
+                self.expected_price_fallback,
+                float(a_low[0].item()),
+                float(a_high[0].item()),
+            ))
+            auction_init_anchors = auction_init_anchors_t.detach().cpu().tolist()
+        else:
+            auction_init_anchors = auction_anchors
+
+        self.auction_policy = AuctionPolicy(
+            obs_dim_phase1, auction_dim, hidden, a_low, a_high,
+            log_std_min=log_std_min, log_std_max=log_std_max,
+            action_anchors=auction_init_anchors,
+        ).to(self.device)
+
+        self.secondary_policy = SecondaryPolicy(
+            obs_dim_phase2, secondary_dim, hidden, s_low, s_high,
+            log_std_min=log_std_min, log_std_max=log_std_max,
+            action_anchors=secondary_anchors,
+        ).to(self.device)
+
+        # MAPPO: centralized critic sees global state (all agents' obs2 concatenated)
+        self.centralized_critic = ppo.get("centralized_critic", False)
+        critic_hidden = ppo.get("critic_hidden_size", hidden)
+
+        if self.centralized_critic and global_state_dim > 0:
+            self.value_net = ValueNetwork(global_state_dim, critic_hidden).to(self.device)
+        else:
+            self.value_net = ValueNetwork(obs_dim_phase2, hidden).to(self.device)
+
+        # Separate actor/critic optimizers for independent learning rates
+        actor_params = (
+            list(self.auction_policy.parameters()) +
+            list(self.secondary_policy.parameters())
+        )
+        critic_params = list(self.value_net.parameters())
+        self.actor_optimizer = optim.Adam(actor_params, lr=ppo["lr"])
+        critic_lr = ppo.get("critic_lr", ppo["lr"])
+        self.critic_optimizer = optim.Adam(critic_params, lr=critic_lr)
+        # Backwards-compat alias used by cycling code in train.py
+        self.optimizer = self.actor_optimizer
+
+        self.buffer = RolloutBuffer()
+        self.actor_loss_history = []
+        self.critic_loss_history = []
+
+        # Critic training enhancements
+        self.critic_extra_epochs = ppo.get("critic_extra_epochs", 0)
+        self.critic_huber = ppo.get("critic_huber", False)
+        self.critic_huber_delta = ppo.get("critic_huber_delta", 10.0)
+        self.normalize_returns = ppo.get("normalize_returns", True)
+        self.clip_value = ppo.get("clip_value", False)  # v6.3: value function clipping
+
+        # Initialize critic loss function
+        if self.critic_huber:
+            self.critic_loss_fn = nn.SmoothL1Loss(beta=self.critic_huber_delta)
+        else:
+            self.critic_loss_fn = nn.MSELoss()
+
+        # P3: per-agent reward normaliser
+        reward_cfg = config.get("reward", {})
+        norm_alpha = reward_cfg.get("normalizer_alpha", 0.01)
+        self._reward_normalizer = RewardNormalizer(alpha=norm_alpha)
+        self._reward_clip_min = reward_cfg.get("clip_min", -10.0)
+        self._reward_clip_max = reward_cfg.get("clip_max", 2.0)
+
+        # KL anchor: frozen snapshot of BC-trained policy (set after BC pretraining)
+        self._bc_auction_policy = None
+        self._bc_secondary_policy = None
+        self.kl_beta = 0.0
+
+    # ------------------------------------------------------------------
+    # P2: Entropy coefficient update (called by train.py)
+    # ------------------------------------------------------------------
+
+    def set_entropy_coef(self, coef: float):
+        """Update entropy coefficient for this training step (P2 decay schedule)."""
+        self.entropy_coef = float(coef)
+
+    def set_kl_beta(self, beta: float):
+        """Update KL anchor penalty weight (decayed by train.py)."""
+        self.kl_beta = float(beta)
+
+    def set_bc_anchor(self):
+        """
+        Snapshot current auction and secondary policy weights as a frozen
+        BC anchor.  Called by train.py immediately after BC pretraining.
+        The anchor networks receive no gradient updates.
+        """
+        self._bc_auction_policy = copy.deepcopy(self.auction_policy).eval()
+        for p in self._bc_auction_policy.parameters():
+            p.requires_grad_(False)
+
+        self._bc_secondary_policy = copy.deepcopy(self.secondary_policy).eval()
+        for p in self._bc_secondary_policy.parameters():
+            p.requires_grad_(False)
+
+    # ------------------------------------------------------------------
+    # P3: Reward normalisation
+    # ------------------------------------------------------------------
+
+    def normalize_reward(self, reward: float) -> float:
+        """
+        Normalise reward with per-agent running stats, then clip.
+        Called by the training loop before storing transitions.
+        """
+        r_norm = self._reward_normalizer.update_and_normalize(reward)
+        return float(np.clip(r_norm, self._reward_clip_min, self._reward_clip_max))
+
+    def _critic_loss(self, v_pred, v_target, old_values=None):
+        """
+        Compute critic loss using Huber loss (if enabled) or MSE.
+        If clip_value is enabled, implements value function clipping.
+
+        Parameters
+        ----------
+        v_pred : Tensor
+            Predicted values from critic.
+        v_target : Tensor
+            Target values (returns).
+        old_values : Tensor, optional
+            Old value predictions (for value clipping). Required if clip_value=True.
+
+        Returns
+        -------
+        loss : Tensor
+            Scalar loss value.
+        """
+        if self.clip_value and old_values is not None:
+            # Clip value predictions to old_values ± clip_eps
+            v_pred_clipped = old_values + torch.clamp(
+                v_pred - old_values, -self.clip_eps, self.clip_eps
+            )
+            # Compute loss for both clipped and unclipped, take max
+            loss_unclipped = self.critic_loss_fn(v_pred, v_target)
+            loss_clipped = self.critic_loss_fn(v_pred_clipped, v_target)
+            return torch.max(loss_unclipped, loss_clipped)
+        else:
+            return self.critic_loss_fn(v_pred, v_target)
+
+    # ------------------------------------------------------------------
+    # Action selection
+    # ------------------------------------------------------------------
+
+    def select_auction_action(self, obs1: np.ndarray, deterministic=False,
+                              epsilon: float = 0.0):
+        """Phase 1: obs(18) → (action[10], raw[10], logp[1]).
+
+        When ``epsilon > 0`` and not deterministic, with probability *epsilon*
+        an epsilon-random action in physical space replaces the policy sample.
+        The raw action and log_prob are still computed under the current policy
+        so that the PPO importance ratio remains correct.
+        3-tranche bid ladder: [p1,q1, p2,q2, p3,q3, invest_frac, t0, t1, t2].
+        """
+        obs_t = torch.FloatTensor(obs1).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            action, raw, log_prob = self.auction_policy.act(obs_t, deterministic)
+
+        if not deterministic and epsilon > 0.0 and np.random.random() < epsilon:
+            with torch.no_grad():
+                low = self.auction_policy.action_bias - self.auction_policy.action_scale
+                high = self.auction_policy.action_bias + self.auction_policy.action_scale
+                if self.exploration_mode == "uniform":
+                    rand_action = low + (high - low) * torch.rand_like(action)
+
+                    # Keep under/overbid directions balanced around expected price
+                    # for all 3 price tranches [0, 2, 4].
+                    price_min = float(low[0].item())
+                    price_max = float(high[0].item())
+                    fallback_expected = float(np.clip(
+                        self.expected_price_fallback, price_min, price_max))
+                    expected_price = (
+                        float(obs1[OBS1_EXPECTED_PRICE_IDX]) * price_max
+                        if len(obs1) > OBS1_EXPECTED_PRICE_IDX
+                        else fallback_expected
+                    )
+                    if not np.isfinite(expected_price):
+                        expected_price = fallback_expected
+                    expected_price = float(np.clip(expected_price, price_min, price_max))
+
+                    for p_idx in [0, 2, 4]:  # 3 tranche price indices
+                        if expected_price <= price_min + 1e-9:
+                            sampled_price = np.random.uniform(expected_price, price_max)
+                        elif expected_price >= price_max - 1e-9:
+                            sampled_price = np.random.uniform(price_min, expected_price)
+                        elif np.random.random() < 0.5:
+                            sampled_price = np.random.uniform(price_min, expected_price)
+                        else:
+                            sampled_price = np.random.uniform(expected_price, price_max)
+                        rand_action[0, p_idx] = float(sampled_price)
+                else:
+                    # Anchored exploration: sample each dim from Gaussian around
+                    # realistic company expectations instead of uniform.
+                    # This gives exploration a sensible starting distribution that
+                    # reflects how real companies would initially behave.
+                    rand_action = torch.zeros_like(action)
+                    price_max = high[0].item()
+                    price_min = low[0].item()
+
+                    # 3 tranches of (price, qty_multiplier): spread prices around expected
+                    expected_price = float(obs1[OBS1_EXPECTED_PRICE_IDX]) * price_max
+                    for t_idx in range(3):
+                        p_offset = (t_idx - 1) * 15.0  # tranche 0: -15, 1: 0, 2: +15
+                        rand_action[0, 2 * t_idx] = np.clip(
+                            np.random.normal(expected_price + p_offset,
+                                             max(expected_price * 0.3, 15.0)),
+                            price_min, price_max)
+                        rand_action[0, 2 * t_idx + 1] = np.clip(
+                            np.random.normal(0.33, 0.10),
+                            low[2 * t_idx + 1].item(), high[2 * t_idx + 1].item())
+
+                    # [6] invest_frac: Gaussian around 0.03 (moderate investment)
+                    rand_action[0, 6] = np.clip(
+                        np.random.normal(0.03, 0.02),
+                        low[6].item(), high[6].item())
+
+                    # [7-9] tech logits: slight solar/onshore preference, moderate spread
+                    rand_action[0, 7] = np.clip(np.random.normal(0.3, 0.5), -1.0, 1.0)
+                    rand_action[0, 8] = np.clip(np.random.normal(-0.5, 0.5), -1.0, 1.0)
+                    rand_action[0, 9] = np.clip(np.random.normal(0.5, 0.5), -1.0, 1.0)
+
+                # Convert to raw (normalised) space
+                rand_raw = torch.clamp(
+                    (rand_action - self.auction_policy.action_bias) /
+                    (self.auction_policy.action_scale + 1e-8), -1.0, 1.0)
+                # Log-prob under current policy (for PPO importance ratio)
+                dist = self.auction_policy.forward(obs_t)
+                rand_lp = dist.log_prob(rand_raw).sum(dim=-1, keepdim=True)
+            return (rand_action.cpu().numpy().squeeze(0),
+                    rand_raw.cpu().numpy().squeeze(0),
+                    rand_lp.cpu().numpy().squeeze(0))
+
+        return (action.cpu().numpy().squeeze(0),
+                raw.cpu().numpy().squeeze(0),
+                log_prob.cpu().numpy().squeeze(0))
+
+    def select_secondary_action(self, obs2: np.ndarray, deterministic=False,
+                                epsilon: float = 0.0):
+        """Phase 2: obs(21) → (action[2], raw[2], logp[1]).
+
+        Epsilon-greedy in physical space (same approach as auction actions).
+        """
+        obs_t = torch.FloatTensor(obs2).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            action, raw, log_prob = self.secondary_policy.act(obs_t, deterministic)
+
+        if not deterministic and epsilon > 0.0 and np.random.random() < epsilon:
+            with torch.no_grad():
+                low = self.secondary_policy.action_bias - self.secondary_policy.action_scale
+                high = self.secondary_policy.action_bias + self.secondary_policy.action_scale
+                if self.exploration_mode == "uniform":
+                    rand_action = low + (high - low) * torch.rand_like(action)
+                else:
+                    rand_action = torch.zeros_like(action)
+
+                    # [0] sec_price_mult: Gaussian around 1.05 (trade near clearing price)
+                    rand_action[0, 0] = np.clip(
+                        np.random.normal(1.05, 0.10),
+                        low[0].item(), high[0].item())
+
+                    # [1] sec_qty: Gaussian around 0 with moderate spread.
+                    # Positive = buy, negative = sell; neutral center lets both be explored.
+                    rand_action[0, 1] = np.clip(
+                        np.random.normal(0.0, 1.0),
+                        low[1].item(), high[1].item())
+
+                rand_raw = torch.clamp(
+                    (rand_action - self.secondary_policy.action_bias) /
+                    (self.secondary_policy.action_scale + 1e-8), -1.0, 1.0)
+                dist = self.secondary_policy.forward(obs_t)
+                rand_lp = dist.log_prob(rand_raw).sum(dim=-1, keepdim=True)
+            return (rand_action.cpu().numpy().squeeze(0),
+                    rand_raw.cpu().numpy().squeeze(0),
+                    rand_lp.cpu().numpy().squeeze(0))
+
+        return (action.cpu().numpy().squeeze(0),
+                raw.cpu().numpy().squeeze(0),
+                log_prob.cpu().numpy().squeeze(0))
+
+    def estimate_value(self, obs: np.ndarray) -> float:
+        """V(s) — from local obs2 (IPPO) or global state (MAPPO)."""
+        obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            return self.value_net(obs_t).cpu().item()
+
+    # ------------------------------------------------------------------
+    # Storage
+    # ------------------------------------------------------------------
+
+    def store_transition(self, obs1, obs2, auc_raw, sec_raw,
+                         auc_lp, sec_lp, reward, done, value,
+                         global_state=None):
+        self.buffer.push(obs1, obs2, auc_raw, sec_raw,
+                         auc_lp, sec_lp, reward, done, value,
+                         global_state=global_state)
+
+    # ------------------------------------------------------------------
+    # PPO Update (end of episode)
+    # ------------------------------------------------------------------
+
+    def update(self, last_value: float = 0.0, actor_update: bool = True) -> Optional[dict]:
+        """
+        PPO update for one episode rollout.
+
+        Parameters
+        ----------
+        last_value : float
+            Bootstrap value for the last step (0 if terminal).
+        actor_update : bool
+            When False (critic-warmup phase) only the value network is trained;
+            actor gradients are not computed or applied.
+        """
+        if len(self.buffer) < 2:
+            return None
+
+        obs1_np = np.nan_to_num(np.array(self.buffer.obs1), nan=0.0, posinf=1e6, neginf=-1e6)
+        obs2_np = np.nan_to_num(np.array(self.buffer.obs2), nan=0.0, posinf=1e6, neginf=-1e6)
+
+        obs1 = torch.FloatTensor(obs1_np).to(self.device)
+        obs2 = torch.FloatTensor(obs2_np).to(self.device)
+
+        # MAPPO: use global states for centralized critic if available
+        if self.centralized_critic and len(self.buffer.global_states) > 0:
+            critic_input = torch.FloatTensor(
+                np.array(self.buffer.global_states)).to(self.device)
+        else:
+            critic_input = obs2
+
+        auc_raw = torch.FloatTensor(np.array(self.buffer.auction_raw)).to(self.device)
+        sec_raw = torch.FloatTensor(np.array(self.buffer.secondary_raw)).to(self.device)
+        old_auc_lp = torch.FloatTensor(np.array(self.buffer.auction_logp)).to(self.device)
+        old_sec_lp = torch.FloatTensor(np.array(self.buffer.secondary_logp)).to(self.device)
+
+        rewards = np.array(self.buffer.rewards, dtype=np.float32)
+        dones = np.array(self.buffer.dones, dtype=np.float32)
+        values = np.array(self.buffer.values, dtype=np.float32)
+
+        rewards = np.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
+        dones = np.nan_to_num(dones, nan=1.0, posinf=1.0, neginf=1.0)
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # GAE (P2: gae_lambda = 0.97 in config for longer credit assignment)
+        T = len(rewards)
+        advantages = np.zeros(T, dtype=np.float32)
+        gae = 0.0
+        for t in reversed(range(T)):
+            next_val = last_value if t == T - 1 else values[t + 1]
+            delta = rewards[t] + self.gamma * (1 - dones[t]) * next_val - values[t]
+            gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
+            advantages[t] = gae
+
+        returns = advantages + values
+        advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
+        returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+
+        adv_t = torch.FloatTensor(advantages).to(self.device).unsqueeze(1)
+        ret_t = torch.FloatTensor(returns).to(self.device).unsqueeze(1)
+
+        # Return normalization
+        if self.normalize_returns and T > 1:
+            ret_mean = ret_t.mean()
+            ret_std = ret_t.std()
+            if ret_std > 1e-8:
+                ret_t = (ret_t - ret_mean) / (ret_std + 1e-8)
+
+        if self.normalize_advantages and T > 1:
+            adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+
+        adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
+        ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Convert old values to tensor for value clipping
+        old_values_t = torch.FloatTensor(values).to(self.device).unsqueeze(1) if self.clip_value else None
+
+        # Critic extra epochs: warm up critic before main PPO loop
+        if self.critic_extra_epochs > 0:
+            for _extra_epoch in range(self.critic_extra_epochs):
+                idx = np.arange(T)
+                self._rng.shuffle(idx)
+                for start in range(0, T, self.mini_batch_size):
+                    end = min(start + self.mini_batch_size, T)
+                    mb = idx[start:end]
+                    v_pred = self.value_net(critic_input[mb])
+                    critic_loss = self._critic_loss(
+                        v_pred, ret_t[mb],
+                        old_values_t[mb] if self.clip_value else None
+                    )
+                    if not torch.isfinite(critic_loss):
+                        continue
+                    self.critic_optimizer.zero_grad()
+                    critic_loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        list(self.value_net.parameters()), self.max_grad_norm)
+                    bad_crit = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in self.value_net.parameters())
+                    if not bad_crit:
+                        self.critic_optimizer.step()
+
+        # PPO epochs
+        total_a_loss = 0.0
+        total_v_loss = 0.0
+        n_up = 0
+
+        for _epoch in range(self.n_epochs):
+            idx = np.arange(T)
+            self._rng.shuffle(idx)
+
+            # P11: KL tracking for early stopping
+            epoch_kl_sum = 0.0
+            epoch_kl_count = 0
+
+            for start in range(0, T, self.mini_batch_size):
+                end = min(start + self.mini_batch_size, T)
+                mb = idx[start:end]
+
+                v_pred = self.value_net(critic_input[mb])
+                value_loss = self._critic_loss(
+                    v_pred, ret_t[mb],
+                    old_values_t[mb] if self.clip_value else None
+                )
+
+                if actor_update:
+                    # Re-evaluate current policy
+                    auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
+                    sec_lp_new, sec_ent = self.secondary_policy.evaluate(obs2[mb], sec_raw[mb])
+
+                    # Phase-specific credit assignment: weight auction policy loss
+                    # by a phase-1-only advantage proxy derived from auction_savings
+                    # in obs2[base+4].  Positive savings amplify the gradient for
+                    # good auction deals; negative savings dampen it.
+                    _auc_savings_idx = self.obs_dim_phase1 + 4  # obs2[base+4]
+                    _auc_savings = obs2[mb, _auc_savings_idx:_auc_savings_idx+1]  # [mb, 1]
+                    _auc_weight = (1.0 + torch.tanh(_auc_savings)).detach()  # [0, 2] range
+
+                    # Per-policy PPO clipping: decomposes the joint ratio so each
+                    # policy's gradient update is independently clipped.  Prevents
+                    # a profitable secondary trade from incorrectly reinforcing
+                    # bad auction bids (and vice versa).
+                    # P11: Tighter log-ratio clamp — max ratio e^2≈7.4 (was e^10≈22026).
+                    # Prevents catastrophic loss from rare high-ratio mini-batches.
+                    auc_log_ratio = torch.clamp(auc_lp_new - old_auc_lp[mb], -2.0, 2.0)
+                    auc_ratio = torch.exp(auc_log_ratio)
+                    auc_adv = adv_t[mb] * _auc_weight
+                    auc_surr1 = auc_ratio * auc_adv
+                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
+                    auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
+
+                    sec_log_ratio = torch.clamp(sec_lp_new - old_sec_lp[mb], -2.0, 2.0)
+                    sec_ratio = torch.exp(sec_log_ratio)
+                    sec_surr1 = sec_ratio * adv_t[mb]
+                    sec_surr2 = torch.clamp(sec_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
+                    sec_policy_loss = -torch.min(sec_surr1, sec_surr2).mean()
+
+                    policy_loss = auc_policy_loss + sec_policy_loss
+
+                    # P11: Approximate KL divergence for early stopping
+                    # Schulman (2020): approx_kl ≈ (ratio - 1) - log(ratio)
+                    with torch.no_grad():
+                        mb_kl = 0.5 * (
+                            ((auc_ratio - 1.0) - auc_log_ratio).mean()
+                            + ((sec_ratio - 1.0) - sec_log_ratio).mean()
+                        )
+                        epoch_kl_sum += mb_kl.item() * len(mb)
+                        epoch_kl_count += len(mb)
+
+                    # P2: entropy_coef updated externally via set_entropy_coef()
+                    entropy = (auc_ent + sec_ent).mean()
+
+                    # KL anchor penalty against frozen BC policy
+                    kl_pen = torch.tensor(0.0, device=self.device)
+                    if self._bc_auction_policy is not None and self.kl_beta > 0.0:
+                        curr_auc_dist = self.auction_policy.forward(obs1[mb])
+                        curr_sec_dist = self.secondary_policy.forward(obs2[mb])
+                        with torch.no_grad():
+                            bc_auc_dist = self._bc_auction_policy.forward(obs1[mb])
+                            bc_sec_dist = self._bc_secondary_policy.forward(obs2[mb])
+                        kl_auc = kl_divergence(curr_auc_dist, bc_auc_dist).mean()
+                        kl_sec = kl_divergence(curr_sec_dist, bc_sec_dist).mean()
+                        kl_pen = self.kl_beta * (kl_auc + kl_sec) * 0.5
+
+                    actor_loss_total = (policy_loss
+                                        - self.entropy_coef * entropy
+                                        + kl_pen)
+                    critic_loss_total = self.value_coef * value_loss
+                else:
+                    # Critic-warmup: train value network only
+                    policy_loss = torch.tensor(0.0, device=self.device)
+                    actor_loss_total = None
+                    critic_loss_total = self.value_coef * value_loss
+
+                # --- Critic step ---
+                if not torch.isfinite(critic_loss_total):
+                    continue
+                self.critic_optimizer.zero_grad()
+                critic_loss_total.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.value_net.parameters()), self.max_grad_norm)
+                bad_crit = any(
+                    p.grad is not None and not torch.isfinite(p.grad).all()
+                    for p in self.value_net.parameters())
+                if bad_crit:
+                    self.critic_optimizer.zero_grad()
+                else:
+                    self.critic_optimizer.step()
+
+                # --- Actor step ---
+                if actor_loss_total is not None:
+                    if not torch.isfinite(actor_loss_total):
+                        total_v_loss += value_loss.item()
+                        n_up += 1
+                        continue
+                    self.actor_optimizer.zero_grad()
+                    actor_loss_total.backward()
+                    actor_params = (list(self.auction_policy.parameters()) +
+                                    list(self.secondary_policy.parameters()))
+                    nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
+                    bad_actor = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in actor_params)
+                    if bad_actor:
+                        self.actor_optimizer.zero_grad()
+                    else:
+                        self.actor_optimizer.step()
+
+                total_a_loss += policy_loss.item()
+                total_v_loss += value_loss.item()
+                n_up += 1
+
+            # P11: KL early stopping — abort remaining epochs if policy
+            # has already drifted significantly from data-collection policy.
+            if actor_update and self.target_kl > 0 and epoch_kl_count > 0:
+                avg_kl = epoch_kl_sum / epoch_kl_count
+                if avg_kl > self.target_kl:
+                    break
+
+        self.buffer.clear()
+
+        avg_a = total_a_loss / max(n_up, 1)
+        avg_v = total_v_loss / max(n_up, 1)
+        self.actor_loss_history.append(avg_a)
+        self.critic_loss_history.append(avg_v)
+        return {"actor_loss": avg_a, "critic_loss": avg_v}
+
+    # ------------------------------------------------------------------
+    # HAPPO: Sequential multi-agent update
+    # ------------------------------------------------------------------
+
+    def compute_gae(self, last_value: float = 0.0):
+        """
+        Extract GAE advantages and returns from the rollout buffer.
+
+        Returns
+        -------
+        adv_t : Tensor [T, 1]
+            Normalised GAE advantages.
+        ret_t : Tensor [T, 1]
+            GAE returns (advantages + values).
+        buf_tensors : dict
+            Pre-processed buffer tensors for reuse in update_happo / compute_post_update_ratio.
+        """
+        if len(self.buffer) < 2:
+            return None, None, None
+
+        obs1_np = np.nan_to_num(np.array(self.buffer.obs1), nan=0.0, posinf=1e6, neginf=-1e6)
+        obs2_np = np.nan_to_num(np.array(self.buffer.obs2), nan=0.0, posinf=1e6, neginf=-1e6)
+
+        obs1 = torch.FloatTensor(obs1_np).to(self.device)
+        obs2 = torch.FloatTensor(obs2_np).to(self.device)
+
+        if self.centralized_critic and len(self.buffer.global_states) > 0:
+            critic_input = torch.FloatTensor(
+                np.array(self.buffer.global_states)).to(self.device)
+        else:
+            critic_input = obs2
+
+        auc_raw = torch.FloatTensor(np.array(self.buffer.auction_raw)).to(self.device)
+        sec_raw = torch.FloatTensor(np.array(self.buffer.secondary_raw)).to(self.device)
+        old_auc_lp = torch.FloatTensor(np.array(self.buffer.auction_logp)).to(self.device)
+        old_sec_lp = torch.FloatTensor(np.array(self.buffer.secondary_logp)).to(self.device)
+
+        rewards = np.nan_to_num(np.array(self.buffer.rewards, dtype=np.float32),
+                                nan=0.0, posinf=0.0, neginf=0.0)
+        dones = np.nan_to_num(np.array(self.buffer.dones, dtype=np.float32),
+                              nan=1.0, posinf=1.0, neginf=1.0)
+        values = np.nan_to_num(np.array(self.buffer.values, dtype=np.float32),
+                               nan=0.0, posinf=0.0, neginf=0.0)
+
+        # GAE
+        T = len(rewards)
+        advantages = np.zeros(T, dtype=np.float32)
+        gae = 0.0
+        for t in reversed(range(T)):
+            next_val = last_value if t == T - 1 else values[t + 1]
+            delta = rewards[t] + self.gamma * (1 - dones[t]) * next_val - values[t]
+            gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
+            advantages[t] = gae
+
+        returns = advantages + values
+        advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
+        returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+
+        adv_t = torch.FloatTensor(advantages).to(self.device).unsqueeze(1)
+        ret_t = torch.FloatTensor(returns).to(self.device).unsqueeze(1)
+
+        # Return normalization
+        if self.normalize_returns and T > 1:
+            ret_mean = ret_t.mean()
+            ret_std = ret_t.std()
+            if ret_std > 1e-8:
+                ret_t = (ret_t - ret_mean) / (ret_std + 1e-8)
+
+        if self.normalize_advantages and T > 1:
+            adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+
+        adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
+        ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Convert old values to tensor for value clipping
+        old_values_t = torch.FloatTensor(values).to(self.device).unsqueeze(1) if self.clip_value else None
+
+        buf_tensors = {
+            "obs1": obs1, "obs2": obs2, "critic_input": critic_input,
+            "auc_raw": auc_raw, "sec_raw": sec_raw,
+            "old_auc_lp": old_auc_lp, "old_sec_lp": old_sec_lp,
+            "old_values": old_values_t,  # for value clipping in update_happo
+            "T": T,
+        }
+        return adv_t, ret_t, buf_tensors
+
+    def update_happo(self, adv_t, ret_t, buf_tensors,
+                     advantage_weights=None, actor_update: bool = True) -> Optional[dict]:
+        """
+        HAPPO update: PPO with externally-weighted advantages.
+
+        Parameters
+        ----------
+        adv_t : Tensor [T, 1]
+            Pre-computed normalised advantages.
+        ret_t : Tensor [T, 1]
+            Pre-computed returns.
+        buf_tensors : dict
+            Buffer tensors from compute_gae().
+        advantage_weights : Tensor [T, 1] or None
+            Cumulative clipped importance ratio from prior agents (HAPPO M factor).
+            When None, equivalent to standard PPO.
+        actor_update : bool
+            When False, only train the critic.
+        """
+        if buf_tensors is None:
+            self.buffer.clear()
+            return None
+
+        obs1 = buf_tensors["obs1"]
+        obs2 = buf_tensors["obs2"]
+        critic_input = buf_tensors["critic_input"]
+        auc_raw = buf_tensors["auc_raw"]
+        sec_raw = buf_tensors["sec_raw"]
+        old_auc_lp = buf_tensors["old_auc_lp"]
+        old_sec_lp = buf_tensors["old_sec_lp"]
+        old_values_t = buf_tensors.get("old_values", None)  # for value clipping
+        T = buf_tensors["T"]
+
+        # Apply HAPPO advantage weighting
+        if advantage_weights is not None:
+            weighted_adv = adv_t * advantage_weights.to(self.device)
+            # HAPPO weighted-advantage re-normalization
+            w_std = weighted_adv.std()
+            if w_std > 1e-6:
+                weighted_adv = (weighted_adv - weighted_adv.mean()) / (w_std + 1e-8)
+        else:
+            weighted_adv = adv_t
+
+        total_a_loss = 0.0
+        total_v_loss = 0.0
+        n_up = 0
+
+        for _epoch in range(self.n_epochs):
+            idx = np.arange(T)
+            self._rng.shuffle(idx)
+
+            epoch_kl_sum = 0.0
+            epoch_kl_count = 0
+
+            for start in range(0, T, self.mini_batch_size):
+                end = min(start + self.mini_batch_size, T)
+                mb = idx[start:end]
+
+                v_pred = self.value_net(critic_input[mb])
+                value_loss = self._critic_loss(
+                    v_pred, ret_t[mb],
+                    old_values_t[mb] if self.clip_value else None
+                )
+
+                if actor_update:
+                    auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
+                    sec_lp_new, sec_ent = self.secondary_policy.evaluate(obs2[mb], sec_raw[mb])
+
+                    # Phase-specific credit assignment (same as update())
+                    _auc_savings_idx = self.obs_dim_phase1 + 4
+                    _auc_savings = obs2[mb, _auc_savings_idx:_auc_savings_idx+1]
+                    _auc_weight = (1.0 + torch.tanh(_auc_savings)).detach()
+
+                    auc_log_ratio = torch.clamp(auc_lp_new - old_auc_lp[mb], -2.0, 2.0)
+                    auc_ratio = torch.exp(auc_log_ratio)
+                    auc_adv = weighted_adv[mb] * _auc_weight
+                    auc_surr1 = auc_ratio * auc_adv
+                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
+                    auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
+
+                    sec_log_ratio = torch.clamp(sec_lp_new - old_sec_lp[mb], -2.0, 2.0)
+                    sec_ratio = torch.exp(sec_log_ratio)
+                    sec_surr1 = sec_ratio * weighted_adv[mb]
+                    sec_surr2 = torch.clamp(sec_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * weighted_adv[mb]
+                    sec_policy_loss = -torch.min(sec_surr1, sec_surr2).mean()
+
+                    policy_loss = auc_policy_loss + sec_policy_loss
+
+                    with torch.no_grad():
+                        mb_kl = 0.5 * (
+                            ((auc_ratio - 1.0) - auc_log_ratio).mean()
+                            + ((sec_ratio - 1.0) - sec_log_ratio).mean()
+                        )
+                        epoch_kl_sum += mb_kl.item() * len(mb)
+                        epoch_kl_count += len(mb)
+
+                    entropy = (auc_ent + sec_ent).mean()
+
+                    kl_pen = torch.tensor(0.0, device=self.device)
+                    if self._bc_auction_policy is not None and self.kl_beta > 0.0:
+                        curr_auc_dist = self.auction_policy.forward(obs1[mb])
+                        curr_sec_dist = self.secondary_policy.forward(obs2[mb])
+                        with torch.no_grad():
+                            bc_auc_dist = self._bc_auction_policy.forward(obs1[mb])
+                            bc_sec_dist = self._bc_secondary_policy.forward(obs2[mb])
+                        kl_auc = kl_divergence(curr_auc_dist, bc_auc_dist).mean()
+                        kl_sec = kl_divergence(curr_sec_dist, bc_sec_dist).mean()
+                        kl_pen = self.kl_beta * (kl_auc + kl_sec) * 0.5
+
+                    actor_loss_total = (policy_loss
+                                        - self.entropy_coef * entropy
+                                        + kl_pen)
+                    critic_loss_total = self.value_coef * value_loss
+                else:
+                    policy_loss = torch.tensor(0.0, device=self.device)
+                    actor_loss_total = None
+                    critic_loss_total = self.value_coef * value_loss
+
+                # --- Critic step ---
+                if not torch.isfinite(critic_loss_total):
+                    continue
+                self.critic_optimizer.zero_grad()
+                critic_loss_total.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.value_net.parameters()), self.max_grad_norm)
+                bad_crit = any(
+                    p.grad is not None and not torch.isfinite(p.grad).all()
+                    for p in self.value_net.parameters())
+                if bad_crit:
+                    self.critic_optimizer.zero_grad()
+                else:
+                    self.critic_optimizer.step()
+
+                # --- Actor step ---
+                if actor_loss_total is not None:
+                    if not torch.isfinite(actor_loss_total):
+                        total_v_loss += value_loss.item()
+                        n_up += 1
+                        continue
+                    self.actor_optimizer.zero_grad()
+                    actor_loss_total.backward()
+                    actor_params = (list(self.auction_policy.parameters()) +
+                                    list(self.secondary_policy.parameters()))
+                    nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
+                    bad_actor = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in actor_params)
+                    if bad_actor:
+                        self.actor_optimizer.zero_grad()
+                    else:
+                        self.actor_optimizer.step()
+
+                total_a_loss += policy_loss.item()
+                total_v_loss += value_loss.item()
+                n_up += 1
+
+            if actor_update and self.target_kl > 0 and epoch_kl_count > 0:
+                avg_kl = epoch_kl_sum / epoch_kl_count
+                if avg_kl > self.target_kl:
+                    break
+
+        self.buffer.clear()
+
+        avg_a = total_a_loss / max(n_up, 1)
+        avg_v = total_v_loss / max(n_up, 1)
+        self.actor_loss_history.append(avg_a)
+        self.critic_loss_history.append(avg_v)
+        return {"actor_loss": avg_a, "critic_loss": avg_v}
+
+    def compute_post_update_ratio(self, buf_tensors) -> torch.Tensor:
+        """
+        Compute the joint importance ratio after a HAPPO update.
+
+        ratio_i = exp((new_auc_lp - old_auc_lp) + (new_sec_lp - old_sec_lp))
+
+        Returns
+        -------
+        ratio : Tensor [T, 1]
+            Per-timestep joint importance ratio (clamped for stability).
+        """
+        obs1 = buf_tensors["obs1"]
+        obs2 = buf_tensors["obs2"]
+        auc_raw = buf_tensors["auc_raw"]
+        sec_raw = buf_tensors["sec_raw"]
+        old_auc_lp = buf_tensors["old_auc_lp"]
+        old_sec_lp = buf_tensors["old_sec_lp"]
+
+        with torch.no_grad():
+            new_auc_lp, _ = self.auction_policy.evaluate(obs1, auc_raw)
+            new_sec_lp, _ = self.secondary_policy.evaluate(obs2, sec_raw)
+
+            # Joint log-ratio (clamped for numerical stability)
+            joint_log_ratio = torch.clamp(
+                (new_auc_lp - old_auc_lp) + (new_sec_lp - old_sec_lp),
+                -2.0, 2.0
+            )
+            ratio = torch.exp(joint_log_ratio)
+
+        return ratio
+
+    # ------------------------------------------------------------------
+    # Save / Load
+    # ------------------------------------------------------------------
+
+    def save(self, path):
+        torch.save({
+            "auction_policy": self.auction_policy.state_dict(),
+            "secondary_policy": self.secondary_policy.state_dict(),
+            "value_net": self.value_net.state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+        }, path)
+
+    def load(self, path):
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
+        self.auction_policy.load_state_dict(ckpt["auction_policy"])
+        self.secondary_policy.load_state_dict(ckpt["secondary_policy"])
+        self.value_net.load_state_dict(ckpt["value_net"])
+        if "actor_optimizer" in ckpt:
+            self.actor_optimizer.load_state_dict(ckpt["actor_optimizer"])
+        if "critic_optimizer" in ckpt:
+            self.critic_optimizer.load_state_dict(ckpt["critic_optimizer"])
