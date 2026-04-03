@@ -357,6 +357,12 @@ def _print_training_legend():
     print("                               SNy/V.VMt@P€ = sold N yrs, V Mt at avg P€")
     print("                               HOLD = no trades")
     print()
+    print("  DIAGNOSTIC SCORES  (episode-mean, non-RL logging only)")
+    print("    Diag(Sfin/Sgrn/Scomp): S_financial / S_green / S_composite per agent")
+    print("    Sfin  : cost efficiency [0,1] — 1 - (budget_spent / annual_budget)")
+    print("    Sgrn  : emission factor progress [0,1] — EF improvement vs initial")
+    print("    Scomp : weighted composite [0,1] — w_cost×Sfin + w_green×Sgrn")
+    print()
     print("  INLINE WARNINGS  (│ warn: key=N — counts year-steps triggering each condition)")
     print("    lowAlloc    Alloc < 30% of volume    │  priceCeil  Price ≥90% of price_max")
     print("    priceFloor  Price hit reserve floor   │  lowDemand  Demand < 70% of supply")
@@ -837,6 +843,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         obs1, _ = env.reset(seed=episode_seed)
         total_rewards = np.zeros(n_agents)
+        # F3: Accumulate per-year diagnostic scores for episode-level summary
+        ep_diag_accumulator = [{
+            "S_financial": 0.0, "S_green": 0.0, "S_composite": 0.0, "count": 0
+        } for _ in range(n_agents)]
 
         # HPP: swap some agents to historical policies for this episode's rollout
         hpp_swapped = {}  # agent_idx → saved (auc_sd, sec_sd)
@@ -980,6 +990,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     yr_row[f"diag_S_financial_A{aid+1}"] = ds["S_financial"]
                     yr_row[f"diag_S_green_A{aid+1}"] = ds["S_green"]
                     yr_row[f"diag_S_composite_A{aid+1}"] = ds["S_composite"]
+                    # Accumulate for episode-level console display
+                    if aid < len(ep_diag_accumulator):
+                        ep_diag_accumulator[aid]["S_financial"] += ds["S_financial"]
+                        ep_diag_accumulator[aid]["S_green"] += ds["S_green"]
+                        ep_diag_accumulator[aid]["S_composite"] += ds["S_composite"]
+                        ep_diag_accumulator[aid]["count"] += 1
             except Exception:
                 pass  # diagnostic scoring is non-critical
             yr_writer.writerow(yr_row)
@@ -1703,6 +1719,17 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     f"{ep_total_penalties[i]:7.0f} {al_str:>7} {cl_str:>7} {loss_age_str:>4} "
                     f"│ {ep_total_mac_reduction[i]:5.3f} │ {sec_str}"
                 )
+            # F3: Compact diagnostic score summary row (episode mean across years)
+            diag_parts = []
+            for i in range(n_agents):
+                acc = ep_diag_accumulator[i]
+                n = max(acc["count"], 1)
+                s_fin  = acc["S_financial"] / n
+                s_grn  = acc["S_green"] / n
+                s_comp = acc["S_composite"] / n
+                diag_parts.append(f"A{i+1}: {s_fin:.2f}/{s_grn:.2f}/{s_comp:.2f}")
+            if diag_parts:
+                print(f"  Diag(Sfin/Sgrn/Scomp): {' │ '.join(diag_parts)}")
             print(sep)
 
             # Optional callback for live plotting (e.g. from notebook)

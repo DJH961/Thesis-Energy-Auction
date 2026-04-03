@@ -167,11 +167,12 @@ auction:
   max_agent_share: 1.0
   cancel_under_subscribed: false   # disabled — under-subscription handled by unsold rollover
   lot_size: 0.0005                 # EU lot-size: 500 EUAs = 0.0005 Mt
-  # Bid collateral: opportunity cost of capital locked during auction.
-  # Real EU ETS: bidders must post collateral with clearing house (ECC)
-  # covering their max potential payment before auction closes.
-  # collateral_cost = rate × max(0, bid_price - clearing_price)
-  #                   × qty_won × hold_fraction
+  # E2: Bid collateral — realistic pre-auction margin requirement.
+  # Real EU ETS: bidders post initial margin with the clearing house (ECC/EEX) before
+  # the auction closes. Real EUA initial margins are 5–15% of contract value depending
+  # on exchange volatility regime. We use 10% as a defensible mid-range value.
+  # Collateral = collateral_fraction × weighted_avg_price × total_bid_qty
+  # If collateral > max_collateral_budget_share × available_budget → scale bids down.
   collateral:
     enabled: true
     opportunity_cost_rate: 0.05
@@ -179,11 +180,21 @@ auction:
     # annual auction step represents ~52 real auctions; 0.02 balances real
     # settlement mechanics with yearly simulation granularity.
     hold_fraction: 0.02
+    # E2: collateral_fraction: flat fraction of weighted-avg (price × qty).
+    # 0.10 = 10% — mid-point of real EUA exchange initial margin range (5–15%).
+    collateral_fraction: 0.10
+    # E2: max_collateral_budget_share: cap collateral at this fraction of remaining
+    # annual budget. 0.50 = collateral can consume at most 50% of remaining budget.
+    max_collateral_budget_share: 0.50
     min_qty_floor_frac: 0.5
 
-    # Effective cost: 0.05 x 0.02 = 0.10% of overbid spread per tonne
-    # Bidding 100EUR above clearing on 3 Mt = 3,000,000 x 100 x 0.001 = 300,000 EUR
-    # Bidding 400EUR above clearing on 3 Mt = 3,000,000 x 400 x 0.001 = 1,200,000 EUR
+  # E4: Leverage/default/suspension parameters.
+  # leverage_multiplier: pre-bid notional cap = cash × leverage_multiplier.
+  # suspension_length: auction rounds an agent is suspended after defaulting.
+  # carry_forward_defaults: whether defaulted volume is added to next auction supply.
+  leverage_multiplier: 3.0       # pre-bid gate: max notional / available cash
+  suspension_length: 2           # rounds suspended after default (future feature)
+  carry_forward_defaults: true   # add defaulted volume to next auction q_cap
 
 # ----------------------------------------------------------
 # Secondary market (agent-to-agent double auction)
