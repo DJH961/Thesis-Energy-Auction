@@ -421,15 +421,15 @@ def test_burnin_msr_reserve():
 # ---------------------------------------------------------------------------
 
 def test_p8_obs_dims():
-    """Phase 1 obs should be 28D base (+ 5*(N_total-1) opponent dims) with opponent modeling.
+    """Phase 1 obs should be 30D base (+ 5*(N_total-1) opponent dims) with opponent modeling.
     N_total = learning + bot agents."""
     env = load_env()
     obs, _ = env.reset()
     n_agents = env.config["companies"]["n_agents"]
     n_total = n_agents + env.config["companies"].get("n_bot_agents", 0)
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
-    expected_p1 = 28 + (5 * (n_total - 1) if opp_enabled else 0)
-    expected_p2 = expected_p1 + 7  # +7: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm
+    expected_p1 = 30 + (5 * (n_total - 1) if opp_enabled else 0)
+    expected_p2 = expected_p1 + 8  # +8: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm, collateral_locked_norm
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
     )

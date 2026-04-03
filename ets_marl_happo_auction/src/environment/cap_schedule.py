@@ -200,6 +200,83 @@ class CapSchedule:
         """Return per-episode counts of price-triggered MSR interventions."""
         return dict(self._msr_event_counts)
 
+    def preview_auction_volume(self, year: int, clearing_price: float = 0.0,
+                               price_max: float = 120.0, penalty_rate: float = 0.0,
+                               inflation_rate: float = 0.0,
+                               price_ma3: float = None) -> float:
+        """
+        Read-only preview of this year's auction volume for Phase 1 observations.
+
+        Mirrors _apply_msr logic using the stored _prev_tnac (1-year TNAC lag)
+        without mutating any state.  Agents can therefore observe THIS year's
+        MSR-adjusted supply *before* placing their bids.
+
+        Parameters
+        ----------
+        year : int
+            Current simulation year (0-indexed).
+        clearing_price : float
+            Last auction clearing price (EUR/t) — used for price-triggered rules.
+        price_max : float
+            Maximum auction price (EUR/t).
+        penalty_rate : float
+            Base non-compliance penalty rate at year 0.
+        inflation_rate : float
+            Annual inflation rate.
+        price_ma3 : float, optional
+            3-year moving average price (EUR/t) for smoothed-spike check.
+
+        Returns
+        -------
+        float
+            Estimated auction volume (Mt) after MSR adjustments.
+        """
+        cap_t = self.get_cap(year)
+        if not self.msr_enabled or self._prev_tnac is None:
+            return max(self.min_auction_frac * cap_t, cap_t)
+
+        tnac = self._prev_tnac  # 1-year lag (already stored from last get_auction_volume)
+        auction_vol = cap_t
+
+        # Read-only snapshot: apply cancellation cap to reserve without mutation
+        prev_auction_vol = self.volume_history[-1] if self.volume_history else cap_t
+        msr_snap = max(0.0, self._msr_reserve - max(0.0, self._msr_reserve - prev_auction_vol))
+
+        # Inflation-adjusted penalty rate
+        if penalty_rate > 0 and inflation_rate >= 0:
+            eff_penalty = penalty_rate * ((1.0 + inflation_rate) ** year)
+        else:
+            eff_penalty = 138.75
+        containment_threshold = eff_penalty * 1.8
+        release_threshold = min(eff_penalty * 2.5, 450.0)
+
+        # A4: Emergency release check (same logic as _apply_msr, read-only)
+        if clearing_price >= release_threshold:
+            no_prior_ma3 = (self._prev_ma3 is None or year < 2)
+            smoothed_spike = (
+                no_prior_ma3 or
+                (price_ma3 is not None and self._prev_ma3 is not None
+                 and price_ma3 > 2.5 * self._prev_ma3)
+            )
+            if smoothed_spike:
+                auction_vol += min(self.emergency_release_amount, msr_snap)
+                return max(auction_vol, self.min_auction_frac * cap_t, 0.0)
+
+        # Containment: suppress withdrawal at high prices
+        if clearing_price >= containment_threshold:
+            if tnac < self.tnac_lower:
+                auction_vol += min(self.release_amount, msr_snap)
+            return max(auction_vol, self.min_auction_frac * cap_t, 0.0)
+
+        # Normal TNAC-based rules
+        if tnac > self.tnac_upper:
+            withheld = self.withhold_rate * tnac
+            auction_vol -= min(withheld, auction_vol)
+        elif tnac < self.tnac_lower:
+            auction_vol += min(self.release_amount, msr_snap)
+
+        return max(auction_vol, self.min_auction_frac * cap_t, 0.0)
+
     def absorb_unsold(self, amount: float):
         """
         Absorb unsold auction allowances into the MSR reserve.

@@ -80,6 +80,9 @@ def auction_action(
     valuation_noise: float = 0.0,
     urgency_multiplier: float = 1.0,
     urgency_denom: float = 1.5,
+    suspension_remaining: int = 0,
+    suspension_length: int = 2,
+    collateral_load_last: float = 0.0,
 ) -> np.ndarray:
     """
     Heuristic Phase-1 (auction + investment) action.
@@ -101,7 +104,9 @@ def auction_action(
     inflation_factor : float, optional
         Cumulative inflation factor override.
     auction_volume : float, optional
-        Current auction supply (Mt) before clearing.
+        THIS YEAR'S MSR-adjusted auction supply (Mt). Use the preview value
+        from _get_obs_phase1 so the heuristic sees the same market size as the
+        obs. Drives supply-scarcity urgency boost.
     cap_t : float, optional
         Current annual cap (Mt). Used with auction_volume for supply ratio.
     valuation_noise : float, optional
@@ -110,6 +115,16 @@ def auction_action(
         Per-bot persistent urgency multiplier. Default: 1.0.
     urgency_denom : float, optional
         Urgency denominator (replaces hardcoded 1.5 in coverage_ratio / 1.5). Default: 1.5.
+    suspension_remaining : int, optional
+        Rounds the agent is still suspended (0 = not suspended). When > 0 the
+        environment forces a zero bid anyway; we return a zero bid here too so
+        BC targets match enforced behaviour.
+    suspension_length : int, optional
+        Total suspension length in rounds (used for normalisation only).
+    collateral_load_last : float, optional
+        Last year's collateral locked / annual_budget [0, 1]. High values mean
+        the agent over-committed; the heuristic scales qty_mult down to stay
+        below the collateral budget limit and avoid future defaults.
 
     Returns
     -------
@@ -122,6 +137,13 @@ def auction_action(
     if reserve_price is None:
         reserve_price = config["ets"].get("reserve_price", 0.0)
     is_green = (company.agent_id % 2) == 1  # odd indices = green-objective
+
+    # Suspension guard: env will force zero bid, return matching zero target so
+    # BC warm-start does not train the policy to bid when suspended.
+    if suspension_remaining > 0:
+        price_min = float(aq["price_min"])
+        logits = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
+        return np.array([price_min, 0.0, 0.0, *logits], dtype=np.float32)
 
     # --- Penalty rate (valuation ceiling) ---
     pen_cfg = config.get("penalty", {})
@@ -180,6 +202,15 @@ def auction_action(
         max_collateral = h_max_coll_share * available_budget
         if projected_collateral > max_collateral:
             qty_mult *= max_collateral / projected_collateral
+
+    # Collateral load safety: if last year's collateral locked was a large share
+    # of the budget, scale back qty_mult proportionally to stay inside limits and
+    # avoid a repeat default/suspension.  Linear fade: no reduction at 0.25,
+    # full 50% reduction at 1.0.
+    if collateral_load_last > 0.25:
+        coll_penalty = min(0.5, (collateral_load_last - 0.25) / 0.75 * 0.5)
+        qty_mult *= (1.0 - coll_penalty)
+
     # Final clip: clamp to [0, high] after budget constraints (budget constraint can reduce
     # below qty_mult_low when funds are tight; we allow 0 rather than force a default bid).
     qty_mult = float(np.clip(qty_mult, 0.0, aq.get("qty_mult_high", 2.0)))

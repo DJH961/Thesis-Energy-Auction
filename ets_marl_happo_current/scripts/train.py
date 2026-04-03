@@ -193,7 +193,18 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
             price_ma3 = env._compute_price_ma3()
             current_year = env.current_year
             cap_t = env.cap_schedule.get_cap(current_year)
-            last_auction_volume = getattr(env, "_last_auction_volume", cap_t)
+            # Use MSR preview for THIS year's supply (matches obs[23] = auction_volume_ratio)
+            base_penalty_rate = float(config["penalty"]["rate"])
+            inflation_rate = float(env._inflation_rate(current_year))
+            this_year_auction_volume = env.cap_schedule.preview_auction_volume(
+                current_year,
+                clearing_price=env.last_clearing_price,
+                price_max=float(config["auction"]["price_max"]),
+                penalty_rate=base_penalty_rate,
+                inflation_rate=inflation_rate,
+                price_ma3=price_ma3,
+            ) + env._defaulted_volume_pending
+            suspension_length = int(config["auction"].get("suspension_length", 2))
 
             auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
             for i in range(n_agents):
@@ -202,8 +213,11 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
                     company, price_ma3, current_year, n_years, config,
                     bank=float(env.holdings[i]),
                     reserve_price=env._compute_dynamic_reserve(),
-                    auction_volume=float(last_auction_volume),
+                    auction_volume=float(this_year_auction_volume),
                     cap_t=float(cap_t),
+                    suspension_remaining=int(env._suspension_remaining[i]),
+                    suspension_length=suspension_length,
+                    collateral_load_last=float(env._last_collateral_load[i]),
                 )
                 auction_actions[i] = h_auc
 
