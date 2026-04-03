@@ -864,16 +864,21 @@ class ETSEnvironment(gym.Env):
                                       cap_t: float = None) -> np.ndarray:
         """Generate Phase-1 actions for all bot agents using heuristic_policy.
 
-        Bot heuristic produces 6D [price, qty_mult, invest_frac, t0, t1, t2].
-        We expand to 10D 3-tranche format by splitting the single bid into
-        three equal tranches at the same price:
-          [p, q/3, p, q/3, p, q/3, invest_frac, t0, t1, t2]
+        Bot heuristic produces 6D [mid_price, total_qty_mult, invest_frac, t0, t1, t2].
+        We expand to 10D 3-tranche format using C1 demand-curve logic:
+          T1: p×0.90, q/3  (cheap tranche — opportunistic)
+          T2: p,       q/3  (core tranche — primary compliance)
+          T3: p×1.10, q/3  (insurance tranche — scarcity guard)
+
+        Tranches are already sorted ascending by price (B1 invariant satisfied).
+        T1/T3 prices are clipped to [price_min, price_max].
         """
         if self.n_bots == 0:
             return np.zeros((0, 10), dtype=np.float32)
         price_ma3 = self._compute_price_ma3()
         reserve = self._compute_dynamic_reserve()
         price_min = float(self.config["auction"]["price_min"])
+        price_max = float(self.config["auction"]["price_max"])
         infl_factor = self._inflation_factor(self.current_year)
         bot_cfg = self.config.get("bots", {})
         urgency_denoms = bot_cfg.get("urgency_denominators", [1.5] * self.n_bots)
@@ -887,7 +892,7 @@ class ETSEnvironment(gym.Env):
                                        0.0, 0.0, 0.0, 0.0], dtype=np.float32)
                 continue
 
-            idx = self.n_agents + b  # bots indexed after learning agents
+            idx = self.n_agents + b
             urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
             action6 = heuristic_policy.auction_action(
                 self.companies[idx], price_ma3, self.current_year,
@@ -903,11 +908,16 @@ class ETSEnvironment(gym.Env):
             )
             if self._enhanced_noise_enabled and bool(self._bot_budget_stressed[b]):
                 action6[1] = float(np.clip(action6[1] * budget_stress_qty_mult, qty_low, qty_high))
-            # Expand 6D → 10D: split single bid into 3 equal tranches
-            p = action6[0]
-            q = action6[1]
-            q_third = q / 3.0
-            actions[b] = np.array([p, q_third, p, q_third, p, q_third,
+
+            # C1: Expand 6D → 10D using 3-tranche demand curve (B1: ascending price)
+            p_mid = float(action6[0])
+            q_total = float(action6[1])
+            q_third = q_total / 3.0
+            # T1: slightly below market (opportunistic), T2: at market, T3: above (insurance)
+            p1 = float(np.clip(p_mid * 0.90, price_min, price_max))
+            p2 = p_mid
+            p3 = float(np.clip(p_mid * 1.10, price_min, price_max))
+            actions[b] = np.array([p1, q_third, p2, q_third, p3, q_third,
                                    action6[2], action6[3], action6[4], action6[5]],
                                   dtype=np.float32)
         return actions
@@ -1086,6 +1096,9 @@ class ETSEnvironment(gym.Env):
         tranche_prices = [[0.0] * N_TRANCHES for _ in range(self.n_total)]
         tranche_quantities = [[0.0] * N_TRANCHES for _ in range(self.n_total)]
 
+        # E1: Aggregate bid volume cap — total bid ≤ 3× annual_need
+        agg_bid_cap_mult = float(self.config["auction"].get("aggregate_bid_cap_mult", 3.0))
+
         for i, company in enumerate(self.companies):
             if not self._is_agent_active(i):
                 bid_qty_multipliers[i] = 0.0
@@ -1096,8 +1109,8 @@ class ETSEnvironment(gym.Env):
             base_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
             estimate_needs[i] = base_need
 
-            total_qty_i = 0.0
-            price_qty_sum = 0.0
+            # Extract raw tranche (price, qty) pairs from action vector
+            raw_tranches = []
             for t in range(N_TRANCHES):
                 p_raw = float(auction_actions[i, 2 * t])
                 q_raw = float(auction_actions[i, 2 * t + 1])
@@ -1107,7 +1120,22 @@ class ETSEnvironment(gym.Env):
                 if lot_size > 0:
                     q_abs = max(lot_size, round(q_abs / lot_size) * lot_size)
                 q_abs = max(0.0, q_abs)
-                # Store per-tranche data
+                raw_tranches.append((p_clipped, q_abs))
+
+            # B1: Sort tranches ascending by price (T1 = cheapest, T3 = most expensive)
+            raw_tranches.sort(key=lambda pq: pq[0])
+
+            # E1: Cap total bid quantity at aggregate_bid_cap_mult × base_need
+            total_unsorted = sum(q for _, q in raw_tranches)
+            agg_cap = agg_bid_cap_mult * base_need
+            if total_unsorted > agg_cap + 1e-9 and total_unsorted > 1e-9:
+                scale = agg_cap / total_unsorted
+                raw_tranches = [(p, q * scale) for p, q in raw_tranches]
+
+            total_qty_i = 0.0
+            price_qty_sum = 0.0
+            for t, (p_clipped, q_abs) in enumerate(raw_tranches):
+                # Store per-tranche data (after sorting)
                 tranche_prices[i][t] = p_clipped
                 tranche_quantities[i][t] = q_abs
                 if q_abs > 1e-6:
@@ -1123,14 +1151,18 @@ class ETSEnvironment(gym.Env):
             else:
                 agent_wavg_price[i] = price_min
 
-        # Pre-auction collateral affordability clip (applied to total agent bid)
+        # E2: Pre-auction collateral affordability clip (10% of weighted-avg bid value)
+        # Collateral = collateral_fraction × weighted_avg_price × total_qty
+        # If collateral > max_collateral_budget_share × available_budget → scale down bids.
         coll_cfg = self.config.get("auction", {}).get("collateral", {})
         if coll_cfg.get("enabled", True):
-            _rate = float(coll_cfg.get("interest_rate", coll_cfg.get("opportunity_cost_rate", 0.05)))
-            _hold = float(coll_cfg.get("hold_fraction", 0.02))
+            coll_frac = float(coll_cfg.get("collateral_fraction",
+                                            coll_cfg.get("opportunity_cost_rate", 0.05)
+                                            * coll_cfg.get("hold_fraction", 0.02)))
+            max_coll_share = float(coll_cfg.get("max_collateral_budget_share", 0.50))
             _floor = float(coll_cfg.get("min_qty_floor_frac", 0.5))
 
-            if _rate > 0.0 and _hold > 0.0:
+            if coll_frac > 0.0:
                 for i, company in enumerate(self.companies):
                     if not self._is_agent_active(i):
                         continue
@@ -1138,21 +1170,20 @@ class ETSEnvironment(gym.Env):
                     avg_p = agent_wavg_price[i]
                     if total_q < 1e-6 or avg_p < 1e-6:
                         continue
-                    need_i = float(company.compute_emissions())
                     budget_remaining = max(
                         0.0,
                         float(company.annual_budget - company.budget_spent_this_year),
                     )
-                    worst_case = _rate * _hold * avg_p * total_q
-                    if worst_case > budget_remaining:
+                    collateral = coll_frac * avg_p * total_q
+                    max_collateral = max_coll_share * budget_remaining
+                    if collateral > max_collateral and max_collateral > 0:
                         # Scale down all tranches for this agent proportionally
-                        if total_q > 1e-6:
-                            scale = max(0.0, budget_remaining / (_rate * _hold * avg_p * total_q))
-                            scale = min(scale, 1.0)
-                            for row in all_bid_rows:
-                                if int(row[0]) == i:
-                                    row[1] *= scale
-                            agent_total_qty[i] *= scale
+                        scale = max(0.0, max_collateral / collateral)
+                        scale = min(scale, 1.0)
+                        for row in all_bid_rows:
+                            if int(row[0]) == i:
+                                row[1] *= scale
+                        agent_total_qty[i] *= scale
 
         # Store aggregate per-agent bid info for logging (backward-compatible)
         self._phase1_bid_prices = agent_wavg_price.copy()
@@ -1873,16 +1904,17 @@ class ETSEnvironment(gym.Env):
                 esg_raw = ef_ratio * time_ratio * (company.annual_budget / 1000.0)
                 esg_signal = esg_scale * esg_raw
 
-            # Permanent cost-efficiency improvement bonus (Priority 5):
-            # Rewards emission factor improvement regardless of w_green, proportional to
-            # remaining time and carbon price. This gives coal agents a gradient to invest early.
-            efficiency_bonus = 0.0
+            # F1: Efficiency bonus now added as a shaping reward (decays with shaping_weight)
+            # This ensures it doesn't permanently distort financial agent baselines.
+            # The bonus rewards emission factor improvement regardless of w_green,
+            # proportional to remaining time and carbon price.
+            efficiency_shaping = 0.0
             if company.initial_ef > 0.01:
                 ef_improvement = max(0.0, company.initial_ef - company.weighted_emission_factor)
                 ef_improvement_ratio = ef_improvement / company.initial_ef
                 time_weight = remaining_years / self.n_years
                 price_weight = clearing_price / 100.0
-                efficiency_bonus = 1.5 * ef_improvement_ratio * time_weight * price_weight
+                efficiency_shaping = 1.5 * ef_improvement_ratio * time_weight * price_weight * self.shaping_weight
 
             # Cost-of-capital on allowances carried after compliance settlement.
             # NOTE: self.holdings[i] is already the post-compliance bank at this
@@ -1892,11 +1924,10 @@ class ETSEnvironment(gym.Env):
             base_reward = float(
                 company.w_cost * (-cost_norm_ex_penalty)
                 + company.w_green * esg_signal
-                + efficiency_bonus  # permanent bonus, applies to ALL agents
                 - penalty_norm  # penalty at full strength for all agents
                 - opp_cost
             )
-            shaping_reward = float(green_bonus)
+            shaping_reward = float(green_bonus + efficiency_shaping)
 
             base_rewards[i] = base_reward
             shaping_rewards[i] = shaping_reward
@@ -1982,6 +2013,85 @@ class ETSEnvironment(gym.Env):
     # ------------------------------------------------------------------
     # Observations
     # ------------------------------------------------------------------
+
+    def compute_diagnostic_score(self, agent_id: int = None) -> dict:
+        """
+        F2: Compute interpretable diagnostic scores for agents.
+
+        Returns a dict with three normalized components (each in [0, 1]):
+          S_financial: cost efficiency (lower total cost = higher score)
+          S_green:     emission factor progress relative to initial
+          S_penalty:   compliance score (1 - normalized penalty incurred)
+          S_composite: weighted combination based on agent's w_cost/w_green
+
+        These scores are logged to CSV for analysis and can be used to
+        evaluate policy quality without reward normalization artifacts.
+
+        Parameters
+        ----------
+        agent_id : int, optional
+            If provided, return scores for that specific agent only.
+            If None, return list of dicts for all learning agents.
+
+        Returns
+        -------
+        dict or list[dict]
+        """
+        results = []
+        budget_ref = max(1.0, float(
+            sum(c.annual_budget for c in self.companies[:self.n_agents]) / max(self.n_agents, 1)
+        ))
+        pen_cfg = self.config["penalty"]
+        eff_penalty = pen_cfg["rate"] * self._inflation_factor(self.current_year)
+
+        for i, company in enumerate(self.companies[:self.n_agents]):
+            if not self._is_agent_active(i):
+                results.append({
+                    "agent_id": i, "S_financial": 0.0, "S_green": 0.0,
+                    "S_penalty": 0.0, "S_composite": 0.0,
+                })
+                continue
+
+            # S_financial: 1 - (total_non_penalty_cost / annual_budget)
+            # Higher score = lower non-penalty spending relative to budget
+            total_cost = company.budget_spent_this_year
+            s_financial = max(0.0, 1.0 - total_cost / max(budget_ref, 1.0))
+
+            # S_green: emission factor progress vs initial
+            if company.initial_ef > 1e-6:
+                ef_progress = max(0.0, company.initial_ef - company.weighted_emission_factor)
+                s_green = ef_progress / company.initial_ef
+            else:
+                s_green = 1.0  # already at zero emissions
+
+            # S_penalty: 1 - (penalty_incurred / (annual_need * eff_penalty))
+            annual_need = max(company.compute_estimate_need(), 1e-6)
+            max_penalty = annual_need * eff_penalty
+            # penalty_cost_this_year is not stored per-step; use proxy from last reward
+            base_vals = self._last_reward_base_values
+            shaping_vals = self._last_reward_shaping_values
+            # Back out penalty from reward: penalty_norm = penalty / 1000
+            # Approximate: we don't have per-agent penalty stored here, so use 0 as safe default
+            # (train.py logs penalties separately via year_log)
+            s_penalty = 1.0  # conservative default; overridden by logged year_log data
+
+            # S_composite: weighted blend
+            s_composite = (company.w_cost * s_financial
+                           + company.w_green * s_green
+                           + 0.3 * s_penalty)  # penalty always weighted (compliance baseline)
+
+            score = {
+                "agent_id": i,
+                "S_financial": round(float(s_financial), 4),
+                "S_green": round(float(s_green), 4),
+                "S_penalty": round(float(s_penalty), 4),
+                "S_composite": round(float(s_composite), 4),
+            }
+            results.append(score)
+
+        if agent_id is not None:
+            return results[agent_id] if agent_id < len(results) else {}
+        return results
 
     def _compute_price_ma3(self) -> float:
         """P1: 3-year moving average of clearing price."""

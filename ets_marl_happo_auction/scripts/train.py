@@ -1006,6 +1006,16 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 yr_row[f"bid_coverage_A{i+1}"] = round(_get("bid_coverages", default=0.0), 4)
                 yr_row[f"bid_to_reserve_A{i+1}"] = round(_get("bid_to_reserve_ratio", default=0.0), 4)
                 yr_row[f"invest_tech_choice_A{i+1}"] = int(_get("invest_tech_choices", default=-1))
+            # F3: Diagnostic scores (one set per learning agent)
+            try:
+                diag_scores = env.compute_diagnostic_score()
+                for ds in diag_scores:
+                    aid = ds["agent_id"]
+                    yr_row[f"diag_S_financial_A{aid+1}"] = ds["S_financial"]
+                    yr_row[f"diag_S_green_A{aid+1}"] = ds["S_green"]
+                    yr_row[f"diag_S_composite_A{aid+1}"] = ds["S_composite"]
+            except Exception:
+                pass  # diagnostic scoring is non-critical
             yr_writer.writerow(yr_row)
 
             obs1 = obs1_next

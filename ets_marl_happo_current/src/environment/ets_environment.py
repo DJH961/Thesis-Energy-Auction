@@ -1857,16 +1857,15 @@ class ETSEnvironment(gym.Env):
                 esg_raw = ef_ratio * time_ratio * (company.annual_budget / 1000.0)
                 esg_signal = esg_scale * esg_raw
 
-            # Permanent cost-efficiency improvement bonus (Priority 5):
-            # Rewards emission factor improvement regardless of w_green, proportional to
-            # remaining time and carbon price. This gives coal agents a gradient to invest early.
-            efficiency_bonus = 0.0
+            # F1: Efficiency bonus now added as a shaping reward (decays with shaping_weight)
+            # This ensures it doesn't permanently distort financial agent baselines.
+            efficiency_shaping = 0.0
             if company.initial_ef > 0.01:
                 ef_improvement = max(0.0, company.initial_ef - company.weighted_emission_factor)
                 ef_improvement_ratio = ef_improvement / company.initial_ef
                 time_weight = remaining_years / self.n_years
                 price_weight = clearing_price / 100.0
-                efficiency_bonus = 1.5 * ef_improvement_ratio * time_weight * price_weight
+                efficiency_shaping = 1.5 * ef_improvement_ratio * time_weight * price_weight * self.shaping_weight
 
             # Cost-of-capital on allowances carried after compliance settlement.
             # NOTE: self.holdings[i] is already the post-compliance bank at this
@@ -1876,11 +1875,10 @@ class ETSEnvironment(gym.Env):
             base_reward = float(
                 company.w_cost * (-cost_norm_ex_penalty)
                 + company.w_green * esg_signal
-                + efficiency_bonus  # permanent bonus, applies to ALL agents
                 - penalty_norm  # penalty at full strength for all agents
                 - opp_cost
             )
-            shaping_reward = float(green_bonus)
+            shaping_reward = float(green_bonus + efficiency_shaping)
 
             base_rewards[i] = base_reward
             shaping_rewards[i] = shaping_reward
@@ -1966,6 +1964,62 @@ class ETSEnvironment(gym.Env):
     # ------------------------------------------------------------------
     # Observations
     # ------------------------------------------------------------------
+
+    def compute_diagnostic_score(self, agent_id: int = None) -> dict:
+        """
+        F2: Compute interpretable diagnostic scores for agents.
+
+        Returns a dict with three normalized components (each in [0, 1]):
+          S_financial: cost efficiency (lower total cost = higher score)
+          S_green:     emission factor progress relative to initial
+          S_penalty:   compliance score (1 - normalized penalty incurred)
+          S_composite: weighted combination based on agent's w_cost/w_green
+
+        Parameters
+        ----------
+        agent_id : int, optional
+            If provided, return scores for that specific agent only.
+        """
+        results = []
+        budget_ref = max(1.0, float(
+            sum(c.annual_budget for c in self.companies[:self.n_agents]) / max(self.n_agents, 1)
+        ))
+        pen_cfg = self.config["penalty"]
+        eff_penalty = pen_cfg["rate"] * self._inflation_factor(self.current_year)
+
+        for i, company in enumerate(self.companies[:self.n_agents]):
+            if not self._is_agent_active(i):
+                results.append({
+                    "agent_id": i, "S_financial": 0.0, "S_green": 0.0,
+                    "S_penalty": 0.0, "S_composite": 0.0,
+                })
+                continue
+
+            s_financial = max(0.0, 1.0 - company.budget_spent_this_year / max(budget_ref, 1.0))
+
+            if company.initial_ef > 1e-6:
+                ef_progress = max(0.0, company.initial_ef - company.weighted_emission_factor)
+                s_green = ef_progress / company.initial_ef
+            else:
+                s_green = 1.0
+
+            s_penalty = 1.0  # conservative default; overridden by year_log data
+
+            s_composite = (company.w_cost * s_financial
+                           + company.w_green * s_green
+                           + 0.3 * s_penalty)
+
+            results.append({
+                "agent_id": i,
+                "S_financial": round(float(s_financial), 4),
+                "S_green": round(float(s_green), 4),
+                "S_penalty": round(float(s_penalty), 4),
+                "S_composite": round(float(s_composite), 4),
+            })
+
+        if agent_id is not None:
+            return results[agent_id] if agent_id < len(results) else {}
+        return results
 
     def _compute_price_ma3(self) -> float:
         """P1: 3-year moving average of clearing price."""

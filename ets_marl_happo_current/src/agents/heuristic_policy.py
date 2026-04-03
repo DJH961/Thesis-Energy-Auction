@@ -257,28 +257,11 @@ def secondary_action(
     """
     Heuristic Phase-2 (secondary market) action.
 
-    Parameters
-    ----------
-    company : Company
-        The company object for this agent (used for need estimation).
-    bank : float
-        Banked allowances held at the start of this year (Mt), before compliance.
-    allocation : float
-        Allowances received at the primary auction (Mt).
-    clearing_price : float
-        Auction clearing price (EUR/t); used as reference for price logic.
-    config : dict
-        Full training config.
-    current_year : int
-        Current year index (0-based).
-    n_years : int
-        Total episode length.
-    valuation_noise : float, optional
-        Per-bot persistent valuation noise (EUR/t), added to market_anchor. Default: 0.0.
-    urgency_multiplier : float, optional
-        Per-bot persistent urgency multiplier. Default: 1.0.
-    urgency_denom : float, optional
-        Urgency denominator (replaces hardcoded 1.5 in coverage_ratio / 1.5). Default: 1.5.
+    C2/C3: Smarter secondary with compliance-risk awareness:
+      - Never sells when carry_forward debt exists (C3)
+      - Boosts buying in final years (C3: compliance risk)
+      - Scales buy qty by budget headroom to avoid overspending (C2)
+      - Green agents sell surplus at half rate (C2: strategic hold)
 
     Returns
     -------
@@ -290,15 +273,36 @@ def secondary_action(
 
     need = max(company.compute_estimate_need() + company._carry_forward, 1e-6)
     remaining_years = max(1, n_years - current_year)
+    is_green = (company.agent_id % 2) == 1
 
-    # Target-bank trajectory: hold a buffer of allowances for future years
+    # Target-bank trajectory: hold buffer for future years
     target_bank = need * min(remaining_years - 1, 2) * 0.3
-    current_position = bank + allocation - need  # surplus after this year's compliance
-    trade_target = (target_bank - current_position) * 0.5  # positive = buy, negative = sell
+    current_position = bank + allocation - need
+    trade_target = (target_bank - current_position) * 0.5
 
-    # Compliance-urgency override: never sell if carrying forward debt
+    # C3: Final-year compliance urgency — aggressively buy in last 2 years
+    if remaining_years <= 2 and current_position < 0:
+        shortfall_boost = min(abs(current_position) * 1.5, qty_max)
+        trade_target = max(trade_target, shortfall_boost)
+
+    # C3: Never sell when carrying forward debt (compliance risk)
     if company._carry_forward > 0.01:
         trade_target = max(0.0, trade_target)
+
+    # C2: Green agents are less aggressive sellers (hold strategic bank)
+    if is_green and trade_target < -0.01:
+        trade_target *= 0.5
+
+    # C2: Budget headroom check — cap buy qty by remaining budget
+    budget_remaining = max(
+        0.0,
+        float(company.annual_budget - company.budget_spent_this_year),
+    )
+    if trade_target > 0.01 and budget_remaining > 0:
+        max_spend = budget_remaining * 0.3
+        max_buy_at_price = max_spend / max(clearing_price, 1.0)
+        if trade_target > max_buy_at_price:
+            trade_target = max_buy_at_price
 
     # Fundamentals-based absolute price (MAC→penalty gradient)
     mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
@@ -308,29 +312,24 @@ def secondary_action(
     sec_price_max_mult = trading_cfg.get("sec_price_max_mult", 2.0)
     sec_price_max = sec_price_max_mult * penalty_rate
 
-    # Coverage ratio for urgency
     coverage_ratio = max((bank + allocation) / need, 0.0)
     urgency = max(0.0, (1.0 - coverage_ratio / urgency_denom) * urgency_multiplier)
     market_anchor = max(mac_cost, clearing_price) + valuation_noise
-
-    severity = abs(trade_target) / max(need, 0.1)  # normalized severity
+    severity = abs(trade_target) / max(need, 0.1)
 
     if trade_target > 0.01:
-        # Need to buy — price from fundamentals, higher with urgency
         buy_qty = min(abs(trade_target), qty_max)
         sec_qty = float(buy_qty)
         price_frac = urgency + 0.2 * min(severity, 1.0)
         sec_price = market_anchor + price_frac * (penalty_rate - market_anchor)
     elif trade_target < -0.01:
-        # Have excess -> sell — ask above MAC
         sell_qty = min(abs(trade_target), qty_max)
         sec_qty = float(-sell_qty)
-        # Sellers ask above MAC, modulated by severity (more surplus → lower ask)
         price_frac = max(0.3, urgency) + 0.15 * min(severity, 1.0)
         sec_price = market_anchor + price_frac * (penalty_rate - market_anchor)
     else:
         sec_qty = 0.0
-        sec_price = clearing_price  # neutral
+        sec_price = clearing_price
 
     sec_price = min(sec_price, 1.8 * penalty_rate)
     sec_price = float(np.clip(sec_price, sec_price_min, sec_price_max))

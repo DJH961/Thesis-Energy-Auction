@@ -170,8 +170,8 @@ auction:
   # Bid collateral: opportunity cost of capital locked during auction.
   # Real EU ETS: bidders must post collateral with clearing house (ECC)
   # covering their max potential payment before auction closes.
-  # collateral_cost = rate × max(0, bid_price - clearing_price)
-  #                   × qty_won × hold_fraction
+  # collateral_fraction = opportunity_cost_rate × hold_fraction = 0.05 × 0.02 = 0.001
+  # (10bps of bid value posted as collateral, capped at max_collateral_budget_share × budget)
   collateral:
     enabled: true
     opportunity_cost_rate: 0.05
@@ -179,11 +179,24 @@ auction:
     # annual auction step represents ~52 real auctions; 0.02 balances real
     # settlement mechanics with yearly simulation granularity.
     hold_fraction: 0.02
+    # collateral_fraction: flat fraction of (price × qty) required as collateral.
+    # Replaces the old opportunity_cost_rate × hold_fraction compound.
+    # 0.001 = 10bps (very small, equivalent to old 0.05×0.02 default)
+    collateral_fraction: 0.001
+    # max_collateral_budget_share: maximum fraction of remaining budget
+    # that can be locked as collateral. Prevents financial agents from
+    # being unable to bid due to prior spending.
+    max_collateral_budget_share: 0.10
     min_qty_floor_frac: 0.5
 
     # Effective cost: 0.05 x 0.02 = 0.10% of overbid spread per tonne
     # Bidding 100EUR above clearing on 3 Mt = 3,000,000 x 100 x 0.001 = 300,000 EUR
     # Bidding 400EUR above clearing on 3 Mt = 3,000,000 x 400 x 0.001 = 1,200,000 EUR
+
+  # E1: Aggregate bid cap — total bid quantity ≤ N × annual_need
+  # Prevents agents from flooding the auction with unrealistic bid quantities.
+  # 3.0 = max 3× annual need across all 3 tranches combined.
+  aggregate_bid_cap_mult: 3.0
 
 # ----------------------------------------------------------
 # Secondary market (agent-to-agent double auction)
