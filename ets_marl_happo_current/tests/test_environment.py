@@ -416,6 +416,21 @@ def test_burnin_msr_reserve():
     assert env.cap_schedule._msr_reserve >= 0
 
 
+def test_burnin_prev_ma3_seeded():
+    """After burn-in, cap_schedule._prev_ma3 should be set (not None) so the
+    A4 smoothed guard is active from year 0 of the real episode."""
+    env = load_env()
+    env.reset(seed=42)
+    assert env.cap_schedule._prev_ma3 is not None, (
+        "_prev_ma3 should be seeded during burn-in so the A4 guard is "
+        "active from year 0; got None instead"
+    )
+    assert env.cap_schedule._prev_ma3 > 0, (
+        f"_prev_ma3 should be a positive price after burn-in; "
+        f"got {env.cap_schedule._prev_ma3}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 17: P8 — obs dims updated correctly (20 base, +2*(N-1) opp)
 # ---------------------------------------------------------------------------
