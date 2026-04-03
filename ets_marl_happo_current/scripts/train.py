@@ -702,6 +702,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"inv_onshore_share_A{i+1}", f"inv_offshore_share_A{i+1}",
                       f"inv_solar_share_A{i+1}"]
     ep_fields += ["price_start", "price_peak", "price_std"]  # episode price trajectory
+    for i in range(n_total_agents):  # post-warmstart initial bank per agent
+        ep_fields += [f"ep_start_bank_A{i+1}"]
     for i in range(n_total_agents):  # allocation + P5/P6/P8/MAC episode aggregates
         ep_fields += [f"mean_alloc_A{i+1}",
                       f"mean_shock_A{i+1}", f"max_shock_A{i+1}",
@@ -1419,6 +1421,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         ep_green_start = [
             first_log.get("green_fracs", [0.0] * n_total_agents)[i] for i in range(n_total_agents)
         ]
+        # Post-warmstart initial holdings (bank_start at year 0), logged for the
+        # "Holdings by Year" plot so it reflects the state after burn-in seeding.
+        ep_start_bank = [
+            first_log.get("bank_start", [0.0] * n_total_agents)[i] for i in range(n_total_agents)
+        ]
         ep_green_end = [
             last_log.get("green_fracs", [0.0] * n_total_agents)[i] for i in range(n_total_agents)
         ]
@@ -1454,6 +1461,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             "price_peak": round(price_peak, 2),
             "price_std": round(price_std, 2),
         }
+        for i in range(n_total_agents):
+            # Post-warmstart initial bank for "Holdings by Year" plot
+            ep_row[f"ep_start_bank_A{i+1}"] = round(ep_start_bank[i], 4)
         for i in range(n_total_agents):
             ep_row[f"reward_A{i+1}"] = round(ep_total_rewards_all[i], 4)
             ep_row[f"reward_base_A{i+1}"] = round(ep_total_rewards_base_all[i], 4)

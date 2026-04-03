@@ -495,6 +495,9 @@ class ETSEnvironment(gym.Env):
             for i, annual_need in enumerate(annual_needs):
                 self.holdings[i] = float(seed_multiple * annual_need) if self._is_agent_active(i) else 0.0
 
+        # Debug: confirm warm-start / burn-in holdings are applied (not zero-start)
+        print(self.holdings)
+
         # Fully retired bots: no banks, no carry-forward debt.
         for i in range(self.n_total):
             if not self._is_agent_active(i):
@@ -728,6 +731,13 @@ class ETSEnvironment(gym.Env):
                 clipped_price = float(np.clip(clearing_price, price_min, price_max))
                 self._price_history.append(clipped_price)
                 self.last_clearing_price = clipped_price
+                # Seed _prev_ma3 with the MA3 that now includes this clearing so
+                # that year 0 of the real episode has a valid MA3 history and the
+                # A4 smoothed guard is active from the start.
+                ma3_now = float(
+                    sum(self._price_history[-3:]) / len(self._price_history[-3:])
+                )
+                self.cap_schedule._prev_ma3 = ma3_now
 
             for i, company in enumerate(self.companies):
                 if not self._is_agent_active(i):
