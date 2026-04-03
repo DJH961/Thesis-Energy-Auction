@@ -143,7 +143,7 @@ def test_rewards_differ_with_different_bids():
 
 
 def test_collateral_cost_logged_matches_formula():
-    """Year log collateral costs should match configured rate*hold*spread*allocation."""
+    """Year log collateral costs should match rate × collateral_locked (E2/E4 formula)."""
     config = load_config()
     config["companies"]["n_bot_agents"] = 0
     config["warm_start"]["enabled"] = False
@@ -163,10 +163,7 @@ def test_collateral_cost_logged_matches_formula():
 
     # Agent 0 overbids (price above clearing) with a moderate quantity so that E4
     # collateral + payment stays within the annual budget (no default).
-    # At bid_price=120, effective_reserve=30: coll_locked = 0.10*(120-30)*bid_q.
-    # With clearing≈80 and budget=880: 80*bid_q + 90*0.10*bid_q ≤ 880 → bid_q ≤ 9.9 Mt.
-    # Using qty_mult=1.0 (bid_q ≈ 8.3 Mt) keeps payment within budget.
-    auction_actions[0, 0] = 120.0  # above clearing → non-zero bid-ask spread for collateral
+    auction_actions[0, 0] = 120.0  # above clearing → non-zero collateral locked
     auction_actions[0, 1] = 1.0    # 1× coverage — affordable under E4 constraints
 
     env.step_auction(auction_actions)
@@ -178,13 +175,10 @@ def test_collateral_cost_logged_matches_formula():
 
     yl = info.get("year_log", {})
     collateral = np.array(yl.get("collateral_costs", []), dtype=float)
-    bids = np.array(yl.get("bid_prices", []), dtype=float)
-    alloc = np.array(yl.get("allocations", []), dtype=float)
-    clearing = float(yl.get("clearing_price", 0.0))
 
     rate = float(config["auction"]["collateral"]["opportunity_cost_rate"])
-    hold = float(config["auction"]["collateral"]["hold_fraction"])
-    expected = rate * hold * np.maximum(0.0, bids - clearing) * alloc
+    # New formula: collateral_cost = rate × collateral_locked (stored in step_auction)
+    expected = rate * env._collateral_locked
 
     assert collateral.shape[0] == env.n_total
     np.testing.assert_allclose(collateral, expected, atol=1e-6)

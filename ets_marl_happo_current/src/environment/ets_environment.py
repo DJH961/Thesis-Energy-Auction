@@ -169,6 +169,9 @@ class ETSEnvironment(gym.Env):
         # _defaulted_volume_pending: allowance volume returned by defaults to add next year
         self._suspension_remaining = np.zeros(self.n_total, dtype=int)
         self._defaulted_volume_pending = 0.0
+        # E2/E4: Per-agent collateral locked in Phase 1 (step_auction).
+        # Stored so Phase 2 can charge the opportunity cost without re-deriving bids.
+        self._collateral_locked = np.zeros(self.n_total)
 
         # Dynamic reserve tracking
         self._last_effective_reserve = config["ets"].get("reserve_price", 0.0)
@@ -396,6 +399,7 @@ class ETSEnvironment(gym.Env):
         self._unsold_rollover = 0.0
         self._suspension_remaining = np.zeros(self.n_total, dtype=int)
         self._defaulted_volume_pending = 0.0
+        self._collateral_locked = np.zeros(self.n_total)
         self._build_episode_inflation_path()
 
         if self._fade_enabled:
@@ -1171,6 +1175,9 @@ class ETSEnvironment(gym.Env):
                     coll_frac_e4 * max(0.0, bid_p - effective_reserve) * bid_q
                 )
 
+        # Store for Phase 2: collateral opportunity cost uses locked amount directly.
+        self._collateral_locked = collateral_locked.copy()
+
         bids = build_bids(bid_actions)
         clearing_price, allocations, payments, auction_stats = market_clearing_ets(
             bids=bids,
@@ -1522,16 +1529,17 @@ class ETSEnvironment(gym.Env):
         # Holdings after secondary market
         holdings = self.holdings + allocations + trade_qtys
 
-        # Bid collateral opportunity cost (EU ETS-style overbidding deterrent).
+        # Collateral opportunity cost: rate × locked collateral from Phase 1 (E2/E4).
+        # self._collateral_locked is computed in step_auction() as:
+        #   collateral_fraction × max(0, bid_price − reserve) × bid_qty
+        # Charging rate × locked_amount is equivalent to the financing cost of
+        # tying up margin capital for the settlement period.
         collateral_costs = np.zeros(self.n_total)
         collateral_cfg = self.config.get("auction", {}).get("collateral", {})
         if collateral_cfg.get("enabled", False):
             rate = float(collateral_cfg.get("opportunity_cost_rate", 0.0))
-            hold = float(collateral_cfg.get("hold_fraction", 0.0))
-            if self._phase1_bid_prices is not None:
-                spreads = np.maximum(0.0, self._phase1_bid_prices - clearing_price)
-                collateral_costs = rate * hold * spreads * np.maximum(allocations, 0.0)
-                collateral_costs[~active_mask] = 0.0
+            collateral_costs = rate * self._collateral_locked
+            collateral_costs[~active_mask] = 0.0
 
         # Use P5-shocked realized emissions for compliance
         #realized_emissions = self._current_emissions
