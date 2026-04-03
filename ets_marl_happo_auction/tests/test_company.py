@@ -460,36 +460,36 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
 # ---------------------------------------------------------------------------
 
 def test_obs_phase1_shape(config):
-    """Phase 1 obs should be 24D base after Phase G consolidation (no opponent modeling)."""
+    """Phase 1 obs should be 26D base after Phase G consolidation + 2 safety dims (no opponent modeling)."""
     c = make_company(config, agent_id=0)
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, auction_gap=1.0)
-    assert obs.shape == (24,), f"Expected 24D (Phase G), got {obs.shape}"
+    assert obs.shape == (26,), f"Expected 26D (Phase G + safety dims), got {obs.shape}"
     assert obs.dtype == np.float32
 
 def test_obs_phase1_with_opponents(config):
-    """With opponent modeling, obs should have 24 + 5*(N-1) dims (Phase G: 24 base)."""
+    """With opponent modeling, obs should have 26 + 5*(N-1) dims (Phase G: 24 base + 2 new)."""
     config_opp = {**config, "opponent_modeling": {"enabled": True}}
     c = make_company(config_opp, agent_id=0)
     opponent_obs = np.zeros(5 * 3, dtype=np.float32)  # 3 opponents
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, opponent_obs=opponent_obs)
-    assert obs.shape == (24 + 15,)
+    assert obs.shape == (26 + 15,)
 
 def test_obs_phase2_extends_phase1(config):
-    """Phase 2 obs = phase1 + 7 standard dims + 6 D1/D2 dims = phase1 + 13 dims."""
+    """Phase 2 obs = phase1 + 7 standard dims + 6 D1/D2 dims + 1 collateral dim = phase1 + 14 dims."""
     c = make_company(config, agent_id=0)
     obs1 = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0, expected_price=80.0)
     obs2 = c.get_observation_phase2(
         obs_phase1=obs1, allocation=2.0, clearing_price=80.0,
         emissions=3.0, banked=1.0, emission_shock=0.05, payment=160.0)
-    # Phase G: 24 base + 13 extra (7 standard + 6 D1/D2)
-    assert obs2.shape == (24 + 13,), f"Expected {24+13}D, got {obs2.shape}"
-    # First 24 dims should match phase1
-    np.testing.assert_array_equal(obs2[:24], obs1)
+    # Phase G: 26 base + 14 extra (7 standard + 6 D1/D2 + 1 collateral)
+    assert obs2.shape == (26 + 14,), f"Expected {26+14}D, got {obs2.shape}"
+    # First 26 dims should match phase1
+    np.testing.assert_array_equal(obs2[:26], obs1)
 
 def test_obs_values_finite(config):
     """All observation values should be finite."""

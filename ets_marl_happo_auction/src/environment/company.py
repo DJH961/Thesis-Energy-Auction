@@ -628,17 +628,19 @@ class Company:
                                tnac_upper=28.0,
                                withhold_rate=0.24,
                                budget_spent: float = 0.0,
-                               annual_budget: float = 1e9):
+                               annual_budget: float = 1e9,
+                               suspension_remaining_norm: float = 0.0,
+                               collateral_load_last: float = 0.0):
         """
-        Phase 1 observation (pre-auction): 24D base + 5*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 26D base + 5*(N-1) opponent dims.
 
-        Phase G consolidation: 28D → 24D (−4 dims)
+        Phase G consolidation: 28D → 24D (−4 dims), then +2 new safety dims = 26D.
           Removed: expected_price_ar1 [was 3] (redundant with MA3 + time)
           Replaced: 5 tech fracs [was 4-8] with 3 summary fracs [4-6]:
             green_frac (sum of onshore+offshore+solar), coal_frac, gas_frac
           Removed: predicted_msr_withholding [was 26] (derivable from TNAC proxy)
 
-        Base 24 dims:
+        Base 26 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
@@ -657,13 +659,17 @@ class Company:
         [17] carry-forward obligation (Mt)
         [18] TNAC proxy (total banked allowances / cap, clipped to [0,3])
         [19] effective reserve price / price_max
-        [20] auction volume ratio = last_auction_volume / cap_t
+        [20] auction volume ratio = THIS YEAR'S auction_volume / cap_t (MSR-adjusted preview)
         [21] MSR reserve normalized = msr_reserve / cap_t
         [22] own bank ratio (clipped [0, 5], normalized by /5)
         [23] budget_headroom (1.0=fresh, 0.0=at limit, negative=overspent)
+        [24] suspension_remaining_norm: rounds still suspended / suspension_length
+             (0=not suspended, 1=fully suspended; helps avoid bids that lead to default)
+        [25] collateral_load_last: last year's collateral locked / annual_budget
+             (clipped [0,1]; high → overbid risk; agents learn to stay below budget)
 
         Opponent dims (if opponent_modeling enabled, 5D per opponent):
-        [24..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
+        [26..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
@@ -703,10 +709,12 @@ class Company:
             self._carry_forward / 5.0,            # [17] carry-forward obligation (Mt)
             float(np.clip(tnac_proxy, 0.0, 3.0)), # [18] TNAC proxy
             effective_reserve / pn,               # [19] effective reserve signal
-            last_auction_volume / max(cap_t, 1e-6),  # [20] auction volume ratio
+            last_auction_volume / max(cap_t, 1e-6),  # [20] THIS YEAR'S auction volume ratio
             msr_reserve / max(cap_t, 1e-6),          # [21] MSR reserve signal
             own_bank_ratio,                          # [22] own bank ratio
             budget_headroom,                         # [23] budget headroom signal
+            float(np.clip(suspension_remaining_norm, 0.0, 1.0)),  # [24] suspension signal
+            float(np.clip(collateral_load_last, 0.0, 1.0)),       # [25] collateral load last year
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -716,9 +724,10 @@ class Company:
                                 clearing_price, emissions, banked=0.0,
                                 emission_shock=0.0, payment=0.0,
                                 tranche_fill_ratios=None,
-                                tranche_price_vs_clearing=None):
+                                tranche_price_vs_clearing=None,
+                                collateral_locked_norm: float = 0.0):
         """
-        Phase 2 observation (post-auction): obs_phase1 + 7 standard dims + 6 D1/D2 dims.
+        Phase 2 observation (post-auction): obs_phase1 + 7 standard dims + 6 D1/D2 dims + 1 collateral dim.
 
         Standard extra dims:
         [base+0] allocation / 5
@@ -738,6 +747,10 @@ class Company:
         [base+10] (tranche_1_price - clearing_price) / price_norm  (signed)
         [base+11] (tranche_2_price - clearing_price) / price_norm
         [base+12] (tranche_3_price - clearing_price) / price_norm
+
+        Collateral dim:
+        [base+13] collateral_locked_norm: this year's collateral locked / annual_budget
+                  clipped to [0, 1]; immediate feedback on auction over-commitment risk
         """
         auction_savings = (allocation * 100.0 - payment) / 1000.0
         total_obligation = max(emissions + self._carry_forward, 1e-6)
@@ -770,23 +783,28 @@ class Company:
             float(np.clip(tranche_price_vs_clearing[2], -1.0, 1.0)),  # [base+12] p3 vs clear
         ], dtype=np.float32)
 
-        return np.concatenate([obs_phase1, extra, d1_d2])
+        collateral_dim = np.array([
+            float(np.clip(collateral_locked_norm, 0.0, 1.0)),    # [base+13]
+        ], dtype=np.float32)
+
+        return np.concatenate([obs_phase1, extra, d1_d2, collateral_dim])
 
     @property
     def obs_dim_phase1(self) -> int:
-        """24 base dims (after Phase G consolidation) + 5*(N_total-1) opponent dims.
+        """26 base dims (Phase G 24D + 2 new safety dims) + 5*(N_total-1) opponent dims.
         N_total = learning agents + bot agents (all market participants).
         Phase G removed: expected_price_ar1 (was [3]), two tech fracs (5→3),
-        and predicted_msr_withholding (was [26]). Net: 28-4 = 24 base dims."""
+        predicted_msr_withholding (was [26]). Net: 28-4+2 = 26 base dims.
+        New dims: suspension_remaining_norm [24], collateral_load_last [25]."""
         if self._opponent_modeling and self._n_total > 1:
-            return 24 + 5 * (self._n_total - 1)
-        return 24
+            return 26 + 5 * (self._n_total - 1)
+        return 26
 
     @property
     def obs_dim_phase2(self) -> int:
-        """obs_dim_phase1 + 7 (standard) + 6 (D1/D2 tranche feedback).
-        Total Phase 2 base = 24 + 7 + 6 = 37 dims (+ opponent modeling if enabled)."""
-        return self.obs_dim_phase1 + 13  # 7 standard + 6 D1/D2
+        """obs_dim_phase1 + 7 (standard) + 6 (D1/D2 tranche feedback) + 1 (collateral_locked_norm).
+        Total Phase 2 base = 26 + 7 + 6 + 1 = 40 dims (+ opponent modeling if enabled)."""
+        return self.obs_dim_phase1 + 14  # 7 standard + 6 D1/D2 + 1 collateral
 
     # ------------------------------------------------------------------
     # Reset

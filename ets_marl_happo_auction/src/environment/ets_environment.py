@@ -178,6 +178,9 @@ class ETSEnvironment(gym.Env):
         # E2/E4: Per-agent collateral locked in Phase 1 (step_auction).
         # Stored so Phase 2 can charge the opportunity cost without re-deriving bids.
         self._collateral_locked = np.zeros(self.n_total)
+        # Per-agent collateral load from PREVIOUS year: collateral_locked / annual_budget.
+        # Exposed in Phase 1 obs so agents learn to avoid over-committing and defaulting.
+        self._last_collateral_load = np.zeros(self.n_total)
 
         # Dynamic reserve tracking
         self._last_effective_reserve = config["ets"].get("reserve_price", 0.0)
@@ -455,6 +458,7 @@ class ETSEnvironment(gym.Env):
         self._suspension_remaining = np.zeros(self.n_total, dtype=int)
         self._defaulted_volume_pending = 0.0
         self._collateral_locked = np.zeros(self.n_total)
+        self._last_collateral_load = np.zeros(self.n_total)
 
         if self._fade_enabled:
             n_active_bots = self._resolve_fade_active_bots(self.current_episode)
@@ -755,6 +759,9 @@ class ETSEnvironment(gym.Env):
                     valuation_noise=valuation_noise,
                     urgency_multiplier=urgency_multiplier,
                     urgency_denom=urgency_denom,
+                    suspension_remaining=int(self._suspension_remaining[i]),
+                    suspension_length=int(self.config["auction"].get("suspension_length", 2)),
+                    collateral_load_last=float(self._last_collateral_load[i]),
                 )
 
                 bid_price = float(np.clip(action[0], price_min, price_max))
@@ -988,6 +995,9 @@ class ETSEnvironment(gym.Env):
                 valuation_noise=float(self._bot_valuation_noise[b]),
                 urgency_multiplier=float(self._bot_urgency_mult[b]),
                 urgency_denom=urgency_denom,
+                suspension_remaining=int(self._suspension_remaining[idx]),
+                suspension_length=int(self.config["auction"].get("suspension_length", 2)),
+                collateral_load_last=float(self._last_collateral_load[idx]),
             )
             if self._enhanced_noise_enabled and bool(self._bot_budget_stressed[b]):
                 action6[1] = float(np.clip(action6[1] * budget_stress_qty_mult, qty_low, qty_high))
@@ -1342,6 +1352,13 @@ class ETSEnvironment(gym.Env):
         # Store for Phase 2: collateral opportunity cost uses locked amount directly.
         self._collateral_locked = collateral_locked.copy()
 
+        # Update per-agent collateral load for next year's Phase 1 obs.
+        for i in range(self.n_total):
+            budget_i = float(self.companies[i].annual_budget)
+            self._last_collateral_load[i] = float(np.clip(
+                collateral_locked[i] / max(budget_i, 1e-6), 0.0, 1.0,
+            ))
+
         # Build bids array from collected tranche rows
         if all_bid_rows:
             bids = np.array(all_bid_rows, dtype=float)
@@ -1557,6 +1574,10 @@ class ETSEnvironment(gym.Env):
                     (self._phase1_tranche_prices[i][t] - clearing_price) / max(pn, 1.0)
                     for t in range(3)
                 ],
+                collateral_locked_norm=float(np.clip(
+                    self._collateral_locked[i] / max(self.companies[i].annual_budget, 1e-6),
+                    0.0, 1.0,
+                )),
             )
             for i in range(self.n_agents)
         ])
@@ -2308,7 +2329,7 @@ class ETSEnvironment(gym.Env):
 
     def _get_obs_phase1(self) -> np.ndarray:
         """Phase 1 observations for learning agents only.
-        Base: 28D. With opponent modeling: 28 + 5*(N_total-1) dims.
+        Base: 26D. With opponent modeling: 26 + 5*(N_total-1) dims.
         Opponent modeling includes ALL market participants (learning + bots).
         """
         cap_t = self.cap_schedule.get_cap(self.current_year)
@@ -2317,10 +2338,25 @@ class ETSEnvironment(gym.Env):
         # TNAC proxy: total banked allowances / cap (market-level scarcity signal)
         tnac = float(self.holdings.sum())
         tnac_proxy = tnac / max(cap_t, 1e-6)
-        last_auction_volume = (self._last_auction_volume
-                       if self._last_auction_volume > 0
-                       else cap_t)
+
+        # THIS YEAR'S auction volume: use MSR preview (read-only, no state changes).
+        # Agents see the actual supply before bidding — critical for MSR flood/drought.
+        price_max = float(self.config["auction"]["price_max"])
+        base_penalty_rate = float(self.config["penalty"]["rate"])
+        inflation_rate = float(self._inflation_rate(self.current_year))
+        this_year_auction_volume = self.cap_schedule.preview_auction_volume(
+            self.current_year,
+            clearing_price=self.last_clearing_price,
+            price_max=price_max,
+            penalty_rate=base_penalty_rate,
+            inflation_rate=inflation_rate,
+            price_ma3=price_ma3,
+        )
+        # Include any defaulted volume pending to be rolled in this year
+        this_year_auction_volume += self._defaulted_volume_pending
+
         msr_reserve = self.cap_schedule.msr_reserve()
+        suspension_length = max(1, int(self.config["auction"].get("suspension_length", 2)))
 
         # Pre-compute 5D public info for ALL participants (learning + bots)
         if self._opponent_modeling and self.n_total > 1:
@@ -2356,6 +2392,8 @@ class ETSEnvironment(gym.Env):
             else:
                 opponent_obs = None
 
+            susp_norm = float(self._suspension_remaining[i]) / suspension_length
+
             obs_i = c.get_observation_phase1(
                 year=self.current_year,
                 cap_t=cap_t,
@@ -2369,13 +2407,15 @@ class ETSEnvironment(gym.Env):
                 last_secondary_volume=self.last_secondary_volume,
                 tnac_proxy=tnac_proxy,
                 effective_reserve=self._last_effective_reserve,
-                last_auction_volume=last_auction_volume,
+                last_auction_volume=this_year_auction_volume,
                 msr_reserve=msr_reserve,
                 bank=float(self.holdings[i]),
                 tnac_upper=float(self.cap_schedule.tnac_upper),
                 withhold_rate=float(self.cap_schedule.withhold_rate),
                 budget_spent=float(c.budget_spent_this_year),
                 annual_budget=float(c.annual_budget),
+                suspension_remaining_norm=susp_norm,
+                collateral_load_last=float(self._last_collateral_load[i]),
             )
             obs_list.append(obs_i)
 
