@@ -48,7 +48,7 @@ import numpy as np
 import gymnasium as gym
 from typing import List, Optional
 
-from src.auction.market_clearing_ets import market_clearing_ets, build_bids
+from src.auction.market_clearing_ets import market_clearing_ets, build_bids, settle_auction
 from src.environment.cap_schedule import CapSchedule
 from src.environment.company import Company
 from src.environment.market_calibration import compute_market_params
@@ -169,6 +169,12 @@ class ETSEnvironment(gym.Env):
         # Unsold allowance rollover: volume offered at auction but not allocated
         # carries forward to the next year's auction supply.
         self._unsold_rollover = 0.0
+
+        # E4: Suspension and default carry-forward tracking
+        # _suspension_remaining[i]: number of auction rounds agent i is still suspended
+        # _defaulted_volume_pending: allowance volume returned by defaults to add next year
+        self._suspension_remaining = np.zeros(self.n_total, dtype=int)
+        self._defaulted_volume_pending = 0.0
 
         # Dynamic reserve tracking
         self._last_effective_reserve = config["ets"].get("reserve_price", 0.0)
@@ -441,6 +447,8 @@ class ETSEnvironment(gym.Env):
 
         self.cap_schedule.reset()
         self._unsold_rollover = 0.0
+        self._suspension_remaining = np.zeros(self.n_total, dtype=int)
+        self._defaulted_volume_pending = 0.0
         self._build_episode_inflation_path()
 
         if self._fade_enabled:
@@ -1059,6 +1067,16 @@ class ETSEnvironment(gym.Env):
         auction_volume = base_auction_volume
         log["cap"] = cap_t
         log["tnac"] = tnac
+
+        # E4: Add defaulted volume from previous year to this year's supply
+        defaulted_rolled_in = 0.0
+        if self._defaulted_volume_pending > 0.0:
+            if self.config["auction"].get("carry_forward_defaults", True):
+                auction_volume += self._defaulted_volume_pending
+                defaulted_rolled_in = self._defaulted_volume_pending
+            self._defaulted_volume_pending = 0.0
+        log["defaulted_volume_rolled_in"] = round(defaulted_rolled_in, 4)
+
         log["auction_volume"] = auction_volume
         self._last_auction_volume = float(auction_volume)
         log["unsold_rollover_in"] = round(self._unsold_rollover, 4)
@@ -1198,6 +1216,27 @@ class ETSEnvironment(gym.Env):
             else:
                 agent_wavg_price[i] = price_min
 
+        # E4: Leverage gate — clip total bid notional by leverage_multiplier × cash.
+        # For multi-tranche bids, scale all tranches proportionally if total notional
+        # (sum of price × qty across tranches) exceeds the leverage limit.
+        aq_cfg = self.config["auction"]
+        lev_mult = float(aq_cfg.get("leverage_multiplier", 3.0))
+        if lev_mult > 0.0:
+            for i, company in enumerate(self.companies):
+                if not self._is_agent_active(i):
+                    continue
+                if agent_total_qty[i] < 1e-9 or agent_wavg_price[i] < 1e-9:
+                    continue
+                cash = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
+                total_notional = agent_wavg_price[i] * agent_total_qty[i]
+                max_notional = lev_mult * cash
+                if total_notional > max_notional and total_notional > 1e-9:
+                    scale = max_notional / total_notional
+                    for row in all_bid_rows:
+                        if int(row[0]) == i:
+                            row[1] *= scale
+                    agent_total_qty[i] *= scale
+
         # E2: Pre-auction collateral affordability clip (10% of weighted-avg bid value)
         # Collateral = collateral_fraction × weighted_avg_price × total_qty
         # If collateral > max_collateral_budget_share × available_budget → scale down bids.
@@ -1239,9 +1278,38 @@ class ETSEnvironment(gym.Env):
         self._phase1_tranche_prices = tranche_prices
         self._phase1_tranche_quantities = tranche_quantities
 
+        # E4: Suspension enforcement — suspended agents cannot bid this round.
+        # Decrement suspension counter; bids for suspended agents already filtered since
+        # their rows were never added to all_bid_rows (qty=0 rows are dropped).
+        suspended_agents_set = set()
+        for i in range(self.n_total):
+            if self._suspension_remaining[i] > 0:
+                suspended_agents_set.add(i)
+                self._suspension_remaining[i] -= 1
+        # Remove any bid rows from suspended agents
+        if suspended_agents_set:
+            all_bid_rows = [row for row in all_bid_rows if int(row[0]) not in suspended_agents_set]
+            for i in suspended_agents_set:
+                agent_total_qty[i] = 0.0
+
         # Compute effective reserve price (dynamic or static)
         effective_reserve = self._compute_dynamic_reserve()
         self._last_effective_reserve = effective_reserve
+
+        # E4: Pre-bid collateral locking — fraction of margin above reserve per agent.
+        coll_frac_e4 = float(coll_cfg.get("collateral_fraction",
+                                           coll_cfg.get("opportunity_cost_rate", 0.05)
+                                           * coll_cfg.get("hold_fraction", 0.02)))
+        collateral_locked = np.zeros(self.n_total)
+        for i in range(self.n_total):
+            if not self._is_agent_active(i) or i in suspended_agents_set:
+                continue
+            total_q = agent_total_qty[i]
+            avg_p = agent_wavg_price[i]
+            if avg_p > 1e-6 and total_q > 1e-6:
+                collateral_locked[i] = (
+                    coll_frac_e4 * max(0.0, avg_p - effective_reserve) * total_q
+                )
 
         # Build bids array from collected tranche rows
         if all_bid_rows:
@@ -1258,6 +1326,37 @@ class ETSEnvironment(gym.Env):
                 "cancel_under_subscribed", False),
             n_agents=self.n_total,
         )
+
+        # E4: Post-clearing settlement — check each winner can pay; handle defaults.
+        suspension_length = int(self.config["auction"].get("suspension_length", 2))
+        agent_cash = np.array([
+            max(0.0, float(c.annual_budget - c.budget_spent_this_year))
+            for c in self.companies
+        ])
+        (allocations, payments,
+         defaults_mask, defaulted_volume,
+         suspension_steps) = settle_auction(
+            allocations=allocations,
+            payments=payments,
+            agent_cash=agent_cash,
+            collateral_locked=collateral_locked,
+            suspension_length=suspension_length,
+        )
+        # Apply defaults: exhaust defaulter's annual budget, set suspension.
+        for i in range(self.n_total):
+            if defaults_mask[i]:
+                excess = max(0.0, self.companies[i].annual_budget
+                             - self.companies[i].budget_spent_this_year)
+                self.companies[i].record_spending(excess)
+                self._suspension_remaining[i] = suspension_steps[i]
+        # Carry forward defaulted volume to next year's q_cap
+        if defaulted_volume > 0.0:
+            self._defaulted_volume_pending += defaulted_volume
+        # Augment auction_stats with E4 default/suspension info
+        auction_stats["defaults"] = int(defaults_mask.sum())
+        auction_stats["defaulted_volume"] = float(defaulted_volume)
+        auction_stats["suspended_agents"] = int((self._suspension_remaining > 0).sum())
+
         # Unsold allowances: either absorbed into MSR or rolled over to next year's auction
         unsold = max(0.0, auction_volume - float(allocations.sum()))
         self._unsold_rollover = unsold
