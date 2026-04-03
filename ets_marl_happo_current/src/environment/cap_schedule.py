@@ -246,7 +246,9 @@ class CapSchedule:
              Trigger requires BOTH:
                (a) absolute threshold: clearing_price >= release_threshold
                (b) smoothed spike OR no prior MA3 history:
-                   price_ma3 > 2.5 × _prev_ma3, or year < 2 / no _prev_ma3
+                   price_ma3 > 2.5 × _prev_ma3, or no _prev_ma3
+                   (year < 2 bypass removed; _prev_ma3 is seeded during
+                   burn-in so the guard is active from year 0)
           2. If price >= containment_threshold: suppress normal withdrawal
              even if TNAC > upper threshold.
           3. Normal TNAC-based rules otherwise.
@@ -316,8 +318,10 @@ class CapSchedule:
         # Smoothed check prevents spurious firing on single-auction anomalies.
         absolute_trigger = clearing_price >= release_threshold
         if absolute_trigger:
-            # Smoothed-spike check: price_ma3 > 2.5× prev_ma3, or no prior MA3
-            no_prior_ma3 = (self._prev_ma3 is None or year < 2)
+            # Smoothed-spike check: price_ma3 > 2.5× prev_ma3, or no prior MA3.
+            # year < 2 bypass removed — _prev_ma3 is seeded during burn-in so
+            # the guard is active from year 0 of the real episode.
+            no_prior_ma3 = self._prev_ma3 is None
             smoothed_spike = (
                 no_prior_ma3 or
                 (price_ma3 is not None and self._prev_ma3 is not None
