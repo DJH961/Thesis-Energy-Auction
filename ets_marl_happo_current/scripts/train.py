@@ -716,6 +716,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     ]
     for i in range(n_agents):
         ep_fields += [f"streak_ceil_A{i+1}", f"streak_floor_A{i+1}", f"streak_zeroqty_A{i+1}"]
+    # F: Episode-mean diagnostic scores per learning agent (F3)
+    for i in range(n_agents):
+        ep_fields += [f"diag_S_financial_A{i+1}", f"diag_S_green_A{i+1}",
+                      f"diag_S_composite_A{i+1}"]
     ep_csv = open(ep_path, "w", newline="")
     ep_writer = csv.DictWriter(ep_csv, fieldnames=ep_fields)
     ep_writer.writeheader()
@@ -749,7 +753,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"estimate_need_A{i+1}",
                       f"bid_coverage_A{i+1}",
                       f"bid_to_reserve_A{i+1}",
-                      f"invest_tech_choice_A{i+1}"]
+                      f"invest_tech_choice_A{i+1}",
+                      # F: Diagnostic scores (F2)
+                      f"diag_S_financial_A{i+1}",
+                      f"diag_S_green_A{i+1}",
+                      f"diag_S_composite_A{i+1}"]
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -1485,6 +1493,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             ep_row[f"inv_onshore_share_A{i+1}"] = round(inv_onshore_share[i], 4)
             ep_row[f"inv_offshore_share_A{i+1}"] = round(inv_offshore_share[i], 4)
             ep_row[f"inv_solar_share_A{i+1}"] = round(inv_solar_share[i], 4)
+
+        # F3: Episode-mean diagnostic scores per learning agent
+        for i in range(n_agents):
+            acc = ep_diag_accumulator[i]
+            n_years_diag = max(acc["count"], 1)
+            ep_row[f"diag_S_financial_A{i+1}"] = round(acc["S_financial"] / n_years_diag, 4)
+            ep_row[f"diag_S_green_A{i+1}"] = round(acc["S_green"] / n_years_diag, 4)
+            ep_row[f"diag_S_composite_A{i+1}"] = round(acc["S_composite"] / n_years_diag, 4)
 
         ep_row["warn_lowAlloc"] = int(env._warnings.get("low_alloc", 0))
         ep_row["warn_priceFloor"] = int(env._warnings.get("price_floor", 0))

@@ -678,3 +678,71 @@ def test_penalty_full_strength_for_esg_agents():
     # But penalties should be SAME (full strength)
 
     assert np.all(np.isfinite(rewards)), "All rewards should be finite"
+
+
+# ---------------------------------------------------------------------------
+# F2: Diagnostic score tests
+# ---------------------------------------------------------------------------
+
+def test_diagnostic_scores_returned_in_info():
+    """step_secondary info should contain 'diagnostic_scores' key (F2)."""
+    env = load_env(seed=0)
+    env.reset()
+    _, info = _run_one_year(env, auction_price=80.0, qty_mult=1.0)
+    assert "diagnostic_scores" in info, "info must contain 'diagnostic_scores'"
+    diag = info["diagnostic_scores"]
+    assert len(diag) == env.n_agents, "One diagnostic score dict per learning agent"
+
+
+def test_diagnostic_score_components_in_range():
+    """S_financial, S_green should be in [0, 1]; S_composite should be non-negative."""
+    env = load_env(seed=1)
+    env.reset()
+    _, info = _run_one_year(env, auction_price=80.0, qty_mult=1.0)
+    for ds in info["diagnostic_scores"]:
+        assert 0.0 <= ds["S_financial"] <= 1.0, f"S_financial={ds['S_financial']} out of range"
+        assert 0.0 <= ds["S_green"] <= 1.0, f"S_green={ds['S_green']} out of range"
+        # S_composite is a weighted blend of sub-scores; weights may not sum to 1 so
+        # it can exceed 1.0 for high-performing ESG agents, but should be non-negative
+        assert ds["S_composite"] >= 0.0, f"S_composite={ds['S_composite']} is negative"
+
+
+def test_diagnostic_high_spending_lowers_s_financial():
+    """An agent that spends close to its full budget should have lower S_financial."""
+    config = load_config()
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    env = ETSEnvironment(config, seed=5)
+    env.reset()
+
+    # Run year with 0 spending (zero bids) → high S_financial
+    _, info_low = _run_one_year(env, auction_price=1.0, qty_mult=0.01)
+    s_fin_low_spend = [ds["S_financial"] for ds in info_low["diagnostic_scores"]]
+
+    env.reset()
+    # Run year with high spending (high price) → lower S_financial
+    _, info_high = _run_one_year(env, auction_price=250.0, qty_mult=1.0)
+    s_fin_high_spend = [ds["S_financial"] for ds in info_high["diagnostic_scores"]]
+
+    # On average, spending more reduces S_financial
+    assert np.mean(s_fin_high_spend) < np.mean(s_fin_low_spend), (
+        "Higher budget spending should yield lower S_financial scores"
+    )
+
+
+def test_diagnostic_scores_all_finite():
+    """All diagnostic score components must be finite across a full episode."""
+    config = load_config()
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    env = ETSEnvironment(config, seed=99)
+    env.reset()
+    for _ in range(env.n_years):
+        _, info = _run_one_year(env, auction_price=80.0, qty_mult=1.0)
+        for ds in info["diagnostic_scores"]:
+            for k in ("S_financial", "S_green", "S_penalty", "S_composite"):
+                assert np.isfinite(ds[k]), f"{k} is not finite: {ds[k]}"
+        if env.episode_done:
+            break

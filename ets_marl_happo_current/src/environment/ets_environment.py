@@ -1679,7 +1679,15 @@ class ETSEnvironment(gym.Env):
         self.episode_done = terminated
 
         obs_next = self._get_obs_phase1()   # shape (n_agents, obs_dim)
-        return obs_next, rewards[:self.n_agents], terminated, False, {"year_log": log}
+        # F2: Compute per-agent diagnostic scores and expose via info dict
+        try:
+            diag_scores = self.compute_diagnostic_score()
+        except Exception:
+            diag_scores = []
+        return obs_next, rewards[:self.n_agents], terminated, False, {
+            "year_log": log,
+            "diagnostic_scores": diag_scores,
+        }
 
     # ------------------------------------------------------------------
     # Legacy step (calls both phases — for testing)
