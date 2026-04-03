@@ -16,7 +16,6 @@ the state space and use predefined action profiles.
 import argparse
 import csv
 import os
-import pickle
 import sys
 import time
 import datetime
@@ -306,10 +305,9 @@ def train_qlearning(config: dict, ql_config: dict, seed: int):
         if (episode + 1) % 100 == 0:
             ckpt_dir = os.path.join(results_dir, "checkpoints")
             os.makedirs(ckpt_dir, exist_ok=True)
-            qtable_path = os.path.join(ckpt_dir, f"qtables_s{seed}_ep{episode+1}.pkl")
+            qtable_path = os.path.join(ckpt_dir, f"qtables_s{seed}_ep{episode+1}.npz")
             qtables = {f"agent_{i}": agents[i].q_table.copy() for i in range(n_agents)}
-            with open(qtable_path, "wb") as f:
-                pickle.dump(qtables, f)
+            np.savez(qtable_path, **qtables)
 
             # Print top-5 Q-values per agent
             if (episode + 1) % 500 == 0:
@@ -323,10 +321,9 @@ def train_qlearning(config: dict, ql_config: dict, seed: int):
                 print()
 
     # Final checkpoint
-    final_path = os.path.join(results_dir, f"qtables_s{seed}_final.pkl")
+    final_path = os.path.join(results_dir, f"qtables_s{seed}_final.npz")
     qtables = {f"agent_{i}": agents[i].q_table.copy() for i in range(n_agents)}
-    with open(final_path, "wb") as f:
-        pickle.dump(qtables, f)
+    np.savez(final_path, **qtables)
 
     ep_csv.close()
     yr_csv.close()
@@ -487,11 +484,10 @@ def main():
         qtable_path = args.qtable_path
         if qtable_path is None:
             results_dir = merged.get("logging", {}).get("results_dir", "results/qlearning/")
-            qtable_path = os.path.join(results_dir, f"qtables_s{args.seed}_final.pkl")
+            qtable_path = os.path.join(results_dir, f"qtables_s{args.seed}_final.npz")
 
         print(f"Loading Q-tables from {qtable_path}")
-        with open(qtable_path, "rb") as f:
-            qtables = pickle.load(f)
+        qtables = dict(np.load(qtable_path))
 
         agents = [
             QLearningAgent(agent_id=i,

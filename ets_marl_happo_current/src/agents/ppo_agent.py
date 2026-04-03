@@ -68,10 +68,11 @@ class RewardNormalizer:
         self._n_samples += 1
         effective_alpha = max(self.alpha, 1.0 / self._n_samples)
 
-        # EMA mean
-        self.mu = (1.0 - effective_alpha) * self.mu + effective_alpha * reward
-        # EMA variance
-        self.var = (1.0 - effective_alpha) * self.var + effective_alpha * (reward - self.mu) ** 2
+        # EMA mean (save old mean for unbiased variance update)
+        old_mu = self.mu
+        self.mu = (1.0 - effective_alpha) * old_mu + effective_alpha * reward
+        # EMA variance (use old_mu to avoid double-counting the mean shift)
+        self.var = (1.0 - effective_alpha) * self.var + effective_alpha * (reward - old_mu) ** 2
         std = max(self.var ** 0.5, self.eps)
         return (reward - self.mu) / std
 
@@ -81,6 +82,11 @@ class RewardNormalizer:
         self.var = 1.0
         self._n_samples = 0
 
+
+# ---------------------------------------------------------------------------
+# Observation index constants
+# ---------------------------------------------------------------------------
+OBS1_EXPECTED_PRICE_IDX = 3  # Phase-1 obs dim 3: normalized expected price (×price_max)
 
 # ---------------------------------------------------------------------------
 # Rollout buffer
@@ -134,6 +140,9 @@ class PPOAgent:
                  config, seed=None, global_state_dim=0):
         self.agent_id = agent_id
         self.config = config
+        self.obs_dim_phase1 = obs_dim_phase1
+        # Seeded RNG for reproducible mini-batch shuffling
+        self._rng = np.random.default_rng(seed if seed is not None else 0 + agent_id)
         ppo = config["ppo"]
 
         self.gamma = ppo["gamma"]
@@ -362,7 +371,8 @@ class PPOAgent:
                     fallback_expected = float(np.clip(
                         self.expected_price_fallback, price_min, price_max))
                     expected_price = (
-                        float(obs1[3]) * price_max if len(obs1) > 3
+                        float(obs1[OBS1_EXPECTED_PRICE_IDX]) * price_max
+                        if len(obs1) > OBS1_EXPECTED_PRICE_IDX
                         else fallback_expected
                     )
                     if not np.isfinite(expected_price):
@@ -387,8 +397,8 @@ class PPOAgent:
                     price_max = high[0].item()
                     price_min = low[0].item()
 
-                    # [0] bid_price: Gaussian around expected_price (obs[3] × price_max)
-                    expected_price = float(obs1[3]) * price_max
+                    # [0] bid_price: Gaussian around expected_price (obs[OBS1_EXPECTED_PRICE_IDX] × price_max)
+                    expected_price = float(obs1[OBS1_EXPECTED_PRICE_IDX]) * price_max
                     rand_action[0, 0] = np.clip(
                         np.random.normal(expected_price, max(expected_price * 0.3, 15.0)),
                         price_min, price_max)
@@ -566,7 +576,7 @@ class PPOAgent:
         if self.critic_extra_epochs > 0:
             for _extra_epoch in range(self.critic_extra_epochs):
                 idx = np.arange(T)
-                np.random.shuffle(idx)
+                self._rng.shuffle(idx)
                 for start in range(0, T, self.mini_batch_size):
                     end = min(start + self.mini_batch_size, T)
                     mb = idx[start:end]
@@ -594,7 +604,7 @@ class PPOAgent:
 
         for _epoch in range(self.n_epochs):
             idx = np.arange(T)
-            np.random.shuffle(idx)
+            self._rng.shuffle(idx)
 
             # P11: KL tracking for early stopping
             epoch_kl_sum = 0.0
@@ -615,6 +625,14 @@ class PPOAgent:
                     auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
                     sec_lp_new, sec_ent = self.secondary_policy.evaluate(obs2[mb], sec_raw[mb])
 
+                    # Phase-specific credit assignment: weight auction policy loss
+                    # by a phase-1-only advantage proxy derived from auction_savings
+                    # in obs2[base+4].  Positive savings amplify the gradient for
+                    # good auction deals; negative savings dampen it.
+                    _auc_savings_idx = self.obs_dim_phase1 + 4  # obs2[base+4]
+                    _auc_savings = obs2[mb, _auc_savings_idx:_auc_savings_idx+1]  # [mb, 1]
+                    _auc_weight = (1.0 + torch.tanh(_auc_savings)).detach()  # [0, 2] range
+
                     # Per-policy PPO clipping: decomposes the joint ratio so each
                     # policy's gradient update is independently clipped.  Prevents
                     # a profitable secondary trade from incorrectly reinforcing
@@ -623,8 +641,9 @@ class PPOAgent:
                     # Prevents catastrophic loss from rare high-ratio mini-batches.
                     auc_log_ratio = torch.clamp(auc_lp_new - old_auc_lp[mb], -2.0, 2.0)
                     auc_ratio = torch.exp(auc_log_ratio)
-                    auc_surr1 = auc_ratio * adv_t[mb]
-                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
+                    auc_adv = adv_t[mb] * _auc_weight
+                    auc_surr1 = auc_ratio * auc_adv
+                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
                     auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
 
                     sec_log_ratio = torch.clamp(sec_lp_new - old_sec_lp[mb], -2.0, 2.0)
@@ -858,7 +877,7 @@ class PPOAgent:
 
         for _epoch in range(self.n_epochs):
             idx = np.arange(T)
-            np.random.shuffle(idx)
+            self._rng.shuffle(idx)
 
             epoch_kl_sum = 0.0
             epoch_kl_count = 0
@@ -877,10 +896,16 @@ class PPOAgent:
                     auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
                     sec_lp_new, sec_ent = self.secondary_policy.evaluate(obs2[mb], sec_raw[mb])
 
+                    # Phase-specific credit assignment (same as update())
+                    _auc_savings_idx = self.obs_dim_phase1 + 4
+                    _auc_savings = obs2[mb, _auc_savings_idx:_auc_savings_idx+1]
+                    _auc_weight = (1.0 + torch.tanh(_auc_savings)).detach()
+
                     auc_log_ratio = torch.clamp(auc_lp_new - old_auc_lp[mb], -2.0, 2.0)
                     auc_ratio = torch.exp(auc_log_ratio)
-                    auc_surr1 = auc_ratio * weighted_adv[mb]
-                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * weighted_adv[mb]
+                    auc_adv = weighted_adv[mb] * _auc_weight
+                    auc_surr1 = auc_ratio * auc_adv
+                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
                     auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
 
                     sec_log_ratio = torch.clamp(sec_lp_new - old_sec_lp[mb], -2.0, 2.0)
@@ -1017,7 +1042,7 @@ class PPOAgent:
         }, path)
 
     def load(self, path):
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
         self.auction_policy.load_state_dict(ckpt["auction_policy"])
         self.secondary_policy.load_state_dict(ckpt["secondary_policy"])
         self.value_net.load_state_dict(ckpt["value_net"])

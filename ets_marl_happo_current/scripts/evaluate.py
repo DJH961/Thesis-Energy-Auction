@@ -44,6 +44,14 @@ def main():
 
     # Build agents and load weights
     agents = build_agents(env, config, args.seed)
+
+    # Save config alongside checkpoint for reproducibility
+    import shutil
+    config_save_path = os.path.join(args.checkpoint, "config.yaml")
+    if not os.path.exists(config_save_path):
+        with open(config_save_path, "w") as f:
+            yaml.dump(config, f, default_flow_style=False)
+
     missing_agents = []
     for i, agent in enumerate(agents):
         ckpt_path = os.path.join(args.checkpoint, f"agent_{i}_best.pt")
@@ -66,6 +74,14 @@ def main():
     # Run one evaluation episode (deterministic)
     obs1, _ = env.reset(seed=args.seed)
     total_rewards = np.zeros(n_agents)
+
+    # Obs-dim assertion: verify environment and agent dimensions match
+    expected_dim = agents[0].obs_dim_phase1
+    actual_dim = obs1.shape[1] if obs1.ndim > 1 else obs1.shape[0]
+    assert actual_dim == expected_dim, (
+        f"Obs dim mismatch: env produces {actual_dim}, agent expects {expected_dim}. "
+        "Config may have changed since checkpoint was saved."
+    )
 
     print("\n" + "="*70)
     print("EVALUATION EPISODE — Technology-Specific Mix")

@@ -617,7 +617,8 @@ class ETSEnvironment(gym.Env):
         # (D) Hidden burn-in years.
         for burnin_year in range(-n_burnin, 0):
             for company in self.companies:
-                company.apply_matured_investments(current_year=burnin_year)
+                # apply_matured_investments removed from top (double-apply fix);
+                # kept only at bottom of burn-in loop (burnin_year + 1).
                 company.reset_budget()
                 company.reset_capex_budget()
 
@@ -1211,7 +1212,10 @@ class ETSEnvironment(gym.Env):
                 company.prev_invest_frac = 0.0
                 continue
 
-            invest_frac = float(np.clip(auction_actions[i, 2], 0.0, company.max_invest_frac))
+            # Continuous linear mapping: [-1, 1] → [0, max_invest_frac]
+            # Eliminates the dead zone where negative actions all map to 0.
+            invest_frac = float((auction_actions[i, 2] + 1.0) / 2.0) * company.max_invest_frac
+            invest_frac = float(np.clip(invest_frac, 0.0, company.max_invest_frac))
             requested_invest_frac = invest_frac
             tech_logits = auction_actions[i, 3:6]
             tech_choice = int(np.argmax(tech_logits))
@@ -1646,8 +1650,10 @@ class ETSEnvironment(gym.Env):
             if qty > 1e-6:
                 buyers.append([i, price, qty])
             elif qty < -1e-6:
-                # P8: allow selling from holdings (bank) as well as auction allocation
-                max_sell = float(allocations[i]) + float(max(0.0, self.holdings[i]))
+                # Enforce no-short-selling: subtract expected compliance need
+                max_sell = max(0.0, float(allocations[i]) + float(max(0.0, self.holdings[i]))
+                              - float(self._current_emissions[i])
+                              - float(self.companies[i]._carry_forward))
                 sell_qty = min(abs(qty), max_sell)
                 if sell_qty > 1e-6:
                     sellers.append([i, price, sell_qty])
@@ -1877,10 +1883,12 @@ class ETSEnvironment(gym.Env):
                 ef_improvement = max(0.0, company.initial_ef - company.weighted_emission_factor)
                 ef_improvement_ratio = ef_improvement / company.initial_ef
                 time_weight = remaining_years / self.n_years
-                price_weight = clearing_price / 1000.0
-                efficiency_bonus = 0.3 * ef_improvement_ratio * time_weight * price_weight
+                price_weight = clearing_price / 100.0
+                efficiency_bonus = 1.5 * ef_improvement_ratio * time_weight * price_weight
 
             # Cost-of-capital on allowances carried after compliance settlement.
+            # NOTE: self.holdings[i] is already the post-compliance bank at this
+            # point (updated in step_secondary before _compute_rewards is called).
             opp_cost = float(self.holdings[i]) * float(clearing_price) * opp_cost_rate / 1000.0
 
             base_reward = float(
@@ -1950,6 +1958,21 @@ class ETSEnvironment(gym.Env):
                     base_rewards[i] += queue_term
                     terminal_queue_values[i] = queue_term
 
+        # Terminal debt liquidation: applied in final year regardless of terminal_bank/queue settings
+        if is_final_year:
+            pen_cfg = self.config["penalty"]
+            eff_penalty = pen_cfg["rate"] * self._inflation_factor(self.current_year)
+            terminal_price = max(clearing_price, self.last_secondary_price, eff_penalty * 0.8)
+
+            for i, company in enumerate(self.companies):
+                if active_mask is not None and not bool(active_mask[i]):
+                    continue
+                # Aggressively penalize outstanding carry_forward debt
+                if company._carry_forward > 0:
+                    debt_penalty = (company._carry_forward * terminal_price * 1.5) / 1000.0
+                    rewards[i] -= debt_penalty
+                    base_rewards[i] -= debt_penalty
+
         self._last_terminal_bank_values = terminal_bank_values
         self._last_terminal_queue_values = terminal_queue_values
         self._last_terminal_liquidation_values = terminal_bank_values + terminal_queue_values
@@ -1965,9 +1988,10 @@ class ETSEnvironment(gym.Env):
     def _compute_price_ma3(self) -> float:
         """P1: 3-year moving average of clearing price."""
         if not self._price_history:
-            if self._reserve_anchor == "auction":
-                return self.last_clearing_price
-            return self.last_secondary_price
+            # Fallback to AR(1) expected price (initialized at ~80€) instead
+            # of last_clearing_price which may be the reserve price after a
+            # failed auction.
+            return self.expected_price
         window = self._price_history[-3:]
         return float(np.mean(window))
 
