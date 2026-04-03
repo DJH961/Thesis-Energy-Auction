@@ -218,6 +218,8 @@ class ETSEnvironment(gym.Env):
         auction_cfg = self.config.get("auction", {})
         print(f"[ETSEnvironment] {self.n_agents} learning + {self.n_bots} bot = {self.n_total} total agents"
               f" | cancel_under_subscribed={auction_cfg.get('cancel_under_subscribed', False)}")
+        # Print initial bank-seed context once per environment instance (avoid reset spam).
+        self._printed_initial_bank_seed_context = False
 
         # Sanity check: in static mode, price_min must be >= reserve_price.
         # In dynamic mode, the effective reserve is computed each year, so
@@ -495,8 +497,21 @@ class ETSEnvironment(gym.Env):
             for i, annual_need in enumerate(annual_needs):
                 self.holdings[i] = float(seed_multiple * annual_need) if self._is_agent_active(i) else 0.0
 
-        # Debug: confirm warm-start / burn-in holdings are applied (not zero-start)
-        print(self.holdings)
+        # One-time startup context: what initial banking is and its unit.
+        if not self._printed_initial_bank_seed_context:
+            _bank_items = []
+            for i in range(self.n_total):
+                if not self._is_agent_active(i):
+                    continue
+                _tag = f"A{i+1}" if i < self.n_agents else f"B{i - self.n_agents + 1}"
+                _bank_items.append(f"{_tag}={self.holdings[i]:.2f}")
+            _bank_total = float(np.sum(self.holdings))
+            print("[ETSEnvironment] Initial bank seed example "
+                  "(episode-start allowance holdings, unit: MtCO2 allowances): "
+                  + ", ".join(_bank_items))
+            print("[ETSEnvironment] Context: this is each active agent's starting bank "
+                  f"before year-1 actions/compliance; total TNAC seed={_bank_total:.2f} MtCO2.")
+            self._printed_initial_bank_seed_context = True
 
         # Fully retired bots: no banks, no carry-forward debt.
         for i in range(self.n_total):
