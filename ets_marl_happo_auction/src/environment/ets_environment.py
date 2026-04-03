@@ -1364,6 +1364,9 @@ class ETSEnvironment(gym.Env):
         auction_stats["defaults"] = int(defaults_mask.sum())
         auction_stats["defaulted_volume"] = float(defaulted_volume)
         auction_stats["suspended_agents"] = int((self._suspension_remaining > 0).sum())
+        # Per-agent lists used by the training console for split RL/bot event board.
+        auction_stats["defaults_agents"]          = sorted(int(i) for i, d in enumerate(defaults_mask) if d)
+        auction_stats["suspension_remaining_list"] = self._suspension_remaining.tolist()
 
         # Unsold allowances: either absorbed into MSR or rolled over to next year's auction
         unsold = max(0.0, auction_volume - float(allocations.sum()))

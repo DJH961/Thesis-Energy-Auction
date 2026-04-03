@@ -326,76 +326,93 @@ class EntropyConditionTracker:
 
 def _print_training_legend():
     """Print field guide once at the start of each training run."""
-    leg = "═" * 82
+    W   = 100
+    leg = "═" * W
     print(f"\n{leg}")
-    print("  TRAINING CONSOLE — COLUMN GUIDE")
+    print("  TRAINING CONSOLE — FIELD GUIDE")
     print(leg)
     print()
-    print("  EPISODE HEADER")
-    print("    Ep / elapsed / ETA  : Episode number, wall-clock time, estimated remaining")
-    print("    ent / shp / eps     : Entropy coef, shaping weight, epsilon-greedy")
-    print("    [ENT-DECAY]         : Entropy decay triggered")
-    print("    [cyc=Ax]            : Active agent (soft cycling)")
+    print("  ┌─ CONTROL PLANE")
+    print("  │  Ep / elapsed / ETA    Episode number · wall-clock time · estimated remaining")
+    print("  │  ent / shp / ε         Entropy coef · shaping weight · ε-greedy rate")
+    print("  │  [ENT-DECAY]           Entropy coefficient is being annealed down")
+    print("  │  [cyc=Ax]              Soft cycling — only agent Ax updates its actor this interval")
+    print("  │  [WARMUP]              Critic-only warmup phase (actor frozen)")
     print()
-    print("  YEAR-BY-YEAR TRAJECTORIES")
-    print("    Price/yr   : Clearing price each year (€/t), with std dev")
-    print("    Emiss/yr   : Total emissions each year (Mt), with avg")
-    print("    Auct/yr    : Auction volume each year (Mt, post-MSR), with final TNAC")
+    print("  ┌─ MARKET TRAJECTORY  (one value per simulated year, oldest → newest)")
+    print("  │  Price    Auction clearing price (€/t) · ↑/↓/→ = trend across episode years")
+    print("  │  Emiss    Total fleet emissions (Mt/yr)")
+    print("  │  Auct     Auction supply volume after MSR withholding/release (Mt)")
+    print("  │  TNAC     Total Number of Allowances in Circulation at episode end (Mt)")
+    print("  │  MSR      Shown only when cumulative cancellation > 0 — reserve & cancelled stock")
     print()
-    print("  MARKET & SECONDARY SUMMARY")
-    print("    comply / green      : Compliance rate, avg green fraction")
-    print("    vol / match / avg_px: Sec market total volume, match rate, avg price")
-    print("    warn: key=N         : Episode warnings (see below)")
+    print("  ┌─ HEALTH SNAPSHOT")
+    print("  │  comply   % of (agent × year) pairs with zero shortfall (full compliance)")
+    print("  │  green    Fleet-avg green energy fraction: start→end (Δpp = percentage-point change)")
+    print("  │  sec      Secondary market: total volume · match rate · avg trade price")
+    print("  │           ↓sell / ↑buy = mean sellers / buyers participating per year")
     print()
-    print("  3-TRANCHE BID LADDER (PRIMARY AUCTION)")
-    print("    Tx Price€ : Price level of tranche x (€/t, clipped to [price_min, price_max])")
-    print("    Tx Qty    : Quantity bid in tranche x (Mt, absolute after multiplier expansion)")
-    print("    One agent submits 3 independent price/qty pairs → uniform-price auction")
+    print("  ┌─ PER-AGENT TABLE  (* = active cycling agent)")
+    print("  │  Green      Green energy share: start→end %(Δpp)")
+    print("  │  Emiss      Mean annual emissions (Mt)")
+    print("  │  BidAmt     Mean annual bid quantity submitted to auction (Mt)")
+    print("  │  Alloc      Mean annual allowances received from auction (Mt)")
+    print("  │  Sf         Shortfall-years / total-years (compliance failures)")
+    print("  │  T1/T2/T3   Final-year tranche bid prices (€/t) — low/mid/high price tiers")
+    print("  │  Rew        Total reward summed over all years (raw RL signal)")
+    print("  │  DiagPts    Sfin/Sgrn/Scomp shown as points on a 0–100 scale")
+    print("  │               Sfin  = cost efficiency score       [0–100 pts]")
+    print("  │               Sgrn  = green progress score        [0–100 pts]")
+    print("  │               Scomp = weighted composite score    [0–100 pts]")
+    print("  │  ALoss/CLoss  Actor / Critic loss from most recent PPO update")
+    print("  │  Secondary    BNy/VMt@P€ = bought N years, V Mt at avg P €  │  HOLD = no trades")
     print()
-    print("  PER-AGENT COLUMNS")
-    print("    Grn       : Green fraction start→end (%)")
-    print("    ΔG        : Net green change (pp)")
-    print("    Emiss     : Mean annual emissions (Mt)")
-    print("    Alloc     : Mean annual allocation (Mt)")
-    print("    Sf        : Shortfall years / total years")
-    print("    Bid€      : Mean bid price (€/t) — weighted average across tranches")
-    print("    BidMt     : Mean bid volume (Mt) — total across tranches")
-    print("    InvFr     : Mean invest fraction")
-    print("    Rew       : Total reward")
-    print("    Short     : Total shortfall (Mt)")
-    print("    Pen       : Total penalty (M€)")
-    print("    ALoss     : Actor loss")
-    print("    CLoss     : Critic loss")
-    print("    MAC       : MAC fuel-switching reduction (Mt)")
-    print("    Secondary : Trade detail — BNy/V.VMt@P€ = bought N yrs, V Mt at avg P€")
-    print("                               SNy/V.VMt@P€ = sold N yrs, V Mt at avg P€")
-    print("                               HOLD = no trades")
+    print("  ┌─ BOT TABLE  (heuristic agents — one row per bot)")
+    print("  │  Same core columns as learning agents, including T1/T2/T3 prices")
+    print("  │  Event board is printed as a separate section below the bot rows")
     print()
-    print("  DIAGNOSTIC SCORES  (episode-mean, non-RL logging only)")
-    print("    Diag(Sfin/Sgrn/Scomp): S_financial / S_green / S_composite per agent")
-    print("    Sfin  : cost efficiency [0,1] — 1 - (budget_spent / annual_budget)")
-    print("    Sgrn  : emission factor progress [0,1] — EF improvement vs initial")
-    print("    Scomp : weighted composite [0,1] — w_cost×Sfin + w_green×Sgrn")
-    print()
-    print("  INLINE WARNINGS  (│ warn: key=N — counts year-steps triggering each condition)")
-    print("    lowAlloc    Alloc < 30% of volume    │  priceCeil  Price ≥90% of price_max")
-    print("    priceFloor  Price hit reserve floor   │  lowDemand  Demand < 70% of supply")
-    print("    noInvest    All invest_frac ≈ 0       │  debtSpiral 3+ shortfall years in a row")
-    print("    bidCluster  Bid std < €5              │  overBank   TNAC > 2× total emissions")
-    print("    1sideSec    All same side (sec mkt)   │  noTrade    Zero sec market volume")
-    print("    cornering   Alloc concentration risk  │  rsvReject  >25% bids below reserve")
-    print()
-    print("  STREAK WARNINGS  (separate ⚠ lines between log intervals)")
-    print("    ⚠ CEILING BID   : Avg bid ≥99% price_max for 200+ episodes")
-    print("    ⚠ FLOOR BID     : Avg bid ≤102% price_min for 200+ episodes")
-    print("    ⚠ ZERO QUANTITY  : Avg bid qty ≤1% qty_max for 200+ episodes")
-    print("    🔄 ENTROPY BOOST : Stuck → entropy boosted to force re-exploration")
+    print("  ┌─ EVENT BOARD  (separate visual block)")
+    print("  │  Defaults/Suspensions by agent: A#/B#:<count> (how many year-events)")
+    print("  │  Stuck states (learning agents): one line only if any condition occurs")
+    print("  │  Format: ceiling=A#:<streak_ep> | floor=A#:<streak_ep> | zeroQty=A#:<streak_ep>")
+    print("  │  Warnings (year-step counts) are printed here, not on the Health line")
+    print("  │  Non-zero warning counters:")
+    print("  │     lowAlloc    Allocation < 30% of auction volume (severe under-bidding)")
+    print("  │     priceFloor  Clearing price hit the reserve floor (~30 €/t)")
+    print("  │     priceCeil   Clearing price ≥ 90% of price_max (near hard cap)")
+    print("  │     auctFail    Auction failed entirely (no valid bids or all below reserve)")
+    print("  │     lowDemand   Total bid demand < 70% of supply (weak market)")
+    print("  │     noInvest    All agents chose invest_frac ≈ 0 (no green investment)")
+    print("  │     debtSpiral  Agent had 3+ consecutive shortfall years (chronic non-compliance)")
+    print("  │     bidCluster  Bid price std dev < €5 (all agents bidding nearly the same)")
+    print("  │     overBank    TNAC > 2× total annual emissions (excessive allowance banking)")
+    print("  │     1sideSec    All secondary-market participants on same side (no counterparty)")
+    print("  │     noTrade     Zero secondary-market volume this year")
+    print("  │     cornering   One agent holds disproportionate share of allocations (HHI risk)")
+    print("  │     rsvReject   > 25% of bids fell below the reserve price (rejected)")
     print(leg)
 
 
 def _format_hms(seconds: float) -> str:
     """Format seconds as HH:MM:SS."""
     return str(datetime.timedelta(seconds=max(0, int(round(float(seconds))))))
+
+
+def _trend_arrow(values: list) -> str:
+    """Return a trend arrow by comparing 2nd-half mean to 1st-half mean."""
+    if len(values) < 4:
+        return ""
+    mid = len(values) // 2
+    a = float(sum(values[:mid]) / mid)
+    b = float(sum(values[mid:]) / (len(values) - mid))
+    if abs(a) < 1e-9:
+        return ""
+    pct = (b - a) / abs(a)
+    if pct > 0.03:
+        return " ↑"
+    if pct < -0.03:
+        return " ↓"
+    return " →"
 
 
 def _resolve_auto_episode_count(raw_value, n_episodes: int,
@@ -1248,34 +1265,21 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 _streak_qty[_i]   = (_streak_qty[_i]   + 1) if avg_bid_qty_per_agent[_i] <= _zero_qty_thresh * _qty_max else 0
 
                 if _streak_ceil[_i] >= _broken_window and _streak_ceil[_i] % _broken_window == 0:
-                    print(
-                        f"⚠ [WARN – CEILING BID] A{_i+1}: avg bid "
-                        f">={_ceil_thresh*100:.0f}% of price_max ({_price_max:.0f} €/t) for "
-                        f"{_streak_ceil[_i]} consecutive episodes (ep {episode})."
-                    )
+                    print(f"⚠ STUCK CEILING: A{_i+1} ({_streak_ceil[_i]}ep)  "
+                          f"avg bid ≥{_ceil_thresh*100:.0f}% of {_price_max:.0f}€  (ep {episode})")
                 if _streak_floor[_i] >= _broken_window and _streak_floor[_i] % _broken_window == 0:
-                    print(
-                        f"⚠ [WARN – FLOOR BID] A{_i+1}: avg bid "
-                        f"<={_floor_thresh*100:.0f}% of price_min ({_price_min:.0f} €/t) for "
-                        f"{_streak_floor[_i]} consecutive episodes (ep {episode})."
-                    )
-                # Per-agent entropy boost logging
+                    print(f"⚠ STUCK FLOOR: A{_i+1} ({_streak_floor[_i]}ep)  "
+                          f"avg bid ≤{_price_min:.0f}€  (ep {episode})")
+                # Per-agent entropy boost — one-time at threshold
                 if _stuck_boost_window > 0:
                     if (_streak_floor[_i] == _stuck_boost_window or
                             _streak_ceil[_i] == _stuck_boost_window):
                         side = "FLOOR" if _streak_floor[_i] >= _stuck_boost_window else "CEILING"
-                        print(
-                            f"🔄 [ENTROPY BOOST] A{_i+1}: stuck at {side} for "
-                            f"{_stuck_boost_window} episodes → entropy boosted "
-                            f"to {_stuck_boost_coef:.3f} (ep {episode})."
-                        )
-
+                        print(f"🔄 ENTROPY BOOST: A{_i+1} stuck {side} ({_stuck_boost_window}ep)"
+                              f"  → ent={_stuck_boost_coef:.3f}  (ep {episode})")
                 if _streak_qty[_i] >= _broken_window and _streak_qty[_i] % _broken_window == 0:
-                    print(
-                        f"⚠ [WARN – ZERO QUANTITY] A{_i+1}: avg bid qty "
-                        f"<={_zero_qty_thresh*100:.0f}% of qty_max ({_qty_max:.1f} Mt) for "
-                        f"{_streak_qty[_i]} consecutive episodes (ep {episode})."
-                    )
+                    print(f"⚠ STUCK ZERO-QTY: A{_i+1} ({_streak_qty[_i]}ep)  "
+                          f"avg qty ≤{_zero_qty_thresh*100:.0f}% of {_qty_max:.1f}Mt  (ep {episode})")
 
         # Average invest_frac action per agent — Phase 1 action[2]
         avg_invest_frac_per_agent = []
@@ -1594,7 +1598,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 f"{_warn_labels.get(k, k)}={v}"
                 for k, v in env._warnings.items() if v > 0
             ]
-            warn_str = "  │ warn: " + " ".join(_warn_parts) if _warn_parts else ""
+            warn_detail = " ".join(_warn_parts) if _warn_parts else "none"
 
             # ── Enhanced secondary market breakdown ────────────────────
             n_total = env.n_total  # learning + bots
@@ -1612,16 +1616,6 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                             sec_holders += 1
             sec_avg_sellers = sec_sellers / max(n_years_ep, 1)
             sec_avg_buyers = sec_buyers / max(n_years_ep, 1)
-            # Per-agent secondary role for learning agents
-            agent_sec_role = []
-            for _ai in range(n_agents):
-                avg_q = avg_sec_qty_per_agent[_ai]
-                if avg_q < -0.01:
-                    agent_sec_role.append("SELL")
-                elif avg_q > 0.01:
-                    agent_sec_role.append("BUY")
-                else:
-                    agent_sec_role.append("HOLD")
 
             # ── Market dynamics aggregates ─────────────────────────────
             total_emiss_ep = sum(
@@ -1629,152 +1623,102 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 for yl in env.episode_log
             )
             avg_annual_emiss = total_emiss_ep / max(n_years_ep, 1)
-            # Compliance rate: fraction of (agent, year) with no shortfall
             total_agent_years = n_total * n_years_ep
             compliant_ay = sum(
                 sum(1 for s in yl.get("shortfalls", [0.0] * n_total) if s < 1e-6)
                 for yl in env.episode_log
             )
             compliance_rate = compliant_ay / max(total_agent_years, 1)
-            avg_green_all = float(np.mean(
-                last_log.get("green_fracs", [0.0] * n_total)[:n_total]))
+            avg_green_start_all = float(np.mean(ep_green_start[:n_total]))
+            avg_green_end_all = float(np.mean(ep_green_end[:n_total]))
 
-            # ── Bot summary ────────────────────────────────────────────
-            bot_lines = []
-            n_bot_agents = config["companies"].get("n_bot_agents", 0)
-            if n_bot_agents > 0:
-                bot_avg_bid = []
-                bot_avg_emiss = []
-                bot_compliant = 0
-                bot_sec_roles = {"SELL": 0, "BUY": 0, "HOLD": 0}
-                for b in range(n_bot_agents):
-                    bidx = n_agents + b  # bots indexed after learning agents in env arrays
-                    # Since bots are at indices n_agents..n_total-1 in env arrays,
-                    # we access them via episode_log which stores n_total-length arrays
-                    b_bids = [yl["bid_prices"][bidx] for yl in env.episode_log
-                              if "bid_prices" in yl and bidx < len(yl["bid_prices"])]
-                    b_emiss = [yl["emissions"][bidx] for yl in env.episode_log
-                               if "emissions" in yl and bidx < len(yl["emissions"])]
-                    b_short = [yl["shortfalls"][bidx] for yl in env.episode_log
-                               if "shortfalls" in yl and bidx < len(yl["shortfalls"])]
-                    b_tq = [yl["trade_qtys"][bidx] for yl in env.episode_log
-                            if "trade_qtys" in yl and bidx < len(yl["trade_qtys"])]
-                    bot_avg_bid.append(np.mean(b_bids) if b_bids else 0.0)
-                    bot_avg_emiss.append(np.mean(b_emiss) if b_emiss else 0.0)
-                    bot_compliant += sum(1 for s in b_short if s < 1e-6)
-                    avg_tq = np.mean(b_tq) if b_tq else 0.0
-                    if avg_tq < -0.01:
-                        bot_sec_roles["SELL"] += 1
-                    elif avg_tq > 0.01:
-                        bot_sec_roles["BUY"] += 1
-                    else:
-                        bot_sec_roles["HOLD"] += 1
-                bot_compliant_yrs = bot_compliant
-                bot_total_yrs = n_bot_agents * n_years_ep
-                bot_sec_str = " ".join(
-                    f"{v}{k[0].lower()}" for k, v in bot_sec_roles.items() if v > 0)
-
-            sep = "═" * 120
-            thin = "─" * 120
-            print(sep)
-            print(f"  Ep {episode:5d} │ {_format_hms(elapsed_s)} elapsed  ETA {_format_hms(eta_s)}  ({avg_ep_s:.2f} s/ep)"
-                  f" │ ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"
-                  f"  eps={current_epsilon:.3f}"
-                  f"{decay_str}{cyc_str}{warmup_str}")
-
-            # Year-by-year price trajectory
-            price_traj = "  ".join(f"{p:3.0f}" for p in prices_ep)
-            print(f"  Price/yr:  {price_traj}   (σ={price_std:.0f})")
-
-            # Year-by-year total emissions trajectory
+            # ── Year-by-year trajectories ──────────────────────────────
             yr_emiss = [sum(yl.get("emissions", [0.0] * n_total)[j] for j in range(n_total))
                         for yl in env.episode_log]
             yr_auct_vol = [yl.get("auction_volume", yl.get("cap", 0.0)) for yl in env.episode_log]
-            emiss_traj = "  ".join(f"{e:3.1f}" for e in yr_emiss)
-            auct_traj  = "  ".join(f"{c:3.1f}" for c in yr_auct_vol)
 
             # MSR status tracking
             msr_cancelled_total = last_log.get("msr_total_cancelled", 0.0)
-            msr_status_str = f"  MSR: reserve={last_log.get('msr_reserve', 0.0):.1f} Mt  cancelled={msr_cancelled_total:.2f} Mt (total)" if msr_cancelled_total > 0.01 else ""
+            msr_str = (f"  MSR: rsv={last_log.get('msr_reserve', 0.0):.1f}Mt"
+                       f"  canc={msr_cancelled_total:.2f}Mt") if msr_cancelled_total > 0.01 else ""
 
-            print(f"  Emiss/yr:  {emiss_traj}   (avg {avg_annual_emiss:.1f} Mt/yr)")
-            print(f"  Auct/yr:   {auct_traj}   (TNAC={tnac:.1f} Mt){msr_status_str}")
+            n_bot_agents = config["companies"].get("n_bot_agents", 0)
 
-            # Market + secondary summary (merged into one compact block)
-            print(f"  Market: comply={compliance_rate*100:.0f}%  green={avg_green_all*100:.0f}%"
-                  f" │ Sec: vol={total_sec_vol:.1f} Mt  match={sec_match_rate*100:.0f}%"
-                  f"  avg_px={avg_sec_price:.1f}€  clear={sec_p:.1f}€"
-                  f"  ({sec_avg_sellers:.0f}sell/{sec_avg_buyers:.0f}buy per yr)"
-                  f"{warn_str}")
-
-            # Bot summary
-            if n_bot_agents > 0:
-                print(f"  Bots ({n_bot_agents}): bid={np.mean(bot_avg_bid):.0f}€"
-                      f"  emiss={np.mean(bot_avg_emiss):.2f} Mt"
-                      f"  comply={bot_compliant_yrs}/{bot_total_yrs}yr"
-                      f"  sec: {bot_sec_str}")
-                bot_idxs = list(range(n_agents, n_total_agents))
-                bot_bid_mult = float(np.mean([avg_bid_mult_per_agent[j] for j in bot_idxs]))
-                bot_bid_cov = float(np.mean([avg_bid_coverage_per_agent[j] for j in bot_idxs]))
-                bot_buy_int = float(np.mean([sec_buy_intent_share[j] for j in bot_idxs]))
-                bot_sell_int = float(np.mean([sec_sell_intent_share[j] for j in bot_idxs]))
-                bot_hold_int = max(0.0, 1.0 - bot_buy_int - bot_sell_int)
-                bot_inv_on = float(np.mean([inv_onshore_share[j] for j in bot_idxs]))
-                bot_inv_off = float(np.mean([inv_offshore_share[j] for j in bot_idxs]))
-                bot_inv_sol = float(np.mean([inv_solar_share[j] for j in bot_idxs]))
-                bot_buy_vol = float(np.sum([per_agent_sec_stats[j]["buy_vol"] for j in bot_idxs]))
-                bot_sell_vol = float(np.sum([per_agent_sec_stats[j]["sell_vol"] for j in bot_idxs]))
-                bot_avg_green_start = float(np.mean([ep_green_start[j] for j in bot_idxs]))
-                bot_avg_green_end = float(np.mean([ep_green_end[j] for j in bot_idxs]))
-                bot_avg_delta_green = bot_avg_green_end - bot_avg_green_start
-                print(f"      behavior: bid_mult={bot_bid_mult:.2f}x  cov={bot_bid_cov:.2f}x"
-                    f"  intent(B/S/H)={bot_buy_int*100:.0f}/{bot_sell_int*100:.0f}/{bot_hold_int*100:.0f}%"
-                    f"  inv(on/off/sol)={bot_inv_on*100:.0f}/{bot_inv_off*100:.0f}/{bot_inv_sol*100:.0f}%"
-                    f"  flow(B/S)={bot_buy_vol:.1f}/{bot_sell_vol:.1f} Mt")
-                print(f"      green: {bot_avg_green_start*100:.0f}→{bot_avg_green_end*100:.0f}% "
-                    f"(Δ{bot_avg_delta_green*100:+.1f}pp)  |  "
-                    f"shortfalls: {sum(ep_shortfall_years[j] for j in bot_idxs)} agent-years")
-
-            # Per-agent table with integrated secondary detail
-            print(thin)
-            
-            # Tranche breakdown from most recent year
+            # ── Tranche prices from final year (for agent rows) ────────
+            _last_tp = []
             if env.episode_log:
-                last_yl = env.episode_log[-1]
-                tranche_prices = last_yl.get("tranche_prices", [])
-                tranche_qtys = last_yl.get("tranche_quantities", [])
-                if tranche_prices and tranche_qtys:
-                    print(f"  TRANCHE BIDS (Yr {last_yl.get('year', n_years_ep)}):")
-                    print(f"  {'Ag':>3}  {'T1 Price€':>9} {'T1 Qty':>7}  │  {'T2 Price€':>9} {'T2 Qty':>7}  │  {'T3 Price€':>9} {'T3 Qty':>7}")
-                    for i in range(n_agents):
-                        if i < len(tranche_prices):
-                            t1p = tranche_prices[i][0] if len(tranche_prices[i]) > 0 else 0.0
-                            t1q = tranche_qtys[i][0] if len(tranche_qtys[i]) > 0 else 0.0
-                            t2p = tranche_prices[i][1] if len(tranche_prices[i]) > 1 else 0.0
-                            t2q = tranche_qtys[i][1] if len(tranche_qtys[i]) > 1 else 0.0
-                            t3p = tranche_prices[i][2] if len(tranche_prices[i]) > 2 else 0.0
-                            t3q = tranche_qtys[i][2] if len(tranche_qtys[i]) > 2 else 0.0
-                            act_mark = "*" if (cycling_enabled and i == active_agent_idx) else " "
-                            print(f"  A{i+1}{act_mark}: {t1p:9.1f} {t1q:7.2f}  │  {t2p:9.1f} {t2q:7.2f}  │  {t3p:9.1f} {t3q:7.2f}")
-                    print(thin)
-            
-            print(f"  {'':4}  {'Grn':>9} {'ΔG':>6} {'Emiss':>6} {'Alloc':>6} "
-                  f"{'Sf':>5} {'Bid€':>6} {'BidMt':>6} {'InvFr':>5} "
-                  f"│ {'Rew':>7} {'Short':>6} {'Pen':>7} {'ALoss':>7} {'CLoss':>7} {'LΔ':>4} "
-                  f"│ {'MAC':>5} │ {'Secondary':>20}")
+                _last_yl = env.episode_log[-1]
+                _last_tp = _last_yl.get("tranche_prices", [])
+
+            # ═══════════════════════════════════════════════════════════
+            #  PRINT
+            # ═══════════════════════════════════════════════════════════
+            W = 130
+            sep = "═" * W
+            thin = "─" * W
+            print(sep)
+
+            # ── Control plane ──────────────────────────────────────────
+            print(f"  Ep {episode:5d} │ {_format_hms(elapsed_s)} elapsed  ETA {_format_hms(eta_s)}"
+                  f"  ({avg_ep_s:.2f} s/ep)"
+                  f" │ ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"
+                  f"  ε={current_epsilon:.3f}"
+                  f"{decay_str}{cyc_str}{warmup_str}")
+
+            # ── Market trajectories ────────────────────────────────────
+            price_traj = "  ".join(f"{p:3.0f}" for p in prices_ep)
+            emiss_traj = "  ".join(f"{e:3.1f}" for e in yr_emiss)
+            auct_traj  = "  ".join(f"{c:3.1f}" for c in yr_auct_vol)
+            print(f"  Price/yr:  {price_traj}   (σ={price_std:.0f}){_trend_arrow(prices_ep)}")
+            print(f"  Emiss/yr:  {emiss_traj}   (avg {avg_annual_emiss:.1f} Mt/yr){_trend_arrow(yr_emiss)}")
+            print(f"  Auct/yr:   {auct_traj}   (TNAC={tnac:.1f} Mt){msr_str}{_trend_arrow(yr_auct_vol)}")
+
+            # ── Health snapshot ─────────────────────────────────────────
+            _gs = avg_green_start_all * 100
+            _ge = avg_green_end_all * 100
+            _dg = _ge - _gs
+            print(f"  Health: comply={compliance_rate*100:.0f}%"
+                  f"  green={_gs:3.0f}→{_ge:3.0f}%({_dg:+.0f}pp)"
+                  f" │ Sec: {total_sec_vol:.1f}Mt  match={sec_match_rate*100:.0f}%"
+                  f"  avg={avg_sec_price:.0f}€  clear={sec_p:.0f}€"
+                f"  (↓{sec_avg_sellers:.0f}sell/↑{sec_avg_buyers:.0f}buy)")
+
+            # ── Per-agent table ─────────────────────────────────────────
+            print(thin)
+            print(f"  {'':4}  {'Green':>16}  {'Emiss':>5} {'BidAmt':>6} {'Alloc':>5}"
+                  f" {'Sf':>4}  {'T1/T2/T3€':>11}"
+                f"  {'Rew':>8}  {'DiagPts(F/G/C)':>16}"
+                  f"  {'ALoss':>7} {'CLoss':>7}"
+                  f"  Secondary")
+
             for i in range(n_agents):
-                act_mark  = "*" if (cycling_enabled and i == active_agent_idx) else " "
-                grn_str   = f"{ep_green_start[i]*100:.0f}→{ep_green_end[i]*100:.0f}%"
-                dgrn_str  = f"{(ep_green_end[i]-ep_green_start[i])*100:+.1f}"
-                sf_str    = f"{ep_shortfall_years[i]}/{n_years_ep}"
-                loss_i    = latest_losses[i] if latest_losses[i] else last_available_losses[i]
-                al_str    = f"{loss_i['actor_loss']:.4f}"  if loss_i else "   n/a"
-                cl_str    = f"{loss_i['critic_loss']:.4f}" if loss_i else "   n/a"
-                if loss_i and last_loss_episode[i] is not None:
-                    loss_age_str = f"{episode - last_loss_episode[i]:4d}"
+                act_mark = "*" if (cycling_enabled and i == active_agent_idx) else " "
+                g0 = ep_green_start[i] * 100
+                g1 = ep_green_end[i] * 100
+                dg = g1 - g0
+                grn_str = f"{g0:3.0f}→{g1:3.0f}%({dg:+3.0f}pp)"
+                sf_str = f"{ep_shortfall_years[i]}/{n_years_ep}"
+
+                # Tranche prices from final year
+                if i < len(_last_tp) and len(_last_tp[i]) >= 3:
+                    t_str = f"{_last_tp[i][0]:3.0f}/{_last_tp[i][1]:3.0f}/{_last_tp[i][2]:3.0f}"
                 else:
-                    loss_age_str = " n/a"
-                # Build compact secondary detail string
+                    t_str = f"{avg_bid_per_agent[i]:3.0f}/  -/  -"
+
+                # Diagnostic scores (inline)
+                acc = ep_diag_accumulator[i]
+                nd = max(acc["count"], 1)
+                s_fin  = acc["S_financial"] / nd
+                s_grn  = acc["S_green"] / nd
+                s_comp = acc["S_composite"] / nd
+                diag_str = f"{s_fin*100:4.0f}/{s_grn*100:4.0f}/{s_comp*100:4.0f}"
+
+                # Losses
+                loss_i = latest_losses[i] if latest_losses[i] else last_available_losses[i]
+                al_str = f"{loss_i['actor_loss']:.4f}" if loss_i else "    n/a"
+                cl_str = f"{loss_i['critic_loss']:.4f}" if loss_i else "    n/a"
+
+                # Secondary detail
                 ss_i = per_agent_sec_stats[i]
                 sec_parts = []
                 if ss_i["buy_years"] > 0:
@@ -1782,25 +1726,88 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 if ss_i["sell_years"] > 0:
                     sec_parts.append(f"S{ss_i['sell_years']}y/{ss_i['sell_vol']:.1f}Mt@{ss_i['sell_avg_px']:.0f}€")
                 sec_str = " ".join(sec_parts) if sec_parts else "HOLD"
-                print(
-                    f"  A{i+1}{act_mark}: "
-                    f"{grn_str:>9} {dgrn_str:>6} {ep_mean_emiss[i]:6.2f} {ep_mean_alloc[i]:6.2f} "
-                    f"{sf_str:>5} {avg_bid_per_agent[i]:6.0f} {avg_bid_qty_per_agent[i]:6.2f} {avg_invest_frac_per_agent[i]:5.3f} "
-                    f"│ {total_rewards[i]:7.1f} {ep_total_shortfalls[i]:6.2f} "
-                    f"{ep_total_penalties[i]:7.0f} {al_str:>7} {cl_str:>7} {loss_age_str:>4} "
-                    f"│ {ep_total_mac_reduction[i]:5.3f} │ {sec_str}"
-                )
-            # F3: Compact diagnostic score summary row (episode mean across years)
-            diag_parts = []
-            for i in range(n_agents):
-                acc = ep_diag_accumulator[i]
-                n = max(acc["count"], 1)
-                s_fin  = acc["S_financial"] / n
-                s_grn  = acc["S_green"] / n
-                s_comp = acc["S_composite"] / n
-                diag_parts.append(f"A{i+1}: {s_fin:.2f}/{s_grn:.2f}/{s_comp:.2f}")
-            if diag_parts:
-                print(f"  Diag(Sfin/Sgrn/Scomp): {' │ '.join(diag_parts)}")
+
+                print(f"  A{i+1}{act_mark}: {grn_str:>16}"
+                        f"  {ep_mean_emiss[i]:5.2f} {avg_bid_qty_per_agent[i]:6.2f} {ep_mean_alloc[i]:5.2f}"
+                      f" {sf_str:>4}  {t_str:>11}"
+                        f"  {ep_total_rewards_all[i]:8.1f}  {diag_str:>16}"
+                      f"  {al_str:>7} {cl_str:>7}"
+                      f"  {sec_str}")
+
+            # ── Bot table (per-bot rows) ────────────────────────────────
+            if n_bot_agents > 0:
+                print(thin)
+                print(f"  {'':4}  {'Green':>16}  {'Emiss':>5} {'BidAmt':>6} {'Alloc':>5}"
+                      f" {'Sf':>4}  {'T1/T2/T3€':>11}"
+                      f"  {'Rew':>8}  Secondary")
+                for b in range(n_bot_agents):
+                    j = n_agents + b
+                    g0 = ep_green_start[j] * 100
+                    g1 = ep_green_end[j] * 100
+                    dg = g1 - g0
+                    grn_str = f"{g0:3.0f}→{g1:3.0f}%({dg:+3.0f}pp)"
+                    sf_str = f"{ep_shortfall_years[j]}/{n_years_ep}"
+                    if j < len(_last_tp) and len(_last_tp[j]) >= 3:
+                        t_bot_str = f"{_last_tp[j][0]:3.0f}/{_last_tp[j][1]:3.0f}/{_last_tp[j][2]:3.0f}"
+                    else:
+                        t_bot_str = f"{avg_bid_per_agent[j]:3.0f}/  -/  -"
+
+                    # Secondary detail
+                    ss_j = per_agent_sec_stats[j]
+                    sec_parts_b = []
+                    if ss_j["buy_years"] > 0:
+                        sec_parts_b.append(f"B{ss_j['buy_years']}y/{ss_j['buy_vol']:.1f}Mt@{ss_j['buy_avg_px']:.0f}€")
+                    if ss_j["sell_years"] > 0:
+                        sec_parts_b.append(f"S{ss_j['sell_years']}y/{ss_j['sell_vol']:.1f}Mt@{ss_j['sell_avg_px']:.0f}€")
+                    sec_str_b = " ".join(sec_parts_b) if sec_parts_b else "HOLD"
+
+                    print(f"  B{b+1} : {grn_str:>16}"
+                          f"  {ep_mean_emiss[j]:5.2f} {avg_bid_qty_per_agent[j]:6.2f} {ep_mean_alloc[j]:5.2f}"
+                          f" {sf_str:>4}  {t_bot_str:>11}"
+                          f"  {ep_total_rewards_all[j]:8.1f}  {sec_str_b}")
+
+            # ── Event board (separate visual block) ────────────────────
+            print(thin)
+            print("  Event Board:")
+
+            _default_counts = {}
+            for yl in env.episode_log:
+                _as = yl.get("auction_stats", {})
+                _def_list = _as.get("defaults_agents", [])
+                for _di in _def_list:
+                    _idx = int(_di)
+                    _default_counts[_idx] = _default_counts.get(_idx, 0) + 1
+
+            if _default_counts:
+                _def_items = []
+                for _idx in sorted(_default_counts):
+                    _tag = f"A{_idx + 1}" if _idx < n_agents else f"B{_idx - n_agents + 1}"
+                    _def_items.append(f"{_tag}:{_default_counts[_idx]}")
+                print(f"  Defaults/Suspensions by agent (count): {'  '.join(_def_items)}")
+            else:
+                print("  Defaults/Suspensions by agent (count): none")
+
+            _stuck_ceil_agents = [
+                f"A{i+1}:{int(v)}ep" for i, v in enumerate(_streak_ceil) if v >= _broken_window
+            ]
+            _stuck_floor_agents = [
+                f"A{i+1}:{int(v)}ep" for i, v in enumerate(_streak_floor) if v >= _broken_window
+            ]
+            _stuck_qty_agents = [
+                f"A{i+1}:{int(v)}ep" for i, v in enumerate(_streak_qty) if v >= _broken_window
+            ]
+            _stuck_parts = []
+            if _stuck_ceil_agents:
+                _stuck_parts.append("ceiling=" + "  ".join(_stuck_ceil_agents))
+            if _stuck_floor_agents:
+                _stuck_parts.append("floor=" + "  ".join(_stuck_floor_agents))
+            if _stuck_qty_agents:
+                _stuck_parts.append("zeroQty=" + "  ".join(_stuck_qty_agents))
+            if _stuck_parts:
+                print(f"  Stuck states (learning, >= {_broken_window}ep): "
+                      f"{' | '.join(_stuck_parts)}")
+            print(f"  Warnings (year-step counts): {warn_detail}")
+
             print(sep)
 
             # Optional callback for live plotting (e.g. from notebook)
