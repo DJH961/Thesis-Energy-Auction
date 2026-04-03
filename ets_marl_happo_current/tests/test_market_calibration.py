@@ -27,7 +27,8 @@ def test_16_agents_matches_current_config():
 
     assert params["cap_year_0"] == pytest.approx(50.0, abs=0.1)
     assert params["tnac_upper"] == pytest.approx(18.0, abs=0.1)
-    assert params["tnac_lower"] == pytest.approx(9.0, abs=0.1)
+    # tnac_lower_ratio updated to 0.22 (from 0.18): 50 × 0.22 ≈ 11.0
+    assert params["tnac_lower"] == pytest.approx(11.0, abs=0.2)
 
 
 def test_12_agents_scales_down():

@@ -5,6 +5,80 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v8.1.0
+
+**Plan v8.1: LRF/MSR Realism, Tranche Sorting, Obs Consolidation, Reward Shaping, Collateral Enforcement**
+
+### Phase A — TNAC/MSR Realism
+- **Linear LRF**: Fixed exponential-decay bug in cap schedule. Cap now declines by equal
+  absolute steps: `cap_t = cap_0 − Σ lrf_k × cap_0`. `lrf_phase_switch` set to year 2
+  (2026–27 use 4.3%; 2028+ use 4.4%).
+- **1-year TNAC lag** (`_prev_tnac`): MSR decisions at year t now use the *prior-year* TNAC,
+  matching EU ETS Decision 2015/1814 Art. 1(5) which observes the previous year's TNAC
+  before any intervention. Year 0 has no MSR unless `force_msr=True` (burn-in mode uses
+  current TNAC directly for calibration).
+- **Updated MSR thresholds**: Lower intake threshold raised 18% → 22% of CAP_0;
+  `release_frac` raised 0.016 → 0.064 (6.4% of CAP_0), matching post-2023 reform values.
+- **Smoothed price trigger (A4)**: Emergency MSR release now requires *both* an absolute
+  threshold breach (≥ 85% of penalty rate or ≥ 300 EUR/t) *and* a MA3 price spike
+  > 2.5× the prior year's MA3. Prevents procyclical flash releases.
+
+### Phase B — Tranche Sorting
+- **B1 invariant**: Tranches sorted ascending by price immediately after action extraction
+  (before all budget/cap checks). Applies to **both RL agents and heuristic bots**:
+  - RL agents: common `raw_tranches.sort()` in `step_auction()`.
+  - Bots: pre-sorted by construction (T1=0.9×, T2=1.0×, T3=1.1× mid price), then also
+    passes through the common sort — the invariant is guaranteed regardless.
+- **No observation-space impact**: Phase 1 obs is built before bidding; Phase 2 D1/D2 dims
+  use post-sort tranche positions (`_phase1_tranche_prices` are stored after B1), so agents
+  receive fill-ratio feedback for the actual sorted positions they submitted.
+
+### Phase C — Heuristic Rewrite
+- **C1 3-tranche demand curve**: Heuristic bot produces T1=0.9×, T2=1.0×, T3=1.1× mid
+  price with qty/3 each, encoding a downward-sloping demand curve.
+- **C2/C3 smarter secondary**: Final-year urgency boost (×3 compliance pressure), no
+  selling when in compliance debt (`carry_forward > 0`), green agents sell surplus at
+  half rate, budget headroom cap on buying.
+
+### Phase D — Per-Tranche Feedback (auction only)
+- 6 new Phase 2 observation dimensions via `_compute_tranche_fill_ratios()`:
+  - 3 per-tranche fill ratios: `allocated_k / bid_qty_k` (0 = no fill, 1 = full fill).
+  - 3 price-vs-clearing signals: `(price_k − clearing_price) / price_norm` (signed).
+- Agents can now observe which tranches were accepted/rejected and by how much,
+  enabling direct learning of optimal demand-curve shaping.
+
+### Phase E — Bid Constraints
+- **E1 aggregate bid cap**: Total bid quantity ≤ 3× annual need across all 3 tranches
+  combined (`aggregate_bid_cap_mult: 3.0`).
+- **E2 revised collateral**: `collateral_fraction` corrected to **0.10** (10% — mid-range of
+  real EUA exchange initial margin 5–15%). `max_collateral_budget_share` updated to **0.50**.
+  Old value (0.001 = 10bps) was unrealistically small.
+- **E4 leverage/suspension config**: Added `leverage_multiplier: 3.0`, `suspension_length: 2`,
+  `carry_forward_defaults: true` to auction config for future enforcement features.
+
+### Phase F — Reward Interpretability
+- **Efficiency bonus as shaping**: `efficiency_bonus` now decays with `shaping_weight` (not
+  a permanent base reward). Consistent naming (`efficiency_bonus` throughout).
+- **`compute_diagnostic_score()`**: New method returning S_financial, S_green, S_penalty,
+  S_composite per agent. Scores are logged to year-level CSV (`diag_S_*_Ai` columns).
+- **Console output**: Episode-mean diagnostic scores now printed in training output:
+  `Diag(Sfin/Sgrn/Scomp): A1: 0.72/0.15/0.52 │ A2: ...`
+
+### Phase G — Observation Space Consolidation (auction only)
+- Phase 1 base reduced from 28D to **24D** (−4 dims):
+  - Removed `expected_price_ar1` at [3] (redundant with MA3 + time signal).
+  - Replaced 5 raw tech fracs [4–8] with 3 summary fracs [3–5]: `green_frac`, `coal_frac`,
+    `gas_frac`. `mix` indices: 0=coal, 1=gas, 2=onshore, 3=offshore, 4=solar.
+  - Removed `predicted_msr_withholding` at [26] (derivable from TNAC proxy at [18]).
+- Phase 2 = 24 + 7 (standard) + 6 (D1/D2) = **37D** base (net +2 vs prior 35D).
+- With 16 total participants (no opponent modeling): 24D Phase 1, 37D Phase 2.
+
+### Config / Metadata
+- Version bumped to `8.1.0` in `pyproject.toml`, `configs/default.yaml`.
+- Per-tranche qty_mult_high reduced 2.0 → 1.5 (aggregate cap of 3.0× is the binding limit).
+
+---
+
 ## v8.0.0
 
 **3-Tranche Bid Ladder + Uniform-Price Call Auction Secondary Market**

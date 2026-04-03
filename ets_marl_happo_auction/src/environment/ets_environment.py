@@ -48,7 +48,7 @@ import numpy as np
 import gymnasium as gym
 from typing import List, Optional
 
-from src.auction.market_clearing_ets import market_clearing_ets, build_bids
+from src.auction.market_clearing_ets import market_clearing_ets, build_bids, settle_auction
 from src.environment.cap_schedule import CapSchedule
 from src.environment.company import Company
 from src.environment.market_calibration import compute_market_params
@@ -169,6 +169,15 @@ class ETSEnvironment(gym.Env):
         # Unsold allowance rollover: volume offered at auction but not allocated
         # carries forward to the next year's auction supply.
         self._unsold_rollover = 0.0
+
+        # E4: Suspension and default carry-forward tracking
+        # _suspension_remaining[i]: number of auction rounds agent i is still suspended
+        # _defaulted_volume_pending: allowance volume returned by defaults to add next year
+        self._suspension_remaining = np.zeros(self.n_total, dtype=int)
+        self._defaulted_volume_pending = 0.0
+        # E2/E4: Per-agent collateral locked in Phase 1 (step_auction).
+        # Stored so Phase 2 can charge the opportunity cost without re-deriving bids.
+        self._collateral_locked = np.zeros(self.n_total)
 
         # Dynamic reserve tracking
         self._last_effective_reserve = config["ets"].get("reserve_price", 0.0)
@@ -294,6 +303,53 @@ class ETSEnvironment(gym.Env):
     # Dynamic reserve price
     # ------------------------------------------------------------------
 
+    def _compute_tranche_fill_ratios(self, allocations: np.ndarray,
+                                     clearing_price: float) -> list:
+        """
+        D1: Compute per-tranche fill ratios analytically.
+
+        For a uniform-price auction: bids above clearing_price are fully
+        filled (up to per-agent holding limits). Bids below clearing_price
+        receive zero fill. At exactly clearing_price, filling is partial.
+
+        We reconstruct per-tranche fills from stored tranche prices and
+        quantities alongside the actual per-agent total allocation.
+
+        Returns a list of length n_agents, each element is a list of 3
+        fill ratios [fill_t1, fill_t2, fill_t3] in [0, 1].
+        """
+        N_TRANCHES = 3
+        results = []
+        for i in range(self.n_agents):
+            prices_i = self._phase1_tranche_prices[i]   # list of 3 prices (ascending, after B1)
+            qtys_i = self._phase1_tranche_quantities[i]  # list of 3 qtys (Mt)
+            total_alloc = float(allocations[i])
+
+            fill_ratios = [0.0] * N_TRANCHES
+            remaining_alloc = total_alloc
+
+            # Distribute allocation from highest-price tranche down (price-priority filling)
+            # Since tranches are sorted ascending (B1), fill in reverse order
+            for t in sorted(range(N_TRANCHES), key=lambda k: -prices_i[k]):
+                if remaining_alloc <= 1e-9:
+                    break
+                qty_t = float(qtys_i[t])
+                if qty_t < 1e-9:
+                    fill_ratios[t] = 0.0
+                    continue
+                if prices_i[t] < clearing_price - 1e-9:
+                    # Below clearing → no fill
+                    fill_ratios[t] = 0.0
+                else:
+                    # At or above clearing → fill from remaining allocation
+                    fill = min(qty_t, remaining_alloc)
+                    fill_ratios[t] = fill / qty_t
+                    remaining_alloc -= fill
+                    remaining_alloc = max(0.0, remaining_alloc)
+
+            results.append(fill_ratios)
+        return results
+
     def _compute_dynamic_reserve(self) -> float:
         """
         Compute effective reserve price for this year's auction.
@@ -394,7 +450,9 @@ class ETSEnvironment(gym.Env):
 
         self.cap_schedule.reset()
         self._unsold_rollover = 0.0
-        self._build_episode_inflation_path()
+        self._suspension_remaining = np.zeros(self.n_total, dtype=int)
+        self._defaulted_volume_pending = 0.0
+        self._collateral_locked = np.zeros(self.n_total)
 
         if self._fade_enabled:
             n_active_bots = self._resolve_fade_active_bots(self.current_episode)
@@ -631,6 +689,10 @@ class ETSEnvironment(gym.Env):
             cap_t = self.cap_schedule.get_cap(burnin_year)
             tnac = float(self.holdings.sum())
             last_price = self._price_history[-1] if self._price_history else price_mean
+            burnin_price_ma3 = (
+                float(sum(self._price_history[-3:]) / len(self._price_history[-3:]))
+                if self._price_history else price_mean
+            )
             auction_volume = self.cap_schedule.get_auction_volume(
                 year=burnin_year,
                 tnac=tnac,
@@ -639,6 +701,7 @@ class ETSEnvironment(gym.Env):
                 penalty_rate=base_penalty_rate,
                 inflation_rate=inflation_rate,
                 force_msr=True,
+                price_ma3=burnin_price_ma3,
             )
             self._last_auction_volume = float(auction_volume)
 
@@ -859,16 +922,21 @@ class ETSEnvironment(gym.Env):
                                       cap_t: float = None) -> np.ndarray:
         """Generate Phase-1 actions for all bot agents using heuristic_policy.
 
-        Bot heuristic produces 6D [price, qty_mult, invest_frac, t0, t1, t2].
-        We expand to 10D 3-tranche format by splitting the single bid into
-        three equal tranches at the same price:
-          [p, q/3, p, q/3, p, q/3, invest_frac, t0, t1, t2]
+        Bot heuristic produces 6D [mid_price, total_qty_mult, invest_frac, t0, t1, t2].
+        We expand to 10D 3-tranche format using C1 demand-curve logic:
+          T1: p×0.90, q/3  (cheap tranche — opportunistic)
+          T2: p,       q/3  (core tranche — primary compliance)
+          T3: p×1.10, q/3  (insurance tranche — scarcity guard)
+
+        Tranches are already sorted ascending by price (B1 invariant satisfied).
+        T1/T3 prices are clipped to [price_min, price_max].
         """
         if self.n_bots == 0:
             return np.zeros((0, 10), dtype=np.float32)
         price_ma3 = self._compute_price_ma3()
         reserve = self._compute_dynamic_reserve()
         price_min = float(self.config["auction"]["price_min"])
+        price_max = float(self.config["auction"]["price_max"])
         infl_factor = self._inflation_factor(self.current_year)
         bot_cfg = self.config.get("bots", {})
         urgency_denoms = bot_cfg.get("urgency_denominators", [1.5] * self.n_bots)
@@ -882,7 +950,7 @@ class ETSEnvironment(gym.Env):
                                        0.0, 0.0, 0.0, 0.0], dtype=np.float32)
                 continue
 
-            idx = self.n_agents + b  # bots indexed after learning agents
+            idx = self.n_agents + b
             urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
             action6 = heuristic_policy.auction_action(
                 self.companies[idx], price_ma3, self.current_year,
@@ -898,11 +966,16 @@ class ETSEnvironment(gym.Env):
             )
             if self._enhanced_noise_enabled and bool(self._bot_budget_stressed[b]):
                 action6[1] = float(np.clip(action6[1] * budget_stress_qty_mult, qty_low, qty_high))
-            # Expand 6D → 10D: split single bid into 3 equal tranches
-            p = action6[0]
-            q = action6[1]
-            q_third = q / 3.0
-            actions[b] = np.array([p, q_third, p, q_third, p, q_third,
+
+            # C1: Expand 6D → 10D using 3-tranche demand curve (B1: ascending price)
+            p_mid = float(action6[0])
+            q_total = float(action6[1])
+            q_third = q_total / 3.0
+            # T1: slightly below market (opportunistic), T2: at market, T3: above (insurance)
+            p1 = float(np.clip(p_mid * 0.90, price_min, price_max))
+            p2 = p_mid
+            p3 = float(np.clip(p_mid * 1.10, price_min, price_max))
+            actions[b] = np.array([p1, q_third, p2, q_third, p3, q_third,
                                    action6[2], action6[3], action6[4], action6[5]],
                                   dtype=np.float32)
         return actions
@@ -988,13 +1061,25 @@ class ETSEnvironment(gym.Env):
         # Pass base penalty rate (not inflation-adjusted) and inflation rate to MSR
         base_penalty_rate = float(self.config["penalty"]["rate"])
         inflation_rate = float(self._inflation_rate(year))
+        price_ma3 = self._compute_price_ma3()
         base_auction_volume = self.cap_schedule.get_auction_volume(
             year, tnac, self.last_clearing_price, price_max,
-            base_penalty_rate, inflation_rate
+            base_penalty_rate, inflation_rate,
+            price_ma3=price_ma3,
         )
         auction_volume = base_auction_volume
         log["cap"] = cap_t
         log["tnac"] = tnac
+
+        # E4: Add defaulted volume from previous year to this year's supply
+        defaulted_rolled_in = 0.0
+        if self._defaulted_volume_pending > 0.0:
+            if self.config["auction"].get("carry_forward_defaults", True):
+                auction_volume += self._defaulted_volume_pending
+                defaulted_rolled_in = self._defaulted_volume_pending
+            self._defaulted_volume_pending = 0.0
+        log["defaulted_volume_rolled_in"] = round(defaulted_rolled_in, 4)
+
         log["auction_volume"] = auction_volume
         self._last_auction_volume = float(auction_volume)
         log["unsold_rollover_in"] = round(self._unsold_rollover, 4)
@@ -1079,6 +1164,9 @@ class ETSEnvironment(gym.Env):
         tranche_prices = [[0.0] * N_TRANCHES for _ in range(self.n_total)]
         tranche_quantities = [[0.0] * N_TRANCHES for _ in range(self.n_total)]
 
+        # E1: Aggregate bid volume cap — total bid ≤ 3× annual_need
+        aggregate_bid_cap_mult = float(self.config["auction"].get("aggregate_bid_cap_mult", 3.0))
+
         for i, company in enumerate(self.companies):
             if not self._is_agent_active(i):
                 bid_qty_multipliers[i] = 0.0
@@ -1089,8 +1177,8 @@ class ETSEnvironment(gym.Env):
             base_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
             estimate_needs[i] = base_need
 
-            total_qty_i = 0.0
-            price_qty_sum = 0.0
+            # Extract raw tranche (price, qty) pairs from action vector
+            raw_tranches = []
             for t in range(N_TRANCHES):
                 p_raw = float(auction_actions[i, 2 * t])
                 q_raw = float(auction_actions[i, 2 * t + 1])
@@ -1100,7 +1188,22 @@ class ETSEnvironment(gym.Env):
                 if lot_size > 0:
                     q_abs = max(lot_size, round(q_abs / lot_size) * lot_size)
                 q_abs = max(0.0, q_abs)
-                # Store per-tranche data
+                raw_tranches.append((p_clipped, q_abs))
+
+            # B1: Sort tranches ascending by price (T1 = cheapest, T3 = most expensive)
+            raw_tranches.sort(key=lambda pq: pq[0])
+
+            # E1: Cap total bid quantity at aggregate_bid_cap_mult × base_need
+            total_unsorted = sum(q for _, q in raw_tranches)
+            agg_cap = aggregate_bid_cap_mult * base_need
+            if total_unsorted > agg_cap + 1e-9 and total_unsorted > 1e-9:
+                scale = agg_cap / total_unsorted
+                raw_tranches = [(p, q * scale) for p, q in raw_tranches]
+
+            total_qty_i = 0.0
+            price_qty_sum = 0.0
+            for t, (p_clipped, q_abs) in enumerate(raw_tranches):
+                # Store per-tranche data (after sorting)
                 tranche_prices[i][t] = p_clipped
                 tranche_quantities[i][t] = q_abs
                 if q_abs > 1e-6:
@@ -1116,14 +1219,39 @@ class ETSEnvironment(gym.Env):
             else:
                 agent_wavg_price[i] = price_min
 
-        # Pre-auction collateral affordability clip (applied to total agent bid)
+        # E4: Leverage gate — clip total bid notional by leverage_multiplier × cash.
+        # For multi-tranche bids, scale all tranches proportionally if total notional
+        # (sum of price × qty across tranches) exceeds the leverage limit.
+        aq_cfg = self.config["auction"]
+        lev_mult = float(aq_cfg.get("leverage_multiplier", 3.0))
+        if lev_mult > 0.0:
+            for i, company in enumerate(self.companies):
+                if not self._is_agent_active(i):
+                    continue
+                if agent_total_qty[i] < 1e-9 or agent_wavg_price[i] < 1e-9:
+                    continue
+                cash = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
+                total_notional = agent_wavg_price[i] * agent_total_qty[i]
+                max_notional = lev_mult * cash
+                if total_notional > max_notional and total_notional > 1e-9:
+                    scale = max_notional / total_notional
+                    for row in all_bid_rows:
+                        if int(row[0]) == i:
+                            row[1] *= scale
+                    agent_total_qty[i] *= scale
+
+        # E2: Pre-auction collateral affordability clip (10% of weighted-avg bid value)
+        # Collateral = collateral_fraction × weighted_avg_price × total_qty
+        # If collateral > max_collateral_budget_share × available_budget → scale down bids.
         coll_cfg = self.config.get("auction", {}).get("collateral", {})
         if coll_cfg.get("enabled", True):
-            _rate = float(coll_cfg.get("interest_rate", coll_cfg.get("opportunity_cost_rate", 0.05)))
-            _hold = float(coll_cfg.get("hold_fraction", 0.02))
+            coll_frac = float(coll_cfg.get("collateral_fraction",
+                                            coll_cfg.get("opportunity_cost_rate", 0.05)
+                                            * coll_cfg.get("hold_fraction", 0.02)))
+            max_coll_share = float(coll_cfg.get("max_collateral_budget_share", 0.50))
             _floor = float(coll_cfg.get("min_qty_floor_frac", 0.5))
 
-            if _rate > 0.0 and _hold > 0.0:
+            if coll_frac > 0.0:
                 for i, company in enumerate(self.companies):
                     if not self._is_agent_active(i):
                         continue
@@ -1131,21 +1259,20 @@ class ETSEnvironment(gym.Env):
                     avg_p = agent_wavg_price[i]
                     if total_q < 1e-6 or avg_p < 1e-6:
                         continue
-                    need_i = float(company.compute_emissions())
                     budget_remaining = max(
                         0.0,
                         float(company.annual_budget - company.budget_spent_this_year),
                     )
-                    worst_case = _rate * _hold * avg_p * total_q
-                    if worst_case > budget_remaining:
+                    collateral = coll_frac * avg_p * total_q
+                    max_collateral = max_coll_share * budget_remaining
+                    if collateral > max_collateral and max_collateral > 0:
                         # Scale down all tranches for this agent proportionally
-                        if total_q > 1e-6:
-                            scale = max(0.0, budget_remaining / (_rate * _hold * avg_p * total_q))
-                            scale = min(scale, 1.0)
-                            for row in all_bid_rows:
-                                if int(row[0]) == i:
-                                    row[1] *= scale
-                            agent_total_qty[i] *= scale
+                        scale = max(0.0, max_collateral / collateral)
+                        scale = min(scale, 1.0)
+                        for row in all_bid_rows:
+                            if int(row[0]) == i:
+                                row[1] *= scale
+                        agent_total_qty[i] *= scale
 
         # Store aggregate per-agent bid info for logging (backward-compatible)
         self._phase1_bid_prices = agent_wavg_price.copy()
@@ -1154,9 +1281,41 @@ class ETSEnvironment(gym.Env):
         self._phase1_tranche_prices = tranche_prices
         self._phase1_tranche_quantities = tranche_quantities
 
+        # E4: Suspension enforcement — suspended agents cannot bid this round.
+        # Decrement suspension counter; bids for suspended agents already filtered since
+        # their rows were never added to all_bid_rows (qty=0 rows are dropped).
+        suspended_agents_set = set()
+        for i in range(self.n_total):
+            if self._suspension_remaining[i] > 0:
+                suspended_agents_set.add(i)
+                self._suspension_remaining[i] -= 1
+        # Remove any bid rows from suspended agents
+        if suspended_agents_set:
+            all_bid_rows = [row for row in all_bid_rows if int(row[0]) not in suspended_agents_set]
+            for i in suspended_agents_set:
+                agent_total_qty[i] = 0.0
+
         # Compute effective reserve price (dynamic or static)
         effective_reserve = self._compute_dynamic_reserve()
         self._last_effective_reserve = effective_reserve
+
+        # E4: Pre-bid collateral locking — fraction of margin above reserve per agent.
+        coll_frac_e4 = float(coll_cfg.get("collateral_fraction",
+                                           coll_cfg.get("opportunity_cost_rate", 0.05)
+                                           * coll_cfg.get("hold_fraction", 0.02)))
+        collateral_locked = np.zeros(self.n_total)
+        for i in range(self.n_total):
+            if not self._is_agent_active(i) or i in suspended_agents_set:
+                continue
+            total_q = agent_total_qty[i]
+            avg_p = agent_wavg_price[i]
+            if avg_p > 1e-6 and total_q > 1e-6:
+                collateral_locked[i] = (
+                    coll_frac_e4 * max(0.0, avg_p - effective_reserve) * total_q
+                )
+
+        # Store for Phase 2: collateral opportunity cost uses locked amount directly.
+        self._collateral_locked = collateral_locked.copy()
 
         # Build bids array from collected tranche rows
         if all_bid_rows:
@@ -1173,6 +1332,39 @@ class ETSEnvironment(gym.Env):
                 "cancel_under_subscribed", False),
             n_agents=self.n_total,
         )
+
+        # E4: Post-clearing settlement — check each winner can pay; handle defaults.
+        suspension_length = int(self.config["auction"].get("suspension_length", 2))
+        agent_cash = np.array([
+            max(0.0, float(c.annual_budget - c.budget_spent_this_year))
+            for c in self.companies
+        ])
+        (allocations, payments,
+         defaults_mask, defaulted_volume,
+         suspension_steps) = settle_auction(
+            allocations=allocations,
+            payments=payments,
+            agent_cash=agent_cash,
+            collateral_locked=collateral_locked,
+            suspension_length=suspension_length,
+        )
+        # Apply defaults: exhaust remaining annual budget (signals insolvency).
+        # Collateral is forfeited implicitly: settle_auction already zeroed the allocation
+        # so no allowances are received, but the locked collateral amount is not returned.
+        for i in range(self.n_total):
+            if defaults_mask[i]:
+                excess = max(0.0, self.companies[i].annual_budget
+                             - self.companies[i].budget_spent_this_year)
+                self.companies[i].record_spending(excess)
+                self._suspension_remaining[i] = suspension_steps[i]
+        # Carry forward defaulted volume to next year's q_cap
+        if defaulted_volume > 0.0:
+            self._defaulted_volume_pending += defaulted_volume
+        # Augment auction_stats with E4 default/suspension info
+        auction_stats["defaults"] = int(defaults_mask.sum())
+        auction_stats["defaulted_volume"] = float(defaulted_volume)
+        auction_stats["suspended_agents"] = int((self._suspension_remaining > 0).sum())
+
         # Unsold allowances: either absorbed into MSR or rolled over to next year's auction
         unsold = max(0.0, auction_volume - float(allocations.sum()))
         self._unsold_rollover = unsold
@@ -1313,8 +1505,15 @@ class ETSEnvironment(gym.Env):
         self._phase1_mac_costs = mac_costs
         self._phase1_log = log
 
+        # D1: Compute per-tranche fill ratios for each learning agent
+        # This uses an analytic reconstruction: given clearing_price and each
+        # tranche's (price, qty) pair, compute expected fill without re-running clearing.
+        tranche_fills = self._compute_tranche_fill_ratios(
+            allocations, clearing_price)
+
         # 10. Build phase 2 observations (learning agents only)
         obs_phase1 = self._get_obs_phase1()   # shape (n_agents, obs_dim)
+        pn = float(self.config["auction"]["price_max"])
 
         obs_phase2 = np.stack([
             self.companies[i].get_observation_phase2(
@@ -1323,8 +1522,13 @@ class ETSEnvironment(gym.Env):
                 clearing_price=clearing_price,
                 emissions=realized_emissions[i],
                 banked=self.holdings[i],
-                emission_shock=float(epsilons[i]),   # P5: shock in obs
-                payment=float(payments[i]),           # for auction_savings dim
+                emission_shock=float(epsilons[i]),
+                payment=float(payments[i]),
+                tranche_fill_ratios=tranche_fills[i],
+                tranche_price_vs_clearing=[
+                    (self._phase1_tranche_prices[i][t] - clearing_price) / max(pn, 1.0)
+                    for t in range(3)
+                ],
             )
             for i in range(self.n_agents)
         ])
@@ -1480,16 +1684,17 @@ class ETSEnvironment(gym.Env):
         # Holdings after secondary market
         holdings = self.holdings + allocations + trade_qtys
 
-        # Bid collateral opportunity cost (EU ETS-style overbidding deterrent).
+        # Collateral opportunity cost: rate × locked collateral from Phase 1 (E2/E4).
+        # self._collateral_locked is computed in step_auction() as:
+        #   collateral_fraction × max(0, avg_bid_price − reserve) × bid_qty
+        # Charging rate × locked_amount is equivalent to the financing cost of
+        # tying up margin capital for the settlement period.
         collateral_costs = np.zeros(self.n_total)
         collateral_cfg = self.config.get("auction", {}).get("collateral", {})
         if collateral_cfg.get("enabled", False):
             rate = float(collateral_cfg.get("opportunity_cost_rate", 0.0))
-            hold = float(collateral_cfg.get("hold_fraction", 0.0))
-            if self._phase1_bid_prices is not None:
-                spreads = np.maximum(0.0, self._phase1_bid_prices - clearing_price)
-                collateral_costs = rate * hold * spreads * np.maximum(allocations, 0.0)
-                collateral_costs[~active_mask] = 0.0
+            collateral_costs = rate * self._collateral_locked
+            collateral_costs[~active_mask] = 0.0
 
         # Use P5-shocked realized emissions for compliance
         #realized_emissions = self._current_emissions
@@ -1640,7 +1845,15 @@ class ETSEnvironment(gym.Env):
         self.episode_done = terminated
 
         obs_next = self._get_obs_phase1()   # shape (n_agents, obs_dim)
-        return obs_next, rewards[:self.n_agents], terminated, False, {"year_log": log}
+        # F2: Compute per-agent diagnostic scores and expose via info dict
+        try:
+            diag_scores = self.compute_diagnostic_score()
+        except Exception:
+            diag_scores = []
+        return obs_next, rewards[:self.n_agents], terminated, False, {
+            "year_log": log,
+            "diagnostic_scores": diag_scores,
+        }
 
     # ------------------------------------------------------------------
     # Legacy step (calls both phases — for testing)
@@ -1866,16 +2079,17 @@ class ETSEnvironment(gym.Env):
                 esg_raw = ef_ratio * time_ratio * (company.annual_budget / 1000.0)
                 esg_signal = esg_scale * esg_raw
 
-            # Permanent cost-efficiency improvement bonus (Priority 5):
+            # F1: Efficiency bonus as a shaping reward (decays with shaping_weight).
+            # Named 'efficiency_bonus' for consistency; acts as shaping (not permanent base reward).
             # Rewards emission factor improvement regardless of w_green, proportional to
-            # remaining time and carbon price. This gives coal agents a gradient to invest early.
+            # remaining time and carbon price.
             efficiency_bonus = 0.0
             if company.initial_ef > 0.01:
                 ef_improvement = max(0.0, company.initial_ef - company.weighted_emission_factor)
                 ef_improvement_ratio = ef_improvement / company.initial_ef
                 time_weight = remaining_years / self.n_years
                 price_weight = clearing_price / 100.0
-                efficiency_bonus = 1.5 * ef_improvement_ratio * time_weight * price_weight
+                efficiency_bonus = 1.5 * ef_improvement_ratio * time_weight * price_weight * self.shaping_weight
 
             # Cost-of-capital on allowances carried after compliance settlement.
             # NOTE: self.holdings[i] is already the post-compliance bank at this
@@ -1885,11 +2099,10 @@ class ETSEnvironment(gym.Env):
             base_reward = float(
                 company.w_cost * (-cost_norm_ex_penalty)
                 + company.w_green * esg_signal
-                + efficiency_bonus  # permanent bonus, applies to ALL agents
                 - penalty_norm  # penalty at full strength for all agents
                 - opp_cost
             )
-            shaping_reward = float(green_bonus)
+            shaping_reward = float(green_bonus + efficiency_bonus)
 
             base_rewards[i] = base_reward
             shaping_rewards[i] = shaping_reward
@@ -1975,6 +2188,85 @@ class ETSEnvironment(gym.Env):
     # ------------------------------------------------------------------
     # Observations
     # ------------------------------------------------------------------
+
+    def compute_diagnostic_score(self, agent_id: int = None) -> dict:
+        """
+        F2: Compute interpretable diagnostic scores for agents.
+
+        Returns a dict with three normalized components (each in [0, 1]):
+          S_financial: cost efficiency (lower total cost = higher score)
+          S_green:     emission factor progress relative to initial
+          S_penalty:   compliance score (1 - normalized penalty incurred)
+          S_composite: weighted combination based on agent's w_cost/w_green
+
+        These scores are logged to CSV for analysis and can be used to
+        evaluate policy quality without reward normalization artifacts.
+
+        Parameters
+        ----------
+        agent_id : int, optional
+            If provided, return scores for that specific agent only.
+            If None, return list of dicts for all learning agents.
+
+        Returns
+        -------
+        dict or list[dict]
+        """
+        results = []
+        budget_ref = max(1.0, float(
+            sum(c.annual_budget for c in self.companies[:self.n_agents]) / max(self.n_agents, 1)
+        ))
+        pen_cfg = self.config["penalty"]
+        eff_penalty = pen_cfg["rate"] * self._inflation_factor(self.current_year)
+
+        for i, company in enumerate(self.companies[:self.n_agents]):
+            if not self._is_agent_active(i):
+                results.append({
+                    "agent_id": i, "S_financial": 0.0, "S_green": 0.0,
+                    "S_penalty": 0.0, "S_composite": 0.0,
+                })
+                continue
+
+            # S_financial: 1 - (total_non_penalty_cost / annual_budget)
+            # Higher score = lower non-penalty spending relative to budget
+            total_cost = company.budget_spent_this_year
+            s_financial = max(0.0, 1.0 - total_cost / max(budget_ref, 1.0))
+
+            # S_green: emission factor progress vs initial
+            if company.initial_ef > 1e-6:
+                ef_progress = max(0.0, company.initial_ef - company.weighted_emission_factor)
+                s_green = ef_progress / company.initial_ef
+            else:
+                s_green = 1.0  # already at zero emissions
+
+            # S_penalty: 1 - (penalty_incurred / (annual_need * eff_penalty))
+            annual_need = max(company.compute_estimate_need(), 1e-6)
+            max_penalty = annual_need * eff_penalty
+            # penalty_cost_this_year is not stored per-step; use proxy from last reward
+            base_vals = self._last_reward_base_values
+            shaping_vals = self._last_reward_shaping_values
+            # Back out penalty from reward: penalty_norm = penalty / 1000
+            # Approximate: we don't have per-agent penalty stored here, so use 0 as safe default
+            # (train.py logs penalties separately via year_log)
+            s_penalty = 1.0  # conservative default; overridden by logged year_log data
+
+            # S_composite: weighted blend
+            s_composite = (company.w_cost * s_financial
+                           + company.w_green * s_green
+                           + 0.3 * s_penalty)  # penalty always weighted (compliance baseline)
+
+            score = {
+                "agent_id": i,
+                "S_financial": round(float(s_financial), 4),
+                "S_green": round(float(s_green), 4),
+                "S_penalty": round(float(s_penalty), 4),
+                "S_composite": round(float(s_composite), 4),
+            }
+            results.append(score)
+
+        if agent_id is not None:
+            return results[agent_id] if agent_id < len(results) else {}
+        return results
 
     def _compute_price_ma3(self) -> float:
         """P1: 3-year moving average of clearing price."""

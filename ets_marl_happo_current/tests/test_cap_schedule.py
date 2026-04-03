@@ -34,13 +34,18 @@ BASE_CONFIG = {
 }
 
 
-def make_schedule(msr_enabled=True, activation_year=0):
+def make_schedule(msr_enabled=True, activation_year=0, seed_prev_tnac=None):
     cfg = BASE_CONFIG.copy()
     cfg["ets"] = dict(cfg["ets"])
     cfg["ets"]["msr"] = dict(cfg["ets"]["msr"])
     cfg["ets"]["msr"]["enabled"] = msr_enabled
     cfg["ets"]["msr"]["activation_year"] = activation_year
-    return CapSchedule(cfg)
+    s = CapSchedule(cfg)
+    # Seed _prev_tnac for tests that want MSR active from the first call.
+    # This simulates a prior year having completed (1-year TNAC lag).
+    if seed_prev_tnac is not None:
+        s._prev_tnac = float(seed_prev_tnac)
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -53,28 +58,43 @@ def test_cap_year_0():
 
 
 def test_cap_negative_year():
-    """Negative years should return caps higher than year 0."""
+    """Negative years should return caps higher than year 0 (linear extrapolation)."""
     s = make_schedule()
     cap_neg1 = s.get_cap(-1)
     cap_0 = s.get_cap(0)
     assert cap_neg1 > cap_0, "Cap at year -1 should exceed cap at year 0"
-    expected = 14.60 / (1 - 0.043)
+    # Linear backward: cap_0 + 1 * lrf_phase1 * cap_0
+    expected = 14.60 * (1.0 + 0.043)
     assert cap_neg1 == pytest.approx(expected, rel=1e-4)
 
 
 def test_cap_year_1_lrf_phase1():
     s = make_schedule()
-    expected = 14.60 * (1 - 0.043)
+    # Linear: cap_0 - 1 * lrf_phase1 * cap_0 = cap_0 * (1 - lrf_phase1)
+    expected = 14.60 - 0.043 * 14.60
     assert s.get_cap(1) == pytest.approx(expected, rel=1e-6)
 
 
+def test_cap_linear_equal_steps():
+    """LRF is a LINEAR decline: each year removes the same absolute amount."""
+    s = make_schedule()
+    caps = [s.get_cap(t) for t in range(6)]
+    # Phase 1 steps (t=1,2,...,switch-1=4) should all equal lrf_phase1 * cap_0
+    step_size_phase1 = 0.043 * 14.60
+    for t in range(1, min(s.lrf_switch, 6)):
+        assert caps[t - 1] - caps[t] == pytest.approx(step_size_phase1, rel=1e-6), \
+            f"Year {t}: step = {caps[t-1]-caps[t]:.6f}, expected {step_size_phase1:.6f}"
+
+
 def test_cap_year_5_switches_to_phase2():
-    """Year 5 should use LRF 4.4%, not 4.3%."""
+    """Year 5 should use LRF 4.4% (linear): step = 0.044 * cap_year_0."""
     s = make_schedule()
     cap4 = s.get_cap(4)
     cap5 = s.get_cap(5)
-    expected = cap4 * (1 - 0.044)
-    assert cap5 == pytest.approx(expected, rel=1e-6)
+    # Linear: step = lrf_phase2 * cap_year_0 (not cap4 * lrf)
+    step = cap4 - cap5
+    expected_step = 0.044 * 14.60
+    assert step == pytest.approx(expected_step, rel=1e-6)
 
 
 def test_cap_strictly_decreasing():
@@ -98,8 +118,9 @@ def test_cap_year_10():
 
 def test_msr_no_adjustment_within_band():
     """TNAC between thresholds → auction volume = cap."""
-    s = make_schedule(msr_enabled=True)
     tnac = 4.0   # between 2.63 and 5.26
+    # Seed prev_tnac so MSR is active at year 1 (1-year lag)
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=tnac)
     vol = s.get_auction_volume(year=1, tnac=tnac)
     cap = s.get_cap(1)
     assert vol == pytest.approx(cap, rel=1e-6)
@@ -107,8 +128,9 @@ def test_msr_no_adjustment_within_band():
 
 def test_msr_withhold_when_tnac_high():
     """TNAC > upper threshold → volume reduced, reserve grows."""
-    s = make_schedule(msr_enabled=True)
     tnac = 10.0   # > 5.26
+    # Seed prev_tnac so MSR sees this high TNAC from previous year
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=tnac)
     cap = s.get_cap(1)
     vol = s.get_auction_volume(year=1, tnac=tnac)
 
@@ -118,35 +140,45 @@ def test_msr_withhold_when_tnac_high():
     assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-5)
 
 
-def test_msr_inactive_before_activation_year():
-    """MSR should not withhold/release/cancel before configured activation year."""
-    s = make_schedule(msr_enabled=True, activation_year=2)
+def test_msr_inactive_year_0_no_prior_tnac():
+    """MSR should not activate at year 0 when no prior TNAC exists (1-year lag)."""
+    s = make_schedule(msr_enabled=True)
     tnac_high = 10.0
 
+    # Year 0: _prev_tnac is None → MSR is inactive regardless of current TNAC
     cap0 = s.get_cap(0)
     vol0 = s.get_auction_volume(year=0, tnac=tnac_high)
     assert vol0 == pytest.approx(cap0, rel=1e-6)
     assert s.msr_reserve() == pytest.approx(0.0, rel=1e-6)
+    # After year 0, _prev_tnac should be set for year 1
+    assert s._prev_tnac == pytest.approx(tnac_high, rel=1e-9)
 
+
+def test_msr_activates_year_1_after_prior_tnac():
+    """MSR activates at year 1+ once _prev_tnac has been populated by year 0."""
+    s = make_schedule(msr_enabled=True)
+    tnac_high = 10.0
+
+    # Year 0: populates _prev_tnac (no MSR action yet)
+    s.get_auction_volume(year=0, tnac=tnac_high)
+
+    # Year 1: MSR should fire using prev_tnac = 10.0 (high TNAC → withhold)
     cap1 = s.get_cap(1)
     vol1 = s.get_auction_volume(year=1, tnac=tnac_high)
-    assert vol1 == pytest.approx(cap1, rel=1e-6)
-    assert s.msr_reserve() == pytest.approx(0.0, rel=1e-6)
-
-    cap2 = s.get_cap(2)
-    vol2 = s.get_auction_volume(year=2, tnac=tnac_high)
-    expected_withheld = min(0.24 * tnac_high, cap2)
-    expected_vol = max(cap2 - expected_withheld, 0.10 * cap2)
-    assert vol2 == pytest.approx(expected_vol, rel=1e-6)
-    assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-6)
+    expected_withheld = min(0.24 * tnac_high, cap1)
+    expected_vol = max(cap1 - expected_withheld, 0.10 * cap1)
+    assert vol1 == pytest.approx(expected_vol, rel=1e-5)
+    assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-5)
 
 
-def test_msr_activation_year_zero_means_immediate():
-    """activation_year=0 should preserve legacy immediate MSR behavior."""
-    s = make_schedule(msr_enabled=True, activation_year=0)
+def test_msr_activation_year_force_msr():
+    """force_msr=True should activate MSR even without a prior TNAC (burn-in use)."""
+    s = make_schedule(msr_enabled=True)
     tnac_high = 10.0
     cap = s.get_cap(0)
-    vol = s.get_auction_volume(year=0, tnac=tnac_high)
+
+    # force_msr bypasses the _prev_tnac=None check (used during burn-in years)
+    vol = s.get_auction_volume(year=0, tnac=tnac_high, force_msr=True)
     expected_withheld = min(0.24 * tnac_high, cap)
     expected_vol = max(cap - expected_withheld, 0.10 * cap)
     assert vol == pytest.approx(expected_vol, rel=1e-6)
@@ -155,7 +187,7 @@ def test_msr_activation_year_zero_means_immediate():
 
 def test_auction_volume_has_min_floor():
     """Auction volume is never below min_auction_frac * cap even with extreme TNAC."""
-    s = make_schedule(msr_enabled=True)
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=1_000.0)
     cap = s.get_cap(1)
     vol = s.get_auction_volume(year=1, tnac=1_000.0)
     assert vol >= 0.10 * cap - 1e-9
@@ -163,11 +195,11 @@ def test_auction_volume_has_min_floor():
 
 def test_msr_release_when_tnac_low():
     """TNAC < lower threshold → release from reserve into auction."""
-    s = make_schedule(msr_enabled=True)
-    # First build up some reserve
+    tnac = 2.0   # < 2.63
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=tnac)
+    # Build up some reserve
     s._msr_reserve = 1.00
 
-    tnac = 2.0   # < 2.63
     cap = s.get_cap(1)
     vol = s.get_auction_volume(year=1, tnac=tnac)
 
@@ -180,6 +212,7 @@ def test_msr_disabled():
     s = make_schedule(msr_enabled=False)
     for tnac in [0.0, 5.0, 15.0]:
         s.reset()
+        s._prev_tnac = tnac  # seed prev so MSR gate is irrelevant
         vol = s.get_auction_volume(year=1, tnac=tnac)
         cap = s.get_cap(1)
         assert vol == pytest.approx(cap, rel=1e-6)
@@ -187,24 +220,26 @@ def test_msr_disabled():
 
 def test_msr_volume_never_negative():
     """Auction volume cannot go negative even with extreme TNAC."""
-    s = make_schedule(msr_enabled=True)
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=1_000.0)
     vol = s.get_auction_volume(year=1, tnac=1000.0)
     assert vol >= 0.0
 
 
 def test_msr_reset():
-    """Reset clears the reserve and history."""
-    s = make_schedule(msr_enabled=True)
+    """Reset clears the reserve, history, and TNAC lag state."""
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=15.0)
     s.get_auction_volume(year=1, tnac=15.0)
     assert s.msr_reserve() > 0
     s.reset()
     assert s.msr_reserve() == 0.0
     assert s.cap_history == []
+    assert s._prev_tnac is None
+    assert s._prev_ma3 is None
 
 
 def test_msr_cancellation():
     """MSR cancellation: holdings above previous auction volume are cancelled."""
-    s = make_schedule(msr_enabled=True)
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=4.0)
     # Manually set reserve and volume history
     s._msr_reserve = 20.0
     s.volume_history = [10.0]
@@ -220,7 +255,7 @@ def test_msr_cancellation():
 
 def test_msr_no_cancellation_when_below():
     """No cancellation when MSR reserve is below previous auction volume."""
-    s = make_schedule(msr_enabled=True)
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=4.0)
     # Set reserve below previous auction volume
     s._msr_reserve = 5.0
     s.volume_history = [10.0]
@@ -228,21 +263,69 @@ def test_msr_no_cancellation_when_below():
     # Call get_auction_volume
     vol = s.get_auction_volume(year=1, tnac=4.0)
 
-    # Reserve should be unchanged by cancellation (may change due to MSR logic)
-    # But no cancellation should have occurred
+    # No cancellation should have occurred
     assert s._total_cancelled == pytest.approx(0.0, rel=1e-5)
 
 
-def test_force_msr_bypasses_activation_year():
-    """force_msr=True should apply MSR logic before activation_year."""
-    s = make_schedule(msr_enabled=True, activation_year=5)
+def test_force_msr_bypasses_prev_tnac_gate():
+    """force_msr=True should apply MSR logic even when _prev_tnac is None."""
+    s = make_schedule(msr_enabled=True)
     tnac_high = 10.0
     cap0 = s.get_cap(0)
 
+    # No seed_prev_tnac, but force_msr bypasses the gate
     vol = s.get_auction_volume(year=0, tnac=tnac_high, force_msr=True)
     expected_withheld = min(0.24 * tnac_high, cap0)
     expected_vol = max(cap0 - expected_withheld, 0.10 * cap0)
 
     assert vol == pytest.approx(expected_vol, rel=1e-6)
     assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-6)
+
+
+def test_msr_smoothed_price_trigger_a4():
+    """A4: Emergency release fires when both absolute threshold and MA3 spike are met."""
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=4.0)
+    # Build reserve for emergency release
+    s._msr_reserve = 5.0
+    # Set previous MA3 price (prev_ma3 = 100 EUR/t)
+    s._prev_ma3 = 100.0
+    # Base rate 138.75 → release_threshold = min(138.75 * 2.5, 450) = 346.875
+    # clearing_price 400 > 346.875 → absolute threshold met
+    # price_ma3 = 300 > 2.5 * 100 = 250 → smoothed spike met
+    initial_reserve = s._msr_reserve
+    vol = s.get_auction_volume(
+        year=2, tnac=4.0, clearing_price=400.0,
+        penalty_rate=138.75, inflation_rate=0.0,
+        price_ma3=300.0,
+    )
+    assert s.msr_reserve() < initial_reserve, "Emergency release should have fired"
+    assert s._msr_event_counts["emergency_release"] == 1
+
+
+def test_msr_smoothed_price_trigger_no_spike():
+    """A4: Emergency release does NOT fire if absolute threshold met but no MA3 spike."""
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=4.0)
+    s._msr_reserve = 5.0
+    s._prev_ma3 = 100.0
+    # clearing_price 400 > release_threshold (absolute met)
+    # price_ma3 = 110 < 2.5 * 100 = 250 → NO smoothed spike → should NOT fire
+    initial_reserve = s._msr_reserve
+    s.get_auction_volume(
+        year=2, tnac=4.0, clearing_price=400.0,
+        penalty_rate=138.75, inflation_rate=0.0,
+        price_ma3=110.0,
+    )
+    # Emergency release should NOT have fired (but may have triggered containment)
+    assert s._msr_event_counts["emergency_release"] == 0, \
+        "Emergency release should not fire without smoothed spike"
+
+
+def test_msr_tnac_lag_prev_tnac_update():
+    """get_auction_volume updates _prev_tnac to the current tnac after each call."""
+    s = make_schedule(msr_enabled=True)
+    assert s._prev_tnac is None
+    s.get_auction_volume(year=0, tnac=7.5)
+    assert s._prev_tnac == pytest.approx(7.5, rel=1e-9)
+    s.get_auction_volume(year=1, tnac=4.2)
+    assert s._prev_tnac == pytest.approx(4.2, rel=1e-9)
 

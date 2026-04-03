@@ -5,6 +5,46 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.4.0
+
+**Plan v8.1 Backport: LRF/MSR Realism, Heuristic Rewrite, Collateral Enforcement, Reward Shaping**
+
+*Note: Phases B, D, G apply only to `ets_marl_happo_auction`. This version receives
+Phases A, C2/C3, E2/E4, and F.*
+
+### Phase A — TNAC/MSR Realism
+- **Linear LRF**: Fixed exponential-decay bug. Cap declines by equal absolute steps:
+  `cap_t = cap_0 − Σ lrf_k × cap_0`. `lrf_phase_switch` set to year 2.
+- **1-year TNAC lag** (`_prev_tnac`): MSR uses prior-year TNAC, matching EU ETS Decision
+  2015/1814. Year 0 has no MSR unless `force_msr=True`.
+- **MSR thresholds**: Lower threshold 18% → 22%; `release_frac` 0.016 → 0.064.
+- **Smoothed price trigger (A4)**: Emergency release requires absolute threshold breach
+  *and* MA3 spike > 2.5× prior year's MA3.
+
+### Phase C — Heuristic Rewrite
+- **C2/C3 smarter secondary**: Final-year urgency boost (×3), no selling when in
+  compliance debt, green agents sell at half rate, budget headroom cap on buying.
+
+### Phase E — Collateral Enforcement
+- **E2 revised collateral**: `collateral_fraction` corrected to 0.10 (10%), previously
+  relying on old `opportunity_cost_rate × hold_fraction = 0.001`. Updated
+  `max_collateral_budget_share` to 0.50.
+- **E4 leverage/suspension config**: Added `leverage_multiplier: 3.0`,
+  `suspension_length: 2`, `carry_forward_defaults: true` to auction config section.
+
+### Phase F — Reward Interpretability
+- **Efficiency bonus as shaping**: `efficiency_bonus` decays with `shaping_weight`.
+  Renamed from `efficiency_shaping` for consistency.
+- **`compute_diagnostic_score()`**: New method logging S_financial, S_green, S_composite
+  per agent. Year-level CSV now includes `diag_S_*_Ai` columns.
+- **Console output**: Episode-mean diagnostic scores printed:
+  `Diag(Sfin/Sgrn/Scomp): A1: 0.72/0.15/0.52 │ A2: ...`
+
+### Config / Metadata
+- Version bumped to `7.4.0` in `pyproject.toml`, `configs/default.yaml`.
+
+---
+
 ## v7.3.0
 
 **Reward Simplification: Remove Revenue, Prune Queue Bonus**

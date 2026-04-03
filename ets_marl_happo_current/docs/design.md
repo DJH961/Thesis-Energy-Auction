@@ -66,44 +66,41 @@ where $E_{system}$ is the sum of initial emissions across all learning agents
 and currently active bots. A manual override (`cap_year_0_override`) is still
 supported for controlled experiments.
 
-Annual cap follows an LRF schedule:
+Annual cap follows a linear LRF schedule:
 
 $$
-cap_{t+1} = cap_t (1 - LRF_t)
+cap_t = cap_0 - \sum_{k=0}^{t-1} lrf_k \cdot cap_0
 $$
 
-- Phase 1 LRF: 4.3%
-- Phase 2 LRF: 4.4%
+- Phase 1 (years 0–1, `lrf_phase_switch=2`): LRF = 4.3%
+- Phase 2 (years 2+): LRF = 4.4%
+
+Each year's cap declines by a fixed absolute amount (`lrf_k × cap_0`), not by a
+compounding fraction. This matches the EU ETS Linear Reduction Factor mechanics
+(EU Directive 2003/87/EC Art. 9).
 
 ### 3.2 MSR logic
 
 MSR operates on auction volume (not cap) using TNAC proxy (sum of all banks):
 - If TNAC > upper threshold: withhold share of excess into reserve.
 - If TNAC < lower threshold: release fixed volume from reserve.
-- In v7.0 default config, TNAC bounds and release amounts are specified as
-  ratios of calibrated year-0 cap (`tnac_*_ratio`, `release_frac`,
-  `emergency_release_frac`) and materialized at environment init/reset.
-- **Activation lag (policy realism):** MSR is inactive before `activation_year`
-  (default year 2). This mirrors the EU ETS lagged TNAC observation logic
-  (Decision 2015/1814, Art. 1(5)), avoiding immediate year-0 interventions
-  before any meaningful circulation signal exists.
+- TNAC thresholds: upper = 36% of CAP_0, lower = 22% of CAP_0 (v7.4).
+- Release fraction = 6.4% of CAP_0 per year (v7.4).
+- **1-year TNAC lag (v7.4):** MSR uses *prior-year* TNAC (`_prev_tnac`), not the
+  current year's holdings. This matches EU ETS Decision 2015/1814 Art. 1(5).
+  Year 0 has no MSR intervention unless `force_msr=True` (burn-in mode).
 
 **Price-responsive safeguards (P9):**
-Current implementation includes price-responsive triggers to prevent procyclical supply withdrawal:
-- **Containment trigger** (70% of penalty rate or 200 EUR/t absolute): When prices are elevated, suppress normal TNAC-triggered withdrawal even if TNAC > upper threshold.
-- **Emergency release trigger** (85% of penalty rate or 300 EUR/t absolute): When prices approach the penalty ceiling, force emergency release from MSR reserve to prevent market cornering.
-
-These triggers reference the inflation-adjusted penalty rate (when available) rather than the auction price_max, providing more stable MSR behavior as penalty rates evolve over time.
+- **Containment trigger** (70% of penalty rate or 200 EUR/t absolute): When prices are elevated, suppress TNAC-triggered withdrawal.
+- **Emergency release trigger (v7.4 A4, smoothed)**: Emergency release requires *both* an absolute threshold breach (≥ 85% of penalty rate or ≥ 300 EUR/t) *and* a MA3 price spike > 2.5× the prior year's MA3.
 
 **MSR cancellation mechanism (EU ETS post-2023 reform):**
-At the start of each year, MSR holdings exceeding the previous year's auction volume are permanently cancelled. This implements the real EU ETS Directive cancellation rule:
+At the start of each year, MSR holdings exceeding the previous year's auction volume are permanently cancelled:
 ```
 excess = max(0, msr_reserve - prev_auction_volume)
 msr_reserve -= excess
 total_cancelled += excess  # cumulative tracker
 ```
-
-In this micro-ETS, cancellation rarely triggers due to short 12-year episodes and moderate TNAC levels, but is included for regulatory completeness and long-run realism.
 
 ### 3.3 Reserve price mode
 
@@ -261,21 +258,25 @@ $$
 With 16 total participants:
 - phase 2 dimension = 110
 
-## 7. Reward Design (Current)
+## 7. Reward Design (v7.4)
 
-Per-agent reward is:
+Per-agent reward is split into a **base reward** and a **shaping reward** that decays
+over training:
 
 $$
-R_i = w_{cost,i}(-\text{costNorm}_i) + w_{green,i}(\text{esgScale}\cdot \text{esgRaw}_i)
-  + \text{greenBonus}_i + \text{queueBonus}_i + \text{terminalValues}_i
-  - \text{oppCost}_i
+R_i = \underbrace{w_{cost,i}(-\text{costNorm}_i) + w_{green,i}(\text{esgScale}\cdot \text{esgRaw}_i)
+  - \text{penalty\_norm}_i - \text{oppCost}_i}_{\text{base reward}}
+  + \underbrace{(\text{greenBonus}_i + \text{efficiencyBonus}_i) \cdot \text{shapingWeight}}_{\text{shaping reward}}
+  + \text{terminalValues}_i
 $$
 
 Where:
-- `costNorm` is net cost after electricity revenue, scaled.
-- Costs include auction, secondary, investment, OPEX, budget penalties, capex throughput penalties, MAC cost, and compliance penalty.
+- `costNorm` is total non-penalty cost, scaled by 1000.
+- Costs include auction, secondary, investment, OPEX, budget penalties, capex throughput, and MAC cost.
+- `penalty_norm` is the compliance penalty at full strength (not affected by shaping weight).
 - `greenBonus` rewards positive green share change with shaping decay over training.
-- `queueBonus` rewards maintaining active construction pipeline.
+- `efficiencyBonus` (v7.4) rewards emission-factor improvement vs initial EF, scaled by
+  remaining time and carbon price. Decays with `shaping_weight`.
 - `esgRaw` uses saved-carbon-years style term before weighting.
 - `esgScale` calibrates ESG magnitude to the same range as `costNorm`.
 - `oppCost` is a cost-of-capital term on post-compliance banked allowances:
@@ -305,18 +306,26 @@ linear payoff, improving market realism by encouraging secondary-market release
 instead of end-horizon stockpile accumulation.
 - queue terminal value (discounted future emissions savings from queued projects)
 
-Policy-timing note for reward interpretation: the MSR activation lag (default
-year 2) is retained when reading early-episode rewards. This is intentional.
-It separates pre-observation market dynamics (years 0-1) from intervention
-dynamics (year 2 onward), matching the lagged TNAC governance logic in EU ETS.
-Thesis justification: this avoids attributing early reward effects to policy
-channels that would not yet be active in the real system, improving causal
-validity when comparing emergent strategy shifts before and after MSR onset.
+Policy-timing note for reward interpretation: the MSR 1-year TNAC lag (v7.4) means
+year-0 rewards are not affected by MSR. Year 1+ rewards reflect prior-year TNAC decisions,
+matching EU ETS governance calendar.
 
 Terminal price anchor uses max of:
 - auction clearing
 - secondary clearing
 - 80% of inflation-adjusted penalty rate
+
+### 7.1 Diagnostic Scores (v7.4)
+
+`compute_diagnostic_score()` returns interpretable per-agent metrics:
+
+| Score | Formula | Meaning |
+|---|---|---|
+| `S_financial` | `max(0, 1 - budget_spent / annual_budget)` | Cost efficiency [0,1] |
+| `S_green` | `ef_improvement / initial_ef` | EF progress [0,1] |
+| `S_composite` | `w_cost × S_fin + w_green × S_grn + 0.3 × S_pen` | Weighted blend |
+
+Scores are logged to year-level CSV as `diag_S_*_Ai` and printed in training console.
 
 ## 8. Learning System
 

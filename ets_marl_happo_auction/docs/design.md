@@ -31,17 +31,39 @@ Each episode simulates 12 years.
 
 ## 2. Market Architecture
 
-### 2.1 Auction type
+### 2.1 Auction type (v8.0+)
 
-The primary market is a uniform-price, sealed-bid, multi-unit buyer auction.
-Each participant submits one annual bid tuple:
-- bid price (EUR/t)
-- bid quantity (Mt)
+The primary market uses a **3-Tranche Bid Ladder**: each participant submits 3 independent
+(price, quantity) pairs forming a demand curve at multiple price levels. This mirrors the
+**demand curves** used in real EEX/ICE call auctions.
+
+- Action space: `[p1, q1, p2, q2, p3, q3, invest_frac, tech_logit0, tech_logit1, tech_logit2]` (10D)
+- All three tranches are expanded into separate bid rows and passed to `market_clearing_ets()`.
+- **B1 invariant (v8.1)**: Tranches are sorted ascending by price immediately after action
+  extraction, before all budget/collateral checks. This applies to **both RL agents and
+  heuristic bots**:
+  - RL agents: common `raw_tranches.sort()` in `step_auction()`.
+  - Bots: also pre-sorted by construction (T1=0.9×, T2=1.0×, T3=1.1× mid price).
+- **Phase 2 observation**: D1/D2 feedback dims (tranche fill ratios + price-vs-clearing)
+  are stored after B1 sorting. Agents observe which tranche positions filled and by how
+  much. This does not affect Phase 1 obs (built before bidding).
 
 Valid bids are sorted by descending price and accepted until auction supply is exhausted.
-All winners pay the same clearing price (the marginal accepted bid).
+All winners pay the same uniform clearing price (the marginal accepted bid).
 
-### 2.2 Practical clearing details in code
+### 2.2 Collateral enforcement (v8.1, E2/E4)
+
+Before each auction, a collateral affordability check scales down bids if:
+```
+collateral = collateral_fraction × wavg_price × total_qty
+           > max_collateral_budget_share × remaining_budget
+```
+- `collateral_fraction: 0.10` (10% — mid-range of real EUA exchange initial margin 5–15%)
+- `max_collateral_budget_share: 0.50` (collateral can use at most 50% of remaining budget)
+- E4 config also registers `leverage_multiplier: 3.0`, `suspension_length: 2`,
+  `carry_forward_defaults: true` for future enforcement.
+
+### 2.3 Practical clearing details in code
 
 - Bids below effective reserve are rejected.
 - Tie-breaks at identical prices are randomized (not pro-rata).
@@ -66,34 +88,41 @@ where $E_{system}$ is the sum of initial emissions across all learning agents
 and currently active bots. A manual override (`cap_year_0_override`) is still
 supported for controlled experiments.
 
-Annual cap follows an LRF schedule:
+Annual cap follows a linear LRF schedule:
 
 $$
-cap_{t+1} = cap_t (1 - LRF_t)
+cap_t = cap_0 - \sum_{k=0}^{t-1} lrf_k \cdot cap_0
 $$
 
-- Phase 1 LRF: 4.3%
-- Phase 2 LRF: 4.4%
+- Phase 1 (years 0–1, `lrf_phase_switch=2`): LRF = 4.3%
+- Phase 2 (years 2+): LRF = 4.4%
+
+Each year's cap declines by a fixed absolute amount (`lrf_k × cap_0`), not by a
+compounding fraction. This matches the EU ETS Linear Reduction Factor mechanics
+(EU Directive 2003/87/EC Art. 9), which specifies a constant annual absolute reduction.
 
 ### 3.2 MSR logic
 
 MSR operates on auction volume (not cap) using TNAC proxy (sum of all banks):
 - If TNAC > upper threshold: withhold share of excess into reserve.
 - If TNAC < lower threshold: release fixed volume from reserve.
-- In v7.0 default config, TNAC bounds and release amounts are specified as
-  ratios of calibrated year-0 cap (`tnac_*_ratio`, `release_frac`,
-  `emergency_release_frac`) and materialized at environment init/reset.
-- **Activation lag (policy realism):** MSR is inactive before `activation_year`
-  (default year 2). This mirrors the EU ETS lagged TNAC observation logic
-  (Decision 2015/1814, Art. 1(5)), avoiding immediate year-0 interventions
-  before any meaningful circulation signal exists.
+- TNAC thresholds: upper = 36% of CAP_0, lower = 22% of CAP_0.
+- Release fraction = 6.4% of CAP_0 per year.
+- In v8.1, TNAC bounds and release amounts are specified as ratios of
+  calibrated year-0 cap (`tnac_*_ratio`, `release_frac`, `emergency_release_frac`)
+  and materialized at environment init/reset.
+- **1-year TNAC lag (v8.1):** MSR uses *prior-year* TNAC (`_prev_tnac`), not the
+  current year's holdings. This matches EU ETS Decision 2015/1814 Art. 1(5), which
+  observes the previous year's TNAC (published ~6 months after year-end). Year 0
+  has no MSR intervention unless `force_msr=True` (burn-in calibration mode).
 
 **Price-responsive safeguards (P9):**
 Current implementation includes price-responsive triggers to prevent procyclical supply withdrawal:
-- **Containment trigger** (70% of penalty rate or 200 EUR/t absolute): When prices are elevated, suppress normal TNAC-triggered withdrawal even if TNAC > upper threshold.
-- **Emergency release trigger** (85% of penalty rate or 300 EUR/t absolute): When prices approach the penalty ceiling, force emergency release from MSR reserve to prevent market cornering.
-
-These triggers reference the inflation-adjusted penalty rate (when available) rather than the auction price_max, providing more stable MSR behavior as penalty rates evolve over time.
+- **Containment trigger** (70% of penalty rate or 200 EUR/t absolute): When prices are elevated,
+  suppress normal TNAC-triggered withdrawal even if TNAC > upper threshold.
+- **Emergency release trigger** (85% of penalty rate or 300 EUR/t absolute, v8.1+):
+  Emergency release requires *both* an absolute threshold breach *and* a MA3 price spike
+  > 2.5× the prior year's MA3 (smoothed trigger, A4). Prevents procyclical flash releases.
 
 **MSR cancellation mechanism (EU ETS post-2023 reform):**
 At the start of each year, MSR holdings exceeding the previous year's auction volume are permanently cancelled. This implements the real EU ETS Directive cancellation rule:
@@ -215,25 +244,44 @@ Participants can sell from current allocation plus bank (no short selling beyond
 
 ### 6.1 Phase 1 observation
 
-Base dimension: 28.
+Base dimension: **24** (v8.1, after Phase G consolidation from 28D).
+
+Consolidated from 28D by removing:
+- `expected_price_ar1` (redundant with MA3 + time signal)
+- 2 raw technology fraction dims (5 → 3 summary fracs)
+- `predicted_msr_withholding` (derivable from TNAC proxy)
 
 Includes:
-- time and cap
-- price signals (MA3, expected AR(1), last secondary)
-- full technology mix and emissions/need/risk indicators
-- queue state
-- carry-forward obligation
-- TNAC proxy
-- effective reserve signal
-- secondary volume and profit signal
+- `[0]` time (normalized by n_years)
+- `[1]` cap (normalized)
+- `[2]` 3-year MA3 clearing price (normalized by price_max)
+- `[3]` green_frac = onshore + offshore + solar fraction (mix[2]+mix[3]+mix[4])
+- `[4]` coal_frac (mix[0])
+- `[5]` gas_frac (mix[1])
+- `[6]` emissions (normalized)
+- `[7]` estimated need (normalized)
+- `[8]` risk factor (p_fail)
+- `[9]` investment experience (consecutive successes)
+- `[10]` auction gap (banked allowances normalized)
+- `[11–13]` construction queue (onshore, offshore, solar)
+- `[14]` weighted emission factor
+- `[15]` last secondary price (normalized)
+- `[16]` last secondary volume (normalized)
+- `[17]` carry-forward obligation (Mt / 5)
+- `[18]` TNAC proxy (total bank / cap, clipped [0,3])
+- `[19]` effective reserve price (normalized)
+- `[20]` auction volume ratio (last_auction_volume / cap_t)
+- `[21]` MSR reserve signal (msr_reserve / cap_t)
+- `[22]` own bank ratio (clipped [0,5], normalized /5)
+- `[23]` budget headroom (1 – budget_spent / annual_budget)
 
 If opponent modeling is enabled:
 
 $$
-obsDimPhase1 = 28 + 5 (N_{total} - 1)
+\text{obsDimPhase1} = 24 + 5 \cdot (N_{total} - 1)
 $$
 
-Each opponent contributes public 5D tuple:
+Each opponent contributes a public 5D tuple:
 - normalized emissions
 - normalized carry-forward
 - green fraction
@@ -241,41 +289,55 @@ Each opponent contributes public 5D tuple:
 - total queue size
 
 With 16 total participants:
-- phase 1 dimension = 103
+- Phase 1 dimension = 24 + 5×15 = **99D**
 
 ### 6.2 Phase 2 observation
 
-Phase 2 appends 7 auction-result features to phase 1:
-- allocation
-- clearing price
-- net compliance position
-- emission shock
-- auction savings proxy
-- coverage ratio
-- normalized carry-forward
+Phase 2 appends 13 features to Phase 1:
+
+**Standard 7 dims:**
+- allocation / 5
+- clearing price / price_max
+- net compliance position: (bank + allocation − emissions − carry_forward) / 5
+- emission shock (P5)
+- auction savings proxy: (allocation × 100 − payment) / 1000
+- coverage ratio: (bank + allocation) / obligation, clipped [0,3], /3
+- normalized carry-forward: carry_forward / estimated_need, clipped [0,3]
+
+**D1/D2 — 6 per-tranche feedback dims (v8.1, auction only):**
+- `[base+7]` tranche 1 fill ratio (0 = no fill, 1 = full fill)
+- `[base+8]` tranche 2 fill ratio
+- `[base+9]` tranche 3 fill ratio
+- `[base+10]` (tranche 1 price − clearing price) / price_norm
+- `[base+11]` (tranche 2 price − clearing price) / price_norm
+- `[base+12]` (tranche 3 price − clearing price) / price_norm
 
 $$
-obsDimPhase2 = obsDimPhase1 + 7
+\text{obsDimPhase2} = \text{obsDimPhase1} + 13
 $$
 
-With 16 total participants:
-- phase 2 dimension = 110
+With 16 total participants (no opponent modeling): 24D Phase 1, **37D** Phase 2.
 
 ## 7. Reward Design (Current)
 
-Per-agent reward is:
+Per-agent reward is split into a **base reward** and a **shaping reward** that decays
+over training:
 
 $$
-R_i = w_{cost,i}(-\text{costNorm}_i) + w_{green,i}(\text{esgScale}\cdot \text{esgRaw}_i)
-  + \text{greenBonus}_i + \text{queueBonus}_i + \text{terminalValues}_i
-  - \text{oppCost}_i
+R_i = \underbrace{w_{cost,i}(-\text{costNorm}_i) + w_{green,i}(\text{esgScale}\cdot \text{esgRaw}_i)
+  - \text{penalty\_norm}_i - \text{oppCost}_i}_{\text{base reward}}
+  + \underbrace{(\text{greenBonus}_i + \text{efficiencyBonus}_i) \cdot \text{shapingWeight}}_{\text{shaping reward}}
+  + \text{terminalValues}_i
 $$
 
 Where:
-- `costNorm` is net cost after electricity revenue, scaled.
-- Costs include auction, secondary, investment, OPEX, budget penalties, capex throughput penalties, MAC cost, and compliance penalty.
+- `costNorm` is total non-penalty cost, scaled by 1000.
+- Costs include auction, secondary, investment, OPEX, budget penalties, capex throughput penalties, and MAC cost.
+- `penalty_norm` is the compliance penalty at full strength (not affected by shaping weight).
 - `greenBonus` rewards positive green share change with shaping decay over training.
-- `queueBonus` rewards maintaining active construction pipeline.
+- `efficiencyBonus` (v8.1) rewards emission-factor improvement vs initial EF, scaled by
+  remaining time and carbon price. Decays with `shaping_weight` — does not permanently
+  distort the financial reward channel.
 - `esgRaw` uses saved-carbon-years style term before weighting.
 - `esgScale` calibrates ESG magnitude to the same range as `costNorm`.
 - `oppCost` is a cost-of-capital term on post-compliance banked allowances:
@@ -305,18 +367,30 @@ linear payoff, improving market realism by encouraging secondary-market release
 instead of end-horizon stockpile accumulation.
 - queue terminal value (discounted future emissions savings from queued projects)
 
-Policy-timing note for reward interpretation: the MSR activation lag (default
-year 2) is retained when reading early-episode rewards. This is intentional.
-It separates pre-observation market dynamics (years 0-1) from intervention
-dynamics (year 2 onward), matching the lagged TNAC governance logic in EU ETS.
-Thesis justification: this avoids attributing early reward effects to policy
-channels that would not yet be active in the real system, improving causal
-validity when comparing emergent strategy shifts before and after MSR onset.
+Policy-timing note for reward interpretation: the MSR 1-year TNAC lag (v8.1) is
+retained when reading early-episode rewards. This is intentional: MSR decisions at
+year t use the prior year's TNAC, matching the real governance calendar. Year-0 rewards
+are not affected by MSR unless `force_msr=True`.
 
 Terminal price anchor uses max of:
 - auction clearing
 - secondary clearing
 - 80% of inflation-adjusted penalty rate
+
+### 7.1 Diagnostic Scores (v8.1)
+
+`compute_diagnostic_score()` returns interpretable per-agent metrics independent of
+reward normalization artifacts:
+
+| Score | Formula | Meaning |
+|---|---|---|
+| `S_financial` | `max(0, 1 - budget_spent / annual_budget)` | Cost efficiency [0,1] |
+| `S_green` | `ef_improvement / initial_ef` | EF progress [0,1] |
+| `S_penalty` | `1` (proxy; override with logged penalties) | Compliance quality [0,1] |
+| `S_composite` | `w_cost × S_fin + w_green × S_grn + 0.3 × S_pen` | Weighted blend |
+
+Scores are logged to year-level CSV as `diag_S_*_Ai` columns, and
+episode-mean scores are printed in the training console.
 
 ## 8. Learning System
 

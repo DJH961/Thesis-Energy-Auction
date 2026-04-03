@@ -426,15 +426,17 @@ def test_burnin_msr_reserve():
 # ---------------------------------------------------------------------------
 
 def test_p8_obs_dims():
-    """Phase 1 obs should be 28D base (+ 5*(N_total-1) opponent dims) with opponent modeling.
-    N_total = learning + bot agents."""
+    """Phase 1 obs should be 24D base (after Phase G) + 5*(N_total-1) opponent dims.
+    Phase 2 obs = Phase 1 + 13 (7 standard + 6 D1/D2 tranche feedback)."""
     env = load_env()
     obs, _ = env.reset()
     n_agents = env.config["companies"]["n_agents"]
     n_total = n_agents + env.config["companies"].get("n_bot_agents", 0)
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
-    expected_p1 = 28 + (5 * (n_total - 1) if opp_enabled else 0)
-    expected_p2 = expected_p1 + 7  # +7: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm
+    # Phase G: 28 → 24 base dims (−4 consolidated)
+    expected_p1 = 24 + (5 * (n_total - 1) if opp_enabled else 0)
+    # Phase D: +6 D1/D2 tranche feedback (total +13 vs Phase 1)
+    expected_p2 = expected_p1 + 13  # 7 standard + 6 D1/D2
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
     )
@@ -614,29 +616,32 @@ def test_call_auction_clears_at_equilibrium():
 # ---------------------------------------------------------------------------
 
 def test_no_holding_limit():
-    """With max_agent_share=1.0, a single high-bidding agent can get all supply."""
+    """With max_agent_share=1.0, a high-bidding agent gets a larger allocation share."""
     env = load_env()
     env.reset(seed=42)
     n_agents = env.n_agents
 
-    # Agent 0 bids very high, others bid at floor
+    # Agent 0 bids at 160 EUR/t (above bot heuristic ~138 EUR/t) with a moderate
+    # quantity multiplier so auction payment stays within its annual budget under E4
+    # collateral constraints.  Other learning agents bid below reserve → filtered out.
+    # Action format (10D): [p1, q1, p2, q2, p3, q3, invest_frac, logit0, logit1, logit2]
     auction_actions = np.zeros((n_agents, 10), dtype=np.float32)
-    auction_actions[:, 0] = 5.0    # all agents bid at floor
-    auction_actions[:, 1] = 1.0    # coverage multiplier
-    auction_actions[0, 0] = 400.0  # agent 0 bids very high
+    auction_actions[:, 0] = 40.0   # T1 price below bot prices (won't win)
+    auction_actions[:, 1] = 0.3    # T1 small qty
+    # Agent 0: single tranche bid at 160 EUR/t with qty_mult=0.69 (budget-safe)
+    auction_actions[0, 0] = 160.0  # T1 price above bots → priority fill
+    auction_actions[0, 1] = 0.69   # total qty affordable under E4 constraints
 
     obs2, log = env.step_auction(auction_actions)
 
-    # With max_agent_share=1.0, agent 0 should receive a large share
-    allocs = np.array(log["auction_stats"]["clearing_price"])  # just check it didn't fail
     assert not log["auction_stats"].get("auction_failed", False), "Auction should not fail"
-    # Agent 0's allocation should be substantial (they bid highest)
+    # Agent 0 should not have defaulted (bid is within budget)
+    assert env._phase1_allocations[0] > 0, "Agent 0 should have won allocation and not defaulted"
+    # Agent 0's allocation should be substantial (they bid highest, no holding limit)
     agent0_alloc = env._phase1_allocations[0]
     total_alloc = float(env._phase1_allocations.sum())
     if total_alloc > 1e-9:
         share = agent0_alloc / total_alloc
-        # With no holding limit, the high bidder should get a significant share
-        # (threshold lowered: 16 participants including heuristic bots dilute shares)
         assert share > 0.10, f"Agent 0 share {share:.2f} too low with no holding limit"
 
 

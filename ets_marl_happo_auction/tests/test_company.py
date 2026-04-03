@@ -460,35 +460,36 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
 # ---------------------------------------------------------------------------
 
 def test_obs_phase1_shape(config):
-    """Phase 1 obs should be 28D base (no opponent modeling)."""
+    """Phase 1 obs should be 24D base after Phase G consolidation (no opponent modeling)."""
     c = make_company(config, agent_id=0)
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, auction_gap=1.0)
-    assert obs.shape == (28,), f"Expected 28D, got {obs.shape}"
+    assert obs.shape == (24,), f"Expected 24D (Phase G), got {obs.shape}"
     assert obs.dtype == np.float32
 
 def test_obs_phase1_with_opponents(config):
-    """With opponent modeling, obs should have 28 + 5*(N-1) dims."""
+    """With opponent modeling, obs should have 24 + 5*(N-1) dims (Phase G: 24 base)."""
     config_opp = {**config, "opponent_modeling": {"enabled": True}}
     c = make_company(config_opp, agent_id=0)
     opponent_obs = np.zeros(5 * 3, dtype=np.float32)  # 3 opponents
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, opponent_obs=opponent_obs)
-    assert obs.shape == (28 + 15,)
+    assert obs.shape == (24 + 15,)
 
 def test_obs_phase2_extends_phase1(config):
-    """Phase 2 obs = phase1 + 7 extra dims."""
+    """Phase 2 obs = phase1 + 7 standard dims + 6 D1/D2 dims = phase1 + 13 dims."""
     c = make_company(config, agent_id=0)
     obs1 = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0, expected_price=80.0)
     obs2 = c.get_observation_phase2(
         obs_phase1=obs1, allocation=2.0, clearing_price=80.0,
         emissions=3.0, banked=1.0, emission_shock=0.05, payment=160.0)
-    assert obs2.shape == (28 + 7,)
-    # First 28 dims should match phase1
-    np.testing.assert_array_equal(obs2[:28], obs1)
+    # Phase G: 24 base + 13 extra (7 standard + 6 D1/D2)
+    assert obs2.shape == (24 + 13,), f"Expected {24+13}D, got {obs2.shape}"
+    # First 24 dims should match phase1
+    np.testing.assert_array_equal(obs2[:24], obs1)
 
 def test_obs_values_finite(config):
     """All observation values should be finite."""
@@ -503,16 +504,18 @@ def test_obs_values_finite(config):
     assert np.all(np.isfinite(obs2))
 
 def test_obs_price_normalization(config):
-    """Prices in obs should be normalized by price_max."""
+    """Prices in obs should be normalized by price_max. Phase G: MA3 at [2] only."""
     c = make_company(config, agent_id=0)
     price_max = config["auction"]["price_max"]  # 500
     clearing = 100.0
-    expected = 200.0
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=clearing,
-        expected_price=expected, price_ma3=clearing)
+        expected_price=200.0, price_ma3=clearing)
+    # [2] = price_ma3 / price_max
     assert abs(obs[2] - clearing / price_max) < 1e-6, "obs[2] should be MA3/price_max"
-    assert abs(obs[3] - expected / price_max) < 1e-6, "obs[3] should be expected/price_max"
+    # [3] = green_frac (NOT expected_price after Phase G)
+    green_expected = float(c.mix[2] + c.mix[3] + c.mix[4])
+    assert abs(obs[3] - green_expected) < 1e-6, "obs[3] should be green_frac after Phase G"
 
 
 # ---------------------------------------------------------------------------

@@ -232,3 +232,79 @@ def build_bids(actions: np.ndarray) -> np.ndarray:
     # reorder: [agent_id, quantity, price]
     bids = np.hstack([agent_ids, actions[:, 1:2], actions[:, 0:1]])
     return bids
+
+
+# ---------------------------------------------------------------------------
+# E4: Post-clearing settlement with default handling
+# ---------------------------------------------------------------------------
+
+def settle_auction(
+    allocations: np.ndarray,
+    payments: np.ndarray,
+    agent_cash: np.ndarray,
+    collateral_locked: np.ndarray,
+    suspension_length: int = 2,
+):
+    """
+    E4: Post-clearing settlement — check each winner can pay; handle defaults.
+
+    For each winning agent, the cash available for payment is reduced by any
+    collateral already locked pre-bid (margin deposit).  If the remaining cash
+    is insufficient to cover the uniform-price payment the agent defaults:
+    allocations are cancelled, collateral is forfeited, and the agent is
+    suspended for ``suspension_length`` auction rounds.
+
+    Non-winners have their collateral returned automatically (no action needed
+    — they never paid anything).
+
+    Parameters
+    ----------
+    allocations : np.ndarray, shape (n_agents,)
+        Provisional allocations from ``market_clearing_ets``.
+    payments : np.ndarray, shape (n_agents,)
+        Provisional payments (allocation × clearing_price).
+    agent_cash : np.ndarray, shape (n_agents,)
+        Available cash per agent at settlement time
+        (typically annual_budget − budget_spent_this_year).
+    collateral_locked : np.ndarray, shape (n_agents,)
+        Collateral locked pre-bid per agent
+        (collateral_fraction × max(0, bid_price − reserve) × bid_qty).
+        Reduces effective cash available for the payment.
+    suspension_length : int
+        Number of auction rounds an agent is suspended after defaulting.
+
+    Returns
+    -------
+    actual_allocations : np.ndarray
+        Final allocations after default resolution (defaulters get 0).
+    actual_payments : np.ndarray
+        Final payments after default resolution (defaulters pay 0).
+    defaults_mask : np.ndarray, dtype=bool
+        True for agents that defaulted.
+    defaulted_volume : float
+        Total allowance volume returned to the market from defaults.
+    suspension_steps : np.ndarray, dtype=int
+        Rounds to suspend per agent (``suspension_length`` for defaulters, 0
+        for all others).
+    """
+    n = len(allocations)
+    actual_allocations = allocations.copy()
+    actual_payments = payments.copy()
+    defaults_mask = np.zeros(n, dtype=bool)
+    suspension_steps = np.zeros(n, dtype=int)
+    defaulted_volume = 0.0
+
+    for i in range(n):
+        if allocations[i] < 1e-9:
+            continue  # non-winner: collateral released automatically
+        # Cash available for payment after collateral is locked
+        cash_available = float(agent_cash[i]) - float(collateral_locked[i])
+        if cash_available < float(payments[i]):
+            # Default: insufficient funds → cancel allocation, forfeit collateral
+            defaults_mask[i] = True
+            defaulted_volume += float(allocations[i])
+            actual_allocations[i] = 0.0
+            actual_payments[i] = 0.0
+            suspension_steps[i] = suspension_length
+
+    return actual_allocations, actual_payments, defaults_mask, defaulted_volume, suspension_steps

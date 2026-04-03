@@ -89,12 +89,19 @@ class TestAuctionAction:
         assert action[1] <= config["auction"]["qty_mult_high"]
 
     def test_qty_increases_with_carry_forward(self, config):
-        """Carry-forward > 0 should increase quantity multiplier."""
+        """Carry-forward > 0 should increase total bid quantity (in Mt)."""
         c = make_company(config, agent_id=0)
         action_no_cf = auction_action(c, price_ma3=80.0, current_year=5, n_years=12, config=config, bank=0.0)
+        need_no_cf = c.compute_estimate_need()
         c._carry_forward = 1.0  # 1 Mt carry-forward
         action_cf = auction_action(c, price_ma3=80.0, current_year=5, n_years=12, config=config, bank=0.0)
-        assert action_cf[1] >= action_no_cf[1], "Carry-forward should increase qty"
+        need_cf = c.compute_estimate_need() + c._carry_forward
+        # E3 budget/leverage constraints may reduce the raw multiplier when carry-forward
+        # increases annual_need (larger notional → leverage gate bites).  Check that the
+        # TOTAL bid volume in Mt increases even if the multiplier itself is clipped.
+        qty_no_cf = action_no_cf[1] * need_no_cf
+        qty_cf = action_cf[1] * need_cf
+        assert qty_cf >= qty_no_cf - 1e-6, f"Carry-forward should increase total bid qty: {qty_cf:.3f} vs {qty_no_cf:.3f}"
 
     def test_invest_frac_within_bounds(self, config):
         c = make_company(config, agent_id=0)
