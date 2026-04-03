@@ -624,8 +624,9 @@ def test_capex_and_compliance_penalties_stack():
     assert not np.allclose(rewards_high, rewards_low, atol=0.01)
 
 
-def test_electricity_revenue_reduces_cost():
-    """With electricity enabled, agents get revenue that offsets costs."""
+def test_electricity_revenue_no_longer_affects_cost():
+    """v7.3: electricity revenue was removed from cost_norm_ex_penalty.
+    Enabling/disabling electricity should produce identical rewards."""
     config = load_config()
     config["electricity"]["enabled"] = True
     env_with = ETSEnvironment(config, seed=42)
@@ -638,9 +639,11 @@ def test_electricity_revenue_reduces_cost():
     env_without.reset()
     rewards_without, _ = _run_one_year(env_without, auction_price=100.0)
 
-    # With electricity revenue, rewards should be higher (less negative)
-    assert rewards_with.mean() > rewards_without.mean(), (
-        f"Electricity revenue should improve rewards: {rewards_with.mean():.3f} vs {rewards_without.mean():.3f}")
+    # v7.3: revenue removed — rewards should be identical regardless of electricity setting
+    np.testing.assert_allclose(
+        rewards_with, rewards_without,
+        err_msg="Revenue removed in v7.3: electricity setting should not affect rewards"
+    )
 
 
 def test_penalty_full_strength_for_esg_agents():

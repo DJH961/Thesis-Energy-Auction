@@ -5,6 +5,27 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.3.0
+
+**Reward Simplification: Remove Revenue, Prune Queue Bonus**
+
+### Reward Changes
+- **Electricity revenue removed from cost normalisation**: `cost_norm_ex_penalty` is now
+  `total_cost_ex_penalty / 1000.0` instead of `(total_cost_ex_penalty - revenue) / 1000.0`.
+  Revenue from electricity sales no longer offsets compliance costs in the reward signal,
+  giving agents a cleaner cost-minimisation gradient.
+- **Queue bonus removed from shaping rewards**: The `queue_bonus` term
+  (`gamma_shaping × n_active_queue × 0.1 × shaping_weight`) has been deleted.
+  Shaping rewards now consist solely of `green_bonus` (diminishing-returns bonus for
+  green investment progress), reducing reward complexity and removing a signal that
+  could incentivise queue-stuffing rather than genuine decarbonisation.
+
+### Config / Metadata
+- Version bumped to `7.3.0` in `pyproject.toml`, `configs/default.yaml`, `README.md`,
+  and `train.py` banner.
+
+---
+
 ## v7.2.1
 
 **Bug Fixes, Security Hardening, and Code Quality**

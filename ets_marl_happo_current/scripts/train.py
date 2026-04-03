@@ -527,7 +527,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v7.2.1: Dynamic calibration | Collateral affordability clip | Budget-headroom obs | Tabula-rasa 80€ fallback | Carry-forward{cf_str}")
+    print(f"v7.3: Remove revenue from cost norm | Prune queue_bonus shaping | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(
         f"PPO profile: {run_profile['profile']} "

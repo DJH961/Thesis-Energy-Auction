@@ -1770,15 +1770,14 @@ class ETSEnvironment(gym.Env):
                          precompliance_holdings=None,
                          old_carry_forward=None, active_mask=None):
         """
-        Reward (HAPPO-compliant, v6.4):
+        Reward (HAPPO-compliant, v7.3):
             R_i = w_cost * (-cost_norm_ex_penalty) + w_green * (esg_scale * esg_raw)
-                  + green_bonus + queue_bonus - penalty_norm - opportunity_cost
+                  + green_bonus - penalty_norm - opportunity_cost
 
         Core signals:
-          cost_norm_ex_penalty: (total_cost_ex_penalty + revenue) / 1000
+          cost_norm_ex_penalty: total_cost_ex_penalty / 1000
           penalty_norm:         penalty_cost / 1000 (applied at full strength for ALL agents)
           green_bonus:          diminishing-returns bonus for green investment progress
-          queue_bonus:          reward for active construction queue items (decays with shaping_weight)
           esg_raw:              saved-carbon-years formula before weighting
 
         Penalty is separated from cost and applied at full strength regardless of w_cost.
@@ -1790,27 +1789,12 @@ class ETSEnvironment(gym.Env):
         terminal_bank_values = np.zeros(self.n_total)
         terminal_queue_values = np.zeros(self.n_total)
         reward_cfg = self.config.get("reward", {})
-        elec_cfg = self.config.get("electricity", {})
         esg_cfg = self.config.get("esg", {})
         esg_enabled = esg_cfg.get("enabled", False)
         esg_scale = float(esg_cfg.get("scale", 2.0))
 
         beta_shaping = reward_cfg.get("shaping_beta", 10.0)
-        gamma_shaping = reward_cfg.get("shaping_gamma", 1.0)
         opp_cost_rate = float(reward_cfg.get("opportunity_cost_rate", 0.05))
-
-        # Electricity revenue parameters (base price inflation-indexed)
-        elec_enabled = elec_cfg.get("enabled", False)
-        base_elec_price = elec_cfg.get("base_price", 50.0)
-        carbon_passthrough = elec_cfg.get("carbon_passthrough", 0.80)
-        inflation_factor = self._inflation_factor(self.current_year)
-
-        if elec_enabled:
-            system_avg_ef = float(np.nanmean([c.weighted_emission_factor for c in self.companies]))
-            if not np.isfinite(system_avg_ef):
-                # Fallback prevents NaN/Inf reward contamination in edge-case states.
-                system_avg_ef = 0.5
-            elec_price = base_elec_price * inflation_factor + carbon_passthrough * clearing_price * system_avg_ef
 
         if mac_costs is None:
             mac_costs = np.zeros(self.n_total)
@@ -1849,12 +1833,7 @@ class ETSEnvironment(gym.Env):
                                      + operational_cost + budget_penalty + capex_penalty
                                      + mac_cost_i + collateral_cost_i + loan_interest_cost)
 
-            # Electricity revenue
-            revenue = 0.0
-            if elec_enabled:
-                revenue = company.output_mwh * elec_price / 1e6  # M€
-
-            cost_norm_ex_penalty = (total_cost_ex_penalty - revenue) / 1000.0
+            cost_norm_ex_penalty = total_cost_ex_penalty / 1000.0
             penalty_norm = penalty_cost / 1000.0
 
             # Green investment bonus with diminishing returns
@@ -1862,10 +1841,6 @@ class ETSEnvironment(gym.Env):
             green_delta = max(0.0, company.green_frac - company.prev_green_frac)
             fossil_scale = max(company.fossil_frac, 0.05)
             green_bonus = beta_shaping * green_delta * fossil_scale * self.shaping_weight * (0.2 + company.w_green)
-
-            # Queue bonus: reward for having active construction projects
-            n_active_queue = len(company._construction_queue)
-            queue_bonus = gamma_shaping * n_active_queue * 0.1 * self.shaping_weight
 
             # ESG signal: saved-carbon-years formula
             esg_signal = 0.0
@@ -1898,7 +1873,7 @@ class ETSEnvironment(gym.Env):
                 - penalty_norm  # penalty at full strength for all agents
                 - opp_cost
             )
-            shaping_reward = float(green_bonus + queue_bonus)
+            shaping_reward = float(green_bonus)
 
             base_rewards[i] = base_reward
             shaping_rewards[i] = shaping_reward
