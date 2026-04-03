@@ -347,14 +347,19 @@ def _print_training_legend():
     print("    vol / match / avg_px: Sec market total volume, match rate, avg price")
     print("    warn: key=N         : Episode warnings (see below)")
     print()
+    print("  3-TRANCHE BID LADDER (PRIMARY AUCTION)")
+    print("    Tx Price€ : Price level of tranche x (€/t, clipped to [price_min, price_max])")
+    print("    Tx Qty    : Quantity bid in tranche x (Mt, absolute after multiplier expansion)")
+    print("    One agent submits 3 independent price/qty pairs → uniform-price auction")
+    print()
     print("  PER-AGENT COLUMNS")
     print("    Grn       : Green fraction start→end (%)")
     print("    ΔG        : Net green change (pp)")
     print("    Emiss     : Mean annual emissions (Mt)")
     print("    Alloc     : Mean annual allocation (Mt)")
     print("    Sf        : Shortfall years / total years")
-    print("    Bid€      : Mean bid price (€/t)")
-    print("    BidMt     : Mean bid volume (Mt)")
+    print("    Bid€      : Mean bid price (€/t) — weighted average across tranches")
+    print("    BidMt     : Mean bid volume (Mt) — total across tranches")
     print("    InvFr     : Mean invest fraction")
     print("    Rew       : Total reward")
     print("    Short     : Total shortfall (Mt)")
@@ -736,7 +741,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"reward_A{i+1}", f"reward_base_A{i+1}", f"reward_shaping_A{i+1}",
                       f"holdings_A{i+1}", f"invest_cost_A{i+1}",
                       f"collateral_cost_A{i+1}",
-                      f"bid_price_A{i+1}", f"queue_size_A{i+1}",
+                      f"bid_price_A{i+1}",
+                      # 3-tranche bid ladder
+                      f"tranche_price_1_A{i+1}", f"tranche_qty_1_A{i+1}",
+                      f"tranche_price_2_A{i+1}", f"tranche_qty_2_A{i+1}",
+                      f"tranche_price_3_A{i+1}", f"tranche_qty_3_A{i+1}",
+                      f"queue_size_A{i+1}",
                       f"emission_shock_A{i+1}", f"cf_shock_A{i+1}",  # P5/P6
                       f"cancellation_A{i+1}",  # P6
                       f"auction_cost_A{i+1}", f"secondary_net_A{i+1}",  # cost breakdown
@@ -950,6 +960,21 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 yr_row[f"invest_cost_A{i+1}"] = _get("invest_costs")
                 yr_row[f"collateral_cost_A{i+1}"] = _get("collateral_costs")
                 yr_row[f"bid_price_A{i+1}"] = _get("bid_prices")
+                # 3-tranche bid ladder data
+                tranche_prices_all = yl.get("tranche_prices", [])
+                tranche_qtys_all = yl.get("tranche_quantities", [])
+                if i < len(tranche_prices_all):
+                    for t in range(3):  # 3 tranches
+                        if t < len(tranche_prices_all[i]):
+                            yr_row[f"tranche_price_{t+1}_A{i+1}"] = round(tranche_prices_all[i][t], 2)
+                            yr_row[f"tranche_qty_{t+1}_A{i+1}"] = round(tranche_qtys_all[i][t], 4)
+                        else:
+                            yr_row[f"tranche_price_{t+1}_A{i+1}"] = 0.0
+                            yr_row[f"tranche_qty_{t+1}_A{i+1}"] = 0.0
+                else:
+                    for t in range(3):
+                        yr_row[f"tranche_price_{t+1}_A{i+1}"] = 0.0
+                        yr_row[f"tranche_qty_{t+1}_A{i+1}"] = 0.0
                 yr_row[f"queue_size_A{i+1}"] = _get("queue_sizes")
                 yr_row[f"emission_shock_A{i+1}"] = _get("emission_shocks")   # P5
                 yr_row[f"cf_shock_A{i+1}"] = _get("cf_shocks")               # P6
@@ -1670,6 +1695,27 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
             # Per-agent table with integrated secondary detail
             print(thin)
+            
+            # Tranche breakdown from most recent year
+            if env.episode_log:
+                last_yl = env.episode_log[-1]
+                tranche_prices = last_yl.get("tranche_prices", [])
+                tranche_qtys = last_yl.get("tranche_quantities", [])
+                if tranche_prices and tranche_qtys:
+                    print(f"  TRANCHE BIDS (Yr {last_yl.get('year', n_years_ep)}):")
+                    print(f"  {'Ag':>3}  {'T1 Price€':>9} {'T1 Qty':>7}  │  {'T2 Price€':>9} {'T2 Qty':>7}  │  {'T3 Price€':>9} {'T3 Qty':>7}")
+                    for i in range(n_agents):
+                        if i < len(tranche_prices):
+                            t1p = tranche_prices[i][0] if len(tranche_prices[i]) > 0 else 0.0
+                            t1q = tranche_qtys[i][0] if len(tranche_qtys[i]) > 0 else 0.0
+                            t2p = tranche_prices[i][1] if len(tranche_prices[i]) > 1 else 0.0
+                            t2q = tranche_qtys[i][1] if len(tranche_qtys[i]) > 1 else 0.0
+                            t3p = tranche_prices[i][2] if len(tranche_prices[i]) > 2 else 0.0
+                            t3q = tranche_qtys[i][2] if len(tranche_qtys[i]) > 2 else 0.0
+                            act_mark = "*" if (cycling_enabled and i == active_agent_idx) else " "
+                            print(f"  A{i+1}{act_mark}: {t1p:9.1f} {t1q:7.2f}  │  {t2p:9.1f} {t2q:7.2f}  │  {t3p:9.1f} {t3q:7.2f}")
+                    print(thin)
+            
             print(f"  {'':4}  {'Grn':>9} {'ΔG':>6} {'Emiss':>6} {'Alloc':>6} "
                   f"{'Sf':>5} {'Bid€':>6} {'BidMt':>6} {'InvFr':>5} "
                   f"│ {'Rew':>7} {'Short':>6} {'Pen':>7} {'ALoss':>7} {'CLoss':>7} {'LΔ':>4} "

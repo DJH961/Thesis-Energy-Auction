@@ -1075,6 +1075,9 @@ class ETSEnvironment(gym.Env):
         # Store aggregate (weighted-average) price and total qty per agent for logging
         agent_total_qty = np.zeros(self.n_total)
         agent_wavg_price = np.zeros(self.n_total)
+        # Store individual tranche prices and quantities per agent [agent][tranche]
+        tranche_prices = [[0.0] * N_TRANCHES for _ in range(self.n_total)]
+        tranche_quantities = [[0.0] * N_TRANCHES for _ in range(self.n_total)]
 
         for i, company in enumerate(self.companies):
             if not self._is_agent_active(i):
@@ -1097,6 +1100,9 @@ class ETSEnvironment(gym.Env):
                 if lot_size > 0:
                     q_abs = max(lot_size, round(q_abs / lot_size) * lot_size)
                 q_abs = max(0.0, q_abs)
+                # Store per-tranche data
+                tranche_prices[i][t] = p_clipped
+                tranche_quantities[i][t] = q_abs
                 if q_abs > 1e-6:
                     all_bid_rows.append([float(i), q_abs, p_clipped])
                     total_qty_i += q_abs
@@ -1144,6 +1150,9 @@ class ETSEnvironment(gym.Env):
         # Store aggregate per-agent bid info for logging (backward-compatible)
         self._phase1_bid_prices = agent_wavg_price.copy()
         self._phase1_bid_quantities = agent_total_qty.copy()
+        # Store individual tranche data for logging
+        self._phase1_tranche_prices = tranche_prices
+        self._phase1_tranche_quantities = tranche_quantities
 
         # Compute effective reserve price (dynamic or static)
         effective_reserve = self._compute_dynamic_reserve()
@@ -1587,6 +1596,9 @@ class ETSEnvironment(gym.Env):
             "holdings": self.holdings.tolist(),
             "shortfalls": shortfalls.tolist(),
             "bid_prices": self._phase1_bid_prices.tolist() if self._phase1_bid_prices is not None else [],
+            "bid_quantities": self._phase1_bid_quantities.tolist() if self._phase1_bid_quantities is not None else [],
+            "tranche_prices": self._phase1_tranche_prices,
+            "tranche_quantities": self._phase1_tranche_quantities,
             "delta_greens": [c.green_frac - c.prev_green_frac for c in self.companies],
             "queue_sizes": [len(c._construction_queue) for c in self.companies],
             "terminal_bank_values": self._last_terminal_bank_values.tolist(),
