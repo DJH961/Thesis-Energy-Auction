@@ -294,6 +294,53 @@ class ETSEnvironment(gym.Env):
     # Dynamic reserve price
     # ------------------------------------------------------------------
 
+    def _compute_tranche_fill_ratios(self, allocations: np.ndarray,
+                                     clearing_price: float) -> list:
+        """
+        D1: Compute per-tranche fill ratios analytically.
+
+        For a uniform-price auction: bids above clearing_price are fully
+        filled (up to per-agent holding limits). Bids below clearing_price
+        receive zero fill. At exactly clearing_price, filling is partial.
+
+        We reconstruct per-tranche fills from stored tranche prices and
+        quantities alongside the actual per-agent total allocation.
+
+        Returns a list of length n_agents, each element is a list of 3
+        fill ratios [fill_t1, fill_t2, fill_t3] in [0, 1].
+        """
+        N_TRANCHES = 3
+        results = []
+        for i in range(self.n_agents):
+            prices_i = self._phase1_tranche_prices[i]   # list of 3 prices (ascending, after B1)
+            qtys_i = self._phase1_tranche_quantities[i]  # list of 3 qtys (Mt)
+            total_alloc = float(allocations[i])
+
+            fill_ratios = [0.0] * N_TRANCHES
+            remaining_alloc = total_alloc
+
+            # Distribute allocation from highest-price tranche down (price-priority filling)
+            # Since tranches are sorted ascending (B1), fill in reverse order
+            for t in sorted(range(N_TRANCHES), key=lambda k: -prices_i[k]):
+                if remaining_alloc <= 1e-9:
+                    break
+                qty_t = float(qtys_i[t])
+                if qty_t < 1e-9:
+                    fill_ratios[t] = 0.0
+                    continue
+                if prices_i[t] < clearing_price - 1e-9:
+                    # Below clearing → no fill
+                    fill_ratios[t] = 0.0
+                else:
+                    # At or above clearing → fill from remaining allocation
+                    fill = min(qty_t, remaining_alloc)
+                    fill_ratios[t] = fill / qty_t
+                    remaining_alloc -= fill
+                    remaining_alloc = max(0.0, remaining_alloc)
+
+            results.append(fill_ratios)
+        return results
+
     def _compute_dynamic_reserve(self) -> float:
         """
         Compute effective reserve price for this year's auction.
@@ -1097,7 +1144,7 @@ class ETSEnvironment(gym.Env):
         tranche_quantities = [[0.0] * N_TRANCHES for _ in range(self.n_total)]
 
         # E1: Aggregate bid volume cap — total bid ≤ 3× annual_need
-        agg_bid_cap_mult = float(self.config["auction"].get("aggregate_bid_cap_mult", 3.0))
+        aggregate_bid_cap_mult = float(self.config["auction"].get("aggregate_bid_cap_mult", 3.0))
 
         for i, company in enumerate(self.companies):
             if not self._is_agent_active(i):
@@ -1127,7 +1174,7 @@ class ETSEnvironment(gym.Env):
 
             # E1: Cap total bid quantity at aggregate_bid_cap_mult × base_need
             total_unsorted = sum(q for _, q in raw_tranches)
-            agg_cap = agg_bid_cap_mult * base_need
+            agg_cap = aggregate_bid_cap_mult * base_need
             if total_unsorted > agg_cap + 1e-9 and total_unsorted > 1e-9:
                 scale = agg_cap / total_unsorted
                 raw_tranches = [(p, q * scale) for p, q in raw_tranches]
@@ -1351,8 +1398,15 @@ class ETSEnvironment(gym.Env):
         self._phase1_mac_costs = mac_costs
         self._phase1_log = log
 
+        # D1: Compute per-tranche fill ratios for each learning agent
+        # This uses an analytic reconstruction: given clearing_price and each
+        # tranche's (price, qty) pair, compute expected fill without re-running clearing.
+        tranche_fills = self._compute_tranche_fill_ratios(
+            allocations, clearing_price)
+
         # 10. Build phase 2 observations (learning agents only)
         obs_phase1 = self._get_obs_phase1()   # shape (n_agents, obs_dim)
+        pn = float(self.config["auction"]["price_max"])
 
         obs_phase2 = np.stack([
             self.companies[i].get_observation_phase2(
@@ -1361,8 +1415,13 @@ class ETSEnvironment(gym.Env):
                 clearing_price=clearing_price,
                 emissions=realized_emissions[i],
                 banked=self.holdings[i],
-                emission_shock=float(epsilons[i]),   # P5: shock in obs
-                payment=float(payments[i]),           # for auction_savings dim
+                emission_shock=float(epsilons[i]),
+                payment=float(payments[i]),
+                tranche_fill_ratios=tranche_fills[i],
+                tranche_price_vs_clearing=[
+                    (self._phase1_tranche_prices[i][t] - clearing_price) / max(pn, 1.0)
+                    for t in range(3)
+                ],
             )
             for i in range(self.n_agents)
         ])
@@ -1904,17 +1963,17 @@ class ETSEnvironment(gym.Env):
                 esg_raw = ef_ratio * time_ratio * (company.annual_budget / 1000.0)
                 esg_signal = esg_scale * esg_raw
 
-            # F1: Efficiency bonus now added as a shaping reward (decays with shaping_weight)
-            # This ensures it doesn't permanently distort financial agent baselines.
-            # The bonus rewards emission factor improvement regardless of w_green,
-            # proportional to remaining time and carbon price.
-            efficiency_shaping = 0.0
+            # F1: Efficiency bonus as a shaping reward (decays with shaping_weight).
+            # Named 'efficiency_bonus' for consistency; acts as shaping (not permanent base reward).
+            # Rewards emission factor improvement regardless of w_green, proportional to
+            # remaining time and carbon price.
+            efficiency_bonus = 0.0
             if company.initial_ef > 0.01:
                 ef_improvement = max(0.0, company.initial_ef - company.weighted_emission_factor)
                 ef_improvement_ratio = ef_improvement / company.initial_ef
                 time_weight = remaining_years / self.n_years
                 price_weight = clearing_price / 100.0
-                efficiency_shaping = 1.5 * ef_improvement_ratio * time_weight * price_weight * self.shaping_weight
+                efficiency_bonus = 1.5 * ef_improvement_ratio * time_weight * price_weight * self.shaping_weight
 
             # Cost-of-capital on allowances carried after compliance settlement.
             # NOTE: self.holdings[i] is already the post-compliance bank at this
@@ -1927,7 +1986,7 @@ class ETSEnvironment(gym.Env):
                 - penalty_norm  # penalty at full strength for all agents
                 - opp_cost
             )
-            shaping_reward = float(green_bonus + efficiency_shaping)
+            shaping_reward = float(green_bonus + efficiency_bonus)
 
             base_rewards[i] = base_reward
             shaping_rewards[i] = shaping_reward

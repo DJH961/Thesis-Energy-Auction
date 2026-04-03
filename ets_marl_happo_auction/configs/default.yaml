@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v8.0
+# ETS MARL — Configuration v8.1
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -161,7 +161,9 @@ auction:
   # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
   # Centred around 1.0 (full coverage), range [0.3, 2.0] = 30%-200% of need.
   qty_mult_low: 0.3
-  qty_mult_high: 2.0
+  qty_mult_high: 1.5   # E1: per-tranche maximum multiplier. With 3 tranches this allows up
+                       # to 4.5× coverage, but aggregate_bid_cap_mult: 3.0 (below) provides
+                       # the binding hard cap at 3.0× annual_need across all tranches.
   # Holding limit: max fraction of auctioned volume one agent can receive.
   # 1.0 = no limit (disabled). Set to 0.25 for California-style 25% cap.
   max_agent_share: 1.0

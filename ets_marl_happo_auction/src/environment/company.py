@@ -630,77 +630,83 @@ class Company:
                                budget_spent: float = 0.0,
                                annual_budget: float = 1e9):
         """
-        Phase 1 observation (pre-auction): 28D base + 5*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 24D base + 5*(N-1) opponent dims.
 
-        Base 28 dims:
+        Phase G consolidation: 28D → 24D (−4 dims)
+          Removed: expected_price_ar1 [was 3] (redundant with MA3 + time)
+          Replaced: 5 tech fracs [was 4-8] with 3 summary fracs [4-6]:
+            green_frac (sum of onshore+offshore+solar), coal_frac, gas_frac
+          Removed: predicted_msr_withholding [was 26] (derivable from TNAC proxy)
+
+        Base 24 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
-        [3]  expected price from AR(1) model (normalized)
-        [4-8]  technology mix vector (5D)
-        [9]  emissions (normalized)
-        [10] estimated need with risk buffer
-        [11] p_fail
-        [12] investment experience
-        [13] auction gap (banked allowances)
-        [14-16] construction queue (onshore, offshore, solar)
-        [17] weighted emission factor (normalized)
-        [18] last secondary market price (normalized)  -- P8
-        [19] last secondary market volume (normalized) -- P8
-        [20] carry-forward obligation (Mt)
-        [21] TNAC proxy (total banked allowances / cap, clipped to [0,3])
-        [22] effective reserve price / price_max
-        [23] auction volume ratio = last_auction_volume / cap_t
-        [24] MSR reserve normalized = msr_reserve / cap_t
-        [25] own bank ratio (clipped [0, 5], normalized by /5)
-        [26] predicted MSR withholding fraction of cap
-        [27] budget_headroom (1.0=fresh, 0.0=at limit, negative=overspent)
+        [3]  green_frac  (onshore + offshore + solar fraction)
+        [4]  coal_frac   (coal technology fraction)
+        [5]  gas_frac    (gas technology fraction)
+        [6]  emissions (normalized)
+        [7]  estimated need with risk buffer
+        [8]  p_fail
+        [9]  investment experience
+        [10] auction gap (banked allowances)
+        [11-13] construction queue (onshore, offshore, solar)
+        [14] weighted emission factor (normalized)
+        [15] last secondary market price (normalized)
+        [16] last secondary market volume (normalized)
+        [17] carry-forward obligation (Mt)
+        [18] TNAC proxy (total banked allowances / cap, clipped to [0,3])
+        [19] effective reserve price / price_max
+        [20] auction volume ratio = last_auction_volume / cap_t
+        [21] MSR reserve normalized = msr_reserve / cap_t
+        [22] own bank ratio (clipped [0, 5], normalized by /5)
+        [23] budget_headroom (1.0=fresh, 0.0=at limit, negative=overspent)
 
         Opponent dims (if opponent_modeling enabled, 5D per opponent):
-        [28..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
+        [24..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
         pn = self._price_norm  # normalization constant (= price_max)
         own_need = max(self.compute_estimate_need(), 0.1)
         own_bank_ratio = float(np.clip(float(bank) / own_need, 0.0, 5.0)) / 5.0
-        predicted_withhold = max(0.0, tnac_proxy * cap_t - tnac_upper) * withhold_rate / max(cap_t, 1e-6)
-        predicted_withhold = float(np.clip(predicted_withhold, 0.0, 1.0))
         budget_headroom = float(np.clip(
             1.0 - (budget_spent / max(annual_budget, 1e-6)),
             -0.5,
             1.0,
         ))
 
+        # G: Aggregated technology fractions (saves 2 dims vs raw mix[0..4])
+        # mix indices: 0=coal, 1=gas, 2=onshore_wind, 3=offshore_wind, 4=solar
+        green_frac = float(self.mix[2] + self.mix[3] + self.mix[4])  # onshore+offshore+solar
+        coal_frac = float(self.mix[0])   # coal fraction
+        gas_frac = float(self.mix[1])    # gas fraction
+
         base = np.array([
             year / 12.0,                          # [0] normalized by n_years
             cap_t / 30.0,                         # [1] normalized for 8-agent cap
-            price_signal / pn,                    # [2]
-            expected_price / pn,                  # [3]
-            self.mix[0],                          # [4] coal frac
-            self.mix[1],                          # [5] gas frac
-            self.mix[2],                          # [6] onshore frac
-            self.mix[3],                          # [7] offshore frac
-            self.mix[4],                          # [8] solar frac
-            self.compute_emissions() / 10.0,      # [9]
-            self.compute_estimate_need() / 10.0,  # [10]
-            self.compute_risk_factor(),           # [11]
-            self._consecutive_successes / 5.0,    # [12]
-            auction_gap / 5.0,                    # [13]
-            queue[0],                             # [14] onshore under construction
-            queue[1],                             # [15] offshore under construction
-            queue[2],                             # [16] solar under construction
-            self.weighted_emission_factor,        # [17] avg EF
-            last_secondary_price / pn,            # [18] P8: secondary price signal
-            last_secondary_volume / 10.0,         # [19] P8: secondary volume signal
-            self._carry_forward / 5.0,            # [20] carry-forward obligation (Mt)
-            float(np.clip(tnac_proxy, 0.0, 3.0)), # [21] TNAC proxy
-            effective_reserve / pn,               # [22] effective reserve signal
-            last_auction_volume / max(cap_t, 1e-6),  # [23] auction volume ratio
-            msr_reserve / max(cap_t, 1e-6),          # [24] MSR reserve signal
-            own_bank_ratio,                          # [25] own bank ratio
-            predicted_withhold,                      # [26] predicted MSR withhold share
-            budget_headroom,                         # [27] budget headroom signal
+            price_signal / pn,                    # [2] MA3 price signal
+            green_frac,                           # [3] G: renewable fraction
+            coal_frac,                            # [4] G: coal fraction
+            gas_frac,                             # [5] G: gas fraction
+            self.compute_emissions() / 10.0,      # [6]
+            self.compute_estimate_need() / 10.0,  # [7]
+            self.compute_risk_factor(),           # [8]
+            self._consecutive_successes / 5.0,    # [9]
+            auction_gap / 5.0,                    # [10]
+            queue[0],                             # [11] onshore under construction
+            queue[1],                             # [12] offshore under construction
+            queue[2],                             # [13] solar under construction
+            self.weighted_emission_factor,        # [14] avg EF
+            last_secondary_price / pn,            # [15] secondary price signal
+            last_secondary_volume / 10.0,         # [16] secondary volume signal
+            self._carry_forward / 5.0,            # [17] carry-forward obligation (Mt)
+            float(np.clip(tnac_proxy, 0.0, 3.0)), # [18] TNAC proxy
+            effective_reserve / pn,               # [19] effective reserve signal
+            last_auction_volume / max(cap_t, 1e-6),  # [20] auction volume ratio
+            msr_reserve / max(cap_t, 1e-6),          # [21] MSR reserve signal
+            own_bank_ratio,                          # [22] own bank ratio
+            budget_headroom,                         # [23] budget headroom signal
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -708,61 +714,79 @@ class Company:
 
     def get_observation_phase2(self, obs_phase1, allocation,
                                 clearing_price, emissions, banked=0.0,
-                                emission_shock=0.0, payment=0.0):
+                                emission_shock=0.0, payment=0.0,
+                                tranche_fill_ratios=None,
+                                tranche_price_vs_clearing=None):
         """
-        Phase 2 observation (post-auction): obs_phase1 + 7 extra dims.
-        Appends auction results + P5 emission shock + auction_savings + coverage_ratio + carry_forward_norm.
+        Phase 2 observation (post-auction): obs_phase1 + 7 standard dims + 6 D1/D2 dims.
 
-        Extra dims:
+        Standard extra dims:
         [base+0] allocation / 5
         [base+1] clearing_price / price_max
         [base+2] net compliance position: (banked + allocation - emissions - carry_forward) / 5
-                 <0 means the agent is still short after using all holdings
-        [base+3] emission_shock (realized deviation from base need)  -- P5
+        [base+3] emission_shock (P5)
         [base+4] auction_savings: (allocation × 100 - payment) / 1000
-                 penalty-value avoided minus cost paid; encodes deal quality
         [base+5] coverage_ratio: (banked + allocation) / max(emissions + carry_forward, 1e-6)
                  clipped to [0, 3], normalized by /3
         [base+6] normalized carry_forward: carry_forward / max(estimated_need, 1e-6)
-                 clipped to [0, 3]; agents need to see their debt
+                 clipped to [0, 3]
+
+        D1/D2 extra dims (Phase D: per-tranche feedback):
+        [base+7]  tranche_1_fill_ratio (0=no fill, 1=full fill)
+        [base+8]  tranche_2_fill_ratio
+        [base+9]  tranche_3_fill_ratio
+        [base+10] (tranche_1_price - clearing_price) / price_norm  (signed)
+        [base+11] (tranche_2_price - clearing_price) / price_norm
+        [base+12] (tranche_3_price - clearing_price) / price_norm
         """
         auction_savings = (allocation * 100.0 - payment) / 1000.0
-
-        # Coverage ratio: how well-covered the agent is for compliance
         total_obligation = max(emissions + self._carry_forward, 1e-6)
         coverage_ratio = float(np.clip((banked + allocation) / total_obligation, 0.0, 3.0)) / 3.0
-
-        # Normalized carry-forward: debt relative to estimated need
         estimated_need = max(self.compute_estimate_need(), 1e-6)
         carry_forward_norm = float(np.clip(self._carry_forward / estimated_need, 0.0, 3.0)) / 3.0
 
         extra = np.array([
-            allocation / 5.0,                                                       # [base+0]
-            clearing_price / self._price_norm,                                      # [base+1]
-            (banked + allocation - emissions - self._carry_forward) / 5.0,          # [base+2]
-            float(emission_shock),                                                  # [base+3] P5
-            float(auction_savings),                                                 # [base+4]
-            coverage_ratio,                                                         # [base+5]
-            carry_forward_norm,                                                     # [base+6]
+            allocation / 5.0,
+            clearing_price / self._price_norm,
+            (banked + allocation - emissions - self._carry_forward) / 5.0,
+            float(emission_shock),
+            float(auction_savings),
+            coverage_ratio,
+            carry_forward_norm,
         ], dtype=np.float32)
-        return np.concatenate([obs_phase1, extra])
+
+        # D1+D2: Per-tranche fill ratios and price-vs-clearing signals
+        if tranche_fill_ratios is None:
+            tranche_fill_ratios = [0.0, 0.0, 0.0]
+        if tranche_price_vs_clearing is None:
+            tranche_price_vs_clearing = [0.0, 0.0, 0.0]
+
+        d1_d2 = np.array([
+            float(np.clip(tranche_fill_ratios[0], 0.0, 1.0)),    # [base+7]  fill T1
+            float(np.clip(tranche_fill_ratios[1], 0.0, 1.0)),    # [base+8]  fill T2
+            float(np.clip(tranche_fill_ratios[2], 0.0, 1.0)),    # [base+9]  fill T3
+            float(np.clip(tranche_price_vs_clearing[0], -1.0, 1.0)),  # [base+10] p1 vs clear
+            float(np.clip(tranche_price_vs_clearing[1], -1.0, 1.0)),  # [base+11] p2 vs clear
+            float(np.clip(tranche_price_vs_clearing[2], -1.0, 1.0)),  # [base+12] p3 vs clear
+        ], dtype=np.float32)
+
+        return np.concatenate([obs_phase1, extra, d1_d2])
 
     @property
     def obs_dim_phase1(self) -> int:
-        """28 base dims + 5*(N_total-1) opponent dims when opponent modeling is enabled.
+        """24 base dims (after Phase G consolidation) + 5*(N_total-1) opponent dims.
         N_total = learning agents + bot agents (all market participants).
-        Base dims include carry-forward at [20], TNAC proxy at [21],
-        effective reserve at [22], auction volume ratio at [23], and
-        MSR reserve signal at [24], own bank ratio at [25], predicted
-        MSR withholding at [26], and auction volume change at [27]."""
+        Phase G removed: expected_price_ar1 (was [3]), two tech fracs (5→3),
+        and predicted_msr_withholding (was [26]). Net: 28-4 = 24 base dims."""
         if self._opponent_modeling and self._n_total > 1:
-            return 28 + 5 * (self._n_total - 1)
-        return 28
+            return 24 + 5 * (self._n_total - 1)
+        return 24
 
     @property
     def obs_dim_phase2(self) -> int:
-        """obs_dim_phase1 + 7 (allocation, price, net_compliance_pos, emission_shock, auction_savings, coverage_ratio, carry_forward_norm)."""
-        return self.obs_dim_phase1 + 7
+        """obs_dim_phase1 + 7 (standard) + 6 (D1/D2 tranche feedback).
+        Total Phase 2 base = 24 + 7 + 6 = 37 dims (+ opponent modeling if enabled)."""
+        return self.obs_dim_phase1 + 13  # 7 standard + 6 D1/D2
 
     # ------------------------------------------------------------------
     # Reset

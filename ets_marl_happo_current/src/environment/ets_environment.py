@@ -1857,15 +1857,15 @@ class ETSEnvironment(gym.Env):
                 esg_raw = ef_ratio * time_ratio * (company.annual_budget / 1000.0)
                 esg_signal = esg_scale * esg_raw
 
-            # F1: Efficiency bonus now added as a shaping reward (decays with shaping_weight)
-            # This ensures it doesn't permanently distort financial agent baselines.
-            efficiency_shaping = 0.0
+            # F1: Efficiency bonus as a shaping reward (decays with shaping_weight).
+            # Named 'efficiency_bonus' for consistency; acts as shaping (not permanent base reward).
+            efficiency_bonus = 0.0
             if company.initial_ef > 0.01:
                 ef_improvement = max(0.0, company.initial_ef - company.weighted_emission_factor)
                 ef_improvement_ratio = ef_improvement / company.initial_ef
                 time_weight = remaining_years / self.n_years
                 price_weight = clearing_price / 100.0
-                efficiency_shaping = 1.5 * ef_improvement_ratio * time_weight * price_weight * self.shaping_weight
+                efficiency_bonus = 1.5 * ef_improvement_ratio * time_weight * price_weight * self.shaping_weight
 
             # Cost-of-capital on allowances carried after compliance settlement.
             # NOTE: self.holdings[i] is already the post-compliance bank at this
@@ -1878,7 +1878,7 @@ class ETSEnvironment(gym.Env):
                 - penalty_norm  # penalty at full strength for all agents
                 - opp_cost
             )
-            shaping_reward = float(green_bonus + efficiency_shaping)
+            shaping_reward = float(green_bonus + efficiency_bonus)
 
             base_rewards[i] = base_reward
             shaping_rewards[i] = shaping_reward
