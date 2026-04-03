@@ -233,7 +233,7 @@ class CapSchedule:
         """
         cap_t = self.get_cap(year)
         if not self.msr_enabled or self._prev_tnac is None:
-            return max(self.min_auction_frac * cap_t, cap_t)
+            return cap_t
 
         tnac = self._prev_tnac  # 1-year lag (already stored from last get_auction_volume)
         auction_vol = cap_t
