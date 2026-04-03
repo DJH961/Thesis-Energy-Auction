@@ -1198,10 +1198,11 @@ class ETSEnvironment(gym.Env):
             collateral_locked=collateral_locked,
             suspension_length=suspension_length,
         )
-        # Apply defaults: exhaust defaulter's annual budget, set suspension.
+        # Apply defaults: exhaust remaining annual budget (signals insolvency).
+        # Collateral is forfeited implicitly: settle_auction already zeroed the allocation
+        # so no allowances are received, but the locked collateral amount is not returned.
         for i in range(self.n_total):
             if defaults_mask[i]:
-                # Forfeit collateral + exhaust remaining budget (agent is effectively insolvent)
                 excess = max(0.0, self.companies[i].annual_budget
                              - self.companies[i].budget_spent_this_year)
                 self.companies[i].record_spending(excess)

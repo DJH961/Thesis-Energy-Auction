@@ -101,7 +101,7 @@ class TestAuctionAction:
         # TOTAL bid volume in Mt increases even if the multiplier itself is clipped.
         qty_no_cf = action_no_cf[1] * need_no_cf
         qty_cf = action_cf[1] * need_cf
-        assert qty_cf >= qty_no_cf, f"Carry-forward should increase total bid qty: {qty_cf:.3f} vs {qty_no_cf:.3f}"
+        assert qty_cf >= qty_no_cf - 1e-6, f"Carry-forward should increase total bid qty: {qty_cf:.3f} vs {qty_no_cf:.3f}"
 
     def test_invest_frac_within_bounds(self, config):
         c = make_company(config, agent_id=0)

@@ -180,6 +180,8 @@ def auction_action(
         max_collateral = h_max_coll_share * available_budget
         if projected_collateral > max_collateral:
             qty_mult *= max_collateral / projected_collateral
+    # Final clip: clamp to [0, high] after budget constraints (budget constraint can reduce
+    # below qty_mult_low when funds are tight; we allow 0 rather than force a default bid).
     qty_mult = float(np.clip(qty_mult, 0.0, aq.get("qty_mult_high", 2.0)))
 
     # --- Investment fraction (NPV-gated) ---
