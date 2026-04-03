@@ -1,7 +1,49 @@
-# Changelog — ETS MARL (`ets_marl_happo_current`)
+# Changelog — ETS MARL (`ets_marl_happo_auction`)
 
 Version numbers reflect the `# ETS MARL — Configuration vX.Y` header in `configs/default.yaml`
 and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
+
+---
+
+## v8.0.0
+
+**3-Tranche Bid Ladder + Uniform-Price Call Auction Secondary Market**
+
+This is a major architectural change, forked from v7.3.0. The folder `ets_marl_happo_auction`
+is a standalone variant focused on realistic auction mechanism design.
+
+### Primary Auction: 3-Tranche Bid Ladder
+- **Action space expanded from 6D to 10D**: Phase 1 actions are now
+  `[p1, q1, p2, q2, p3, q3, invest_frac, tech_logit0, tech_logit1, tech_logit2]`.
+- Each `(p_k, q_k)` pair is an independent price/coverage-multiplier bid submitted to
+  the uniform-price auction. This mirrors the **demand curves** used in real EEX/ICE
+  call auctions where participants express willingness-to-pay at multiple price levels.
+- All three tranches are expanded into separate bid rows and passed to `market_clearing_ets()`.
+- Bot agents have their single heuristic bid split into 3 equal tranches automatically.
+- Collateral affordability clips are applied to the agent's total bid across tranches.
+- Logging retains backward-compatible per-agent weighted-average price and total quantity.
+
+### Secondary Market: Uniform-Price Call Auction (Clearinghouse)
+- **Replaced bilateral double auction** with a **Uniform-Price Call Auction**.
+- All agent bids are aggregated into a single **demand curve** (sorted descending by price)
+  and a single **supply curve** (sorted ascending by price).
+- The intersection determines a single **uniform clearing price** at which all overlapping
+  volume clears. Buyers pay clearing_price + tx_cost; sellers receive clearing_price - tx_cost.
+- Pro-rata allocation on the excess side when supply ≠ demand at the equilibrium price.
+- This mechanism **mathematically guarantees maximum social surplus** and finds the exact
+  market equilibrium that a Continuous Double Auction would naturally discover over a longer
+  time horizon, making it both highly realistic and computationally efficient.
+- Removed the external liquidity pool (no longer needed with proper equilibrium pricing).
+
+### PPO Agent Updates
+- Exploration noise updated for 10D action space: side-balanced sampling for all 3
+  price tranches in uniform mode; Gaussian anchors spread ±15 EUR around expected price.
+- Action anchors updated: `[75, 0.33, 80, 0.33, 85, 0.33, 0.03, 0.3, -0.5, 0.5]`.
+
+### Config / Metadata
+- Version bumped to `8.0.0` in `pyproject.toml`, `configs/default.yaml`, `README.md`,
+  and `train.py` banner.
+- New folder `ets_marl_happo_auction` co-exists alongside `ets_marl_happo_current` (v7.3).
 
 ---
 

@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v7.3
+# ETS MARL — Configuration v8.0
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -490,7 +490,8 @@ exploration:
   epsilon_final: 0.05
   epsilon_decay_episodes: 0   # auto: 35% of n_episodes, clamped to [300, 12000]
   # Action anchors in physical space (set initial policy mean via head bias).
-  # Auction: [bid_price, qty_mult, invest_frac, logit_onshore, logit_offshore, logit_solar]
-  auction_anchors: [80.0, 1.0, 0.03, 0.3, -0.5, 0.5]
+  # Auction: [p1, q1, p2, q2, p3, q3, invest_frac, logit_onshore, logit_offshore, logit_solar]
+  # 3-tranche ladder: tranche 1 slightly below, tranche 2 at, tranche 3 slightly above expected price
+  auction_anchors: [75.0, 0.33, 80.0, 0.33, 85.0, 0.33, 0.03, 0.3, -0.5, 0.5]
   # Secondary: [sec_price (absolute €/t), sec_qty]
   secondary_anchors: [80.0, 0.0]
