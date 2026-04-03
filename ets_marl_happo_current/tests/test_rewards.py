@@ -104,7 +104,10 @@ def _run_one_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.0):
     auction_actions = np.zeros((n, 6), dtype=np.float32)
     auction_actions[:, 0] = auction_price
     auction_actions[:, 1] = qty_mult
-    auction_actions[:, 2] = invest_frac
+    # With v7.2.1: invest_frac = ((action + 1) / 2) * max_invest_frac
+    # To get desired invest_frac: action = 2 * invest_frac / max_invest_frac - 1
+    max_invest_frac = env.companies[0].max_invest_frac
+    auction_actions[:, 2] = 2.0 * invest_frac / max_invest_frac - 1.0
     auction_actions[:, 3:] = [0.0, 0.0, 1.0]  # solar logits
     env.step_auction(auction_actions)
 
@@ -373,7 +376,11 @@ def _run_to_final_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.0):
         auction_actions = np.zeros((n, 6), dtype=np.float32)
         auction_actions[:, 0] = auction_price
         auction_actions[:, 1] = qty_mult
-        auction_actions[:, 2] = invest_frac
+        # With v7.2.1: invest_frac = ((action + 1) / 2) * max_invest_frac
+        # To get invest_frac=0: action = -1.0
+        # To get desired invest_frac: action = 2 * invest_frac / max_invest_frac - 1
+        max_invest_frac = env.companies[0].max_invest_frac
+        auction_actions[:, 2] = 2.0 * invest_frac / max_invest_frac - 1.0
         auction_actions[:, 3:] = [0.0, 0.0, 1.0]  # solar logits
         env.step_auction(auction_actions)
 
@@ -399,7 +406,9 @@ class TestTerminalBankValue:
 
         env_with = ETSEnvironment(config, seed=42)
         env_with.reset()
-        rewards_with, _ = _run_to_final_year(env_with, auction_price=80.0, qty_mult=1.3)
+        # Use higher qty_mult to ensure agents have surplus (no carry_forward debt)
+        # to avoid terminal debt penalty affecting the comparison
+        rewards_with, _ = _run_to_final_year(env_with, auction_price=80.0, qty_mult=1.5)
 
         config2 = load_config()
         config2["reward"]["terminal_bank_value"] = False
@@ -411,7 +420,7 @@ class TestTerminalBankValue:
 
         env_without = ETSEnvironment(config2, seed=42)
         env_without.reset()
-        rewards_without, _ = _run_to_final_year(env_without, auction_price=80.0, qty_mult=1.3)
+        rewards_without, _ = _run_to_final_year(env_without, auction_price=80.0, qty_mult=1.5)
 
         # If any agent has banked allowances, terminal value should boost reward
         # At minimum, rewards should not be lower with terminal bank value enabled

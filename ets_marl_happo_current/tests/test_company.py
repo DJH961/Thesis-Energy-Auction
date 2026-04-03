@@ -419,10 +419,15 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
     env = ETSEnvironment(cfg, seed=22)
     env.reset(seed=22)
 
+    # With v7.2.1: invest_frac = ((action + 1) / 2) * max_invest_frac
+    # To get invest_frac=target_frac: action = 2 * target_frac / max_invest_frac - 1
+    max_invest_frac = cfg["investment"]["max_invest_frac"]
+    action_value = 2.0 * target_frac / max_invest_frac - 1.0
+
     actions = np.zeros((env.n_agents, 6), dtype=np.float32)
     actions[:, 0] = 120.0
     actions[:, 1] = 1.0
-    actions[:, 2] = target_frac
+    actions[:, 2] = action_value
     actions[:, 3] = 1.0  # onshore
     env.step_auction(actions)
     sec = np.zeros((env.n_agents, 2), dtype=np.float32)

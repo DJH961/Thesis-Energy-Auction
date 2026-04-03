@@ -1958,7 +1958,16 @@ class ETSEnvironment(gym.Env):
                     base_rewards[i] += queue_term
                     terminal_queue_values[i] = queue_term
 
-                # Terminal debt liquidation: aggressively penalize outstanding debt
+        # Terminal debt liquidation: applied in final year regardless of terminal_bank/queue settings
+        if is_final_year:
+            pen_cfg = self.config["penalty"]
+            eff_penalty = pen_cfg["rate"] * self._inflation_factor(self.current_year)
+            terminal_price = max(clearing_price, self.last_secondary_price, eff_penalty * 0.8)
+
+            for i, company in enumerate(self.companies):
+                if active_mask is not None and not bool(active_mask[i]):
+                    continue
+                # Aggressively penalize outstanding carry_forward debt
                 if company._carry_forward > 0:
                     debt_penalty = (company._carry_forward * terminal_price * 1.5) / 1000.0
                     rewards[i] -= debt_penalty
