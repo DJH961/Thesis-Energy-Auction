@@ -161,9 +161,13 @@ def test_collateral_cost_logged_matches_formula():
     auction_actions[:, 2] = 0.0
     auction_actions[:, 3:] = [0.0, 0.0, 1.0]
 
-    # One deliberate overbid with high coverage to force positive collateral.
-    auction_actions[0, 0] = 260.0
-    auction_actions[0, 1] = 2.0
+    # Agent 0 overbids (price above clearing) with a moderate quantity so that E4
+    # collateral + payment stays within the annual budget (no default).
+    # At bid_price=120, effective_reserve=30: coll_locked = 0.10*(120-30)*bid_q.
+    # With clearing≈80 and budget=880: 80*bid_q + 90*0.10*bid_q ≤ 880 → bid_q ≤ 9.9 Mt.
+    # Using qty_mult=1.0 (bid_q ≈ 8.3 Mt) keeps payment within budget.
+    auction_actions[0, 0] = 120.0  # above clearing → non-zero bid-ask spread for collateral
+    auction_actions[0, 1] = 1.0    # 1× coverage — affordable under E4 constraints
 
     env.step_auction(auction_actions)
 

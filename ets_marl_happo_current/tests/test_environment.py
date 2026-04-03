@@ -606,29 +606,31 @@ def test_liquidity_pool_fills_at_reference_plus_spread():
 # ---------------------------------------------------------------------------
 
 def test_no_holding_limit():
-    """With max_agent_share=1.0, a single high-bidding agent can get all supply."""
+    """With max_agent_share=1.0, a high-bidding agent gets a larger allocation share."""
     env = load_env()
     env.reset(seed=42)
     n_agents = env.n_agents
 
-    # Agent 0 bids very high, others bid at floor
+    # Agent 0 bids at 160 EUR/t (above bot heuristic ~138 EUR/t) with a moderate
+    # quantity multiplier (0.7×) so the auction payment stays within its annual
+    # budget under E4 collateral constraints.  Other learning agents bid below
+    # reserve and so are filtered out; bots generate their own higher bids.
     auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
-    auction_actions[:, 0] = 5.0    # all agents bid at floor
-    auction_actions[:, 1] = 1.0    # coverage multiplier
-    auction_actions[0, 0] = 400.0  # agent 0 bids very high
+    auction_actions[:, 0] = 40.0   # other agents bid below bot prices
+    auction_actions[:, 1] = 0.3    # small multiplier
+    auction_actions[0, 0] = 160.0  # agent 0 bids above bots → priority fill
+    auction_actions[0, 1] = 0.7    # moderate qty — payment affordable under E4
 
     obs2, log = env.step_auction(auction_actions)
 
-    # With max_agent_share=1.0, agent 0 should receive a large share
-    allocs = np.array(log["auction_stats"]["clearing_price"])  # just check it didn't fail
     assert not log["auction_stats"].get("auction_failed", False), "Auction should not fail"
-    # Agent 0's allocation should be substantial (they bid highest)
+    # Agent 0 should not have defaulted (bid is within budget)
+    assert env._phase1_allocations[0] > 0, "Agent 0 should have won allocation and not defaulted"
+    # Agent 0's allocation should be substantial (they bid highest, no holding limit)
     agent0_alloc = env._phase1_allocations[0]
     total_alloc = float(env._phase1_allocations.sum())
     if total_alloc > 1e-9:
         share = agent0_alloc / total_alloc
-        # With no holding limit, the high bidder should get a significant share
-        # (threshold lowered: 16 participants including heuristic bots dilute shares)
         assert share > 0.10, f"Agent 0 share {share:.2f} too low with no holding limit"
 
 
