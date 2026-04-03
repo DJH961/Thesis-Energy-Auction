@@ -47,6 +47,9 @@ class CapSchedule:
         # activation_year retained for backward-compat reading but no longer
         # drives MSR gate; 1-year TNAC lag is enforced via _prev_tnac instead.
         self.msr_activation_year = msr.get("activation_year", msr.get("msr_activation_year", 1))
+        # Maximum rollover multiplier: caps unsold-rollover so a single year's
+        # auction volume cannot exceed cap_t × max_rollover_multiplier.
+        self.max_rollover_multiplier = ets_cfg.get("max_rollover_multiplier", 1.5)
 
         self.reserve_price = ets_cfg.get("reserve_price", 0.0)
 
@@ -175,10 +178,14 @@ class CapSchedule:
         min_vol = self.min_auction_frac * cap_t
         auction_vol = max(auction_vol, min_vol)
 
-        # Add any unsold volume rolled over from the previous year
+        # Add any unsold volume rolled over from the previous year.
+        # Cap the rollover so the total auction volume cannot exceed
+        # cap_t × max_rollover_multiplier (prevents runaway accumulation
+        # of unsold rollovers across burn-in or low-demand years).
         rollover = self._unsold_rollover_pending
         self._unsold_rollover_pending = 0.0
         auction_vol += rollover
+        auction_vol = min(auction_vol, cap_t * self.max_rollover_multiplier)
 
         # Store for logging
         self.cap_history.append(cap_t)
@@ -270,7 +277,7 @@ class CapSchedule:
 
         # Normal TNAC-based rules
         if tnac > self.tnac_upper:
-            withheld = self.withhold_rate * tnac
+            withheld = self.withhold_rate * (tnac - self.tnac_upper)
             auction_vol -= min(withheld, auction_vol)
         elif tnac < self.tnac_lower:
             auction_vol += min(self.release_amount, msr_snap)
@@ -370,10 +377,13 @@ class CapSchedule:
         # since the burn-in loop builds historical state without a true prior year.
         tnac = current_tnac if force_msr else self._prev_tnac
 
-        # MSR cancellation: cancel holdings exceeding previous year's auction volume
-        # This implements the EU ETS post-2023 reform where excess MSR holdings
-        # are permanently removed from the system.
+        # MSR cancellation: cancel holdings exceeding previous year's auction volume.
+        # The cancellation floor is at least the previous year's cap so that
+        # distorted auction volumes (e.g. from large rollovers) do not cause
+        # premature cancellation of legitimate MSR reserves.
         prev_auction_vol = self.volume_history[-1] if self.volume_history else auction_vol
+        prev_cap = self.get_cap(year - 1) if year > 0 else self.cap_year_0
+        prev_auction_vol = max(prev_auction_vol, prev_cap)
         excess = max(0, self._msr_reserve - prev_auction_vol)
         self._msr_reserve -= excess
         self._total_cancelled += excess
@@ -425,7 +435,7 @@ class CapSchedule:
 
         # Normal MSR logic (TNAC-based)
         if tnac > self.tnac_upper:
-            withheld = self.withhold_rate * tnac
+            withheld = self.withhold_rate * (tnac - self.tnac_upper)
             withheld = min(withheld, auction_vol)
             self._msr_reserve += withheld
             auction_vol -= withheld

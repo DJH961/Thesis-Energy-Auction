@@ -796,6 +796,11 @@ class ETSEnvironment(gym.Env):
             price_floor,
         )
         self.last_secondary_price = self.last_clearing_price
+
+        # Clear any unsold rollover that accumulated during burn-in so it does
+        # not inflate the year-0 auction volume of the real episode.
+        self.cap_schedule._unsold_rollover_pending = 0.0
+
         self._calibrate_post_init_bank(ws_cfg)
 
     def _calibrate_post_init_bank(self, ws_cfg: dict):

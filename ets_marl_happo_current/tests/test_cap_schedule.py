@@ -134,7 +134,7 @@ def test_msr_withhold_when_tnac_high():
     cap = s.get_cap(1)
     vol = s.get_auction_volume(year=1, tnac=tnac)
 
-    expected_withheld = min(0.24 * tnac, cap)
+    expected_withheld = min(0.24 * (tnac - s.tnac_upper), cap)
     expected_vol = max(cap - expected_withheld, 0.10 * cap)
     assert vol == pytest.approx(expected_vol, rel=1e-5)
     assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-5)
@@ -165,7 +165,7 @@ def test_msr_activates_year_1_after_prior_tnac():
     # Year 1: MSR should fire using prev_tnac = 10.0 (high TNAC → withhold)
     cap1 = s.get_cap(1)
     vol1 = s.get_auction_volume(year=1, tnac=tnac_high)
-    expected_withheld = min(0.24 * tnac_high, cap1)
+    expected_withheld = min(0.24 * (tnac_high - s.tnac_upper), cap1)
     expected_vol = max(cap1 - expected_withheld, 0.10 * cap1)
     assert vol1 == pytest.approx(expected_vol, rel=1e-5)
     assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-5)
@@ -179,7 +179,7 @@ def test_msr_activation_year_force_msr():
 
     # force_msr bypasses the _prev_tnac=None check (used during burn-in years)
     vol = s.get_auction_volume(year=0, tnac=tnac_high, force_msr=True)
-    expected_withheld = min(0.24 * tnac_high, cap)
+    expected_withheld = min(0.24 * (tnac_high - s.tnac_upper), cap)
     expected_vol = max(cap - expected_withheld, 0.10 * cap)
     assert vol == pytest.approx(expected_vol, rel=1e-6)
     assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-6)
@@ -238,19 +238,22 @@ def test_msr_reset():
 
 
 def test_msr_cancellation():
-    """MSR cancellation: holdings above previous auction volume are cancelled."""
+    """MSR cancellation: holdings above max(prev_auction_vol, prev_cap) are cancelled."""
     s = make_schedule(msr_enabled=True, seed_prev_tnac=4.0)
     # Manually set reserve and volume history
     s._msr_reserve = 20.0
     s.volume_history = [10.0]
 
     # Call get_auction_volume to trigger cancellation
+    # cancellation floor = max(volume_history[-1], get_cap(year-1))
+    #                    = max(10.0, get_cap(0)) = max(10.0, 14.60) = 14.60
     vol = s.get_auction_volume(year=1, tnac=4.0)
+    expected_floor = max(10.0, s.get_cap(0))   # 14.60
 
-    # Reserve should be reduced to previous auction volume
-    assert s._msr_reserve == pytest.approx(10.0, rel=1e-5)
-    # Total cancelled should equal the excess
-    assert s._total_cancelled == pytest.approx(10.0, rel=1e-5)
+    # Reserve should be reduced to the cancellation floor
+    assert s._msr_reserve == pytest.approx(expected_floor, rel=1e-5)
+    # Total cancelled should equal the excess above the floor
+    assert s._total_cancelled == pytest.approx(20.0 - expected_floor, rel=1e-5)
 
 
 def test_msr_no_cancellation_when_below():
@@ -275,7 +278,7 @@ def test_force_msr_bypasses_prev_tnac_gate():
 
     # No seed_prev_tnac, but force_msr bypasses the gate
     vol = s.get_auction_volume(year=0, tnac=tnac_high, force_msr=True)
-    expected_withheld = min(0.24 * tnac_high, cap0)
+    expected_withheld = min(0.24 * (tnac_high - s.tnac_upper), cap0)
     expected_vol = max(cap0 - expected_withheld, 0.10 * cap0)
 
     assert vol == pytest.approx(expected_vol, rel=1e-6)

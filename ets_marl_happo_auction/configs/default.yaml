@@ -85,6 +85,7 @@ ets:
   reserve_price: 30.0              # auction bid floor (matches price_min)
   reserve_price_mode: "static"     # "static" or "dynamic" (= max(reserve_price, discount x MA3))
   unsold_to_msr: false             # unsold volume rolls over to next year (not absorbed into MSR)
+  max_rollover_multiplier: 1.5     # caps rollover: auction_vol ≤ cap_t × multiplier per year
   # Price history anchor for MA3 calculation.
   # "auction": only successful auction clearing prices enter the MA3 (stable, prevents
   #            reserve-price pollution when auctions fail).
