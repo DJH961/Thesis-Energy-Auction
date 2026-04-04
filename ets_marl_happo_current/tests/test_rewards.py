@@ -740,3 +740,141 @@ def test_diagnostic_scores_all_finite():
                 assert np.isfinite(ds[k]), f"{k} is not finite: {ds[k]}"
         if env.episode_done:
             break
+
+
+# ---------------------------------------------------------------------------
+# E4: Suspension penalty tests
+# ---------------------------------------------------------------------------
+
+def test_suspension_penalty_reduces_reward():
+    """An agent that defaults this step should receive reward reduced by suspension_penalty."""
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    config["reward"]["shaping_beta"] = 0.0
+    config["esg"]["enabled"] = False
+    penalty_value = 5.0
+    config["reward"]["suspension_penalty"] = penalty_value
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    # Compute baseline rewards with no defaults
+    zeros = np.zeros(env.n_total)
+    env._defaults_this_step[:] = False
+    env.holdings[:] = 10.0
+    env._compute_rewards(
+        payments=zeros,
+        trade_costs=zeros,
+        penalties=zeros,
+        invest_costs=zeros,
+        emissions=zeros,
+        clearing_price=80.0,
+        mac_costs=zeros,
+        precompliance_holdings=zeros,
+        old_carry_forward=zeros,
+    )
+    rewards_no_default = env._last_reward_base_values.copy()
+
+    # Now mark agent 0 as having defaulted this step
+    env._defaults_this_step[:] = False
+    env._defaults_this_step[0] = True
+    env.holdings[:] = 10.0
+    env._compute_rewards(
+        payments=zeros,
+        trade_costs=zeros,
+        penalties=zeros,
+        invest_costs=zeros,
+        emissions=zeros,
+        clearing_price=80.0,
+        mac_costs=zeros,
+        precompliance_holdings=zeros,
+        old_carry_forward=zeros,
+    )
+    rewards_with_default = env._last_reward_base_values.copy()
+
+    # Agent 0 should be penalised by exactly suspension_penalty
+    delta_agent0 = rewards_no_default[0] - rewards_with_default[0]
+    assert abs(delta_agent0 - penalty_value) < 1e-6, (
+        f"Agent 0 reward should drop by suspension_penalty={penalty_value}, "
+        f"got delta={delta_agent0:.6f}")
+
+    # All other agents should be unaffected
+    for i in range(1, env.n_total):
+        delta_other = rewards_no_default[i] - rewards_with_default[i]
+        assert abs(delta_other) < 1e-6, (
+            f"Agent {i} reward should not change (no default), got delta={delta_other:.6f}")
+
+
+def test_suspension_penalty_zero_when_not_defaulted():
+    """No suspension penalty should be applied when _defaults_this_step is all-False."""
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    config["reward"]["shaping_beta"] = 0.0
+    config["esg"]["enabled"] = False
+    config["reward"]["suspension_penalty"] = 5.0
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    zeros = np.zeros(env.n_total)
+    env._defaults_this_step[:] = False
+    env.holdings[:] = 10.0
+
+    env._compute_rewards(
+        payments=zeros,
+        trade_costs=zeros,
+        penalties=zeros,
+        invest_costs=zeros,
+        emissions=zeros,
+        clearing_price=80.0,
+        mac_costs=zeros,
+        precompliance_holdings=zeros,
+        old_carry_forward=zeros,
+    )
+    rewards_first = env._last_reward_base_values.copy()
+
+    # Repeat with same zero flags — should be identical
+    env._defaults_this_step[:] = False
+    env.holdings[:] = 10.0
+    env._compute_rewards(
+        payments=zeros,
+        trade_costs=zeros,
+        penalties=zeros,
+        invest_costs=zeros,
+        emissions=zeros,
+        clearing_price=80.0,
+        mac_costs=zeros,
+        precompliance_holdings=zeros,
+        old_carry_forward=zeros,
+    )
+    rewards_second = env._last_reward_base_values.copy()
+
+    np.testing.assert_allclose(rewards_first, rewards_second, atol=1e-9,
+                                err_msg="Rewards should be identical with no defaults")
+
+
+def test_defaults_this_step_reset_on_env_reset():
+    """_defaults_this_step should be all-False after env.reset()."""
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    # Manually set some defaults
+    env._defaults_this_step[0] = True
+    env._defaults_this_step[1] = True
+
+    # After reset, should be cleared
+    env.reset()
+    assert not np.any(env._defaults_this_step), (
+        "_defaults_this_step should be all-False after reset()")

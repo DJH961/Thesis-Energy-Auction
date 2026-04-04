@@ -167,8 +167,11 @@ class ETSEnvironment(gym.Env):
         # E4: Suspension and default carry-forward tracking
         # _suspension_remaining[i]: number of auction rounds agent i is still suspended
         # _defaulted_volume_pending: allowance volume returned by defaults to add next year
+        # _defaults_this_step[i]: True if agent i defaulted in the most recent step_auction;
+        #   used to apply the suspension_penalty in _compute_rewards().
         self._suspension_remaining = np.zeros(self.n_total, dtype=int)
         self._defaulted_volume_pending = 0.0
+        self._defaults_this_step = np.zeros(self.n_total, dtype=bool)
         # E2/E4: Per-agent collateral locked in Phase 1 (step_auction).
         # Stored so Phase 2 can charge the opportunity cost without re-deriving bids.
         self._collateral_locked = np.zeros(self.n_total)
@@ -404,6 +407,7 @@ class ETSEnvironment(gym.Env):
         self._unsold_rollover = 0.0
         self._suspension_remaining = np.zeros(self.n_total, dtype=int)
         self._defaulted_volume_pending = 0.0
+        self._defaults_this_step = np.zeros(self.n_total, dtype=bool)
         self._collateral_locked = np.zeros(self.n_total)
         self._last_collateral_load = np.zeros(self.n_total)
         self._build_episode_inflation_path()
@@ -1252,6 +1256,7 @@ class ETSEnvironment(gym.Env):
         # Apply defaults: exhaust remaining annual budget (signals insolvency).
         # Collateral is forfeited implicitly: settle_auction already zeroed the allocation
         # so no allowances are received, but the locked collateral amount is not returned.
+        self._defaults_this_step = defaults_mask.copy()
         for i in range(self.n_total):
             if defaults_mask[i]:
                 excess = max(0.0, self.companies[i].annual_budget
@@ -1917,15 +1922,16 @@ class ETSEnvironment(gym.Env):
                          precompliance_holdings=None,
                          old_carry_forward=None, active_mask=None):
         """
-        Reward (HAPPO-compliant, v7.3):
+        Reward (HAPPO-compliant, v7.4):
             R_i = w_cost * (-cost_norm_ex_penalty) + w_green * (esg_scale * esg_raw)
-                  + green_bonus - penalty_norm - opportunity_cost
+                  + green_bonus - penalty_norm - opportunity_cost - suspension_penalty
 
         Core signals:
           cost_norm_ex_penalty: total_cost_ex_penalty / 1000
           penalty_norm:         penalty_cost / 1000 (applied at full strength for ALL agents)
           green_bonus:          diminishing-returns bonus for green investment progress
           esg_raw:              saved-carbon-years formula before weighting
+          suspension_penalty:   large one-off hit when agent defaulted this step (from config)
 
         Penalty is separated from cost and applied at full strength regardless of w_cost.
         Terminal bonuses: log-scaled bank value /1000 + ESG terminal queue.
@@ -1942,6 +1948,7 @@ class ETSEnvironment(gym.Env):
 
         beta_shaping = reward_cfg.get("shaping_beta", 10.0)
         opp_cost_rate = float(reward_cfg.get("opportunity_cost_rate", 0.05))
+        suspension_penalty = float(reward_cfg.get("suspension_penalty", 5.0))
 
         if mac_costs is None:
             mac_costs = np.zeros(self.n_total)
@@ -2012,11 +2019,17 @@ class ETSEnvironment(gym.Env):
             # point (updated in step_secondary before _compute_rewards is called).
             opp_cost = float(self.holdings[i]) * float(clearing_price) * opp_cost_rate / 1000.0
 
+            # E4: One-off suspension penalty — applied when this agent defaulted this step.
+            # This is a hard, unconditional signal to make suspension clearly undesirable,
+            # independent of w_cost. Configured via reward.suspension_penalty (default 5.0).
+            susp_hit = suspension_penalty if bool(self._defaults_this_step[i]) else 0.0
+
             base_reward = float(
                 company.w_cost * (-cost_norm_ex_penalty)
                 + company.w_green * esg_signal
                 - penalty_norm  # penalty at full strength for all agents
                 - opp_cost
+                - susp_hit      # suspension alarm: unconditional large penalty on default
             )
             shaping_reward = float(green_bonus + efficiency_bonus)
 

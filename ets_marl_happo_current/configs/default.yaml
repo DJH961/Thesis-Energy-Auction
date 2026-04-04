@@ -314,7 +314,7 @@ electricity:
 
 # ----------------------------------------------------------
 # Reward (HAPPO-compliant)
-# R_i = -cost_norm - emissions_intensity - penalty_norm
+# R_i = -cost_norm - emissions_intensity - penalty_norm - suspension_penalty
 #        + green_bonus + queue_bonus + terminal_values
 # ----------------------------------------------------------
 reward:
@@ -329,6 +329,7 @@ reward:
   terminal_bank_value: true      # value banked allowances at terminal_price in final year
   terminal_queue_value: true     # value construction queue via NPV of carbon savings
   terminal_payoff_years: 5       # years of future savings for queue valuation
+  suspension_penalty: 5.0        # large one-off penalty applied when an agent defaults/is suspended
 
 # ----------------------------------------------------------
 # ESG signal — saved-carbon-years formula
