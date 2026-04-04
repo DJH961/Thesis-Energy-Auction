@@ -243,7 +243,8 @@ class Company:
         return self._compute_p_fail()
 
     def compute_estimate_need(self) -> float:
-        return self.compute_emissions() * (1.0 + self.compute_risk_factor())
+        # Intentionally unbuffered: agents can learn their own coverage buffer.
+        return self.compute_emissions()
 
     # ------------------------------------------------------------------
     # Operational costs
@@ -262,6 +263,7 @@ class Company:
     # ------------------------------------------------------------------
 
     def _compute_p_fail(self) -> float:
+        # Investment execution risk only (project failure), not compliance uncertainty.
         p_base = self.p_fail_min + (self.p_fail_max - self.p_fail_min) * (self.fossil_frac ** self.p_fail_alpha)
         if self._consecutive_successes >= self.exp_threshold:
             p_base -= self.exp_discount
@@ -648,7 +650,7 @@ class Company:
         [4]  coal_frac   (coal technology fraction)
         [5]  gas_frac    (gas technology fraction)
         [6]  emissions (normalized)
-        [7]  estimated need with risk buffer
+        [7]  expected annual emissions (no risk buffer)
         [8]  p_fail
         [9]  investment experience
         [10] auction gap (banked allowances)

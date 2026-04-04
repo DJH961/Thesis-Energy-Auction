@@ -5,6 +5,53 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.5.0
+
+**MSR Three-Band Withholding, Rollover Accounting Fix, Unbuffered Need, Heuristic Cleanup**
+
+*Backport of v8.2 changes from `ets_marl_happo_auction`. All phases apply equally to both variants.*
+
+### Phase A — MSR Three-Band Withholding (`cap_schedule.py`, `market_calibration.py`)
+- **`_compute_tnac_withholding()` helper**: Extracted TNAC withholding into a dedicated
+  method with three distinct regimes matching Decision (EU) 2015/1814 and its 2023 amendment:
+  - `TNAC > upper`: withhold `24% × TNAC` (% of *total* TNAC, corrects prior excess-only formula).
+  - `mid ≤ TNAC ≤ upper`: withhold `TNAC − mid` (tapered intake above mid-threshold).
+  - `TNAC < mid`: no MSR intake.
+- **Legislative TNAC proportions**: `TNAC_LOWER_REF=400`, `TNAC_MID_REF=833`,
+  `TNAC_UPPER_REF=1096` scaled to simulation cap; preserves 400:833:1096 proportions.
+- **`tnac_mid` propagated** through return dict, environment init/reset, and attribute
+  assignment branches.
+- **Config**: `tnac_lower_ratio` corrected 0.22 → 0.1314; `tnac_mid_ratio: 0.2737` added.
+
+### Phase B — Rollover Accounting Fix (`ets_environment.py`, `cap_schedule.py`)
+- **CapSchedule telemetry attrs**: `_last_unsold_rollover_in`, `_last_msr_withheld`,
+  `_last_msr_released` set inside `get_auction_volume()`.
+- **`msr_withhold_this_year` / `msr_release_this_year`** year-log entries now accurate.
+- **Double-count fix**: `unsold = auction_volume − allocations.sum() − defaulted_volume`.
+- **Pre-obs estimate** includes both pending rollover channels with cap.
+
+### Phase C — Unbuffered Estimate Need (`company.py`)
+- **`compute_estimate_need()` simplified**: Returns bare `compute_emissions()`, no risk
+  buffer. Agents learn their own coverage buffer through bidding.
+- `_compute_p_fail()` comment clarified as investment execution risk only.
+
+### Phase D — Heuristic Simplification (`heuristic_policy.py`)
+- **Green-agent seller discount removed**: `is_green` variable and 50% sell-rate reduction
+  eliminated from `secondary_action()`.
+
+### Phase E — Tests and Minor Fixes
+- **New tests**: Cover three-band TNAC regimes and rollover interaction.
+- **Updated tests**: Withholding formula, `tnac_mid` fixture, `tnac_lower` value.
+- **`test_company`**: Added check that `compute_estimate_need()` returns bare emissions.
+- **`test_environment`** / **`test_market_calibration`**: Updated for `tnac_mid` and
+  rollover accounting.
+- **`qty_mult_high` default**: Corrected 1.3 → 2.0.
+
+### Config / Metadata
+- Version bumped to `7.5.0` in `pyproject.toml`, `configs/default.yaml`.
+
+---
+
 ## v7.4.0
 
 **Plan v8.1 Backport: LRF/MSR Realism, Heuristic Rewrite, Collateral Enforcement, Reward Shaping**

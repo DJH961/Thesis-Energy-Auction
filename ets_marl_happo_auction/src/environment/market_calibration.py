@@ -12,6 +12,11 @@ import warnings
 import numpy as np
 
 
+TNAC_LOWER_REF = 400.0
+TNAC_MID_REF = 833.0
+TNAC_UPPER_REF = 1096.0
+
+
 def _resolve_active_bots(config: dict, n_active_bots: int | None) -> int:
 	"""Resolve active bot count with safe bounds."""
 	if n_active_bots is None:
@@ -60,7 +65,7 @@ def compute_market_params(config: dict, n_active_bots: int | None = None):
 	"""Compute cap_year_0 and MSR amounts from config.
 
 	Returns dict with keys:
-	  cap_year_0, tnac_upper, tnac_lower,
+	  cap_year_0, tnac_upper, tnac_mid, tnac_lower,
 	  release_amount, emergency_release_amount,
 	  total_emissions, n_active_participants
 	"""
@@ -83,6 +88,12 @@ def compute_market_params(config: dict, n_active_bots: int | None = None):
 		return {
 			"cap_year_0": cap_year_0,
 			"tnac_upper": float(msr_cfg.get("tnac_upper", 0.0)),
+			"tnac_mid": float(
+				msr_cfg.get(
+					"tnac_mid",
+					float(msr_cfg.get("tnac_upper", 0.0)) * (TNAC_MID_REF / TNAC_UPPER_REF),
+				)
+			),
 			"tnac_lower": float(msr_cfg.get("tnac_lower", 0.0)),
 			"release_amount": float(msr_cfg.get("release_amount", 0.0)),
 			"emergency_release_amount": float(msr_cfg.get("emergency_release_amount", 0.0)),
@@ -97,14 +108,19 @@ def compute_market_params(config: dict, n_active_bots: int | None = None):
 		overhead = float(ets_cfg.get("cap_overhead_pct", 0.11))
 		cap_year_0 = float(total_emissions) * (1.0 + overhead)
 
-	tnac_upper = cap_year_0 * float(msr_cfg.get("tnac_upper_ratio", 0.36))
-	tnac_lower = cap_year_0 * float(msr_cfg.get("tnac_lower_ratio", 0.18))
+	tnac_upper_ratio = float(msr_cfg.get("tnac_upper_ratio", 0.36))
+	# Preserve legislative TNAC band proportions when scaling to micro-ETS.
+	ratio_scale = tnac_upper_ratio / TNAC_UPPER_REF
+	tnac_upper = cap_year_0 * (TNAC_UPPER_REF * ratio_scale)
+	tnac_mid = cap_year_0 * (TNAC_MID_REF * ratio_scale)
+	tnac_lower = cap_year_0 * (TNAC_LOWER_REF * ratio_scale)
 	release_amount = cap_year_0 * float(msr_cfg.get("release_frac", 0.016))
 	emergency_release = cap_year_0 * float(msr_cfg.get("emergency_release_frac", 0.08))
 
 	return {
 		"cap_year_0": float(cap_year_0),
 		"tnac_upper": float(tnac_upper),
+		"tnac_mid": float(tnac_mid),
 		"tnac_lower": float(tnac_lower),
 		"release_amount": float(release_amount),
 		"emergency_release_amount": float(emergency_release),

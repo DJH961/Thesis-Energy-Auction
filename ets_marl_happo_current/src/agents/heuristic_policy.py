@@ -306,11 +306,10 @@ def secondary_action(
     """
     Heuristic Phase-2 (secondary market) action.
 
-    C2/C3: Smarter secondary with compliance-risk awareness:
+        C2/C3: Smarter secondary with compliance-risk awareness:
       - Never sells when carry_forward debt exists (C3)
       - Boosts buying in final years (C3: compliance risk)
       - Scales buy qty by budget headroom to avoid overspending (C2)
-      - Green agents sell surplus at half rate (C2: strategic hold)
 
     Returns
     -------
@@ -322,7 +321,6 @@ def secondary_action(
 
     need = max(company.compute_estimate_need() + company._carry_forward, 1e-6)
     remaining_years = max(1, n_years - current_year)
-    is_green = (company.agent_id % 2) == 1
 
     # Target-bank trajectory: hold buffer for future years
     target_bank = need * min(remaining_years - 1, 2) * 0.3
@@ -337,10 +335,6 @@ def secondary_action(
     # C3: Never sell when carrying forward debt (compliance risk)
     if company._carry_forward > 0.01:
         trade_target = max(0.0, trade_target)
-
-    # C2: Green agents are less aggressive sellers (hold strategic bank)
-    if is_green and trade_target < -0.01:
-        trade_target *= 0.5
 
     # C2: Budget headroom check — cap buy qty by remaining budget
     budget_remaining = max(

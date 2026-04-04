@@ -82,12 +82,17 @@ compounding fraction. This matches the EU ETS Linear Reduction Factor mechanics
 ### 3.2 MSR logic
 
 MSR operates on auction volume (not cap) using TNAC proxy (sum of all banks):
-- If TNAC > upper threshold: withhold share of excess into reserve.
+**Three-band withholding (v7.5)** based on legislative TNAC proportions from Decision (EU) 2015/1814 (400:833:1096 Mt scaled to simulation size):
+- If TNAC > upper threshold: withhold `0.24 × TNAC` (24% of total TNAC, not just the excess).
+- If mid threshold ≤ TNAC ≤ upper threshold: withhold `TNAC − mid` (tapered intake).
+- If lower threshold ≤ TNAC < mid threshold: no TNAC-triggered intake.
 - If TNAC < lower threshold: release fixed volume from reserve.
-- TNAC thresholds: upper = 36% of CAP_0, lower = 22% of CAP_0 (v7.4).
+- Threshold scaling preserves lower:mid:upper = 400:833:1096 when mapped to simulation scale.
+  (`tnac_upper_ratio=0.36`, `tnac_mid_ratio=0.2737`, `tnac_lower_ratio=0.1314` of CAP_0.)
 - Release fraction = 6.4% of CAP_0 per year (v7.4).
 - **1-year TNAC lag (v7.4):** MSR uses *prior-year* TNAC (`_prev_tnac`), not the
-  current year's holdings. This matches EU ETS Decision 2015/1814 Art. 1(5).
+  current year's holdings. This follows Decision (EU) 2015/1814 Art. 1(5), with
+  intake regime updates from Decision (EU) 2023/852.
   Year 0 has no MSR intervention unless `force_msr=True` (burn-in mode).
 
 **Price-responsive safeguards (P9):**

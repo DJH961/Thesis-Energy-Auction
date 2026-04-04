@@ -269,6 +269,7 @@ class ETSEnvironment(gym.Env):
         """Write derived calibration values into ETS config for downstream readers."""
         config.setdefault("ets", {})["cap_year_0"] = float(params["cap_year_0"])
         config.setdefault("ets", {}).setdefault("msr", {})["tnac_upper"] = float(params["tnac_upper"])
+        config.setdefault("ets", {}).setdefault("msr", {})["tnac_mid"] = float(params["tnac_mid"])
         config.setdefault("ets", {}).setdefault("msr", {})["tnac_lower"] = float(params["tnac_lower"])
         config.setdefault("ets", {}).setdefault("msr", {})["release_amount"] = float(params["release_amount"])
         config.setdefault("ets", {}).setdefault("msr", {})["emergency_release_amount"] = float(
@@ -469,6 +470,7 @@ class ETSEnvironment(gym.Env):
                     self.cap_schedule.update_calibration(
                         cap_year_0=params["cap_year_0"],
                         tnac_upper=params["tnac_upper"],
+                        tnac_mid=params["tnac_mid"],
                         tnac_lower=params["tnac_lower"],
                         release_amount=params["release_amount"],
                         emergency_release_amount=params["emergency_release_amount"],
@@ -476,6 +478,7 @@ class ETSEnvironment(gym.Env):
                 else:
                     self.cap_schedule.cap_year_0 = float(params["cap_year_0"])
                     self.cap_schedule.tnac_upper = float(params["tnac_upper"])
+                    self.cap_schedule.tnac_mid = float(params["tnac_mid"])
                     self.cap_schedule.tnac_lower = float(params["tnac_lower"])
                     self.cap_schedule.release_amount = float(params["release_amount"])
                     self.cap_schedule.emergency_release_amount = float(params["emergency_release_amount"])
@@ -1111,6 +1114,11 @@ class ETSEnvironment(gym.Env):
         log["cap"] = cap_t
         log["tnac"] = tnac
 
+        # Keep unsold and defaulted rollovers as independent accounting streams.
+        unsold_rolled_in = float(getattr(self.cap_schedule, "_last_unsold_rollover_in", 0.0))
+        msr_withheld = float(getattr(self.cap_schedule, "_last_msr_withheld", 0.0))
+        msr_released = float(getattr(self.cap_schedule, "_last_msr_released", 0.0))
+
         # E4: Add defaulted volume from previous year to this year's supply
         defaulted_rolled_in = 0.0
         if self._defaulted_volume_pending > 0.0:
@@ -1120,18 +1128,27 @@ class ETSEnvironment(gym.Env):
             self._defaulted_volume_pending = 0.0
         log["defaulted_volume_rolled_in"] = round(defaulted_rolled_in, 4)
 
+        # Keep a non-fatal diagnostic: equal values can occur legitimately.
+        if (
+            unsold_rolled_in > 0.0
+            and defaulted_rolled_in > 0.0
+            and np.isclose(unsold_rolled_in, defaulted_rolled_in, rtol=0.0, atol=1e-9)
+        ):
+            log["rollover_channels_equal"] = True
+
         log["auction_volume"] = auction_volume
         self._last_auction_volume = float(auction_volume)
-        log["unsold_rollover_in"] = round(self._unsold_rollover, 4)
+        self._unsold_rollover = unsold_rolled_in
+        log["unsold_rollover_in"] = round(unsold_rolled_in, 4)
 
         # MSR tracking: reserve level and cumulative cancellations
         msr_reserve_before = self.cap_schedule.msr_reserve()
         log["msr_reserve"] = msr_reserve_before
         log["msr_total_cancelled"] = self.cap_schedule._total_cancelled
 
-        # Track MSR withholding/release this year (will be updated post-auction)
-        log["msr_withhold_this_year"] = 0.0
-        log["msr_release_this_year"] = 0.0
+        # Track MSR withholding/release applied inside cap_schedule.get_auction_volume.
+        log["msr_withhold_this_year"] = round(msr_withheld, 4)
+        log["msr_release_this_year"] = round(msr_released, 4)
 
         # Combine learning agent actions with bot actions after auction supply
         # is known, so bot urgency can react to supply restrictions.
@@ -1188,7 +1205,7 @@ class ETSEnvironment(gym.Env):
         price_min = self.config["auction"]["price_min"]
         price_max = self.config["auction"]["price_max"]
         qty_mult_low = self.config["auction"].get("qty_mult_low", 0.3)
-        qty_mult_high = self.config["auction"].get("qty_mult_high", 1.3)
+        qty_mult_high = self.config["auction"].get("qty_mult_high", 2.0)
         lot_size = self.config["auction"].get("lot_size", 0.0)
 
         N_TRANCHES = 3
@@ -1214,6 +1231,8 @@ class ETSEnvironment(gym.Env):
                 bid_coverages[i] = 0.0
                 continue
 
+            # Base need is intentionally unbuffered (expected emissions + debt);
+            # agents learn safety buffers through the bid multiplier itself.
             base_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
             estimate_needs[i] = base_need
 
@@ -1415,8 +1434,10 @@ class ETSEnvironment(gym.Env):
         auction_stats["defaults_agents"]          = sorted(int(i) for i, d in enumerate(defaults_mask) if d)
         auction_stats["suspension_remaining_list"] = self._suspension_remaining.tolist()
 
-        # Unsold allowances: either absorbed into MSR or rolled over to next year's auction
-        unsold = max(0.0, auction_volume - float(allocations.sum()))
+        # Unsold allowances (non-default residual): either absorbed into MSR
+        # or rolled over to next year's auction. Defaulted volume is tracked
+        # separately in _defaulted_volume_pending and must not be double counted.
+        unsold = max(0.0, auction_volume - float(allocations.sum()) - float(defaulted_volume))
         self._unsold_rollover = unsold
         log["unsold_rollover_out"] = round(unsold, 4)
         if self.config["ets"].get("unsold_to_msr", False):
@@ -2357,8 +2378,12 @@ class ETSEnvironment(gym.Env):
             inflation_rate=inflation_rate,
             price_ma3=price_ma3,
         )
-        # Include any defaulted volume pending to be rolled in this year
-        this_year_auction_volume += self._defaulted_volume_pending
+        # Include both rollover channels that are added in step_auction.
+        unsold_pending = float(getattr(self.cap_schedule, "_unsold_rollover_pending", 0.0))
+        defaulted_pending = float(self._defaulted_volume_pending)
+        this_year_auction_volume += unsold_pending + defaulted_pending
+        max_rollover_mult = float(getattr(self.cap_schedule, "max_rollover_multiplier", 1.5))
+        this_year_auction_volume = min(this_year_auction_volume, cap_t * max_rollover_mult)
 
         msr_reserve = self.cap_schedule.msr_reserve()
         suspension_length = max(1, int(self.config["auction"].get("suspension_length", 2)))

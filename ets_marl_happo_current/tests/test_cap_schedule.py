@@ -24,7 +24,8 @@ BASE_CONFIG = {
         "msr": {
             "enabled": True,
             "tnac_upper": 5.26,   # 18.0 × 14.6/50.0 (scaled to match test cap)
-            "tnac_lower": 2.63,   # 9.0 × 14.6/50.0 (scaled to match test cap)
+            "tnac_mid": 4.00,     # 833/1096 of upper threshold
+            "tnac_lower": 1.92,   # 400/1096 of upper threshold
             "withhold_rate": 0.24,
             "release_amount": 0.80,
             "min_auction_frac": 0.10,
@@ -117,13 +118,26 @@ def test_cap_year_10():
 # ---------------------------------------------------------------------------
 
 def test_msr_no_adjustment_within_band():
-    """TNAC between thresholds → auction volume = cap."""
-    tnac = 4.0   # between 2.63 and 5.26
+    """TNAC between lower and mid thresholds → auction volume = cap."""
+    tnac = 3.0   # between 1.92 and 4.00
     # Seed prev_tnac so MSR is active at year 1 (1-year lag)
     s = make_schedule(msr_enabled=True, seed_prev_tnac=tnac)
     vol = s.get_auction_volume(year=1, tnac=tnac)
     cap = s.get_cap(1)
     assert vol == pytest.approx(cap, rel=1e-6)
+
+
+def test_msr_withhold_in_middle_band():
+    """Mid-threshold <= TNAC <= upper threshold → withhold TNAC - mid threshold."""
+    tnac = 4.8   # between 4.00 and 5.26
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=tnac)
+    cap = s.get_cap(1)
+    vol = s.get_auction_volume(year=1, tnac=tnac)
+
+    expected_withheld = min(tnac - s.tnac_mid, cap)
+    expected_vol = max(cap - expected_withheld, 0.10 * cap)
+    assert vol == pytest.approx(expected_vol, rel=1e-5)
+    assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-5)
 
 
 def test_msr_withhold_when_tnac_high():
@@ -134,10 +148,36 @@ def test_msr_withhold_when_tnac_high():
     cap = s.get_cap(1)
     vol = s.get_auction_volume(year=1, tnac=tnac)
 
-    expected_withheld = min(0.24 * (tnac - s.tnac_upper), cap)
+    expected_withheld = min(0.24 * tnac, cap)
     expected_vol = max(cap - expected_withheld, 0.10 * cap)
     assert vol == pytest.approx(expected_vol, rel=1e-5)
     assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-5)
+
+
+def test_msr_withheld_rate_above_upper_threshold():
+    """Above upper threshold, withheld amount follows 24% of TNAC."""
+    tnac = 8.5
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=tnac)
+    cap = s.get_cap(1)
+    s.get_auction_volume(year=1, tnac=tnac)
+    assert s._last_msr_withheld == pytest.approx(min(0.24 * tnac, cap), rel=1e-9)
+
+
+def test_msr_withholding_reduces_final_supply_even_with_rollovers():
+    """High-TNAC withholding must reduce final supply below raw cap + rollovers."""
+    tnac = 10.0
+    unsold_rollover = 0.60
+    defaulted_rollover = 0.40
+
+    s = make_schedule(msr_enabled=True, seed_prev_tnac=tnac)
+    raw_cap = s.get_cap(1)
+    s._unsold_rollover_pending = unsold_rollover
+
+    supply_before_defaults = s.get_auction_volume(year=1, tnac=tnac)
+    final_supply = supply_before_defaults + defaulted_rollover
+
+    assert s._last_msr_withheld > 0.0
+    assert final_supply < raw_cap + unsold_rollover + defaulted_rollover
 
 
 def test_msr_inactive_year_0_no_prior_tnac():
@@ -165,7 +205,7 @@ def test_msr_activates_year_1_after_prior_tnac():
     # Year 1: MSR should fire using prev_tnac = 10.0 (high TNAC → withhold)
     cap1 = s.get_cap(1)
     vol1 = s.get_auction_volume(year=1, tnac=tnac_high)
-    expected_withheld = min(0.24 * (tnac_high - s.tnac_upper), cap1)
+    expected_withheld = min(0.24 * tnac_high, cap1)
     expected_vol = max(cap1 - expected_withheld, 0.10 * cap1)
     assert vol1 == pytest.approx(expected_vol, rel=1e-5)
     assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-5)
@@ -179,7 +219,7 @@ def test_msr_activation_year_force_msr():
 
     # force_msr bypasses the _prev_tnac=None check (used during burn-in years)
     vol = s.get_auction_volume(year=0, tnac=tnac_high, force_msr=True)
-    expected_withheld = min(0.24 * (tnac_high - s.tnac_upper), cap)
+    expected_withheld = min(0.24 * tnac_high, cap)
     expected_vol = max(cap - expected_withheld, 0.10 * cap)
     assert vol == pytest.approx(expected_vol, rel=1e-6)
     assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-6)
@@ -195,7 +235,7 @@ def test_auction_volume_has_min_floor():
 
 def test_msr_release_when_tnac_low():
     """TNAC < lower threshold → release from reserve into auction."""
-    tnac = 2.0   # < 2.63
+    tnac = 1.5   # < 1.92
     s = make_schedule(msr_enabled=True, seed_prev_tnac=tnac)
     # Build up some reserve
     s._msr_reserve = 1.00
@@ -278,7 +318,7 @@ def test_force_msr_bypasses_prev_tnac_gate():
 
     # No seed_prev_tnac, but force_msr bypasses the gate
     vol = s.get_auction_volume(year=0, tnac=tnac_high, force_msr=True)
-    expected_withheld = min(0.24 * (tnac_high - s.tnac_upper), cap0)
+    expected_withheld = min(0.24 * tnac_high, cap0)
     expected_vol = max(cap0 - expected_withheld, 0.10 * cap0)
 
     assert vol == pytest.approx(expected_vol, rel=1e-6)

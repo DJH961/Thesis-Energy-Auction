@@ -5,6 +5,83 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v8.2.0
+
+**MSR Three-Band Withholding, Rollover Accounting Fix, Unbuffered Need, Heuristic Cleanup**
+
+### Phase A — MSR Three-Band Withholding (`cap_schedule.py`, `market_calibration.py`)
+- **`_compute_tnac_withholding()` helper**: Extracted TNAC withholding into a dedicated
+  method with three distinct regimes matching Decision (EU) 2015/1814 and its 2023 amendment:
+  - `TNAC > upper`: withhold `24% × TNAC` (% of *total* surplus, not just the excess).
+    Corrects prior formula that only withheld from `TNAC − upper`.
+  - `mid ≤ TNAC ≤ upper`: withhold `TNAC − mid` (tapered intake proportional to surplus
+    above mid-threshold).
+  - `TNAC < mid`: no MSR intake.
+- **Legislative TNAC proportions**: Lower:mid:upper bands derived from `TNAC_LOWER_REF=400`,
+  `TNAC_MID_REF=833`, `TNAC_UPPER_REF=1096` (EU Decision 2015/1814 Mt values), scaled to
+  simulation cap. Preserves the 400:833:1096 proportions at micro-ETS scale.
+  Module-level constants added to both `cap_schedule.py` and `market_calibration.py`.
+- **`tnac_mid` propagated**: Added to `compute_market_params()` return dict,
+  `ETSEnvironment._write_derived_calibration()`, `update_calibration()` call in reset path,
+  and direct attribute assignment branch.
+- **Config**: `tnac_lower_ratio` corrected 0.22 → 0.1314 (= 400/1096 × upper_ratio);
+  `tnac_mid_ratio: 0.2737` added (= 833/1096 × upper_ratio) as informational anchor.
+
+### Phase B — Rollover Accounting Fix (`ets_environment.py`, `cap_schedule.py`)
+- **CapSchedule telemetry attrs**: `_last_unsold_rollover_in`, `_last_msr_withheld`,
+  `_last_msr_released` set inside `get_auction_volume()` for immediate, accurate logging.
+  Previously, `msr_withhold_this_year` was zeroed at auction start and never updated.
+- **`msr_withhold_this_year` / `msr_release_this_year`**: Year-log entries now drawn from
+  `cap_schedule._last_msr_withheld` / `_last_msr_released` immediately after
+  `get_auction_volume()` returns, giving correct per-year accounting.
+- **Double-count fix**: `unsold = auction_volume − allocations.sum() − defaulted_volume`.
+  Previously, the defaulted volume that had already been added to `auction_volume` was
+  incorrectly also included in the unsold calculation, inflating next year's rollover.
+- **Pre-obs estimate update**: `this_year_auction_volume` preview (used in Phase 1 obs
+  before `step_auction` runs) now sums both pending rollover channels
+  (`_unsold_rollover_pending + _defaulted_volume_pending`) and applies
+  `max_rollover_multiplier` cap. Prior code only added `_defaulted_volume_pending`.
+- **MSR withholding assertion**: Debug-time `assert` verifies a nonzero `_last_msr_withheld`
+  is reflected in the pre-floor auction volume, catching future mis-wiring.
+
+### Phase C — Unbuffered Estimate Need (`company.py`)
+- **`compute_estimate_need()` simplified**: Risk buffer removed. Returns bare
+  `compute_emissions()` instead of `emissions × (1 + risk_factor)`. Agents discover their
+  optimal coverage buffer through bid multiplier learning; pre-baking a buffer conflated
+  intrinsic environmental risk with the agent's bidding strategy.
+- **`_compute_p_fail()` comment updated**: Clarified as investment execution risk (project
+  failure probability), not compliance uncertainty.
+
+### Phase D — Heuristic Simplification (`heuristic_policy.py`)
+- **Green-agent seller discount removed**: `is_green` variable and the associated 50%
+  sell-rate reduction eliminated from `secondary_action()`. ESG differentiation is expressed
+  via reward weights (`w_green`), not heuristic overrides; keeping a bot-level discount was
+  inconsistent with that design.
+
+### Phase E — Tests and Minor Fixes
+- **New tests** (`test_cap_schedule.py`): `test_msr_withhold_in_middle_band`,
+  `test_msr_withheld_rate_above_upper_threshold`,
+  `test_msr_withholding_reduces_final_supply_even_with_rollovers` — cover all three TNAC
+  regime branches including rollover interaction.
+- **Updated tests**: Withholding formula updated throughout (rate × TNAC, not
+  rate × (TNAC − upper)); `tnac_mid` threshold added to test fixture; `tnac_lower` value
+  updated to match 400/1096 proportional scaling.
+- **`test_company`**: Added assertion that `compute_estimate_need()` returns bare emissions
+  (no risk buffer).
+- **`test_environment`** / **`test_market_calibration`**: Updated for `tnac_mid` propagation
+  and rollover accounting changes.
+- **`qty_mult_high` default**: Corrected 1.3 → 2.0 in `step_auction()` (consistent with
+  aggregate bid cap of 3× for a 3-tranche ladder).
+
+### New Artefacts
+- **`ets_marl-auction - Step-by-Step Debug.ipynb`**: New notebook for interactive
+  step-by-step episode debugging and supply-flow diagnostics.
+
+### Config / Metadata
+- Version bumped to `8.2.0` in `pyproject.toml`, `configs/default.yaml`.
+
+---
+
 ## v8.1.0
 
 **Plan v8.1: LRF/MSR Realism, Tranche Sorting, Obs Consolidation, Reward Shaping, Collateral Enforcement**

@@ -566,6 +566,44 @@ def test_unsold_volume_rolls_over_to_next_year():
     assert env.cap_schedule._unsold_rollover_pending == pytest.approx(0.0, abs=1e-9)
 
 
+def test_defaulted_volume_not_double_counted_with_unsold_rollover():
+    """Defaulted volume and unsold rollover must not be added twice."""
+    import copy
+
+    with open(CONFIG_PATH) as f:
+        config = yaml.safe_load(f)
+
+    # Disable bots for deterministic demand and relax leverage so defaults can occur.
+    config = copy.deepcopy(config)
+    config["companies"]["n_bot_agents"] = 0
+    config["auction"]["leverage_multiplier"] = 100.0
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset(seed=42)
+    n_agents = env.n_agents
+
+    # Aggressive bids to stress affordability and trigger defaults.
+    auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+    auction_actions[:, 0] = 500.0
+    auction_actions[:, 1] = 2.0
+
+    _, log = env.step_auction(auction_actions)
+
+    defaulted = float(log["auction_stats"].get("defaulted_volume", 0.0))
+    assert defaulted > 0.0, "Expected defaulted volume for this stress setup"
+
+    rollover_total = float(env.cap_schedule._unsold_rollover_pending + env._defaulted_volume_pending)
+    post_settlement_gap = max(
+        0.0,
+        float(log["auction_volume"]) - float(np.sum(env._phase1_allocations)),
+    )
+
+    assert rollover_total == pytest.approx(post_settlement_gap, abs=1e-6), (
+        "Rollover streams should exactly match the post-settlement supply gap "
+        "(no double counting of defaults in unsold rollover)."
+    )
+
+
 def test_secondary_profit_ema_resets_each_episode():
     """Secondary profit EMA must not leak state across episode resets."""
     env = load_env()
@@ -627,14 +665,14 @@ def test_no_holding_limit():
     n_agents = env.n_agents
 
     # Agent 0 bids at 160 EUR/t (above bot heuristic ~138 EUR/t) with a moderate
-    # quantity multiplier (0.7×) so the auction payment stays within its annual
+    # quantity multiplier (0.8×) so the auction payment stays within its annual
     # budget under E4 collateral constraints.  Other learning agents bid below
     # reserve and so are filtered out; bots generate their own higher bids.
     auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
     auction_actions[:, 0] = 40.0   # other agents bid below bot prices
     auction_actions[:, 1] = 0.3    # small multiplier
     auction_actions[0, 0] = 160.0  # agent 0 bids above bots → priority fill
-    auction_actions[0, 1] = 0.7    # moderate qty — payment affordable under E4
+    auction_actions[0, 1] = 0.8    # moderate qty — payment affordable under E4
 
     obs2, log = env.step_auction(auction_actions)
 

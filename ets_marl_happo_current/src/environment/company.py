@@ -243,7 +243,8 @@ class Company:
         return self._compute_p_fail()
 
     def compute_estimate_need(self) -> float:
-        return self.compute_emissions() * (1.0 + self.compute_risk_factor())
+        # Intentionally unbuffered: agents can learn their own coverage buffer.
+        return self.compute_emissions()
 
     # ------------------------------------------------------------------
     # Operational costs
@@ -262,6 +263,7 @@ class Company:
     # ------------------------------------------------------------------
 
     def _compute_p_fail(self) -> float:
+        # Investment execution risk only (project failure), not compliance uncertainty.
         p_base = self.p_fail_min + (self.p_fail_max - self.p_fail_min) * (self.fossil_frac ** self.p_fail_alpha)
         if self._consecutive_successes >= self.exp_threshold:
             p_base -= self.exp_discount
@@ -626,6 +628,7 @@ class Company:
                                msr_reserve=0.0,
                                bank=0.0,
                                tnac_upper=28.0,
+                               tnac_mid=None,
                                withhold_rate=0.24,
                                budget_spent: float = 0.0,
                                annual_budget: float = 1e9,
@@ -641,7 +644,7 @@ class Company:
         [3]  expected price from AR(1) model (normalized)
         [4-8]  technology mix vector (5D)
         [9]  emissions (normalized)
-        [10] estimated need with risk buffer
+        [10] expected annual emissions (no risk buffer)
         [11] p_fail
         [12] investment experience
         [13] auction gap (banked allowances)
@@ -670,7 +673,15 @@ class Company:
         pn = self._price_norm  # normalization constant (= price_max)
         own_need = max(self.compute_estimate_need(), 0.1)
         own_bank_ratio = float(np.clip(float(bank) / own_need, 0.0, 5.0)) / 5.0
-        predicted_withhold = max(0.0, tnac_proxy * cap_t - tnac_upper) * withhold_rate / max(cap_t, 1e-6)
+        tnac_mid = float(tnac_mid) if tnac_mid is not None else float(tnac_upper) * (833.0 / 1096.0)
+        predicted_tnac = float(tnac_proxy * cap_t)
+        if predicted_tnac > float(tnac_upper):
+            withheld_abs = float(withhold_rate) * predicted_tnac
+        elif tnac_mid <= predicted_tnac <= float(tnac_upper):
+            withheld_abs = predicted_tnac - tnac_mid
+        else:
+            withheld_abs = 0.0
+        predicted_withhold = withheld_abs / max(cap_t, 1e-6)
         predicted_withhold = float(np.clip(predicted_withhold, 0.0, 1.0))
         budget_headroom = float(np.clip(
             1.0 - (budget_spent / max(annual_budget, 1e-6)),

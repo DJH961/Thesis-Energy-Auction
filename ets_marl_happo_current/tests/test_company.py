@@ -170,6 +170,11 @@ def test_greener_company_emits_less(config):
     assert c_dirty.compute_emissions() > c_clean.compute_emissions()
 
 
+def test_estimate_need_matches_emissions_no_risk_buffer(config):
+    c = make_company(config, agent_id=0)
+    assert c.compute_estimate_need() == pytest.approx(c.compute_emissions(), rel=1e-9)
+
+
 # ---------------------------------------------------------------------------
 # MAC fuel-switching
 # ---------------------------------------------------------------------------

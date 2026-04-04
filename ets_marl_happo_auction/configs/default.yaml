@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v8.1
+# ETS MARL — Configuration v8.2
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -70,8 +70,9 @@ ets:
 
   msr:
     enabled: true
-    tnac_upper_ratio: 0.36     # fraction of computed cap_year_0 (calibrated for micro-ETS)
-    tnac_lower_ratio: 0.22     # raised from 0.18 → 0.22 (closer to CMW guide's 25%)
+    tnac_upper_ratio: 0.36     # anchor ratio for scaled TNAC bands
+    tnac_mid_ratio: 0.2737     # 833/1096 of upper (informational)
+    tnac_lower_ratio: 0.1314   # 400/1096 of upper (informational)
     withhold_rate: 0.24
     release_frac: 0.064        # raised from 0.016 → 0.064 (6.4% of cap, scales EU 100 Mt)
     activation_year: 1   # legacy field; 1-year TNAC lag now enforced via _prev_tnac

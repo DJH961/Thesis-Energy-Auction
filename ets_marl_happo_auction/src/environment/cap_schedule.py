@@ -11,9 +11,17 @@ Implements the EU ETS cap trajectory:
 
 EU ETS references:
   - LRF 4.3% (2026–27), 4.4% (2028+): EU ETS Directive post-2023 reform.
-  - MSR thresholds scaled to micro-ETS; upper≈36%, lower≈22% of cap_year_0.
+    - MSR TNAC bands preserve legislative proportions lower:mid:upper
+        ~= 400:833:1096 when scaled to the micro-ETS cap.
   - MSR release amount: 6.4% of cap_year_0 per year (scaled from EU 100 Mt).
 """
+
+
+# Legislative TNAC thresholds from Decision (EU) 2015/1814 (as amended).
+TNAC_LOWER_REF = 400.0
+TNAC_MID_REF = 833.0
+TNAC_UPPER_REF = 1096.0
+TNAC_MID_OVER_UPPER = TNAC_MID_REF / TNAC_UPPER_REF
 
 
 class CapSchedule:
@@ -36,11 +44,11 @@ class CapSchedule:
 
         msr = ets_cfg["msr"]
         self.msr_enabled = msr["enabled"]
-        # Threshold calibration: upper≈36% of cap_year_0 (relaxed ratio for
-        # micro-ETS; real EU ≈53%). Lower raised to ≈22% (closer to CMW
-        # guide's 25%, balanced for 16-agent system).
-        self.tnac_upper = msr["tnac_upper"]               # Mt
-        self.tnac_lower = msr["tnac_lower"]               # Mt
+        # Threshold calibration: scaled from legislative bands so lower:mid:upper
+        # keeps the 400:833:1096 proportions at micro-ETS scale.
+        self.tnac_upper = float(msr["tnac_upper"])         # Mt
+        self.tnac_mid = float(msr.get("tnac_mid", self.tnac_upper * TNAC_MID_OVER_UPPER))
+        self.tnac_lower = float(msr["tnac_lower"])         # Mt
         self.withhold_rate = msr["withhold_rate"]         # fraction
         self.release_amount = msr["release_amount"]       # Mt/year (≈6.4% of cap)
         self.min_auction_frac = msr.get("min_auction_frac", 0.10)
@@ -73,6 +81,11 @@ class CapSchedule:
         # Unsold volume pending rollover to next year's auction
         self._unsold_rollover_pending = 0.0
 
+        # Last-call supply-flow telemetry (used by environment logging/debugging)
+        self._last_unsold_rollover_in = 0.0
+        self._last_msr_withheld = 0.0
+        self._last_msr_released = 0.0
+
         # Total cancelled allowances (MSR cancellation mechanism)
         self._total_cancelled = 0.0
 
@@ -94,6 +107,22 @@ class CapSchedule:
             "containment_release": 0,
             "withdrawal_suppressed": 0,
         }
+
+    def _compute_tnac_withholding(self, tnac: float, auction_vol: float) -> float:
+        """
+        Compute TNAC-based MSR withholding before any price-trigger overrides.
+
+        Regimes:
+          - tnac > tnac_upper: withhold_rate * tnac (24% of TOTAL TNAC)
+          - tnac_mid <= tnac <= tnac_upper: tnac - tnac_mid
+          - tnac_lower <= tnac < tnac_mid: 0
+          - tnac < tnac_lower: 0 (release branch handled by caller)
+        """
+        if tnac > self.tnac_upper:
+            return min(self.withhold_rate * tnac, auction_vol)
+        if self.tnac_mid <= tnac <= self.tnac_upper:
+            return min(tnac - self.tnac_mid, auction_vol)
+        return 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -161,6 +190,9 @@ class CapSchedule:
         """
         cap_t = self.get_cap(year)
         auction_vol = cap_t  # baseline: 100% auctioning
+        self._last_unsold_rollover_in = 0.0
+        self._last_msr_withheld = 0.0
+        self._last_msr_released = 0.0
 
         if self.msr_enabled:
             auction_vol = self._apply_msr(year, auction_vol,
@@ -171,6 +203,10 @@ class CapSchedule:
                                           inflation_rate=inflation_rate,
                                           force_msr=force_msr,
                                           price_ma3=price_ma3)
+            if self._last_msr_withheld > 0.0:
+                assert auction_vol <= (cap_t - self._last_msr_withheld + 1e-9), (
+                    "MSR withholding logged but not reflected in pre-floor auction volume."
+                )
 
         # Safety floor: prevents micro-ETS strangulation where MSR zeros out
         # auctions (no direct EU ETS equivalent, but Auctioning Regulation
@@ -183,6 +219,7 @@ class CapSchedule:
         # cap_t × max_rollover_multiplier (prevents runaway accumulation
         # of unsold rollovers across burn-in or low-demand years).
         rollover = self._unsold_rollover_pending
+        self._last_unsold_rollover_in = float(rollover)
         self._unsold_rollover_pending = 0.0
         auction_vol += rollover
         auction_vol = min(auction_vol, cap_t * self.max_rollover_multiplier)
@@ -276,9 +313,9 @@ class CapSchedule:
             return max(auction_vol, self.min_auction_frac * cap_t, 0.0)
 
         # Normal TNAC-based rules
-        if tnac > self.tnac_upper:
-            withheld = self.withhold_rate * (tnac - self.tnac_upper)
-            auction_vol -= min(withheld, auction_vol)
+        withheld = self._compute_tnac_withholding(tnac, auction_vol)
+        if withheld > 0.0:
+            auction_vol -= withheld
         elif tnac < self.tnac_lower:
             auction_vol += min(self.release_amount, msr_snap)
 
@@ -370,6 +407,8 @@ class CapSchedule:
         # A2: 1-year TNAC lag gate
         # MSR skipped if no prior TNAC exists AND force_msr not set.
         if not force_msr and self._prev_tnac is None:
+            self._last_msr_withheld = 0.0
+            self._last_msr_released = 0.0
             return auction_vol
 
         # Use lagged TNAC for normal MSR decisions (end of previous year).
@@ -419,11 +458,14 @@ class CapSchedule:
                 self._msr_reserve -= release
                 auction_vol += release
                 self._msr_event_counts["emergency_release"] += 1
+                self._last_msr_withheld = 0.0
+                self._last_msr_released = float(release)
                 return auction_vol
 
         # Containment: suppress withdrawal when prices are already elevated
         if clearing_price >= containment_threshold:
             # No withdrawal even if TNAC > upper; only release if TNAC < lower
+            release = 0.0
             if tnac < self.tnac_lower:
                 release = min(self.release_amount, self._msr_reserve)
                 self._msr_reserve -= release
@@ -431,27 +473,36 @@ class CapSchedule:
                 self._msr_event_counts["containment_release"] += 1
             else:
                 self._msr_event_counts["withdrawal_suppressed"] += 1
+            self._last_msr_withheld = 0.0
+            self._last_msr_released = float(release)
             return auction_vol
 
         # Normal MSR logic (TNAC-based)
-        if tnac > self.tnac_upper:
-            withheld = self.withhold_rate * (tnac - self.tnac_upper)
-            withheld = min(withheld, auction_vol)
+        withheld = self._compute_tnac_withholding(tnac, auction_vol)
+        release = 0.0
+        if withheld > 0.0:
             self._msr_reserve += withheld
             auction_vol -= withheld
-
         elif tnac < self.tnac_lower:
             release = min(self.release_amount, self._msr_reserve)
             self._msr_reserve -= release
             auction_vol += release
 
+        self._last_msr_withheld = float(withheld)
+        self._last_msr_released = float(release)
+
         return auction_vol
 
     def update_calibration(self, cap_year_0, tnac_upper, tnac_lower,
-                           release_amount, emergency_release_amount):
+                           release_amount, emergency_release_amount,
+                           tnac_mid=None):
         """Update runtime calibration values and reset MSR internal state."""
         self.cap_year_0 = float(cap_year_0)
         self.tnac_upper = float(tnac_upper)
+        if tnac_mid is None:
+            self.tnac_mid = float(self.tnac_upper * TNAC_MID_OVER_UPPER)
+        else:
+            self.tnac_mid = float(tnac_mid)
         self.tnac_lower = float(tnac_lower)
         self.release_amount = float(release_amount)
         self.emergency_release_amount = float(emergency_release_amount)
@@ -460,6 +511,9 @@ class CapSchedule:
         self._msr_reserve = 0.0
         self._unsold_absorbed = 0.0
         self._unsold_rollover_pending = 0.0
+        self._last_unsold_rollover_in = 0.0
+        self._last_msr_withheld = 0.0
+        self._last_msr_released = 0.0
         self._total_cancelled = 0.0
         self._prev_tnac = None
         self._prev_ma3 = None
@@ -476,6 +530,9 @@ class CapSchedule:
         self._msr_reserve = 0.0
         self._unsold_absorbed = 0.0
         self._unsold_rollover_pending = 0.0
+        self._last_unsold_rollover_in = 0.0
+        self._last_msr_withheld = 0.0
+        self._last_msr_released = 0.0
         self._total_cancelled = 0.0
         # A2: reset TNAC lag so year 0 starts with no prior TNAC
         self._prev_tnac = None

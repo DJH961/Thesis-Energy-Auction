@@ -27,8 +27,11 @@ def test_16_agents_matches_current_config():
 
     assert params["cap_year_0"] == pytest.approx(50.0, abs=0.1)
     assert params["tnac_upper"] == pytest.approx(18.0, abs=0.1)
-    # tnac_lower_ratio updated to 0.22 (from 0.18): 50 × 0.22 ≈ 11.0
-    assert params["tnac_lower"] == pytest.approx(11.0, abs=0.2)
+    # Preserve lower:mid:upper ~= 400:833:1096 when scaling to micro-ETS.
+    assert params["tnac_mid"] == pytest.approx(13.7, abs=0.2)
+    assert params["tnac_lower"] == pytest.approx(6.6, abs=0.2)
+    assert params["tnac_mid"] / params["tnac_upper"] == pytest.approx(833.0 / 1096.0, rel=1e-6)
+    assert params["tnac_lower"] / params["tnac_upper"] == pytest.approx(400.0 / 1096.0, rel=1e-6)
 
 
 def test_12_agents_scales_down():
@@ -92,6 +95,7 @@ def test_backward_compat_no_overhead_key():
 
     assert params["cap_year_0"] == pytest.approx(50.0)
     assert params["tnac_upper"] == pytest.approx(18.0)
+    assert params["tnac_mid"] == pytest.approx(18.0 * 833.0 / 1096.0)
     assert params["tnac_lower"] == pytest.approx(9.0)
 
 

@@ -1,6 +1,8 @@
-# ETS MARL — Current Version (HAPPO/PPO) v7.4
+# ETS MARL — Current Version (HAPPO/PPO) v7.5
 
 This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
+
+**v7.5 improvements:** Three-band MSR withholding aligned with EU legislative TNAC proportions (400:833:1096), corrected withholding formula (24% of total TNAC above upper threshold), rollover accounting overhaul (unsold and defaulted volumes tracked as independent streams, no double-counting), `compute_estimate_need()` unbuffered (agents learn their own bid buffer), heuristic green-seller discount removed, `qty_mult_high` default corrected, new MSR telemetry attributes on `CapSchedule`, and expanded test coverage for all three TNAC regimes.
 
 **v7.4 improvements (plan v8.1 backport):** Linear LRF, 1-year TNAC lag for MSR realism, smoothed MA3 price trigger, smarter secondary heuristic (C2/C3), corrected collateral config (E2/E4: 10% initial margin, 50% budget cap), efficiency bonus as shaping reward, diagnostic score logging.
 
@@ -26,7 +28,8 @@ Each "episode" simulates **12 years** of a carbon market. Every year:
 5. Companies can **bank** (save) unused allowances for future years.
 6. A **Market Stability Reserve (MSR)** automatically adjusts the auction supply based on the total number of allowances in circulation (TNAC). The MSR implements the EU ETS post-2023 reform including:
    - **1-year TNAC lag (v7.4)**: MSR uses the *prior year's* TNAC, matching EU ETS Decision 2015/1814 (Art. 1(5)). Year 0 has no MSR intervention.
-   - **Updated thresholds**: Lower threshold 22% of CAP_0, release_frac 6.4% of CAP_0.
+   - **Three-band withholding (v7.5)**: Uses legislative TNAC proportions lower:mid:upper = 400:833:1096. Above upper: withhold 24% of total TNAC. Between mid and upper: withhold TNAC − mid. Below mid: no intake.
+   - **Updated thresholds (v7.5)**: `tnac_lower_ratio` corrected to 0.1314, `tnac_mid_ratio` 0.2737, `tnac_upper_ratio` 0.36 (anchor).
    - **Cancellation mechanism**: MSR holdings exceeding the previous year's auction volume are permanently cancelled.
    - **Smoothed price trigger (v7.4)**: Emergency release requires both an absolute threshold breach (≥ 85% of penalty / 300 EUR/t) *and* a MA3 price spike > 2.5× prior year's MA3.
 
