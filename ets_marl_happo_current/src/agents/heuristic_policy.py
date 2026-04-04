@@ -183,25 +183,20 @@ def auction_action(
         qty_mult, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0),
     ))
 
-    # E3: Pre-bid budget awareness — apply leverage gate and E2 collateral check.
-    # Mirrors the environment-side E4/E2 enforcement so the heuristic respects
-    # the same constraints and doesn't rely on silent post-hoc clipping.
+    # E3: Pre-bid budget awareness.
+    # Use a settlement-consistent cap so payment + collateral cannot exceed
+    # available budget, preventing bot defaults by construction.
     available_budget = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
-    lev_mult = float(aq.get("leverage_multiplier", 3.0))
-    if lev_mult > 0.0 and bid_price > 1e-6 and available_budget > 0.0:
-        max_notional_qty = lev_mult * available_budget / bid_price
-        if qty_mult * annual_need > max_notional_qty:
-            qty_mult = max_notional_qty / max(annual_need, 1e-6)
     coll_cfg_h = aq.get("collateral", {})
     h_coll_frac = float(coll_cfg_h.get("collateral_fraction",
                                         coll_cfg_h.get("opportunity_cost_rate", 0.05)
                                         * coll_cfg_h.get("hold_fraction", 0.02)))
-    h_max_coll_share = float(coll_cfg_h.get("max_collateral_budget_share", 0.50))
     if h_coll_frac > 0.0 and bid_price > 1e-6 and available_budget > 0.0:
-        projected_collateral = h_coll_frac * bid_price * qty_mult * annual_need
-        max_collateral = h_max_coll_share * available_budget
-        if projected_collateral > max_collateral:
-            qty_mult *= max_collateral / projected_collateral
+        above_reserve = max(0.0, bid_price - float(reserve_price))
+        denom = bid_price + h_coll_frac * above_reserve
+        max_safe_qty = available_budget / max(denom, 1e-6)
+        if qty_mult * annual_need > max_safe_qty:
+            qty_mult = max_safe_qty / max(annual_need, 1e-6)
 
     # Collateral load safety: if last year's collateral locked was a large share
     # of the budget, scale back qty_mult proportionally to stay inside limits and
