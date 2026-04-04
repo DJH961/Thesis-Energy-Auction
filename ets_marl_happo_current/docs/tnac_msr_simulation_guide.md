@@ -118,14 +118,14 @@ If you find the MSR is always active or never active, adjust these ratios. The k
 
 | Period | Intake rate |
 |--------|-------------|
-| Original MSR (2019–2023) | 12% of TNAC |
-| Strengthened MSR (2024 onwards) | 24% of TNAC |
+| Original MSR (2019–2023) | 12% of excess TNAC above upper threshold |
+| Strengthened MSR (2024 onwards) | 24% of excess TNAC above upper threshold |
 
 **For your simulation, use 24%** (the current and recommended rate):
 
 ```
 if TNAC_t > UPPER_THRESHOLD:
-    MSR_INTAKE_{t+1} = 0.24 × TNAC_t
+    MSR_INTAKE_{t+1} = 0.24 × (TNAC_t - UPPER_THRESHOLD)
 ```
 
 **Mechanism:** The intake does NOT recall allowances from agents. Instead, it reduces the number of allowances available at the next auction. The surplus stays in private hands — but future supply shrinks.
@@ -221,7 +221,7 @@ START OF YEAR t:
 
   2. DETERMINE AUCTION VOLUME based on last year's TNAC:
      if TNAC_{t-1} > UPPER_THRESHOLD:
-         INTAKE = 0.24 × TNAC_{t-1}
+         INTAKE = 0.24 × (TNAC_{t-1} - UPPER_THRESHOLD)
          AUCTION_VOLUME_t = CAP_t - INTAKE
          (INTAKE goes to MSR after auction)
      elif TNAC_{t-1} < LOWER_THRESHOLD:
@@ -262,9 +262,9 @@ Note: MSR intake is conceptually "withheld from auction" — the allowances that
 | LRF Phase 4c | `LRF_3` | 4.4% of `BASE_CAP` per year |
 | Upper TNAC threshold | `T_upper` | 53% of `CAP_0` |
 | Lower TNAC threshold | `T_lower` | 25% of `CAP_0` |
-| MSR intake rate | `r_intake` | 24% of TNAC |
+| MSR intake rate | `r_intake` | 24% of excess TNAC above `T_upper` |
 | MSR release amount | `Q_release` | 6.4% of `CAP_0` (fixed quantity) |
-| MSR cancellation threshold | — | Previous year's auction volume |
+| MSR cancellation threshold | — | max(previous year's auction volume, previous year's cap) |
 | Initial emissions-to-cap ratio | — | ~90% (mild 10% surplus) |
 | Price spike trigger | — | Current price > 3× two-year average |
 | Non-compliance penalty | — | €100/tCO₂ (adjustable for inflation) |
@@ -302,10 +302,10 @@ tnac_t = sum(agent.allowance_balance for agent in agents)
 
 ### 7.1 MSR Intake Exceeds Cap
 
-If 24% of TNAC is larger than the annual cap (possible when the surplus is extreme relative to a shrinking cap), clamp the auction to zero. You cannot auction negative allowances.
+If 24% of the excess TNAC above the upper threshold is larger than the annual cap (possible when the surplus is extreme relative to a shrinking cap), clamp the auction to zero. You cannot auction negative allowances.
 
 ```python
-intake = 0.24 * tnac
+intake = 0.24 * (tnac - upper_threshold)
 auction_volume = max(0, cap_t - intake)
 actual_intake = cap_t - auction_volume  # Only what was actually withheld
 msr_holdings += actual_intake
@@ -368,7 +368,12 @@ def run_msr_cycle(year, cap_0, base_cap, lrf, tnac_prev, msr_holdings,
 
     # --- Step 1: MSR Cancellation ---
     if year > 0:
-        cancellation = max(0, msr_holdings - auction_volume_prev)
+        # The cancellation floor is the larger of (a) last year's actual auction
+        # volume and (b) last year's cap. This prevents distorted auction volumes
+        # (e.g. from large unsold rollovers) from causing premature cancellation.
+        cap_prev = cap_0 - ((year - 1) * lrf * base_cap)
+        cancellation_floor = max(auction_volume_prev, cap_prev)
+        cancellation = max(0, msr_holdings - cancellation_floor)
         msr_holdings -= cancellation
     else:
         cancellation = 0
@@ -382,8 +387,8 @@ def run_msr_cycle(year, cap_0, base_cap, lrf, tnac_prev, msr_holdings,
     release = 0.0
 
     if tnac_prev > upper_threshold:
-        # INTAKE: Withhold 24% of TNAC from auction
-        intake = 0.24 * tnac_prev
+        # INTAKE: Withhold 24% of the EXCESS above the upper threshold from auction
+        intake = 0.24 * (tnac_prev - upper_threshold)
         auction_volume = max(0, cap_t - intake)
         actual_intake = cap_t - auction_volume
         msr_holdings += actual_intake
@@ -419,12 +424,12 @@ Year t-1 ends:
        │
        ▼
 Year t begins:
-  MSR Cancellation ──► MSR shrinks (holdings > last auction vol are destroyed)
+  MSR Cancellation ──► MSR shrinks (holdings > max(last auction vol, last cap) are destroyed)
        │
        ▼
   TNAC_{t-1} evaluated against thresholds:
        │
-       ├─ TNAC > 53% of CAP_0  ──► INTAKE: 24% of TNAC withheld from auction
+       ├─ TNAC > 53% of CAP_0  ──► INTAKE: 24% of (TNAC - upper_threshold) withheld from auction
        │                            Fewer allowances auctioned → MSR grows
        │
        ├─ TNAC < 25% of CAP_0  ──► RELEASE: ~6.4% of CAP_0 added to auction
