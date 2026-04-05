@@ -71,6 +71,69 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
   (references `/annual_budget` instead of `/1000`).
 - **All 246 tests pass**.
 
+### Phase G — Phase-Split Policy Gradient + Raw Tranche Logging (`ppo_agent.py`, `ets_environment.py`, `train.py`)
+
+#### G1 — RolloutBuffer phase tagging (`ppo_agent.py`)
+- **`phases` list**: `RolloutBuffer` now stores a `phases` list alongside each transition,
+  recording either `'auction'` or `'secondary'`. The `push()` method accepts a `phase=`
+  keyword argument (default `'secondary'`) to tag each stored transition.
+- **Motivation**: Without phase tagging, `update_happo()` applied the auction policy loss to
+  every buffer row — including secondary-phase rows whose observations live in the obs2-space
+  (different dimension from obs1). This caused a silent gradient corruption bug.
+
+#### G2 — Phase-split actor losses in `update()`, `update_happo()`, `compute_gae()` (`ppo_agent.py`)
+- **`compute_gae()`**: Builds `is_auction_t: BoolTensor[T]` from `buffer.phases`. This mask
+  is exposed in `buf_tensors["is_auction"]` so both `update()` and `update_happo()` consume it
+  without re-deriving it per mini-batch.
+- **`update()` and `update_happo()`**: Actor losses are now split per mini-batch:
+  - `auc_policy_loss` — computed only on `is_auc_mb` rows (obs1-space); auction policy only.
+  - `sec_policy_loss` — computed only on `~is_auc_mb` rows (obs2-space); secondary policy only.
+  - KL divergence, entropy bonus, and BC-KL penalty all follow the same mask.
+- **`compute_post_update_ratio()`**: HAPPO M-factor now uses per-phase log-ratios, preventing
+  cross-obs-space contamination in the cumulative importance ratio chain.
+- **`train.py`**: Auction-phase `store_transition()` call tagged `phase='auction'` with
+  `sec_lp=np.zeros(1, dtype=np.float32)` (shape-consistent placeholder); secondary-phase
+  call tagged `phase='secondary'`.
+
+#### G3 — Raw tranche storage and logging (`ets_environment.py`)
+- **Pre-sort storage**: `step_auction()` now saves both representations of each agent's
+  3-tranche bid ladder:
+  - `self._phase1_tranche_prices_raw[i]` / `self._phase1_tranche_quantities_raw[i]`:
+    pre-B1-sort prices and quantities, preserving the action-slot→tranche identity needed
+    for policy gradient credit assignment.
+  - `self._phase1_tranche_prices[i]` / `self._phase1_tranche_quantities[i]`:
+    B1-ascending-sorted (retained for market clearing and diagnostics).
+  Comment added: *"B1 sort is for clearing + diagnostics only; raw slots preserve policy
+  gradient identity."*
+- **Log dict keys renamed and extended**: `year_log` now exposes four tranche keys instead
+  of two:
+  - `'tranche_prices_sorted'` (was `'tranche_prices'`) — B1-sorted, per clearing.
+  - `'tranche_quantities_sorted'` (was `'tranche_quantities'`) — B1-sorted.
+  - `'tranche_prices_raw'` — new, pre-sort action-slot order.
+  - `'tranche_quantities_raw'` — new, pre-sort action-slot order.
+- **`train.py`**: Log consumers updated to use `tranche_prices_sorted` /
+  `tranche_quantities_sorted`.
+
+#### G4 — Collateral normalization confirmation (`ets_environment.py`)
+- Verified that `compute_auction_rewards()` divides the collateral opportunity cost by
+  `annual_budget`, consistent with `collateral_load_last` at Phase-1 obs index [25].
+  No code change required; added inline comment confirming the match.
+
+#### G5 — Tests (`tests/test_mappo.py`, `tests/test_rewards.py`)
+- **`test_mappo.py` — `_run_one_episode` helper**: Updated to store 2 transitions per year
+  (auction then secondary) matching the real training loop. Auction-phase call uses
+  `sec_lp=np.zeros(1, dtype=np.float32)` to avoid inhomogeneous `np.array()` errors.
+- **`test_batch_accumulation_buffer_size`**: Expected buffer size corrected from `4 × n_years`
+  to `4 × 2 × n_years` (two transitions per year-step).
+- **`test_gae_respects_done_flags`**: Done-flag indices corrected from `n_years-1` /
+  `2×n_years-1` to `2×n_years-1` / `4×n_years-1` (secondary row carries `done=True`).
+- **`test_auction_reward_normalization`** (new, `test_rewards.py`): Deterministic
+  single-agent clearing with collateral enabled. Asserts that
+  `r_auction[i] == -(payment + collateral_cost + invest + opex_delta + mac) / annual_budget`
+  to within 1e-6, exercising the complete `compute_auction_rewards()` path with a known,
+  reproducible clearing outcome.
+- **All 247 tests pass** (246 baseline + 1 new).
+
 ### Config / Metadata
 - `pyproject.toml`: version 8.3.0
 - `default.yaml` header: v8.3
