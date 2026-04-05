@@ -65,7 +65,7 @@ ets:
   # To override with a manual value, set cap_year_0_override to a number.
   cap_year_0_override: null     # null enables emission-weighted calibration
   initial_bank_fraction: 0.10   # default episode-start bank seed fraction of annual need
-  cap_overhead_pct: 0.02        # 2% surplus over total initial emissions
+  cap_overhead_pct: 0.04        # 4% surplus over total initial emissions
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044

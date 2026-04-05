@@ -1265,7 +1265,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         )
         sec_match_rate = years_with_trades / max(effective_n_years, 1)
 
-        # Average bid price per agent across the episode
+        # Average bid price per agent across the episode.
+        # Use quantity-weighted average when possible so Bid€ reflects submitted volume.
         avg_bid_per_agent = []
         for i in range(n_total_agents):
             bids_this_ep = [
@@ -1273,7 +1274,20 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 for yl in env.episode_log
                 if "bid_prices" in yl and i < len(yl["bid_prices"])
             ]
-            avg_bid_per_agent.append(np.mean(bids_this_ep) if bids_this_ep else 0.0)
+            qtys_this_ep_for_price = [
+                max(0.0, yl["bid_quantities"][i])
+                for yl in env.episode_log
+                if "bid_quantities" in yl and i < len(yl["bid_quantities"])
+            ]
+            if bids_this_ep and qtys_this_ep_for_price and len(bids_this_ep) == len(qtys_this_ep_for_price):
+                total_qty = float(np.sum(qtys_this_ep_for_price))
+                if total_qty > 1e-9:
+                    weighted_px = float(np.dot(bids_this_ep, qtys_this_ep_for_price) / total_qty)
+                    avg_bid_per_agent.append(weighted_px)
+                else:
+                    avg_bid_per_agent.append(float(np.mean(bids_this_ep)))
+            else:
+                avg_bid_per_agent.append(float(np.mean(bids_this_ep)) if bids_this_ep else 0.0)
 
         # Average bid quantity (Mt) per agent — Phase 1 action[1] after multiplier expansion
         avg_bid_qty_per_agent = []
@@ -1716,14 +1730,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                   f"{decay_str}{cyc_str}{warmup_str}")
 
             # ── Market trajectories ────────────────────────────────────
-            price_traj = "  ".join(f"{p:3.0f}" for p in prices_ep)
-            emiss_traj = "  ".join(f"{e:3.1f}" for e in yr_emiss)
-            bid_traj = "  ".join(f"{b:3.1f}" for b in yr_bid_total)
-            auct_traj  = "  ".join(f"{c:3.1f}" for c in yr_auct_vol)
-            print(f"  Price/yr:  {price_traj}   (σ={price_std:.0f}){_trend_arrow(prices_ep)}")
-            print(f"  Emiss/yr:  {emiss_traj}   (avg {avg_annual_emiss:.1f} Mt/yr){_trend_arrow(yr_emiss)}")
-            print(f"  Bid/yr:    {bid_traj}   (agents' total auction demand, Mt){_trend_arrow(yr_bid_total)}")
-            print(f"  CouldBuy:  {auct_traj}   (auction supply after cap+rollover+MSR, TNAC={tnac:.1f} Mt){msr_str}{_trend_arrow(yr_auct_vol)}")
+            price_traj = " ".join(f"{p:5.0f}" for p in prices_ep)
+            emiss_traj = " ".join(f"{e:5.1f}" for e in yr_emiss)
+            bid_traj = " ".join(f"{b:5.1f}" for b in yr_bid_total)
+            auct_traj  = " ".join(f"{c:5.1f}" for c in yr_auct_vol)
+            print(f"  {'Price/yr':<8}: {price_traj}   (σ={price_std:.0f}){_trend_arrow(prices_ep)}")
+            print(f"  {'Emiss/yr':<8}: {emiss_traj}   (avg {avg_annual_emiss:.1f} Mt/yr){_trend_arrow(yr_emiss)}")
+            print(f"  {'Bid/yr':<8}: {bid_traj}   (agents' total auction demand, Mt){_trend_arrow(yr_bid_total)}")
+            print(f"  {'Auct/yr':<8}: {auct_traj}   (auction supply after cap+rollover+MSR, TNAC={tnac:.1f} Mt){msr_str}{_trend_arrow(yr_auct_vol)}")
 
             # ── Health snapshot ─────────────────────────────────────────
             _gs = avg_green_start_all * 100
@@ -1760,10 +1774,13 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 # Diagnostic scores (inline)
                 acc = ep_diag_accumulator[i]
                 nd = max(acc["count"], 1)
-                s_fin  = acc["S_financial"] / nd
-                s_grn  = acc["S_green"] / nd
-                s_comp = acc["S_composite"] / nd
-                diag_str = f"{s_fin*100:4.0f}/{s_grn*100:4.0f}/{s_comp*100:4.0f}"
+                s_fin  = float(np.nan_to_num(acc["S_financial"] / nd, nan=0.0, posinf=1.0, neginf=0.0))
+                s_grn  = float(np.nan_to_num(acc["S_green"] / nd, nan=0.0, posinf=1.0, neginf=0.0))
+                s_comp = float(np.nan_to_num(acc["S_composite"] / nd, nan=0.0, posinf=1.0, neginf=0.0))
+                s_fin_pts = int(np.clip(round(s_fin * 100.0), 0, 100))
+                s_grn_pts = int(np.clip(round(s_grn * 100.0), 0, 100))
+                s_cmp_pts = int(np.clip(round(s_comp * 100.0), 0, 100))
+                diag_str = f"{s_fin_pts:3d}/{s_grn_pts:3d}/{s_cmp_pts:3d}"
 
                 # Losses
                 loss_i = latest_losses[i] if latest_losses[i] else last_available_losses[i]
