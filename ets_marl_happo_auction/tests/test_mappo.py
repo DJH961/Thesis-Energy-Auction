@@ -151,6 +151,17 @@ def _run_one_episode(env, agents, n_agents, n_years, config):
         _centralized = config["ppo"].get("centralized_critic", False)
         global_state = obs2.flatten() if _centralized else None
 
+        # Store auction-phase transition so auction_policy gets gradients
+        for i in range(n_agents):
+            value = agents[i].estimate_value(
+                global_state if _centralized else obs2[i])
+            agents[i].store_transition(
+                obs1[i], obs2[i], auction_raws[i], np.zeros(2, dtype=np.float32),
+                auction_logps[i], 0.0, 0.0, False, value,
+                global_state=global_state,
+                phase='auction',
+            )
+
         sec_actions = np.zeros((n_agents, 2), dtype=np.float32)
         sec_raws, sec_logps = [], []
         for i in range(n_agents):
@@ -161,6 +172,7 @@ def _run_one_episode(env, agents, n_agents, n_years, config):
 
         obs1_next, rewards, done, _, _ = env.step_secondary(sec_actions)
 
+        # Store secondary-phase transition
         for i in range(n_agents):
             value = agents[i].estimate_value(
                 global_state if _centralized else obs2[i])
@@ -168,6 +180,7 @@ def _run_one_episode(env, agents, n_agents, n_years, config):
                 obs1[i], obs2[i], auction_raws[i], sec_raws[i],
                 auction_logps[i], sec_logps[i], rewards[i], done, value,
                 global_state=global_state,
+                phase='secondary',
             )
 
         obs1 = obs1_next

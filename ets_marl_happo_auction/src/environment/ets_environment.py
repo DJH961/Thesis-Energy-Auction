@@ -153,6 +153,8 @@ class ETSEnvironment(gym.Env):
         self._phase1_log = None
         self._phase1_bid_prices = None
         self._phase1_bid_quantities = None  # actual Mt quantities after multiplier expansion
+        self._phase1_tranche_prices_raw = None   # pre-B1-sort, action-slot order
+        self._phase1_tranche_quantities_raw = None
 
         # P4: Per-agent fossil fraction history within the episode (last 3 years)
         self._fossil_frac_history: List[List[float]] = [[] for _ in range(self.n_total)]
@@ -1218,8 +1220,14 @@ class ETSEnvironment(gym.Env):
         agent_total_qty = np.zeros(self.n_total)
         agent_wavg_price = np.zeros(self.n_total)
         # Store individual tranche prices and quantities per agent [agent][tranche]
+        # _prices/_quantities: B1-sorted (ascending) — used for clearing and diagnostics
+        # _prices_raw/_quantities_raw: pre-sort order (action slot 0,1,2 → tranche 0,1,2)
+        # Raw slots preserve policy gradient identity so backprop flows to the correct
+        # action component; B1 sort is for clearing + diagnostics only.
         tranche_prices = [[0.0] * N_TRANCHES for _ in range(self.n_total)]
         tranche_quantities = [[0.0] * N_TRANCHES for _ in range(self.n_total)]
+        tranche_prices_raw = [[0.0] * N_TRANCHES for _ in range(self.n_total)]
+        tranche_quantities_raw = [[0.0] * N_TRANCHES for _ in range(self.n_total)]
 
         # E1: Aggregate bid volume cap — total bid ≤ 3× annual_need
         aggregate_bid_cap_mult = float(self.config["auction"].get("aggregate_bid_cap_mult", 3.0))
@@ -1249,7 +1257,13 @@ class ETSEnvironment(gym.Env):
                 q_abs = max(0.0, q_abs)
                 raw_tranches.append((p_clipped, q_abs))
 
-            # B1: Sort tranches ascending by price (T1 = cheapest, T3 = most expensive)
+            # B1: Sort tranches ascending by price (T1 = cheapest, T3 = most expensive).
+            # B1 sort is for clearing + diagnostics only; raw slots preserve
+            # policy gradient identity (action[2t] → tranche t before sort).
+            # Save raw (pre-sort) order first.
+            for t, (p_raw, q_raw) in enumerate(raw_tranches):
+                tranche_prices_raw[i][t] = p_raw
+                tranche_quantities_raw[i][t] = q_raw
             raw_tranches.sort(key=lambda pq: pq[0])
 
             # E1: Cap total bid quantity at aggregate_bid_cap_mult × base_need
@@ -1337,8 +1351,12 @@ class ETSEnvironment(gym.Env):
         self._phase1_bid_prices = agent_wavg_price.copy()
         self._phase1_bid_quantities = agent_total_qty.copy()
         # Store individual tranche data for logging
+        # _phase1_tranche_prices / _quantities: B1-sorted (ascending) — used for clearing
+        # _phase1_tranche_prices_raw / _quantities_raw: pre-sort action-slot order
         self._phase1_tranche_prices = tranche_prices
         self._phase1_tranche_quantities = tranche_quantities
+        self._phase1_tranche_prices_raw = tranche_prices_raw
+        self._phase1_tranche_quantities_raw = tranche_quantities_raw
 
         # E4: Suspension enforcement — suspended agents cannot bid this round.
         # Decrement suspension counter; bids for suspended agents already filtered since
@@ -1916,8 +1934,10 @@ class ETSEnvironment(gym.Env):
             "shortfalls": shortfalls.tolist(),
             "bid_prices": self._phase1_bid_prices.tolist() if self._phase1_bid_prices is not None else [],
             "bid_quantities": self._phase1_bid_quantities.tolist() if self._phase1_bid_quantities is not None else [],
-            "tranche_prices": self._phase1_tranche_prices,
-            "tranche_quantities": self._phase1_tranche_quantities,
+            "tranche_prices_sorted": self._phase1_tranche_prices,
+            "tranche_quantities_sorted": self._phase1_tranche_quantities,
+            "tranche_prices_raw": self._phase1_tranche_prices_raw,
+            "tranche_quantities_raw": self._phase1_tranche_quantities_raw,
             "delta_greens": [c.green_frac - c.prev_green_frac for c in self.companies],
             "queue_sizes": [len(c._construction_queue) for c in self.companies],
             "terminal_bank_values": self._last_terminal_bank_values.tolist(),

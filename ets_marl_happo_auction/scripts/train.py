@@ -957,6 +957,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     auc_lp=auction_logps[i], sec_lp=0.0,
                     reward=float(r_auction[i]), done=False, value=value_auc,
                     global_state=global_state,
+                    phase='auction',  # auction policy trained on these rows
                 )
 
             # === PHASE 2: Secondary Market ===
@@ -992,6 +993,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     auc_lp=auction_logps[i], sec_lp=secondary_logps[i],
                     reward=float(r_secondary[i]), done=terminated, value=value_sec,
                     global_state=global_state,
+                    phase='secondary',  # secondary policy trained on these rows
                 )
 
             total_rewards += rewards  # log RAW rewards for diagnostics
@@ -1031,8 +1033,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 yr_row[f"collateral_cost_A{i+1}"] = _get("collateral_costs")
                 yr_row[f"bid_price_A{i+1}"] = _get("bid_prices")
                 # 3-tranche bid ladder data
-                tranche_prices_all = yl.get("tranche_prices", [])
-                tranche_qtys_all = yl.get("tranche_quantities", [])
+                tranche_prices_all = yl.get("tranche_prices_sorted", [])
+                tranche_qtys_all = yl.get("tranche_quantities_sorted", [])
                 if i < len(tranche_prices_all):
                     for t in range(3):  # 3 tranches
                         if t < len(tranche_prices_all[i]):
@@ -1694,7 +1696,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             _last_tp = []
             if env.episode_log:
                 _last_yl = env.episode_log[-1]
-                _last_tp = _last_yl.get("tranche_prices", [])
+                _last_tp = _last_yl.get("tranche_prices_sorted", [])
 
             # ═══════════════════════════════════════════════════════════
             #  PRINT
