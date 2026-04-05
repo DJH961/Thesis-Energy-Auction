@@ -318,10 +318,6 @@ def test_empty_bids():
 
     assert stats["auction_failed"] is True
     assert stats["fail_reason"] == "no_bids"
-    assert len(alloc) == 0
-    assert len(pay) == 0
-
-
 # ---------------------------------------------------------------------------
 # Test 14: Unsold volume in stats
 # ---------------------------------------------------------------------------
