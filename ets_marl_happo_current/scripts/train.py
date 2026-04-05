@@ -943,6 +943,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     auc_lp=auction_logps[i], sec_lp=0.0,
                     reward=float(r_auction[i]), done=False, value=value_auc,
                     global_state=global_state,
+                    phase='auction',
                 )
 
             # === PHASE 2: Secondary Market ===
@@ -979,6 +980,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     auc_lp=auction_logps[i], sec_lp=secondary_logps[i],
                     reward=float(r_secondary[i]), done=terminated, value=value_sec,
                     global_state=global_state,
+                    phase='secondary',
                 )
 
             total_rewards += rewards  # log RAW rewards for diagnostics

@@ -134,6 +134,11 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
   reproducible clearing outcome.
 - **All 247 tests pass** (246 baseline + 1 new).
 
+#### G6 — `select_auction_action()` docstring clarification (`ppo_agent.py`)
+- Added note that the 10D action space (3-tranche bid ladder) is specific to the
+  `ets_marl_happo_auction` variant. `ets_marl_happo_current` uses a 6D single-bid policy
+  `[price, qty_mult, invest_frac, tech0, tech1, tech2]`.
+
 ### Config / Metadata
 - `pyproject.toml`: version 8.3.0
 - `default.yaml` header: v8.3

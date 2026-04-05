@@ -360,6 +360,9 @@ class PPOAgent:
         The raw action and log_prob are still computed under the current policy
         so that the PPO importance ratio remains correct.
         3-tranche bid ladder: [p1,q1, p2,q2, p3,q3, invest_frac, t0, t1, t2].
+        This 10D action space is specific to the ``ets_marl_happo_auction`` variant.
+        ``ets_marl_happo_current`` uses a 6D single-bid policy
+        ``[price, qty_mult, invest_frac, tech0, tech1, tech2]``.
         """
         obs_t = torch.FloatTensor(obs1).unsqueeze(0).to(self.device)
         with torch.no_grad():

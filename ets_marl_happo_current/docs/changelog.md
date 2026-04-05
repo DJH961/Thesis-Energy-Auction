@@ -65,6 +65,37 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
   (references `/annual_budget` instead of `/1000`).
 - **All 245 tests pass**.
 
+### Phase G — Phase-Split Policy Gradient Backport (`ppo_agent.py`, `train.py`)
+
+*Backport of the correctness fix from `ets_marl_happo_auction` Phase G.*
+
+#### G1 — RolloutBuffer phase tagging (`ppo_agent.py`)
+- **`phases` list**: `RolloutBuffer.clear()` now initialises `self.phases = []`. The `push()`
+  method accepts a `phase='secondary'` keyword argument that tags each stored transition as
+  either `'auction'` or `'secondary'`.
+
+#### G2 — `store_transition()` phase param (`ppo_agent.py`)
+- `store_transition()` now accepts and forwards `phase='secondary'` to `buffer.push()`.
+
+#### G3 — Phase-split actor losses in `compute_gae()` + `update_happo()` (`ppo_agent.py`)
+- **`compute_gae()`**: Builds `is_auction_t: BoolTensor[T]` from `buffer.phases`, exposed as
+  `buf_tensors["is_auction"]` for reuse in `update_happo()` and `compute_post_update_ratio()`.
+- **`update_happo()`**: Actor losses are now split per mini-batch:
+  - `auc_policy_loss` — computed only on `is_auc_mb` rows (obs1-space).
+  - `sec_policy_loss` — computed only on `~is_auc_mb` rows (obs2-space).
+  - BC-KL penalty also applies phase masking to avoid evaluating policies on the wrong
+    observation space.
+
+#### G4 — Phase-masked `compute_post_update_ratio()` (`ppo_agent.py`)
+- Replaced joint `(new_auc_lp − old_auc_lp) + (new_sec_lp − old_sec_lp)` formula with
+  per-row phase assignment: auction rows receive the auction log-ratio (obs1-space); secondary
+  rows receive the secondary log-ratio (obs2-space). Prevents cross-obs contamination in the
+  HAPPO cumulative M-factor chain.
+
+#### G5 — `train.py` phase tagging
+- Auction-phase `store_transition()` call now passes `phase='auction'`.
+- Secondary-phase `store_transition()` call now passes `phase='secondary'`.
+
 ### Config / Metadata
 - `pyproject.toml`: version 7.6.0
 - `default.yaml` header: v7.6
