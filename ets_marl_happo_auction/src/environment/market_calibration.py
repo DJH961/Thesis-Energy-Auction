@@ -109,11 +109,19 @@ def compute_market_params(config: dict, n_active_bots: int | None = None):
 		cap_year_0 = float(total_emissions) * (1.0 + overhead)
 
 	tnac_upper_ratio = float(msr_cfg.get("tnac_upper_ratio", 0.36))
-	# Preserve legislative TNAC band proportions when scaling to micro-ETS.
-	ratio_scale = tnac_upper_ratio / TNAC_UPPER_REF
-	tnac_upper = cap_year_0 * (TNAC_UPPER_REF * ratio_scale)
-	tnac_mid = cap_year_0 * (TNAC_MID_REF * ratio_scale)
-	tnac_lower = cap_year_0 * (TNAC_LOWER_REF * ratio_scale)
+	# If explicit band ratios are provided, honor them directly; otherwise
+	# preserve legislative TNAC band proportions from the upper ratio.
+	tnac_mid_ratio_cfg = msr_cfg.get("tnac_mid_ratio", None)
+	tnac_lower_ratio_cfg = msr_cfg.get("tnac_lower_ratio", None)
+	if tnac_mid_ratio_cfg is not None and tnac_lower_ratio_cfg is not None:
+		tnac_upper = cap_year_0 * tnac_upper_ratio
+		tnac_mid = cap_year_0 * float(tnac_mid_ratio_cfg)
+		tnac_lower = cap_year_0 * float(tnac_lower_ratio_cfg)
+	else:
+		ratio_scale = tnac_upper_ratio / TNAC_UPPER_REF
+		tnac_upper = cap_year_0 * (TNAC_UPPER_REF * ratio_scale)
+		tnac_mid = cap_year_0 * (TNAC_MID_REF * ratio_scale)
+		tnac_lower = cap_year_0 * (TNAC_LOWER_REF * ratio_scale)
 	release_amount = cap_year_0 * float(msr_cfg.get("release_frac", 0.016))
 	emergency_release = cap_year_0 * float(msr_cfg.get("emergency_release_frac", 0.08))
 

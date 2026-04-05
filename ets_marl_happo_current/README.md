@@ -1,10 +1,8 @@
-# ETS MARL — Current Version (HAPPO/PPO) v7.6
+# ETS MARL — Current (HAPPO/PPO)
 
 This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
 
-**v7.6 improvements:** OPEX delta (only change from baseline enters cost signal, not absolute OPEX), per-agent financial-scale normalization (`/annual_budget` instead of `/1000`), per-agent ESG scale to preserve 50/50 balance, batch normalization in GAE (replaces per-step EMA), raw rewards stored in buffer, `_auc_weight` heuristic removed, fixed HAPPO ordering by initial emission intensity (highest emitters first), and new tests for reward function and learning changes.
-
-**v7.5 improvements:** Three-band MSR withholding aligned with EU legislative TNAC proportions (400:833:1096), corrected withholding formula (24% of total TNAC above upper threshold), rollover accounting overhaul (unsold and defaulted volumes tracked as independent streams, no double-counting), `compute_estimate_need()` unbuffered (agents learn their own bid buffer), heuristic green-seller discount removed, `qty_mult_high` default corrected, new MSR telemetry attributes on `CapSchedule`, and expanded test coverage for all three TNAC regimes.
+Recent changes and release-specific details are tracked in `docs/changelog.md`.
 
 ## What Does This Code Do?
 
@@ -27,11 +25,11 @@ Each "episode" simulates **12 years** of a carbon market. Every year:
 4. Companies that don't have enough allowances to cover their emissions face a **penalty** (base **€138.75/t in 2026**, indexed from €132.06 in 2024; plus carry-forward obligations).
 5. Companies can **bank** (save) unused allowances for future years.
 6. A **Market Stability Reserve (MSR)** automatically adjusts the auction supply based on the total number of allowances in circulation (TNAC). The MSR implements the EU ETS post-2023 reform including:
-   - **1-year TNAC lag (v7.4)**: MSR uses the *prior year's* TNAC, matching EU ETS Decision 2015/1814 (Art. 1(5)). Year 0 has no MSR intervention.
-   - **Three-band withholding (v7.5)**: Uses legislative TNAC proportions lower:mid:upper = 400:833:1096. Above upper: withhold 24% of total TNAC. Between mid and upper: withhold TNAC − mid. Below mid: no intake.
-   - **Updated thresholds (v7.5)**: `tnac_lower_ratio` corrected to 0.1314, `tnac_mid_ratio` 0.2737, `tnac_upper_ratio` 0.36 (anchor).
+   - **1-year TNAC lag**: MSR uses the *prior year's* TNAC, matching EU ETS Decision 2015/1814 (Art. 1(5)). Year 0 has no MSR intervention.
+   - **Three-band withholding**: Uses legislative TNAC proportions lower:mid:upper = 400:833:1096. Above upper: withhold 24% of total TNAC. Between mid and upper: withhold TNAC − mid. Below mid: no intake.
+   - **Updated thresholds**: `tnac_lower_ratio` corrected to 0.1314, `tnac_mid_ratio` 0.2737, `tnac_upper_ratio` 0.36 (anchor).
    - **Cancellation mechanism**: MSR holdings exceeding the previous year's auction volume are permanently cancelled.
-   - **Smoothed price trigger (v7.4)**: Emergency release requires both an absolute threshold breach (≥ 85% of penalty / 300 EUR/t) *and* a MA3 price spike > 2.5× prior year's MA3.
+   - **Smoothed price trigger**: Emergency release requires both an absolute threshold breach (≥ 85% of penalty / 300 EUR/t) *and* a MA3 price spike > 2.5× prior year's MA3.
 
 ### Terminal Value Rewards
 
@@ -148,7 +146,7 @@ ets_marl_happo_current/
 │       └── replay_buffer.py      # Stores past experiences for learning
 │
 ├── configs/
-│   └── default.yaml              # All simulation parameters (v7.3)
+│   └── default.yaml              # All simulation parameters
 │
 ├── scripts/
 │   ├── train.py                  # Starts a training run

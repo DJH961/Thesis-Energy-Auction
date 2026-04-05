@@ -828,7 +828,7 @@ def test_esg_cost_balance_preserved():
 
 
 def test_batch_normalization_replaces_ema():
-    """compute_gae() produces finite, non-zero advantages with raw rewards."""
+    """compute_gae() handles alternating phases and returns a correct phase mask."""
     import torch
     from src.agents.ppo_agent import PPOAgent
 
@@ -865,18 +865,22 @@ def test_batch_normalization_replaces_ema():
         seed=42,
     )
 
-    # Fill buffer with raw rewards (not normalized)
+    expected_is_auction = []
+    # Fill buffer with raw rewards and alternating phase tags
     for t in range(12):
         obs1 = np.random.randn(obs1_dim).astype(np.float32)
         obs2 = np.random.randn(obs2_dim).astype(np.float32)
         auc_raw = np.random.randn(len(auction_low)).astype(np.float32)
         sec_raw = np.random.randn(len(secondary_low)).astype(np.float32)
         raw_reward = -50.0 + t * 5.0  # varying scale, un-normalized
+        phase = "auction" if (t % 2 == 0) else "secondary"
+        expected_is_auction.append(phase == "auction")
         agent.store_transition(
             obs1=obs1, obs2=obs2,
             auc_raw=auc_raw, sec_raw=sec_raw,
             auc_lp=-1.0, sec_lp=-1.0,
             reward=raw_reward, done=(t == 11), value=0.0,
+            phase=phase,
         )
 
     adv_t, ret_t, buf_tensors = agent.compute_gae(last_value=0.0)
@@ -885,6 +889,12 @@ def test_batch_normalization_replaces_ema():
     assert torch.all(torch.isfinite(adv_t)), "Advantages contain non-finite values"
     assert adv_t.abs().sum() > 0, "All advantages are zero"
     assert torch.all(torch.isfinite(ret_t)), "Returns contain non-finite values"
+    assert buf_tensors is not None and "is_auction" in buf_tensors
+    np.testing.assert_array_equal(
+        buf_tensors["is_auction"].cpu().numpy(),
+        np.array(expected_is_auction, dtype=bool),
+        err_msg="compute_gae should preserve auction/secondary phase mask",
+    )
 
 
 def test_split_rewards_sum_to_total():

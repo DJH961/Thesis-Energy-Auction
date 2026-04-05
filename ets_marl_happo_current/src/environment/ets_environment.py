@@ -37,6 +37,7 @@ Roadmap improvements (P5-P8):
 """
 
 import copy
+import warnings
 
 import numpy as np
 import gymnasium as gym
@@ -223,6 +224,7 @@ class ETSEnvironment(gym.Env):
               f" | cancel_under_subscribed={auction_cfg.get('cancel_under_subscribed', False)}")
         # Print initial bank-seed context once per environment instance (avoid reset spam).
         self._printed_initial_bank_seed_context = False
+        self._year1_tnac_warning_emitted = False
 
         # Sanity check: in static mode, price_min must be >= reserve_price.
         # In dynamic mode, the effective reserve is computed each year, so
@@ -486,21 +488,22 @@ class ETSEnvironment(gym.Env):
             else:
                 self._apply_warm_start(ws_cfg)
         else:
-            # Seed initial bank near 0.3x annual need, but keep aggregate TNAC
+            # Seed initial bank near a configured fraction of annual need, but keep aggregate TNAC
             # inside the MSR band to avoid immediate year-0 intervention.
+            initial_bank_fraction = float(self.config.get("ets", {}).get("initial_bank_fraction", 0.30))
             annual_needs = np.array([
                 (max(company.compute_estimate_need(), 0.1) if self._is_agent_active(i) else 0.0)
                 for i, company in enumerate(self.companies)
             ], dtype=float)
             total_need = float(annual_needs.sum())
-            desired_tnac = 0.3 * total_need
+            desired_tnac = initial_bank_fraction * total_need
             tnac_lower = float(self.cap_schedule.tnac_lower)
             tnac_upper = float(self.cap_schedule.tnac_upper)
             if total_need > 1e-9 and tnac_upper > tnac_lower:
                 target_tnac = float(np.clip(desired_tnac, tnac_lower * 1.05, tnac_upper * 0.95))
                 seed_multiple = target_tnac / total_need
             else:
-                seed_multiple = 0.3
+                seed_multiple = initial_bank_fraction
             for i, annual_need in enumerate(annual_needs):
                 self.holdings[i] = float(seed_multiple * annual_need) if self._is_agent_active(i) else 0.0
 
@@ -1518,7 +1521,9 @@ class ETSEnvironment(gym.Env):
 
         This captures costs attributable to auction-phase decisions:
         auction payment, collateral, investment, OPEX delta, MAC cost,
-        and budget/capex penalties. Normalized by annual_budget.
+        loan interest, and a prospective capex-throughput penalty estimate.
+        Budget penalty is intentionally excluded here because final annual
+        spending is only known after secondary market settlement.
 
         Must be called after step_auction() and before step_secondary().
 
@@ -1538,9 +1543,19 @@ class ETSEnvironment(gym.Env):
             mac_cost_i = float(self._phase1_mac_costs[i])
             collateral_cost_i = float(self._collateral_locked[i]) * float(
                 self.config["auction"]["collateral"].get("opportunity_cost_rate", 0.05))
+            loan_interest_cost = float(company.compute_green_loan_cost())
+
+            projected_capex_spend = float(company.capex_spent_this_year + investment_cost)
+            capex_overshoot = max(0.0, projected_capex_spend - float(company.capex_throughput))
+            if capex_overshoot > 1e-6:
+                capex_ratio = capex_overshoot / max(float(company.capex_throughput), 1e-6)
+                capex_penalty = float(company.capex_overspend_coef) * (capex_ratio ** 2) * float(company.capex_throughput)
+            else:
+                capex_penalty = 0.0
 
             r_auction[i] = -(auction_cost + collateral_cost_i + investment_cost
-                             + opex_delta + mac_cost_i) / budget_divisor
+                             + opex_delta + mac_cost_i + loan_interest_cost
+                             + capex_penalty) / budget_divisor
         return r_auction
 
     # ------------------------------------------------------------------
@@ -1792,6 +1807,24 @@ class ETSEnvironment(gym.Env):
                 rho * clearing_price + (1.0 - rho) * price_floor + shock,
                 price_floor,
             )
+
+        # Year 1 TNAC diagnostic: run once per episode after first full year settles.
+        if self.current_year == 0:
+            year1_tnac = float(np.sum(self.holdings))
+            year1_low = 1.0
+            year1_high = 8.0
+            in_band = (year1_low <= year1_tnac <= year1_high)
+            log["year1_tnac"] = year1_tnac
+            log["year1_tnac_expected_low"] = year1_low
+            log["year1_tnac_expected_high"] = year1_high
+            log["year1_tnac_in_range"] = bool(in_band)
+            if (not in_band) and (not self._year1_tnac_warning_emitted):
+                warnings.warn(
+                    f"[ETSEnvironment] Year 1 TNAC diagnostic out of expected range "
+                    f"[{year1_low:.1f}, {year1_high:.1f}] Mt: observed {year1_tnac:.2f} Mt.",
+                    stacklevel=2,
+                )
+                self._year1_tnac_warning_emitted = True
 
         self.current_year += 1
         terminated = self.current_year >= self.n_years

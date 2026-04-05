@@ -1,9 +1,36 @@
 # Changelog — ETS MARL (`ets_marl_happo_current`)
 
-Version numbers reflect the `# ETS MARL — Configuration vX.Y` header in `configs/default.yaml`
+Version numbers reflect the `# ETS MARL — Configuration vX.Y[.Z]` header in `configs/default.yaml`
 and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
+
+## v7.6.1
+
+**Calibration/Diagnostics + Phase-Aware Reward Pipeline Patch**
+
+### Market calibration and policy parameters
+- Year-0 cap override set to **47.0 Mt** via `cap_year_0_override`.
+- Initial bank seeding made explicit in config (`initial_bank_fraction=0.10`) and consumed by environment reset logic.
+- TNAC/MSR policy set to target values:
+  - `tnac_upper=25.5 Mt`, `tnac_lower=12.0 Mt`
+  - intake rate `0.24`
+  - MSR release `3.0 Mt`
+- `market_calibration.py` now respects explicit mid/lower TNAC ratios when supplied.
+
+### Diagnostics and long-run logging
+- Added a one-time Year-1 TNAC diagnostic warning for out-of-range startup states (`[1.0, 8.0] Mt`).
+- Warning is emission-guarded to avoid log spam in very long runs.
+
+### Reward and learning pipeline
+- `compute_auction_rewards()` now includes loan-interest pressure and projected capex-pressure term.
+- `compute_gae()` now normalizes rewards by phase (auction vs secondary) before clipping.
+- PPO reward clip fallback raised from `2.0` to `10.0`.
+- IPPO `update()` now applies explicit phase masks so auction policy gradients use auction rows and secondary policy gradients use secondary rows.
+
+### Validation
+- Updated reward tests to assert phase tagging/masking behavior in GAE.
+- Focused updated tests pass for this patch.
 
 ## v7.6.0
 

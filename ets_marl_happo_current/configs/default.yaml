@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v7.6
+# ETS MARL — Configuration v7.6.1
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -61,7 +61,8 @@ ets:
   # cap_year_0, msr.tnac_upper, msr.tnac_lower are now DERIVED from:
   #   total_system_emissions × (1 + cap_overhead_pct)
   # To override with a manual value, set cap_year_0_override to a number.
-  cap_year_0_override: null     # set to e.g. 50.0 to force manual cap
+  cap_year_0_override: 47.0     # fixed policy scenario cap (Mt)
+  initial_bank_fraction: 0.10   # default episode-start bank seed fraction of annual need
   cap_overhead_pct: 0.11        # 11% surplus over total initial emissions
 
   lrf_phase1: 0.043
@@ -70,11 +71,11 @@ ets:
 
   msr:
     enabled: true
-    tnac_upper_ratio: 0.36     # anchor ratio for scaled TNAC bands
-    tnac_mid_ratio: 0.2737     # 833/1096 of upper (informational)
-    tnac_lower_ratio: 0.1314   # 400/1096 of upper (informational)
+    tnac_upper_ratio: 0.5425531915  # 25.5 Mt / 47.0 Mt
+    tnac_mid_ratio: 0.4123613139    # 19.38 Mt / 47.0 Mt (833/1096 of upper)
+    tnac_lower_ratio: 0.2553191489  # 12.0 Mt / 47.0 Mt
     withhold_rate: 0.24
-    release_frac: 0.064        # raised from 0.016 → 0.064 (6.4% of cap, scales EU 100 Mt)
+    release_frac: 0.0638297872 # 3.0 Mt / 47.0 Mt
     activation_year: 1   # legacy field; 1-year TNAC lag now enforced via _prev_tnac
                          # (Decision 2015/1814 Art 1(5))
     price_containment_absolute: 350   # hard fallback for containment trigger (EUR/t)

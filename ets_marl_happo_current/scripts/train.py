@@ -570,7 +570,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v7.6: OPEX delta + /annual_budget norm + batch GAE + HAPPO emission ordering | Carry-forward{cf_str}")
+    print(f"v7.6.1: OPEX delta + /annual_budget norm + phase-aware GAE + calibration tune | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(
         f"PPO profile: {run_profile['profile']} "
