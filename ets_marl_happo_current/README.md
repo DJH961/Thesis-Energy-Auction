@@ -1,10 +1,10 @@
-# ETS MARL — Current Version (HAPPO/PPO) v7.5
+# ETS MARL — Current Version (HAPPO/PPO) v7.6
 
 This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
 
-**v7.5 improvements:** Three-band MSR withholding aligned with EU legislative TNAC proportions (400:833:1096), corrected withholding formula (24% of total TNAC above upper threshold), rollover accounting overhaul (unsold and defaulted volumes tracked as independent streams, no double-counting), `compute_estimate_need()` unbuffered (agents learn their own bid buffer), heuristic green-seller discount removed, `qty_mult_high` default corrected, new MSR telemetry attributes on `CapSchedule`, and expanded test coverage for all three TNAC regimes.
+**v7.6 improvements:** OPEX delta (only change from baseline enters cost signal, not absolute OPEX), per-agent financial-scale normalization (`/annual_budget` instead of `/1000`), per-agent ESG scale to preserve 50/50 balance, batch normalization in GAE (replaces per-step EMA), raw rewards stored in buffer, `_auc_weight` heuristic removed, fixed HAPPO ordering by initial emission intensity (highest emitters first), and new tests for reward function and learning changes.
 
-**v7.4 improvements (plan v8.1 backport):** Linear LRF, 1-year TNAC lag for MSR realism, smoothed MA3 price trigger, smarter secondary heuristic (C2/C3), corrected collateral config (E2/E4: 10% initial margin, 50% budget cap), efficiency bonus as shaping reward, diagnostic score logging.
+**v7.5 improvements:** Three-band MSR withholding aligned with EU legislative TNAC proportions (400:833:1096), corrected withholding formula (24% of total TNAC above upper threshold), rollover accounting overhaul (unsold and defaulted volumes tracked as independent streams, no double-counting), `compute_estimate_need()` unbuffered (agents learn their own bid buffer), heuristic green-seller discount removed, `qty_mult_high` default corrected, new MSR telemetry attributes on `CapSchedule`, and expanded test coverage for all three TNAC regimes.
 
 ## What Does This Code Do?
 

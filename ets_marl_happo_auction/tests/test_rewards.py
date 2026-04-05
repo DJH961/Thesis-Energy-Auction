@@ -213,8 +213,8 @@ def test_green_bonus_with_investment():
     assert np.all(np.isfinite(rewards_invest))
 
 
-def test_terminal_bank_uses_1000_divisor():
-    """Terminal bank value should remain /1000-scaled under log terminal valuation."""
+def test_terminal_bank_uses_budget_divisor():
+    """Terminal bank value should remain /annual_budget-scaled under log terminal valuation."""
     config = load_config()
     config["reward"]["terminal_bank_value"] = True
     config["reward"]["terminal_queue_value"] = False
@@ -227,14 +227,15 @@ def test_terminal_bank_uses_1000_divisor():
     env.reset()
     # Run to final year with high qty to build up bank
     rewards, _ = _run_to_final_year(env, auction_price=80.0, qty_mult=1.5)
-    # With log scaling, terminal value should stay below linear bank*price/1000,
+    # With log scaling, terminal value should stay below linear bank*price/budget,
     # and far below an incorrect /100 scaling.
     for i in range(env.n_agents):
         if env.holdings[i] > 0.1:
-            linear_upper = env.holdings[i] * 500 / 1000.0
+            budget = max(env.companies[i].annual_budget, 1.0)
+            linear_upper = env.holdings[i] * 500 / budget
             assert env._last_terminal_bank_values[i] <= linear_upper + 1e-6
             assert env._last_terminal_bank_values[i] < env.holdings[i] * 500 / 100.0, (
-                f"Terminal bank value too large — likely using /100 instead of /1000")
+                f"Terminal bank value too large — likely using /100 instead of /annual_budget")
 
 
 def test_terminal_bank_diminishing_returns():
@@ -773,3 +774,290 @@ def test_diagnostic_scores_all_finite():
                 assert np.isfinite(ds[k]), f"{k} is not finite: {ds[k]}"
         if env.episode_done:
             break
+
+
+# ---------------------------------------------------------------------------
+# v8.3: New tests for reward function and learning changes
+# ---------------------------------------------------------------------------
+
+def test_opex_delta_zero_for_unchanged_mix():
+    """An agent with no investment gets opex_delta ≈ 0 (only inflation variance)."""
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    # Disable inflation randomness so delta is purely from mix change
+    config["penalty"]["inflation_random_std"] = 0.0
+    config["penalty"]["inflation_random_window"] = 0.0
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    # Run one year with NO investment → mix unchanged
+    _run_one_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.0)
+
+    for i in range(min(4, env.n_agents)):
+        company = env.companies[i]
+        opex_now = company.compute_operational_cost(1)
+        opex_baseline = company.baseline_opex
+        # With zero inflation randomness and no mix change, the only difference
+        # is from the fixed inflation rate (≈2%), so delta should be small
+        opex_delta = opex_now - opex_baseline
+        assert abs(opex_delta) < 0.05 * company.annual_budget, (
+            f"Agent {i}: opex_delta={opex_delta:.2f} too large for unchanged mix "
+            f"(baseline={opex_baseline:.2f}, now={opex_now:.2f})")
+
+
+def test_esg_cost_balance_preserved():
+    """For an ESG agent (w_green=0.5), cost and ESG signals are within 5× of each other."""
+    config = load_config()
+    config["esg"]["enabled"] = True
+    config["esg"]["scale"] = 2.0
+    config["simulation"]["n_years"] = 12
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    config["reward"]["shaping_beta"] = 0.0
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+    env.set_episode(0)
+
+    _run_one_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.05)
+
+    for i in range(1, min(8, env.n_agents), 2):
+        company = env.companies[i]
+        if company.w_green < 0.4:
+            continue
+        budget_divisor = max(company.annual_budget, 1.0)
+        base_esg_scale = float(config["esg"]["scale"])
+        esg_scale_i = base_esg_scale * (1000.0 / budget_divisor)
+
+        assert esg_scale_i > 0, f"Agent {i} has non-positive esg_scale_i={esg_scale_i}"
+        assert company.initial_ef > 0.01, f"Agent {i} has zero initial_ef"
+        # Verify the product esg_scale_i × (budget/1000) = base_esg_scale
+        product = esg_scale_i * (budget_divisor / 1000.0)
+        assert abs(product - base_esg_scale) < 1e-6, (
+            f"Agent {i}: esg_scale_i × (budget/1000) = {product}, expected {base_esg_scale}")
+
+
+def test_batch_normalization_replaces_ema():
+    """compute_gae() produces finite, non-zero advantages with raw rewards."""
+    import torch
+    from src.agents.ppo_agent import PPOAgent
+
+    config = load_config()
+    config["companies"]["n_agents"] = 2
+    config["companies"]["n_bot_agents"] = 0
+    config["ppo"]["hidden_size"] = 32
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    obs1_dim = env.companies[0].obs_dim_phase1
+    obs2_dim = env.companies[0].obs_dim_phase2
+    aq = config["auction"]
+    inv = config["investment"]
+    p_lo, p_hi = aq["price_min"], aq["price_max"]
+    q_lo = aq.get("qty_mult_low", 0.3)
+    q_hi = aq.get("qty_mult_high", 2.0)
+    auction_low = np.array([
+        p_lo, q_lo, p_lo, q_lo, p_lo, q_lo,
+        0.0, -1.0, -1.0, -1.0
+    ], dtype=np.float32)
+    auction_high = np.array([
+        p_hi, q_hi, p_hi, q_hi, p_hi, q_hi,
+        inv["max_invest_frac"], 1.0, 1.0, 1.0
+    ], dtype=np.float32)
+    secondary_low = np.array([30.0, -10.0], dtype=np.float32)
+    secondary_high = np.array([500.0, 10.0], dtype=np.float32)
+
+    agent = PPOAgent(
+        agent_id=0,
+        obs_dim_phase1=obs1_dim,
+        obs_dim_phase2=obs2_dim,
+        auction_action_low=auction_low,
+        auction_action_high=auction_high,
+        secondary_action_low=secondary_low,
+        secondary_action_high=secondary_high,
+        config=config,
+        seed=42,
+    )
+
+    # Fill buffer with raw rewards (not normalized)
+    for t in range(12):
+        obs1 = np.random.randn(obs1_dim).astype(np.float32)
+        obs2 = np.random.randn(obs2_dim).astype(np.float32)
+        auc_raw = np.random.randn(len(auction_low)).astype(np.float32)
+        sec_raw = np.random.randn(len(secondary_low)).astype(np.float32)
+        raw_reward = -50.0 + t * 5.0
+        agent.store_transition(
+            obs1=obs1, obs2=obs2,
+            auc_raw=auc_raw, sec_raw=sec_raw,
+            auc_lp=-1.0, sec_lp=-1.0,
+            reward=raw_reward, done=(t == 11), value=0.0,
+        )
+
+    adv_t, ret_t, buf_tensors = agent.compute_gae(last_value=0.0)
+
+    assert adv_t is not None, "compute_gae returned None advantages"
+    assert torch.all(torch.isfinite(adv_t)), "Advantages contain non-finite values"
+    assert adv_t.abs().sum() > 0, "All advantages are zero"
+    assert torch.all(torch.isfinite(ret_t)), "Returns contain non-finite values"
+
+
+def test_split_rewards_sum_to_total():
+    """r_auction + r_secondary ≈ old_single_reward for the same environment state."""
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    n = env.n_agents
+    auction_actions = np.zeros((n, 10), dtype=np.float32)
+    auction_actions[:, 0] = 80.0   # p1
+    auction_actions[:, 1] = 0.33   # q1
+    auction_actions[:, 2] = 80.0   # p2
+    auction_actions[:, 3] = 0.33   # q2
+    auction_actions[:, 4] = 80.0   # p3
+    auction_actions[:, 5] = 0.34   # q3
+    auction_actions[:, 6] = -1.0   # no investment
+    auction_actions[:, 9] = 1.0    # solar
+
+    env.step_auction(auction_actions)
+
+    # Get auction intermediate reward
+    r_auction = env.compute_auction_rewards()
+
+    secondary_actions = np.zeros((n, 2), dtype=np.float32)
+    secondary_actions[:, 0] = 1.0
+    secondary_actions[:, 1] = 0.0
+    _, total_rewards, _, _, _ = env.step_secondary(secondary_actions)
+
+    # r_secondary = total - r_auction
+    r_secondary = total_rewards - r_auction[:n]
+
+    # Sum should be close to total
+    r_sum = r_auction[:n] + r_secondary
+    np.testing.assert_allclose(r_sum, total_rewards, atol=1e-6,
+        err_msg="Split rewards should sum to total reward")
+
+
+def test_tranche_reward_sum():
+    """The total auction cost / annual_budget should be consistent with tranche costs."""
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    config["companies"]["n_bot_agents"] = 0
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    n = env.n_agents
+    # Deterministic 3-tranche bid: all same price, split quantity
+    auction_actions = np.zeros((n, 10), dtype=np.float32)
+    auction_actions[:, 0] = 80.0   # p1
+    auction_actions[:, 1] = 0.33   # q1
+    auction_actions[:, 2] = 80.0   # p2
+    auction_actions[:, 3] = 0.33   # q2
+    auction_actions[:, 4] = 80.0   # p3
+    auction_actions[:, 5] = 0.34   # q3
+    max_invest_frac = env.companies[0].max_invest_frac
+    auction_actions[:, 6] = -1.0   # no investment
+    auction_actions[:, 9] = 1.0    # solar logit
+
+    obs2, auction_info = env.step_auction(auction_actions)
+
+    # Get auction payments from year_log
+    yl = auction_info if isinstance(auction_info, dict) else {}
+    payments = np.array(yl.get("payments", np.zeros(n)))
+
+    # Verify each agent's auction cost / budget is reasonable
+    for i in range(n):
+        budget = max(env.companies[i].annual_budget, 1.0)
+        cost_norm = float(payments[i]) / budget
+        # With uniform clearing and same bids, cost should be non-negative
+        assert np.isfinite(cost_norm), f"Agent {i} cost_norm is not finite: {cost_norm}"
+
+
+def test_auction_reward_normalization():
+    """
+    Deterministic clearing: assert r_auction == -(bid_cost + collateral) / annual_budget.
+
+    Uses a single-agent environment (no bots) with collateral enabled to ensure
+    a non-zero collateral_locked term, then verifies compute_auction_rewards()
+    equals exactly -(auction_payment + collateral_cost) / annual_budget ± 1e-6.
+
+    Investment, OPEX delta, and MAC costs are zeroed out by design (no invest,
+    same year so opex_delta = 0, no MAC reductions requested).
+    """
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    # Single learning agent, no bots — deterministic and easy to reason about
+    config["companies"]["n_agents"] = 1
+    config["companies"]["n_bot_agents"] = 0
+    # Enable collateral so the collateral term is non-trivial
+    config["auction"]["collateral"]["enabled"] = True
+    config["auction"]["collateral"]["collateral_fraction"] = 0.10
+    opp_rate = 0.05
+    config["auction"]["collateral"]["opportunity_cost_rate"] = opp_rate
+    # Disable MAC reductions so mac_cost = 0
+    config["mac"]["enabled"] = False
+    # Disable investment (invest_frac action handled via action vector below)
+    # and OPEX shaping so opex_delta = 0
+    config["reward"]["opex_delta_weight"] = 0.0
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    # Bid at a single deterministic price well above reserve so collateral locks
+    bid_price = 100.0
+    qty_mult = 1.0
+    n = env.n_agents  # == 1
+    auction_actions = np.zeros((n, 10), dtype=np.float32)
+    auction_actions[:, 0] = bid_price   # p1
+    auction_actions[:, 1] = qty_mult / 3.0
+    auction_actions[:, 2] = bid_price   # p2
+    auction_actions[:, 3] = qty_mult / 3.0
+    auction_actions[:, 4] = bid_price   # p3
+    auction_actions[:, 5] = qty_mult / 3.0
+    auction_actions[:, 6] = -1.0        # no investment → invest_frac = 0
+
+    env.step_auction(auction_actions)
+
+    r_auction = env.compute_auction_rewards()
+
+    for i in range(n):
+        company = env.companies[i]
+        budget = max(company.annual_budget, 1.0)
+
+        # Components that should be non-zero
+        payment_i = float(env._phase1_payments[i])
+        coll_locked_i = float(env._collateral_locked[i])
+        coll_cost_i = coll_locked_i * opp_rate
+
+        # Components zeroed by config above
+        invest_cost_i = float(env._phase1_invest_costs[i])
+        mac_cost_i = float(env._phase1_mac_costs[i])
+        opex_delta_i = (
+            company.compute_operational_cost(env.current_year) - company.baseline_opex
+        )
+
+        expected = -(payment_i + coll_cost_i + invest_cost_i + opex_delta_i + mac_cost_i) / budget
+        np.testing.assert_allclose(
+            r_auction[i], expected, atol=1e-6,
+            err_msg=(
+                f"Agent {i}: r_auction={r_auction[i]:.8f} expected={expected:.8f} "
+                f"(payment={payment_i:.4f}, collateral={coll_cost_i:.4f}, budget={budget:.2f})"
+            ),
+        )

@@ -329,24 +329,28 @@ Per-agent reward is split into a **base reward** and a **shaping reward** that d
 over training:
 
 $$
-R_i = \underbrace{w_{cost,i}(-\text{costNorm}_i) + w_{green,i}(\text{esgScale}\cdot \text{esgRaw}_i)
+R_i = \underbrace{w_{cost,i}(-\text{costNorm}_i) + w_{green,i}(\text{esgScale}_i\cdot \text{esgRaw}_i)
   - \text{penalty\_norm}_i - \text{oppCost}_i}_{\text{base reward}}
   + \underbrace{(\text{greenBonus}_i + \text{efficiencyBonus}_i) \cdot \text{shapingWeight}}_{\text{shaping reward}}
   + \text{terminalValues}_i
 $$
 
 Where:
-- `costNorm` is total non-penalty cost, scaled by 1000.
-- Costs include auction, secondary, investment, OPEX, budget penalties, capex throughput penalties, and MAC cost.
-- `penalty_norm` is the compliance penalty at full strength (not affected by shaping weight).
+- `costNorm` is total non-penalty cost, scaled by `annual_budget` (v8.3: changed from /1000).
+- Costs include auction, secondary, investment, OPEX delta (v8.3), budget penalties, capex throughput penalties, and MAC cost.
+- **OPEX delta** (v8.3): Only the change from baseline OPEX enters the cost signal: `opex_delta = current_opex - baseline_opex`. Positive delta = costs rose; negative = OPEX savings from greening.
+- `penalty_norm` is the compliance penalty at full strength, normalized by `annual_budget`.
 - `greenBonus` rewards positive green share change with shaping decay over training.
 - `efficiencyBonus` (v8.1) rewards emission-factor improvement vs initial EF, scaled by
   remaining time and carbon price. Decays with `shaping_weight` — does not permanently
   distort the financial reward channel.
 - `esgRaw` uses saved-carbon-years style term before weighting.
-- `esgScale` calibrates ESG magnitude to the same range as `costNorm`.
+- `esgScale_i` (v8.3) is per-agent: `base_esg_scale × (1000 / annual_budget)`, compensating
+  for the divisor change to preserve the ESG-to-cost balance.
 - `oppCost` is a cost-of-capital term on post-compliance banked allowances:
-  $\text{oppCost}_i = holdings_i \cdot price_t \cdot r_{opp} / 1000$.
+  $\text{oppCost}_i = holdings_i \cdot price_t \cdot r_{opp} / \text{annual\_budget}$.
+- **Collateral normalization** (v8.3): Collateral cost in the reward uses `/annual_budget`,
+  consistent with `collateral_load_last` obs[29] which already normalizes by annual_budget.
 
 This structure makes objective weights explicit:
 - Financial agents (`w_cost=1.0`, `w_green=0.0`) optimize pure cost.
@@ -358,7 +362,7 @@ Terminal values in final year (configurable):
 
 $$
 V^{bank}_i = \log\left(1 + \frac{B_i}{\max(\hat{E}_i, 0.1)}\right)
-\cdot \hat{E}_i \cdot \frac{P_T}{1000}
+\cdot \hat{E}_i \cdot \frac{P_T}{\text{annual\_budget}}
 $$
 
 where $B_i$ is banked allowances, $\hat{E}_i$ is annual estimated need,

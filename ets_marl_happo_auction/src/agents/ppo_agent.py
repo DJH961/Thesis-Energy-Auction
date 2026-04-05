@@ -109,9 +109,16 @@ class RolloutBuffer:
         self.rewards = []
         self.dones = []
         self.values = []
+        self.phases = []  # 'auction' or 'secondary' per transition (for phase-split gradients)
 
     def push(self, obs1, obs2, auc_raw, sec_raw, auc_lp, sec_lp, reward, done, value,
-             global_state=None):
+             global_state=None, phase='secondary'):
+        """
+        phase : str, either 'auction' or 'secondary'
+            Tags the transition so policy losses are applied only to the
+            correct observation space.  Auction rows → auction_policy on obs1;
+            secondary rows → secondary_policy on obs2.
+        """
         self.obs1.append(obs1)
         self.obs2.append(obs2)
         if global_state is not None:
@@ -123,6 +130,7 @@ class RolloutBuffer:
         self.rewards.append(reward)
         self.dones.append(done)
         self.values.append(value)
+        self.phases.append(phase)
 
     def __len__(self):
         return len(self.rewards)
@@ -352,6 +360,9 @@ class PPOAgent:
         The raw action and log_prob are still computed under the current policy
         so that the PPO importance ratio remains correct.
         3-tranche bid ladder: [p1,q1, p2,q2, p3,q3, invest_frac, t0, t1, t2].
+        This 10D action space is specific to the ``ets_marl_happo_auction`` variant.
+        ``ets_marl_happo_current`` uses a 6D single-bid policy
+        ``[price, qty_mult, invest_frac, tech0, tech1, tech2]``.
         """
         obs_t = torch.FloatTensor(obs1).unsqueeze(0).to(self.device)
         with torch.no_grad():
@@ -490,10 +501,15 @@ class PPOAgent:
 
     def store_transition(self, obs1, obs2, auc_raw, sec_raw,
                          auc_lp, sec_lp, reward, done, value,
-                         global_state=None):
+                         global_state=None, phase='secondary'):
+        """
+        phase : str, either 'auction' or 'secondary'
+            Tags which phase produced this transition so update() and
+            update_happo() can route policy losses to the correct obs space.
+        """
         self.buffer.push(obs1, obs2, auc_raw, sec_raw,
                          auc_lp, sec_lp, reward, done, value,
-                         global_state=global_state)
+                         global_state=global_state, phase=phase)
 
     # ------------------------------------------------------------------
     # PPO Update (end of episode)
@@ -531,6 +547,11 @@ class PPOAgent:
         sec_raw = torch.FloatTensor(np.array(self.buffer.secondary_raw)).to(self.device)
         old_auc_lp = torch.FloatTensor(np.array(self.buffer.auction_logp)).to(self.device)
         old_sec_lp = torch.FloatTensor(np.array(self.buffer.secondary_logp)).to(self.device)
+
+        # Phase mask: True = auction transition (obs1-space), False = secondary (obs2-space).
+        # Auction policy is trained only on auction rows; secondary only on secondary rows.
+        is_auction = torch.BoolTensor(
+            [p == 'auction' for p in self.buffer.phases]).to(self.device)
 
         rewards = np.array(self.buffer.rewards, dtype=np.float32)
         dones = np.array(self.buffer.dones, dtype=np.float32)
@@ -623,62 +644,75 @@ class PPOAgent:
 
                 if actor_update:
                     # Re-evaluate current policy
-                    auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
-                    sec_lp_new, sec_ent = self.secondary_policy.evaluate(obs2[mb], sec_raw[mb])
+                    # Phase-split: auction policy only on auction rows, secondary only on secondary rows.
+                    # Without this split the auction log-prob is evaluated on secondary obs (wrong dim).
+                    is_auc_mb = is_auction[mb]   # [mb_size] bool
+                    sec_mb = ~is_auc_mb          # [mb_size] bool
 
-                    # Phase-specific credit assignment: weight auction policy loss
-                    # by a phase-1-only advantage proxy derived from auction_savings
-                    # in obs2[base+4].  Positive savings amplify the gradient for
-                    # good auction deals; negative savings dampen it.
-                    _auc_savings_idx = self.obs_dim_phase1 + 4  # obs2[base+4]
-                    _auc_savings = obs2[mb, _auc_savings_idx:_auc_savings_idx+1]  # [mb, 1]
-                    _auc_weight = (1.0 + torch.tanh(_auc_savings)).detach()  # [0, 2] range
+                    auc_policy_loss = torch.tensor(0.0, device=self.device)
+                    sec_policy_loss = torch.tensor(0.0, device=self.device)
+                    auc_ent = torch.zeros(1, device=self.device)
+                    sec_ent = torch.zeros(1, device=self.device)
+                    auc_log_ratio = torch.zeros(1, 1, device=self.device)
+                    sec_log_ratio = torch.zeros(1, 1, device=self.device)
+                    auc_ratio = torch.ones(1, 1, device=self.device)
+                    sec_ratio = torch.ones(1, 1, device=self.device)
 
-                    # Per-policy PPO clipping: decomposes the joint ratio so each
-                    # policy's gradient update is independently clipped.  Prevents
-                    # a profitable secondary trade from incorrectly reinforcing
-                    # bad auction bids (and vice versa).
-                    # P11: Tighter log-ratio clamp — max ratio e^2≈7.4 (was e^10≈22026).
-                    # Prevents catastrophic loss from rare high-ratio mini-batches.
-                    auc_log_ratio = torch.clamp(auc_lp_new - old_auc_lp[mb], -2.0, 2.0)
-                    auc_ratio = torch.exp(auc_log_ratio)
-                    auc_adv = adv_t[mb] * _auc_weight
-                    auc_surr1 = auc_ratio * auc_adv
-                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
-                    auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
+                    # Auction policy: obs1-space, auction-phase rows only
+                    if is_auc_mb.any():
+                        auc_lp_new, auc_ent = self.auction_policy.evaluate(
+                            obs1[mb][is_auc_mb], auc_raw[mb][is_auc_mb])
+                        auc_log_ratio = torch.clamp(
+                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -2.0, 2.0)
+                        auc_ratio = torch.exp(auc_log_ratio)
+                        auc_adv = adv_t[mb][is_auc_mb]
+                        auc_surr1 = auc_ratio * auc_adv
+                        auc_surr2 = torch.clamp(
+                            auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
+                        auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
 
-                    sec_log_ratio = torch.clamp(sec_lp_new - old_sec_lp[mb], -2.0, 2.0)
-                    sec_ratio = torch.exp(sec_log_ratio)
-                    sec_surr1 = sec_ratio * adv_t[mb]
-                    sec_surr2 = torch.clamp(sec_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
-                    sec_policy_loss = -torch.min(sec_surr1, sec_surr2).mean()
+                    # Secondary policy: obs2-space, secondary-phase rows only
+                    if sec_mb.any():
+                        sec_lp_new, sec_ent = self.secondary_policy.evaluate(
+                            obs2[mb][sec_mb], sec_raw[mb][sec_mb])
+                        sec_log_ratio = torch.clamp(
+                            sec_lp_new - old_sec_lp[mb][sec_mb], -2.0, 2.0)
+                        sec_ratio = torch.exp(sec_log_ratio)
+                        sec_adv = adv_t[mb][sec_mb]
+                        sec_surr1 = sec_ratio * sec_adv
+                        sec_surr2 = torch.clamp(
+                            sec_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * sec_adv
+                        sec_policy_loss = -torch.min(sec_surr1, sec_surr2).mean()
 
                     policy_loss = auc_policy_loss + sec_policy_loss
 
                     # P11: Approximate KL divergence for early stopping
-                    # Schulman (2020): approx_kl ≈ (ratio - 1) - log(ratio)
                     with torch.no_grad():
-                        mb_kl = 0.5 * (
-                            ((auc_ratio - 1.0) - auc_log_ratio).mean()
-                            + ((sec_ratio - 1.0) - sec_log_ratio).mean()
-                        )
+                        kl_auc = ((auc_ratio - 1.0) - auc_log_ratio).mean()
+                        kl_sec = ((sec_ratio - 1.0) - sec_log_ratio).mean()
+                        mb_kl = 0.5 * (kl_auc + kl_sec)
                         epoch_kl_sum += mb_kl.item() * len(mb)
                         epoch_kl_count += len(mb)
 
                     # P2: entropy_coef updated externally via set_entropy_coef()
-                    entropy = (auc_ent + sec_ent).mean()
+                    entropy = (auc_ent.mean() + sec_ent.mean()) * 0.5
 
                     # KL anchor penalty against frozen BC policy
                     kl_pen = torch.tensor(0.0, device=self.device)
                     if self._bc_auction_policy is not None and self.kl_beta > 0.0:
-                        curr_auc_dist = self.auction_policy.forward(obs1[mb])
-                        curr_sec_dist = self.secondary_policy.forward(obs2[mb])
-                        with torch.no_grad():
-                            bc_auc_dist = self._bc_auction_policy.forward(obs1[mb])
-                            bc_sec_dist = self._bc_secondary_policy.forward(obs2[mb])
-                        kl_auc = kl_divergence(curr_auc_dist, bc_auc_dist).mean()
-                        kl_sec = kl_divergence(curr_sec_dist, bc_sec_dist).mean()
-                        kl_pen = self.kl_beta * (kl_auc + kl_sec) * 0.5
+                        kl_auc_bc = torch.tensor(0.0, device=self.device)
+                        kl_sec_bc = torch.tensor(0.0, device=self.device)
+                        if is_auc_mb.any():
+                            curr_auc_dist = self.auction_policy.forward(obs1[mb][is_auc_mb])
+                            with torch.no_grad():
+                                bc_auc_dist = self._bc_auction_policy.forward(obs1[mb][is_auc_mb])
+                            kl_auc_bc = kl_divergence(curr_auc_dist, bc_auc_dist).mean()
+                        if sec_mb.any():
+                            curr_sec_dist = self.secondary_policy.forward(obs2[mb][sec_mb])
+                            with torch.no_grad():
+                                bc_sec_dist = self._bc_secondary_policy.forward(obs2[mb][sec_mb])
+                            kl_sec_bc = kl_divergence(curr_sec_dist, bc_sec_dist).mean()
+                        kl_pen = self.kl_beta * (kl_auc_bc + kl_sec_bc) * 0.5
 
                     actor_loss_total = (policy_loss
                                         - self.entropy_coef * entropy
@@ -751,6 +785,10 @@ class PPOAgent:
         """
         Extract GAE advantages and returns from the rollout buffer.
 
+        v8.3: Batch normalization of rewards inside GAE.
+        Raw rewards are stored in the buffer; normalization happens here
+        instead of at storage time, using per-batch mean/std.
+
         Returns
         -------
         adv_t : Tensor [T, 1]
@@ -780,12 +818,28 @@ class PPOAgent:
         old_auc_lp = torch.FloatTensor(np.array(self.buffer.auction_logp)).to(self.device)
         old_sec_lp = torch.FloatTensor(np.array(self.buffer.secondary_logp)).to(self.device)
 
+        # Phase mask: True = auction transition (obs1-space), False = secondary (obs2-space).
+        # Exposed in buf_tensors so update_happo() can apply each policy loss to the
+        # correct rows without cross-contaminating obs dimensions.
+        is_auction_t = torch.BoolTensor(
+            [p == 'auction' for p in self.buffer.phases]).to(self.device)
+
         rewards = np.nan_to_num(np.array(self.buffer.rewards, dtype=np.float32),
                                 nan=0.0, posinf=0.0, neginf=0.0)
         dones = np.nan_to_num(np.array(self.buffer.dones, dtype=np.float32),
                               nan=1.0, posinf=1.0, neginf=1.0)
         values = np.nan_to_num(np.array(self.buffer.values, dtype=np.float32),
                                nan=0.0, posinf=0.0, neginf=0.0)
+
+        # v8.3: Batch normalization of rewards for GAE computation.
+        # Replaces per-step EMA normalization with batch-level standardization,
+        # giving the critic a consistent target scale across episodes.
+        # EPS_STD prevents division by zero when all rewards are identical.
+        mu = rewards.mean()
+        std = rewards.std()
+        _EPS_STD = 1e-8
+        rewards = (rewards - mu) / max(std, _EPS_STD)
+        rewards = np.clip(rewards, -10.0, 10.0)
 
         # GAE
         T = len(rewards)
@@ -826,6 +880,7 @@ class PPOAgent:
             "old_auc_lp": old_auc_lp, "old_sec_lp": old_sec_lp,
             "old_values": old_values_t,  # for value clipping in update_happo
             "T": T,
+            "is_auction": is_auction_t,  # [T] bool: route policy losses to correct obs space
         }
         return adv_t, ret_t, buf_tensors
 
@@ -862,6 +917,8 @@ class PPOAgent:
         old_values_t = buf_tensors.get("old_values", None)  # for value clipping
         T = buf_tensors["T"]
 
+        is_auction = buf_tensors["is_auction"]  # [T] bool
+
         # Apply HAPPO advantage weighting
         if advantage_weights is not None:
             weighted_adv = adv_t * advantage_weights.to(self.device)
@@ -894,49 +951,71 @@ class PPOAgent:
                 )
 
                 if actor_update:
-                    auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
-                    sec_lp_new, sec_ent = self.secondary_policy.evaluate(obs2[mb], sec_raw[mb])
+                    # Phase-split: auction policy only on auction rows, secondary only on secondary rows.
+                    is_auc_mb = is_auction[mb]   # [mb_size] bool
+                    sec_mb = ~is_auc_mb          # [mb_size] bool
 
-                    # Phase-specific credit assignment (same as update())
-                    _auc_savings_idx = self.obs_dim_phase1 + 4
-                    _auc_savings = obs2[mb, _auc_savings_idx:_auc_savings_idx+1]
-                    _auc_weight = (1.0 + torch.tanh(_auc_savings)).detach()
+                    auc_policy_loss = torch.tensor(0.0, device=self.device)
+                    sec_policy_loss = torch.tensor(0.0, device=self.device)
+                    auc_ent = torch.zeros(1, device=self.device)
+                    sec_ent = torch.zeros(1, device=self.device)
+                    auc_log_ratio = torch.zeros(1, 1, device=self.device)
+                    sec_log_ratio = torch.zeros(1, 1, device=self.device)
+                    auc_ratio = torch.ones(1, 1, device=self.device)
+                    sec_ratio = torch.ones(1, 1, device=self.device)
 
-                    auc_log_ratio = torch.clamp(auc_lp_new - old_auc_lp[mb], -2.0, 2.0)
-                    auc_ratio = torch.exp(auc_log_ratio)
-                    auc_adv = weighted_adv[mb] * _auc_weight
-                    auc_surr1 = auc_ratio * auc_adv
-                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
-                    auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
+                    # Auction policy: obs1-space, auction-phase rows only
+                    if is_auc_mb.any():
+                        auc_lp_new, auc_ent = self.auction_policy.evaluate(
+                            obs1[mb][is_auc_mb], auc_raw[mb][is_auc_mb])
+                        auc_log_ratio = torch.clamp(
+                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -2.0, 2.0)
+                        auc_ratio = torch.exp(auc_log_ratio)
+                        auc_adv = weighted_adv[mb][is_auc_mb]
+                        auc_surr1 = auc_ratio * auc_adv
+                        auc_surr2 = torch.clamp(
+                            auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
+                        auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
 
-                    sec_log_ratio = torch.clamp(sec_lp_new - old_sec_lp[mb], -2.0, 2.0)
-                    sec_ratio = torch.exp(sec_log_ratio)
-                    sec_surr1 = sec_ratio * weighted_adv[mb]
-                    sec_surr2 = torch.clamp(sec_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * weighted_adv[mb]
-                    sec_policy_loss = -torch.min(sec_surr1, sec_surr2).mean()
+                    # Secondary policy: obs2-space, secondary-phase rows only
+                    if sec_mb.any():
+                        sec_lp_new, sec_ent = self.secondary_policy.evaluate(
+                            obs2[mb][sec_mb], sec_raw[mb][sec_mb])
+                        sec_log_ratio = torch.clamp(
+                            sec_lp_new - old_sec_lp[mb][sec_mb], -2.0, 2.0)
+                        sec_ratio = torch.exp(sec_log_ratio)
+                        sec_adv = weighted_adv[mb][sec_mb]
+                        sec_surr1 = sec_ratio * sec_adv
+                        sec_surr2 = torch.clamp(
+                            sec_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * sec_adv
+                        sec_policy_loss = -torch.min(sec_surr1, sec_surr2).mean()
 
                     policy_loss = auc_policy_loss + sec_policy_loss
 
                     with torch.no_grad():
-                        mb_kl = 0.5 * (
-                            ((auc_ratio - 1.0) - auc_log_ratio).mean()
-                            + ((sec_ratio - 1.0) - sec_log_ratio).mean()
-                        )
+                        kl_auc = ((auc_ratio - 1.0) - auc_log_ratio).mean()
+                        kl_sec = ((sec_ratio - 1.0) - sec_log_ratio).mean()
+                        mb_kl = 0.5 * (kl_auc + kl_sec)
                         epoch_kl_sum += mb_kl.item() * len(mb)
                         epoch_kl_count += len(mb)
 
-                    entropy = (auc_ent + sec_ent).mean()
+                    entropy = (auc_ent.mean() + sec_ent.mean()) * 0.5
 
                     kl_pen = torch.tensor(0.0, device=self.device)
                     if self._bc_auction_policy is not None and self.kl_beta > 0.0:
-                        curr_auc_dist = self.auction_policy.forward(obs1[mb])
-                        curr_sec_dist = self.secondary_policy.forward(obs2[mb])
-                        with torch.no_grad():
-                            bc_auc_dist = self._bc_auction_policy.forward(obs1[mb])
-                            bc_sec_dist = self._bc_secondary_policy.forward(obs2[mb])
-                        kl_auc = kl_divergence(curr_auc_dist, bc_auc_dist).mean()
-                        kl_sec = kl_divergence(curr_sec_dist, bc_sec_dist).mean()
-                        kl_pen = self.kl_beta * (kl_auc + kl_sec) * 0.5
+                        kl_auc_bc = torch.tensor(0.0, device=self.device)
+                        kl_sec_bc = torch.tensor(0.0, device=self.device)
+                        if is_auc_mb.any():
+                            curr_auc_dist = self.auction_policy.forward(obs1[mb][is_auc_mb])
+                            with torch.no_grad():
+                                bc_auc_dist = self._bc_auction_policy.forward(obs1[mb][is_auc_mb])
+                            kl_auc_bc = kl_divergence(curr_auc_dist, bc_auc_dist).mean()
+                        if sec_mb.any():
+                            curr_sec_dist = self.secondary_policy.forward(obs2[mb][sec_mb])
+                            with torch.no_grad():
+                                bc_sec_dist = self._bc_secondary_policy.forward(obs2[mb][sec_mb])
+                            kl_sec_bc = kl_divergence(curr_sec_dist, bc_sec_dist).mean()
+                        kl_pen = self.kl_beta * (kl_auc_bc + kl_sec_bc) * 0.5
 
                     actor_loss_total = (policy_loss
                                         - self.entropy_coef * entropy
@@ -1000,14 +1079,16 @@ class PPOAgent:
 
     def compute_post_update_ratio(self, buf_tensors) -> torch.Tensor:
         """
-        Compute the joint importance ratio after a HAPPO update.
+        Compute the per-timestep importance ratio after a HAPPO update.
 
-        ratio_i = exp((new_auc_lp - old_auc_lp) + (new_sec_lp - old_sec_lp))
+        Phase-aware: auction rows use only the auction log-ratio; secondary
+        rows use only the secondary log-ratio.  This avoids contaminating the
+        HAPPO M-factor with cross-obs-space evaluations.
 
         Returns
         -------
         ratio : Tensor [T, 1]
-            Per-timestep joint importance ratio (clamped for stability).
+            Per-timestep importance ratio (clamped for stability).
         """
         obs1 = buf_tensors["obs1"]
         obs2 = buf_tensors["obs2"]
@@ -1015,16 +1096,29 @@ class PPOAgent:
         sec_raw = buf_tensors["sec_raw"]
         old_auc_lp = buf_tensors["old_auc_lp"]
         old_sec_lp = buf_tensors["old_sec_lp"]
+        is_auction = buf_tensors["is_auction"]   # [T] bool
+        T = buf_tensors["T"]
 
         with torch.no_grad():
-            new_auc_lp, _ = self.auction_policy.evaluate(obs1, auc_raw)
-            new_sec_lp, _ = self.secondary_policy.evaluate(obs2, sec_raw)
+            joint_log_ratio = torch.zeros(T, 1, device=self.device)
 
-            # Joint log-ratio (clamped for numerical stability)
-            joint_log_ratio = torch.clamp(
-                (new_auc_lp - old_auc_lp) + (new_sec_lp - old_sec_lp),
-                -2.0, 2.0
-            )
+            # Auction rows: ratio from auction policy only (obs1-space)
+            if is_auction.any():
+                new_auc_lp, _ = self.auction_policy.evaluate(
+                    obs1[is_auction], auc_raw[is_auction])
+                auc_lr = torch.clamp(
+                    new_auc_lp - old_auc_lp[is_auction], -2.0, 2.0)
+                joint_log_ratio[is_auction] = auc_lr
+
+            # Secondary rows: ratio from secondary policy only (obs2-space)
+            sec_mask = ~is_auction
+            if sec_mask.any():
+                new_sec_lp, _ = self.secondary_policy.evaluate(
+                    obs2[sec_mask], sec_raw[sec_mask])
+                sec_lr = torch.clamp(
+                    new_sec_lp - old_sec_lp[sec_mask], -2.0, 2.0)
+                joint_log_ratio[sec_mask] = sec_lr
+
             ratio = torch.exp(joint_log_ratio)
 
         return ratio

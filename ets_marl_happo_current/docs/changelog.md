@@ -5,6 +5,105 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.6.0
+
+**Reward Function Overhaul, Batch GAE Normalization, HAPPO Emission Ordering**
+
+### Phase A — Reward Function Changes (`ets_environment.py`, `company.py`)
+- **Baseline OPEX**: Added `baseline_opex` snapshot in `Company.__init__()`, computed at
+  `current_year=0`. The reward function now uses `opex_delta = current_opex - baseline_opex`
+  instead of absolute operational cost. Positive delta = costs rose; negative = OPEX savings
+  from greening. This ensures agents aren't penalized for unavoidable base operating costs.
+- **Per-agent financial-scale normalization**: All cost, penalty, opportunity cost, terminal
+  bank value, and terminal debt penalty divisors changed from fixed `/1000.0` to
+  `/company.annual_budget`. This ensures reward magnitudes are proportional to each agent's
+  financial capacity, giving small-budget and large-budget agents comparable gradient signals.
+- **Per-agent ESG scale**: `esg_scale_i = base_esg_scale × (1000.0 / annual_budget)`
+  compensates for the divisor change to preserve the ESG-to-cost ratio that was calibrated
+  with the original `/1000` scaling. Maintains the 50/50 balance for ESG agents (w_green=0.5).
+- **Terminal values updated**: Bank value, debt liquidation penalty, and opportunity cost all
+  use `/annual_budget` instead of `/1000`.
+
+### Phase B — GAE/Normalization Changes (`ppo_agent.py`, `train.py`)
+- **Raw rewards in buffer**: `train.py` now stores raw (un-normalized) rewards directly in
+  the rollout buffer. `RewardNormalizer.update_and_normalize()` is still called for
+  monitoring/logging, but its output is no longer used in the learning path.
+- **Batch normalization in `compute_gae()`**: Rewards are standardized per-batch at the top
+  of `compute_gae()`: `rewards = (rewards - mu) / max(std, 1e-8)`, then clipped to `[-10, 10]`.
+  This replaces per-step EMA normalization, giving the critic a consistent target scale
+  and eliminating cold-start bias artifacts.
+- **`RewardNormalizer` preserved**: Class and `update_and_normalize()` retained for tracking
+  reward scale in logs; no longer on the critical path.
+
+### Phase C — _auc_weight Removal (`ppo_agent.py`)
+- **Removed `_auc_weight` heuristic** from both `update()` and `update_happo()`. With
+  per-agent budget normalization, the advantage signal is properly scaled without needing
+  the observation-derived auction-savings weight. The auction policy loss now uses raw
+  advantages identically to the secondary policy.
+
+### Phase D — HAPPO Ordering (`train.py`)
+- **Fixed emission-intensity ordering**: Replaced `episode_rng.permutation(n_agents)` with
+  `sorted(range(n_agents), key=lambda i: env.companies[i].initial_ef, reverse=True)`.
+  Highest emitters are updated first, receiving the cleanest advantages before cumulative
+  importance ratio drift from earlier agents' updates. This is deterministic and aligns
+  learning priority with where abatement decisions matter most.
+
+### Phase E — Split Rewards / Two-Phase (`ets_environment.py`, `train.py`)
+- **`compute_auction_rewards()` method**: New method computes per-agent intermediate reward
+  after `step_auction()` completes: `r_auction = -(auction_cost + collateral + investment
+  + opex_delta + mac_cost) / annual_budget`. Returns before secondary market execution.
+- **Two transitions per year-step**: `train.py` now stores two buffer entries per year:
+  (1) auction-phase transition with `r_auction`, `done=False`; (2) secondary-phase transition
+  with `r_secondary = total_reward - r_auction`, `done=terminated`. This doubles T from
+  `n_years` to `2 × n_years` per episode, providing proper credit assignment to each phase.
+- **`expected_T` updated**: HAPPO ratio chain now expects `2 × n_years × episodes_per_update`.
+
+### Phase F — Tests
+- **New tests**: `test_opex_delta_zero_for_unchanged_mix`, `test_esg_cost_balance_preserved`,
+  `test_batch_normalization_replaces_ema`, `test_split_rewards_sum_to_total`.
+- **Updated**: `test_terminal_bank_uses_1000_divisor` → `test_terminal_bank_uses_budget_divisor`
+  (references `/annual_budget` instead of `/1000`).
+- **All 245 tests pass**.
+
+### Phase G — Phase-Split Policy Gradient Backport (`ppo_agent.py`, `train.py`)
+
+*Backport of the correctness fix from `ets_marl_happo_auction` Phase G.*
+
+#### G1 — RolloutBuffer phase tagging (`ppo_agent.py`)
+- **`phases` list**: `RolloutBuffer.clear()` now initialises `self.phases = []`. The `push()`
+  method accepts a `phase='secondary'` keyword argument that tags each stored transition as
+  either `'auction'` or `'secondary'`.
+
+#### G2 — `store_transition()` phase param (`ppo_agent.py`)
+- `store_transition()` now accepts and forwards `phase='secondary'` to `buffer.push()`.
+
+#### G3 — Phase-split actor losses in `compute_gae()` + `update_happo()` (`ppo_agent.py`)
+- **`compute_gae()`**: Builds `is_auction_t: BoolTensor[T]` from `buffer.phases`, exposed as
+  `buf_tensors["is_auction"]` for reuse in `update_happo()` and `compute_post_update_ratio()`.
+- **`update_happo()`**: Actor losses are now split per mini-batch:
+  - `auc_policy_loss` — computed only on `is_auc_mb` rows (obs1-space).
+  - `sec_policy_loss` — computed only on `~is_auc_mb` rows (obs2-space).
+  - BC-KL penalty also applies phase masking to avoid evaluating policies on the wrong
+    observation space.
+
+#### G4 — Phase-masked `compute_post_update_ratio()` (`ppo_agent.py`)
+- Replaced joint `(new_auc_lp − old_auc_lp) + (new_sec_lp − old_sec_lp)` formula with
+  per-row phase assignment: auction rows receive the auction log-ratio (obs1-space); secondary
+  rows receive the secondary log-ratio (obs2-space). Prevents cross-obs contamination in the
+  HAPPO cumulative M-factor chain.
+
+#### G5 — `train.py` phase tagging
+- Auction-phase `store_transition()` call now passes `phase='auction'`.
+- Secondary-phase `store_transition()` call now passes `phase='secondary'`.
+
+### Config / Metadata
+- `pyproject.toml`: version 7.6.0
+- `default.yaml` header: v7.6
+- `train.py` banner updated
+- `README.md`: v7.6 improvements documented
+
+---
+
 ## v7.5.0
 
 **MSR Three-Band Withholding, Rollover Accounting Fix, Unbuffered Need, Heuristic Cleanup**

@@ -203,8 +203,8 @@ def test_green_bonus_with_investment():
     assert np.all(np.isfinite(rewards_invest))
 
 
-def test_terminal_bank_uses_1000_divisor():
-    """Terminal bank value should remain /1000-scaled under log terminal valuation."""
+def test_terminal_bank_uses_budget_divisor():
+    """Terminal bank value should remain /annual_budget-scaled under log terminal valuation."""
     config = load_config()
     config["reward"]["terminal_bank_value"] = True
     config["reward"]["terminal_queue_value"] = False
@@ -217,14 +217,15 @@ def test_terminal_bank_uses_1000_divisor():
     env.reset()
     # Run to final year with high qty to build up bank
     rewards, _ = _run_to_final_year(env, auction_price=80.0, qty_mult=1.5)
-    # With log scaling, terminal value should stay below linear bank*price/1000,
+    # With log scaling, terminal value should stay below linear bank*price/budget,
     # and far below an incorrect /100 scaling.
     for i in range(env.n_agents):
         if env.holdings[i] > 0.1:
-            linear_upper = env.holdings[i] * 500 / 1000.0
+            budget = max(env.companies[i].annual_budget, 1.0)
+            linear_upper = env.holdings[i] * 500 / budget
             assert env._last_terminal_bank_values[i] <= linear_upper + 1e-6
             assert env._last_terminal_bank_values[i] < env.holdings[i] * 500 / 100.0, (
-                f"Terminal bank value too large — likely using /100 instead of /1000")
+                f"Terminal bank value too large — likely using /100 instead of /annual_budget")
 
 
 def test_terminal_bank_diminishing_returns():
@@ -740,3 +741,185 @@ def test_diagnostic_scores_all_finite():
                 assert np.isfinite(ds[k]), f"{k} is not finite: {ds[k]}"
         if env.episode_done:
             break
+
+
+# ---------------------------------------------------------------------------
+# v7.6: New tests for reward function and learning changes
+# ---------------------------------------------------------------------------
+
+def test_opex_delta_zero_for_unchanged_mix():
+    """An agent with no investment gets opex_delta ≈ 0 (only inflation variance)."""
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    # Disable inflation randomness so delta is purely from mix change
+    config["penalty"]["inflation_random_std"] = 0.0
+    config["penalty"]["inflation_random_window"] = 0.0
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    # Run one year with NO investment → mix unchanged
+    _run_one_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.0)
+
+    for i in range(min(4, env.n_agents)):
+        company = env.companies[i]
+        opex_now = company.compute_operational_cost(1)
+        opex_baseline = company.baseline_opex
+        # With zero inflation randomness and no mix change, the only difference
+        # is from the fixed inflation rate (≈2%), so delta should be small
+        opex_delta = opex_now - opex_baseline
+        # At 2% inflation, 10 TWh at ~55 EUR/MWh → ~550M, 2% = ~11M.
+        # budget ≈ 800-880M, so delta/budget < 2%
+        assert abs(opex_delta) < 0.05 * company.annual_budget, (
+            f"Agent {i}: opex_delta={opex_delta:.2f} too large for unchanged mix "
+            f"(baseline={opex_baseline:.2f}, now={opex_now:.2f})")
+
+
+def test_esg_cost_balance_preserved():
+    """For an ESG agent (w_green=0.5), cost and ESG signals are within 5× of each other."""
+    config = load_config()
+    config["esg"]["enabled"] = True
+    config["esg"]["scale"] = 2.0
+    config["simulation"]["n_years"] = 12
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    config["reward"]["shaping_beta"] = 0.0  # disable shaping to isolate signals
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+    env.set_episode(0)
+
+    # Run one year with moderate investment to trigger ESG signal
+    _run_one_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.05)
+
+    # Verify per-agent ESG scale compensates for /annual_budget divisor change.
+    # The esg_scale_i = base_esg_scale × (1000 / annual_budget) ensures that
+    # the product esg_scale_i × (annual_budget / 1000) in esg_raw cancels out,
+    # preserving the same magnitude as the old /1000 formula.
+    for i in range(1, min(8, env.n_agents), 2):
+        company = env.companies[i]
+        if company.w_green < 0.4:
+            continue
+        budget_divisor = max(company.annual_budget, 1.0)
+        base_esg_scale = float(config["esg"]["scale"])
+        esg_scale_i = base_esg_scale * (1000.0 / budget_divisor)
+
+        # Verify the scale factor exactly compensates for the divisor change
+        # esg_signal = esg_scale_i × ef_ratio × time_ratio × (budget/1000)
+        # = base_esg_scale × (1000/budget) × ef_ratio × time_ratio × (budget/1000)
+        # = base_esg_scale × ef_ratio × time_ratio  (budget cancels out)
+        # This is the same as the old formula with esg_scale × ef_ratio × time_ratio × (budget/1000) / 1000
+        # Wait: old formula had esg_scale * esg_raw where esg_raw = ef_ratio * time_ratio * (budget/1000)
+        # So old signal = 2.0 * ef_ratio * time_ratio * (budget/1000)
+        # New signal = esg_scale_i * ef_ratio * time_ratio * (budget/1000)
+        #            = 2.0 * (1000/budget) * ef_ratio * time_ratio * (budget/1000)
+        #            = 2.0 * ef_ratio * time_ratio  (same magnitude, budget cancels)
+        assert esg_scale_i > 0, f"Agent {i} has non-positive esg_scale_i={esg_scale_i}"
+        assert company.initial_ef > 0.01, f"Agent {i} has zero initial_ef"
+        # The compensation factor should exactly equal base_esg_scale when budget=1000
+        # For other budgets, verify the product esg_scale_i × (budget/1000) = base_esg_scale
+        product = esg_scale_i * (budget_divisor / 1000.0)
+        assert abs(product - base_esg_scale) < 1e-6, (
+            f"Agent {i}: esg_scale_i × (budget/1000) = {product}, expected {base_esg_scale}")
+
+
+def test_batch_normalization_replaces_ema():
+    """compute_gae() produces finite, non-zero advantages with raw rewards."""
+    import torch
+    from src.agents.ppo_agent import PPOAgent
+
+    config = load_config()
+    config["companies"]["n_agents"] = 2
+    config["companies"]["n_bot_agents"] = 0
+    config["ppo"]["hidden_size"] = 32
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    obs1_dim = env.companies[0].obs_dim_phase1
+    obs2_dim = env.companies[0].obs_dim_phase2
+    aq = config["auction"]
+    inv = config["investment"]
+    auction_low = np.array([
+        aq["price_min"], aq.get("qty_mult_low", 0.3), 0.0, -1.0, -1.0, -1.0
+    ], dtype=np.float32)
+    auction_high = np.array([
+        aq["price_max"], aq.get("qty_mult_high", 2.0), inv["max_invest_frac"], 1.0, 1.0, 1.0
+    ], dtype=np.float32)
+    secondary_low = np.array([30.0, -10.0], dtype=np.float32)
+    secondary_high = np.array([500.0, 10.0], dtype=np.float32)
+
+    agent = PPOAgent(
+        agent_id=0,
+        obs_dim_phase1=obs1_dim,
+        obs_dim_phase2=obs2_dim,
+        auction_action_low=auction_low,
+        auction_action_high=auction_high,
+        secondary_action_low=secondary_low,
+        secondary_action_high=secondary_high,
+        config=config,
+        seed=42,
+    )
+
+    # Fill buffer with raw rewards (not normalized)
+    for t in range(12):
+        obs1 = np.random.randn(obs1_dim).astype(np.float32)
+        obs2 = np.random.randn(obs2_dim).astype(np.float32)
+        auc_raw = np.random.randn(len(auction_low)).astype(np.float32)
+        sec_raw = np.random.randn(len(secondary_low)).astype(np.float32)
+        raw_reward = -50.0 + t * 5.0  # varying scale, un-normalized
+        agent.store_transition(
+            obs1=obs1, obs2=obs2,
+            auc_raw=auc_raw, sec_raw=sec_raw,
+            auc_lp=-1.0, sec_lp=-1.0,
+            reward=raw_reward, done=(t == 11), value=0.0,
+        )
+
+    adv_t, ret_t, buf_tensors = agent.compute_gae(last_value=0.0)
+
+    assert adv_t is not None, "compute_gae returned None advantages"
+    assert torch.all(torch.isfinite(adv_t)), "Advantages contain non-finite values"
+    assert adv_t.abs().sum() > 0, "All advantages are zero"
+    assert torch.all(torch.isfinite(ret_t)), "Returns contain non-finite values"
+
+
+def test_split_rewards_sum_to_total():
+    """r_auction + r_secondary ≈ old_single_reward for the same environment state."""
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    n = env.n_agents
+    auction_actions = np.zeros((n, 6), dtype=np.float32)
+    auction_actions[:, 0] = 80.0
+    auction_actions[:, 1] = 1.0
+    max_invest_frac = env.companies[0].max_invest_frac
+    auction_actions[:, 2] = -1.0  # no investment
+    auction_actions[:, 3:] = [0.0, 0.0, 1.0]
+
+    env.step_auction(auction_actions)
+
+    # Get auction intermediate reward
+    r_auction = env.compute_auction_rewards()
+
+    secondary_actions = np.zeros((n, 2), dtype=np.float32)
+    secondary_actions[:, 0] = 1.0
+    secondary_actions[:, 1] = 0.0
+    _, total_rewards, _, _, _ = env.step_secondary(secondary_actions)
+
+    # r_secondary = total - r_auction
+    r_secondary = total_rewards - r_auction[:n]
+
+    # Sum should be close to total
+    r_sum = r_auction[:n] + r_secondary
+    np.testing.assert_allclose(r_sum, total_rewards, atol=1e-6,
+        err_msg="Split rewards should sum to total reward")

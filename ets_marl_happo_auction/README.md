@@ -1,12 +1,12 @@
-# ETS MARL — Auction Version (HAPPO/PPO) v8.2.1
+# ETS MARL — Auction Version (HAPPO/PPO) v8.3
 
 This is the **auction-focused version** of the carbon market simulation (forked from v7.3). It introduces a **3-tranche bid ladder** for the primary auction and replaces the bilateral secondary market with a **Uniform-Price Call Auction** (clearinghouse mechanism), mirroring how real EEX/ICE daily fixing works.
+
+**v8.3 improvements:** OPEX delta (only change from baseline enters cost signal, not absolute OPEX), per-agent financial-scale normalization (`/annual_budget` instead of `/1000`), per-agent ESG scale to preserve 50/50 balance, batch normalization in GAE (replaces per-step EMA), raw rewards stored in buffer, `_auc_weight` heuristic removed, fixed HAPPO ordering by initial emission intensity (highest emitters first), collateral normalization consistent with `/annual_budget`, and new tests for reward function, learning changes, and tranche-level rewards.
 
 **v8.2.1 improvements:** Heuristic bot tranche ladder is now configurable via `bots.tranche_qty_split` (default 50/30/20) and `bots.tranche_price_*` spread settings; T3 spread widens with urgency in late-episode years (`T3 = mid_price × (1.10 + 0.05 × urgency)` by default); and per-tranche budget dropping is implemented (drop T1 first, then scale T2/T3). The temporary single-agent ordering assert guard in auction clearing was rolled back.
 
 **v8.2 improvements:** Three-band MSR withholding aligned with EU legislative TNAC proportions (400:833:1096), corrected withholding formula (24% of total TNAC above upper threshold), rollover accounting overhaul (unsold and defaulted volumes tracked as independent streams, no double-counting), `compute_estimate_need()` unbuffered (agents learn their own bid buffer), heuristic green-seller discount removed, `qty_mult_high` default corrected 1.3→2.0, new MSR telemetry attributes on `CapSchedule`, and expanded test coverage for all three TNAC regimes.
-
-**v8.1 improvements:** Linear LRF (equal absolute annual steps), 1-year TNAC lag for MSR realism, B1 tranche-sorting invariant (ascending by price for both RL agents and bots), observation space consolidated 28D→24D + 6 D1/D2 tranche feedback dims, efficiency bonus as shaping, diagnostic score logging, corrected E2/E4 collateral config (10% initial margin).
 
 This mathematically guarantees maximum social surplus and finds the exact market equilibrium a Continuous Double Auction would discover over a longer time horizon.
 
