@@ -786,9 +786,11 @@ class PPOAgent:
         # v8.3: Batch normalization of rewards for GAE computation.
         # Replaces per-step EMA normalization with batch-level standardization,
         # giving the critic a consistent target scale across episodes.
+        # EPS_STD prevents division by zero when all rewards are identical.
         mu = rewards.mean()
         std = rewards.std()
-        rewards = (rewards - mu) / max(std, 1e-8)
+        _EPS_STD = 1e-8
+        rewards = (rewards - mu) / max(std, _EPS_STD)
         rewards = np.clip(rewards, -10.0, 10.0)
 
         # GAE

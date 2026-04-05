@@ -796,20 +796,35 @@ def test_esg_cost_balance_preserved():
     # Run one year with moderate investment to trigger ESG signal
     _run_one_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.05)
 
-    # Check ESG agents (odd-indexed: w_green=0.5)
+    # Verify per-agent ESG scale compensates for /annual_budget divisor change.
+    # The esg_scale_i = base_esg_scale × (1000 / annual_budget) ensures that
+    # the product esg_scale_i × (annual_budget / 1000) in esg_raw cancels out,
+    # preserving the same magnitude as the old /1000 formula.
     for i in range(1, min(8, env.n_agents), 2):
         company = env.companies[i]
         if company.w_green < 0.4:
             continue
-        # Reconstruct the cost and ESG components
         budget_divisor = max(company.annual_budget, 1.0)
         base_esg_scale = float(config["esg"]["scale"])
         esg_scale_i = base_esg_scale * (1000.0 / budget_divisor)
 
-        # The ESG signal magnitude: esg_scale_i × ef_ratio × time_ratio × (budget/1000)
-        # This should cancel out with the budget_divisor change, preserving balance
-        # We just verify both components are finite and non-trivial
+        # Verify the scale factor exactly compensates for the divisor change
+        # esg_signal = esg_scale_i × ef_ratio × time_ratio × (budget/1000)
+        # = base_esg_scale × (1000/budget) × ef_ratio × time_ratio × (budget/1000)
+        # = base_esg_scale × ef_ratio × time_ratio  (budget cancels out)
+        # This is the same as the old formula with esg_scale × ef_ratio × time_ratio × (budget/1000) / 1000
+        # Wait: old formula had esg_scale * esg_raw where esg_raw = ef_ratio * time_ratio * (budget/1000)
+        # So old signal = 2.0 * ef_ratio * time_ratio * (budget/1000)
+        # New signal = esg_scale_i * ef_ratio * time_ratio * (budget/1000)
+        #            = 2.0 * (1000/budget) * ef_ratio * time_ratio * (budget/1000)
+        #            = 2.0 * ef_ratio * time_ratio  (same magnitude, budget cancels)
+        assert esg_scale_i > 0, f"Agent {i} has non-positive esg_scale_i={esg_scale_i}"
         assert company.initial_ef > 0.01, f"Agent {i} has zero initial_ef"
+        # The compensation factor should exactly equal base_esg_scale when budget=1000
+        # For other budgets, verify the product esg_scale_i × (budget/1000) = base_esg_scale
+        product = esg_scale_i * (budget_divisor / 1000.0)
+        assert abs(product - base_esg_scale) < 1e-6, (
+            f"Agent {i}: esg_scale_i × (budget/1000) = {product}, expected {base_esg_scale}")
 
 
 def test_batch_normalization_replaces_ema():

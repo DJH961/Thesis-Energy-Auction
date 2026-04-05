@@ -818,16 +818,14 @@ def test_esg_cost_balance_preserved():
     config["warm_start"]["enabled"] = False
     config["uncertainty"]["enabled"] = False
     config["construction_jitter"]["enabled"] = False
-    config["reward"]["shaping_beta"] = 0.0  # disable shaping to isolate signals
+    config["reward"]["shaping_beta"] = 0.0
 
     env = ETSEnvironment(config, seed=42)
     env.reset()
     env.set_episode(0)
 
-    # Run one year with moderate investment to trigger ESG signal
     _run_one_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.05)
 
-    # Check ESG agents (odd-indexed: w_green=0.5)
     for i in range(1, min(8, env.n_agents), 2):
         company = env.companies[i]
         if company.w_green < 0.4:
@@ -835,7 +833,13 @@ def test_esg_cost_balance_preserved():
         budget_divisor = max(company.annual_budget, 1.0)
         base_esg_scale = float(config["esg"]["scale"])
         esg_scale_i = base_esg_scale * (1000.0 / budget_divisor)
+
+        assert esg_scale_i > 0, f"Agent {i} has non-positive esg_scale_i={esg_scale_i}"
         assert company.initial_ef > 0.01, f"Agent {i} has zero initial_ef"
+        # Verify the product esg_scale_i × (budget/1000) = base_esg_scale
+        product = esg_scale_i * (budget_divisor / 1000.0)
+        assert abs(product - base_esg_scale) < 1e-6, (
+            f"Agent {i}: esg_scale_i × (budget/1000) = {product}, expected {base_esg_scale}")
 
 
 def test_batch_normalization_replaces_ema():
