@@ -15,7 +15,7 @@
 
 simulation:
   n_years: 12
-  n_episodes: 100000
+  n_episodes: 100
   seeds: [42, 123, 456]
 
 tabula_rasa:
@@ -63,7 +63,7 @@ ets:
   # To override with a manual value, set cap_year_0_override to a number.
   cap_year_0_override: null     # null enables emission-weighted calibration
   initial_bank_fraction: 0.10   # default episode-start bank seed fraction of annual need
-  cap_overhead_pct: 0.02        # 2% surplus over total initial emissions
+  cap_overhead_pct: 0.11        # 11% surplus over total initial emissions
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044
@@ -80,7 +80,7 @@ ets:
                          # (Decision 2015/1814 Art 1(5))
     price_containment_absolute: 350   # hard fallback for containment trigger (EUR/t)
     price_release_absolute: 450       # hard fallback for release trigger (EUR/t)
-    emergency_release_frac: 0.064  # 3.0 Mt / 47.0 Mt (aligned with release_frac)
+    emergency_release_frac: 0.08  # fraction of cap (was 4.0 Mt / 50.0 Mt)
     min_auction_frac: 0.10            # safety floor for minimum auction volume
 
   banking: true
@@ -444,8 +444,8 @@ warm_start:
   burnin_price_seed_mean: 70.0
   burnin_price_seed_std: 10.0
   n_burnin_prices: 2
-  bank_seed_min: 0.05
-  bank_seed_max: 0.15
+  bank_seed_min: 0.2
+  bank_seed_max: 0.4
   queue_mu_onshore: 1.5
   queue_mu_offshore: 0.5
   queue_mu_solar: 2.0
@@ -463,7 +463,7 @@ logging:
 # Behavioral cloning warm-start (heuristic pre-training)
 # ----------------------------------------------------------
 pretrain:
-  enabled: true
+  enabled: false
   episodes: 0   # auto: 4% of n_episodes, clamped to [40, 800]
   epochs: 0     # auto: scales with n_episodes, clamped to [4, 12]
   lr: 0.001
@@ -508,3 +508,4 @@ exploration:
   auction_anchors: [80.0, 1.0, 0.03, 0.3, -0.5, 0.5]
   # Secondary: [sec_price (absolute €/t), sec_qty]
   secondary_anchors: [80.0, 0.0]
+

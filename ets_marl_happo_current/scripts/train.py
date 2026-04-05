@@ -940,7 +940,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 agents[i].store_transition(
                     obs1=obs1[i], obs2=obs2[i],
                     auc_raw=auction_raws[i], sec_raw=np.zeros(2, dtype=np.float32),
-                    auc_lp=auction_logps[i], sec_lp=0.0,
+                    auc_lp=auction_logps[i], sec_lp=np.zeros(1, dtype=np.float32),
                     reward=float(r_auction[i]), done=False, value=value_auc,
                     global_state=global_state,
                     phase='auction',
@@ -1655,6 +1655,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             # ── Year-by-year trajectories ──────────────────────────────
             yr_emiss = [sum(yl.get("emissions", [0.0] * n_total)[j] for j in range(n_total))
                         for yl in env.episode_log]
+            yr_bid_total = [sum(yl.get("bid_quantities", [0.0] * n_total)[j] for j in range(n_total))
+                            for yl in env.episode_log]
             yr_auct_vol = [yl.get("auction_volume", yl.get("cap", 0.0)) for yl in env.episode_log]
 
             # MSR status tracking
@@ -1682,10 +1684,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             # ── Market trajectories ────────────────────────────────────
             price_traj = "  ".join(f"{p:3.0f}" for p in prices_ep)
             emiss_traj = "  ".join(f"{e:3.1f}" for e in yr_emiss)
+            bid_traj = "  ".join(f"{b:3.1f}" for b in yr_bid_total)
             auct_traj  = "  ".join(f"{c:3.1f}" for c in yr_auct_vol)
             print(f"  Price/yr:  {price_traj}   (σ={price_std:.0f}){_trend_arrow(prices_ep)}")
             print(f"  Emiss/yr:  {emiss_traj}   (avg {avg_annual_emiss:.1f} Mt/yr){_trend_arrow(yr_emiss)}")
-            print(f"  Auct/yr:   {auct_traj}   (TNAC={tnac:.1f} Mt){msr_str}{_trend_arrow(yr_auct_vol)}")
+            print(f"  Bid/yr:    {bid_traj}   (agents' total auction demand, Mt){_trend_arrow(yr_bid_total)}")
+            print(f"  CouldBuy:  {auct_traj}   (auction supply after cap+rollover+MSR, TNAC={tnac:.1f} Mt){msr_str}{_trend_arrow(yr_auct_vol)}")
 
             # ── Health snapshot ─────────────────────────────────────────
             _gs = avg_green_start_all * 100

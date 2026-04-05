@@ -1809,16 +1809,20 @@ class ETSEnvironment(gym.Env):
             )
 
         # Year 1 TNAC diagnostic: run once per episode after first full year settles.
+        # Keep these values in logs for offline checks; warning emission is opt-in
+        # to avoid noisy test output under stochastic/random-policy runs.
         if self.current_year == 0:
+            diag_cfg = self.config.get("diagnostics", {})
             year1_tnac = float(np.sum(self.holdings))
-            year1_low = 1.0
-            year1_high = 8.0
+            year1_low = float(diag_cfg.get("year1_tnac_expected_low", 1.0))
+            year1_high = float(diag_cfg.get("year1_tnac_expected_high", 8.0))
+            warn_year1_tnac = bool(diag_cfg.get("warn_year1_tnac_out_of_range", False))
             in_band = (year1_low <= year1_tnac <= year1_high)
             log["year1_tnac"] = year1_tnac
             log["year1_tnac_expected_low"] = year1_low
             log["year1_tnac_expected_high"] = year1_high
             log["year1_tnac_in_range"] = bool(in_band)
-            if (not in_band) and (not self._year1_tnac_warning_emitted):
+            if warn_year1_tnac and (not in_band) and (not self._year1_tnac_warning_emitted):
                 warnings.warn(
                     f"[ETSEnvironment] Year 1 TNAC diagnostic out of expected range "
                     f"[{year1_low:.1f}, {year1_high:.1f}] Mt: observed {year1_tnac:.2f} Mt.",

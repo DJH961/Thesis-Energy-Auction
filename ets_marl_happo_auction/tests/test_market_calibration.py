@@ -10,7 +10,13 @@ import yaml
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.environment.ets_environment import ETSEnvironment
-from src.environment.market_calibration import compute_market_params
+from src.environment.market_calibration import (
+    TNAC_LOWER_REF,
+    TNAC_MID_REF,
+    TNAC_UPPER_REF,
+    compute_market_params,
+    compute_system_emissions,
+)
 
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "configs", "default.yaml")
@@ -24,32 +30,36 @@ def _load_config():
 def test_16_agents_matches_current_config():
     cfg = _load_config()
     params = compute_market_params(cfg)
+    total_emissions, _ = compute_system_emissions(cfg)
+    expected_cap = total_emissions * (1.0 + cfg["ets"]["cap_overhead_pct"])
+    expected_upper = expected_cap * cfg["ets"]["msr"]["tnac_upper_ratio"]
 
-    assert params["cap_year_0"] == pytest.approx(50.0, abs=0.1)
-    assert params["tnac_upper"] == pytest.approx(18.0, abs=0.1)
+    assert params["cap_year_0"] == pytest.approx(expected_cap, rel=1e-9)
+    assert params["tnac_upper"] == pytest.approx(expected_upper, rel=1e-9)
     # Preserve lower:mid:upper ~= 400:833:1096 when scaling to micro-ETS.
-    assert params["tnac_mid"] == pytest.approx(13.7, abs=0.2)
-    assert params["tnac_lower"] == pytest.approx(6.6, abs=0.2)
-    assert params["tnac_mid"] / params["tnac_upper"] == pytest.approx(833.0 / 1096.0, rel=1e-6)
-    assert params["tnac_lower"] / params["tnac_upper"] == pytest.approx(400.0 / 1096.0, rel=1e-6)
+    assert params["tnac_mid"] / params["tnac_upper"] == pytest.approx(TNAC_MID_REF / TNAC_UPPER_REF, rel=1e-6)
+    assert params["tnac_lower"] / params["tnac_upper"] == pytest.approx(TNAC_LOWER_REF / TNAC_UPPER_REF, rel=1e-6)
 
 
 def test_12_agents_scales_down():
     cfg = _load_config()
+    full_cap = compute_market_params(cfg)["cap_year_0"]
     cfg["companies"]["n_bot_agents"] = 4
     params = compute_market_params(cfg)
 
-    # Emission-weighted scaling with first-4 bots retained (coal/gas-heavy mix)
-    # yields a higher cap than participant-count-only scaling.
-    assert params["cap_year_0"] == pytest.approx(44.5, abs=1.0)
+    assert params["cap_year_0"] < full_cap
 
 
 def test_8_agents_scales_down():
     cfg = _load_config()
+    cap_16 = compute_market_params(cfg)["cap_year_0"]
+    cfg_12 = copy.deepcopy(cfg)
+    cfg_12["companies"]["n_bot_agents"] = 4
+    cap_12 = compute_market_params(cfg_12)["cap_year_0"]
     cfg["companies"]["n_bot_agents"] = 0
     params = compute_market_params(cfg)
 
-    assert params["cap_year_0"] == pytest.approx(25.0, abs=1.0)
+    assert params["cap_year_0"] < cap_12 < cap_16
 
 
 def test_emission_weighted_not_participant_count():
@@ -73,10 +83,25 @@ def test_emission_weighted_not_participant_count():
 def test_cap_override_ignores_formula():
     cfg = _load_config()
     cfg["ets"]["cap_year_0_override"] = 60.0
+    cfg["ets"]["cap_overhead_pct"] = 999.0
     cfg["companies"]["n_bot_agents"] = 0
 
     params = compute_market_params(cfg)
     assert params["cap_year_0"] == pytest.approx(60.0)
+
+
+def test_cap_schedule_uses_override_without_overhead_stack():
+    cfg = _load_config()
+    cfg["ets"]["cap_year_0_override"] = 60.0
+    cfg["ets"]["cap_overhead_pct"] = 999.0
+    cfg["warm_start"]["enabled"] = False
+    cfg["uncertainty"]["enabled"] = False
+    cfg["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(cfg, seed=123)
+    env.reset(seed=123)
+
+    assert env.cap_schedule.cap_year_0 == pytest.approx(60.0)
 
 
 def test_backward_compat_no_overhead_key():

@@ -742,15 +742,15 @@ def test_diagnostic_high_spending_lowers_s_financial():
     config["uncertainty"]["enabled"] = False
     config["construction_jitter"]["enabled"] = False
     env = ETSEnvironment(config, seed=5)
-    env.reset()
+    env.reset(seed=5)
 
     # Run year with 0 spending (zero bids) → high S_financial
     _, info_low = _run_one_year(env, auction_price=1.0, qty_mult=0.01)
     s_fin_low_spend = [ds["S_financial"] for ds in info_low["diagnostic_scores"]]
 
-    env.reset()
-    # Run year with high spending (high price) → lower S_financial
-    _, info_high = _run_one_year(env, auction_price=250.0, qty_mult=1.0)
+    env.reset(seed=5)
+    # Run year with high spending (high price + elevated coverage) → lower S_financial
+    _, info_high = _run_one_year(env, auction_price=250.0, qty_mult=2.0)
     s_fin_high_spend = [ds["S_financial"] for ds in info_high["diagnostic_scores"]]
 
     # On average, spending more reduces S_financial

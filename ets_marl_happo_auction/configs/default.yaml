@@ -63,9 +63,9 @@ ets:
   # cap_year_0, msr.tnac_upper, msr.tnac_lower are now DERIVED from:
   #   total_system_emissions × (1 + cap_overhead_pct)
   # To override with a manual value, set cap_year_0_override to a number.
-  cap_year_0_override: 47.0     # fixed policy scenario cap (Mt)
+  cap_year_0_override: null     # null enables emission-weighted calibration
   initial_bank_fraction: 0.10   # default episode-start bank seed fraction of annual need
-  cap_overhead_pct: 0.11        # 11% surplus over total initial emissions
+  cap_overhead_pct: 0.02        # 2% surplus over total initial emissions
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044
@@ -73,16 +73,16 @@ ets:
 
   msr:
     enabled: true
-    tnac_upper_ratio: 0.5425531915  # 25.5 Mt / 47.0 Mt
-    tnac_mid_ratio: 0.4123613139    # 19.38 Mt / 47.0 Mt (833/1096 of upper)
-    tnac_lower_ratio: 0.2553191489  # 12.0 Mt / 47.0 Mt
+    tnac_upper_ratio: 0.36
+    tnac_mid_ratio: null            # null => derive 833/1096 proportion from upper
+    tnac_lower_ratio: null          # null => derive 400/1096 proportion from upper
     withhold_rate: 0.24
     release_frac: 0.0638297872 # 3.0 Mt / 47.0 Mt
     activation_year: 1   # legacy field; 1-year TNAC lag now enforced via _prev_tnac
                          # (Decision 2015/1814 Art 1(5))
     price_containment_absolute: 350   # hard fallback for containment trigger (EUR/t)
     price_release_absolute: 450       # hard fallback for release trigger (EUR/t)
-    emergency_release_frac: 0.08  # fraction of cap (was 4.0 Mt / 50.0 Mt)
+    emergency_release_frac: 0.064  # 3.0 Mt / 47.0 Mt (aligned with release_frac)
     min_auction_frac: 0.10            # safety floor for minimum auction volume
 
   banking: true
@@ -465,8 +465,8 @@ warm_start:
   burnin_price_seed_mean: 70.0
   burnin_price_seed_std: 10.0
   n_burnin_prices: 2
-  bank_seed_min: 0.2
-  bank_seed_max: 0.4
+  bank_seed_min: 0.05
+  bank_seed_max: 0.15
   queue_mu_onshore: 1.5
   queue_mu_offshore: 0.5
   queue_mu_solar: 2.0
