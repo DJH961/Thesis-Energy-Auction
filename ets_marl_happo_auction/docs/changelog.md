@@ -5,6 +5,67 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v8.3.0
+
+**Reward Function Overhaul, Batch GAE Normalization, HAPPO Emission Ordering**
+
+### Phase A — Reward Function Changes (`ets_environment.py`, `company.py`)
+- **Baseline OPEX**: Added `baseline_opex` snapshot in `Company.__init__()`, computed at
+  `current_year=0`. The reward function now uses `opex_delta = current_opex - baseline_opex`
+  instead of absolute operational cost. Positive delta = costs rose; negative = OPEX savings
+  from greening. This ensures agents aren't penalized for unavoidable base operating costs.
+- **Per-agent financial-scale normalization**: All cost, penalty, opportunity cost, terminal
+  bank value, and terminal debt penalty divisors changed from fixed `/1000.0` to
+  `/company.annual_budget`. This ensures reward magnitudes are proportional to each agent's
+  financial capacity, giving small-budget and large-budget agents comparable gradient signals.
+- **Per-agent ESG scale**: `esg_scale_i = base_esg_scale × (1000.0 / annual_budget)`
+  compensates for the divisor change to preserve the ESG-to-cost ratio that was calibrated
+  with the original `/1000` scaling. Maintains the 50/50 balance for ESG agents (w_green=0.5).
+- **Terminal values updated**: Bank value, debt liquidation penalty, and opportunity cost all
+  use `/annual_budget` instead of `/1000`.
+- **Collateral normalization**: Collateral cost in the reward uses `/annual_budget`,
+  consistent with the `collateral_load_last` observation at index [29] which already
+  normalizes by `annual_budget`.
+
+### Phase B — GAE/Normalization Changes (`ppo_agent.py`, `train.py`)
+- **Raw rewards in buffer**: `train.py` now stores raw (un-normalized) rewards directly in
+  the rollout buffer. `RewardNormalizer.update_and_normalize()` is still called for
+  monitoring/logging, but its output is no longer used in the learning path.
+- **Batch normalization in `compute_gae()`**: Rewards are standardized per-batch at the top
+  of `compute_gae()`: `rewards = (rewards - mu) / max(std, 1e-8)`, then clipped to `[-10, 10]`.
+  This replaces per-step EMA normalization, giving the critic a consistent target scale
+  and eliminating cold-start bias artifacts.
+- **`RewardNormalizer` preserved**: Class and `update_and_normalize()` retained for tracking
+  reward scale in logs; no longer on the critical path.
+
+### Phase C — _auc_weight Removal (`ppo_agent.py`)
+- **Removed `_auc_weight` heuristic** from both `update()` and `update_happo()`. With
+  per-agent budget normalization, the advantage signal is properly scaled without needing
+  the observation-derived auction-savings weight. The auction policy loss now uses raw
+  advantages identically to the secondary policy.
+
+### Phase D — HAPPO Ordering (`train.py`)
+- **Fixed emission-intensity ordering**: Replaced `episode_rng.permutation(n_agents)` with
+  `sorted(range(n_agents), key=lambda i: env.companies[i].initial_ef, reverse=True)`.
+  Highest emitters are updated first, receiving the cleanest advantages before cumulative
+  importance ratio drift from earlier agents' updates. This is deterministic and aligns
+  learning priority with where abatement decisions matter most.
+
+### Phase E — Tests
+- **New tests**: `test_opex_delta_zero_for_unchanged_mix`, `test_esg_cost_balance_preserved`,
+  `test_batch_normalization_replaces_ema`, `test_tranche_reward_sum`.
+- **Updated**: `test_terminal_bank_uses_1000_divisor` → `test_terminal_bank_uses_budget_divisor`
+  (references `/annual_budget` instead of `/1000`).
+- **All 245 tests pass**.
+
+### Config / Metadata
+- `pyproject.toml`: version 8.3.0
+- `default.yaml` header: v8.3
+- `train.py` banner updated
+- `README.md`: v8.3 improvements documented
+
+---
+
 ## v8.2.0
 
 **MSR Three-Band Withholding, Rollover Accounting Fix, Unbuffered Need, Heuristic Cleanup**
