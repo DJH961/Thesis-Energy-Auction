@@ -963,13 +963,14 @@ class ETSEnvironment(gym.Env):
         """Generate Phase-1 actions for all bot agents using heuristic_policy.
 
         Bot heuristic produces 6D [mid_price, total_qty_mult, invest_frac, t0, t1, t2].
-        We expand to 10D 3-tranche format using C1 demand-curve logic:
-          T1: p×0.90, q/3  (cheap tranche — opportunistic)
-          T2: p,       q/3  (core tranche — primary compliance)
-          T3: p×1.10, q/3  (insurance tranche — scarcity guard)
+                We expand to 10D 3-tranche format using configurable bot tranche settings:
+                    - Quantity split from bots.tranche_qty_split (normalized)
+                    - Price spread from bots.tranche_price_* config
+                    - T3 spread widens with urgency in late-episode years
+                    - Budget-stressed bots drop T1 first, then scale T2/T3 if needed
 
         Tranches are already sorted ascending by price (B1 invariant satisfied).
-        T1/T3 prices are clipped to [price_min, price_max].
+                Tranche prices are clipped to [price_min, price_max].
         """
         if self.n_bots == 0:
             return np.zeros((0, 10), dtype=np.float32)
@@ -1010,15 +1011,36 @@ class ETSEnvironment(gym.Env):
             if self._enhanced_noise_enabled and bool(self._bot_budget_stressed[b]):
                 action6[1] = float(np.clip(action6[1] * budget_stress_qty_mult, qty_low, qty_high))
 
-            # C1: Expand 6D → 10D using 3-tranche demand curve (B1: ascending price)
+            annual_need = max(
+                self.companies[idx].compute_estimate_need() + self.companies[idx]._carry_forward,
+                0.1,
+            )
+            budget_remaining = max(
+                0.0,
+                float(self.companies[idx].annual_budget - self.companies[idx].budget_spent_this_year),
+            )
+
+            # C1: Expand 6D -> 10D using configurable tranche ladder.
             p_mid = float(action6[0])
             q_total = float(action6[1])
-            q_third = q_total / 3.0
-            # T1: slightly below market (opportunistic), T2: at market, T3: above (insurance)
-            p1 = float(np.clip(p_mid * 0.90, price_min, price_max))
-            p2 = p_mid
-            p3 = float(np.clip(p_mid * 1.10, price_min, price_max))
-            actions[b] = np.array([p1, q_third, p2, q_third, p3, q_third,
+            tranche_prices, tranche_qty_mults = heuristic_policy.build_tranche_ladder(
+                mid_price=p_mid,
+                total_qty_mult=q_total,
+                config=self.config,
+                price_min=price_min,
+                price_max=price_max,
+                current_year=self.current_year,
+                n_years=self.n_years,
+                bank=float(self.holdings[idx]),
+                annual_need=annual_need,
+                urgency_multiplier=float(self._bot_urgency_mult[b]),
+                urgency_denom=urgency_denom,
+                reserve_price=reserve,
+                available_budget=budget_remaining,
+            )
+            actions[b] = np.array([tranche_prices[0], tranche_qty_mults[0],
+                                   tranche_prices[1], tranche_qty_mults[1],
+                                   tranche_prices[2], tranche_qty_mults[2],
                                    action6[2], action6[3], action6[4], action6[5]],
                                   dtype=np.float32)
         return actions
@@ -1062,7 +1084,8 @@ class ETSEnvironment(gym.Env):
             [p1, q1, p2, q2, p3, q3, invest_frac, tech_logit0, tech_logit1, tech_logit2]
             3-tranche bid ladder: each (p_k, q_k) pair is an independent
             price/coverage bid. Bot actions are generated internally via
-            heuristic_policy (still 6D, expanded to 3 identical tranches).
+            heuristic_policy (still 6D, expanded using configurable tranche
+            split/spread and budget-aware dropping).
 
         Returns
         -------
@@ -1242,7 +1265,7 @@ class ETSEnvironment(gym.Env):
                 p_raw = float(auction_actions[i, 2 * t])
                 q_raw = float(auction_actions[i, 2 * t + 1])
                 p_clipped = float(np.clip(p_raw, price_min, price_max))
-                q_mult = float(np.clip(q_raw, qty_mult_low, qty_mult_high))
+                q_mult = float(np.clip(q_raw, 0.0, qty_mult_high))
                 q_abs = q_mult * base_need
                 if lot_size > 0:
                     q_abs = max(lot_size, round(q_abs / lot_size) * lot_size)

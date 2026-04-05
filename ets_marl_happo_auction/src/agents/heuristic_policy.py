@@ -22,11 +22,14 @@ C1: NPV-aware 3-tranche demand curve
 Instead of a single (price, qty) bid, the heuristic now constructs a
 3-segment demand curve:
   - Tranche 1 (low price, highest priority): price near MAC/MA3, qty = 50% of
-    target_bank_gap. Buys "cheap" allowances if market offers them.
+        target_bank_gap by default. Buys "cheap" allowances if market offers them.
   - Tranche 2 (mid price, core bid): price at market_anchor + urgency gradient,
-    qty = 100% of annual_need gap. The primary compliance bid.
-  - Tranche 3 (high price, insurance): price near penalty, qty = 25% buffer.
-    Ensures compliance even in scarce markets at full cost.
+        qty = 30% by default. The primary compliance bid.
+    - Tranche 3 (high price, insurance): price near penalty, qty = 20% by default.
+        Ensures compliance even in scarce markets at full cost.
+
+The tranche quantity split and price spread are configurable via
+config["bots"]["tranche_qty_split"] and config["bots"]["tranche_price_*"].
 
 The (price, qty_mult) pairs are already sorted ascending by price, satisfying
 the B1 tranche-sorting invariant.
@@ -47,6 +50,131 @@ _TECH_ONSHORE = 2
 _TECH_OFFSHORE = 3
 _TECH_SOLAR = 4
 _BUILDABLE = [_TECH_ONSHORE, _TECH_OFFSHORE, _TECH_SOLAR]
+
+
+def _normalize_tranche_split(split_cfg) -> np.ndarray:
+    """Return non-negative 3-way split that sums to 1."""
+    split = np.array(split_cfg if split_cfg is not None else [1.0, 1.0, 1.0], dtype=float)
+    if split.shape[0] != 3 or not np.all(np.isfinite(split)):
+        split = np.array([1.0, 1.0, 1.0], dtype=float)
+    split = np.maximum(split, 0.0)
+    s = float(split.sum())
+    if s <= 1e-9:
+        return np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=float)
+    return split / s
+
+
+def _compute_tranche_urgency(bank: float, annual_need: float, current_year: int,
+                             n_years: int, urgency_multiplier: float,
+                             urgency_denom: float) -> float:
+    """Coverage- and time-aware urgency in [0, 1] for tranche shaping."""
+    need = max(float(annual_need), 1e-6)
+    coverage_ratio = max(float(bank) / need, 0.0)
+    coverage_urgency = max(0.0, 1.0 - coverage_ratio / max(float(urgency_denom), 1e-6))
+    remaining_years = max(1, int(n_years) - int(current_year))
+    late_episode_urgency = max(0.0, 1.0 - remaining_years / max(float(n_years), 1.0))
+    urgency = max(coverage_urgency, late_episode_urgency)
+    return float(np.clip(urgency * float(urgency_multiplier), 0.0, 1.0))
+
+
+def _apply_per_tranche_budget_drop(prices: np.ndarray, qty_mults: np.ndarray,
+                                   annual_need: float, available_budget: float,
+                                   reserve_price: float, collateral_fraction: float) -> np.ndarray:
+    """When cash-constrained, drop T1 first, then scale T2/T3 to fit budget."""
+    need = max(float(annual_need), 1e-6)
+    budget = max(0.0, float(available_budget))
+    if budget <= 0.0:
+        return np.zeros_like(qty_mults)
+
+    q = np.maximum(qty_mults.astype(float), 0.0)
+    p = prices.astype(float)
+
+    def tranche_cost(q_mult_arr: np.ndarray) -> np.ndarray:
+        qty_abs = q_mult_arr * need
+        above_reserve = np.maximum(0.0, p - float(reserve_price))
+        unit = p + float(collateral_fraction) * above_reserve
+        return qty_abs * unit
+
+    base_cost = float(np.sum(tranche_cost(q)))
+    if base_cost <= budget + 1e-9:
+        return q
+
+    # Drop cheapest tranche first (T1 after ascending sort).
+    q[0] = 0.0
+    cost_after_t1 = float(np.sum(tranche_cost(q)))
+    if cost_after_t1 <= budget + 1e-9:
+        return q
+
+    # If still too expensive, scale T2/T3 proportionally.
+    rem_cost = float(np.sum(tranche_cost(q[1:])))
+    if rem_cost <= 1e-9:
+        q[1:] = 0.0
+        return q
+
+    scale = float(np.clip(budget / rem_cost, 0.0, 1.0))
+    q[1:] *= scale
+    return q
+
+
+def build_tranche_ladder(
+    mid_price: float,
+    total_qty_mult: float,
+    config: dict,
+    price_min: float,
+    price_max: float,
+    current_year: int,
+    n_years: int,
+    bank: float,
+    annual_need: float,
+    urgency_multiplier: float = 1.0,
+    urgency_denom: float = 1.5,
+    reserve_price: float = 0.0,
+    available_budget: float = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build 3-tranche (price, qty_mult) arrays with configurable split/spread."""
+    bot_cfg = config.get("bots", {})
+    split = _normalize_tranche_split(bot_cfg.get("tranche_qty_split", [1.0, 1.0, 1.0]))
+
+    low_mult = float(bot_cfg.get("tranche_price_low_mult", 0.90))
+    high_base = float(bot_cfg.get("tranche_price_high_mult", 1.10))
+    high_urgency_add = float(bot_cfg.get("tranche_price_high_urgency_add", 0.05))
+
+    urgency = _compute_tranche_urgency(
+        bank=bank,
+        annual_need=annual_need,
+        current_year=current_year,
+        n_years=n_years,
+        urgency_multiplier=urgency_multiplier,
+        urgency_denom=urgency_denom,
+    )
+
+    prices = np.array([
+        float(mid_price) * low_mult,
+        float(mid_price),
+        float(mid_price) * (high_base + high_urgency_add * urgency),
+    ], dtype=float)
+    prices = np.clip(prices, float(price_min), float(price_max))
+
+    qty_mults = np.maximum(0.0, float(total_qty_mult)) * split
+
+    if available_budget is not None:
+        aq = config.get("auction", {})
+        coll_cfg = aq.get("collateral", {})
+        coll_frac = float(coll_cfg.get(
+            "collateral_fraction",
+            coll_cfg.get("opportunity_cost_rate", 0.05) * coll_cfg.get("hold_fraction", 0.02),
+        ))
+        qty_mults = _apply_per_tranche_budget_drop(
+            prices=prices,
+            qty_mults=qty_mults,
+            annual_need=annual_need,
+            available_budget=available_budget,
+            reserve_price=reserve_price,
+            collateral_fraction=coll_frac,
+        )
+
+    order = np.argsort(prices)
+    return prices[order], qty_mults[order]
 
 
 def _compute_npv_invest_frac(company, best_tech, frac_test, remaining_years,
@@ -122,10 +250,14 @@ def auction_action(
       [mid_price, mid_qty_mult, invest_frac, logit_onshore, logit_offshore, logit_solar]
 
     The bot expansion in ets_environment.py converts this 6D to 10D by splitting
-    into 3 tranches:
-      T1: price = mid_price × 0.90, qty_mult = target_qty / 3 (cheap tranche)
-      T2: price = mid_price,        qty_mult = target_qty / 3 (core tranche)
-      T3: price = mid_price × 1.10, qty_mult = target_qty / 3 (insurance tranche)
+        into 3 tranches using configurable split/spread from config["bots"]:
+            T1: price = mid_price × tranche_price_low_mult, qty via tranche_qty_split[0]
+            T2: price = mid_price,                           qty via tranche_qty_split[1]
+            T3: price = mid_price × (tranche_price_high_mult + tranche_price_high_urgency_add × urgency)
+                    qty via tranche_qty_split[2]
+
+        Under tight budgets, the ladder applies per-tranche dropping logic:
+        T1 is zeroed first, then T2/T3 are scaled proportionally if still constrained.
 
     Parameters
     ----------

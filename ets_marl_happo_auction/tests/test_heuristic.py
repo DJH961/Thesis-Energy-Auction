@@ -17,7 +17,7 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.agents.heuristic_policy import auction_action, secondary_action
+from src.agents.heuristic_policy import auction_action, secondary_action, build_tranche_ladder
 from src.environment.company import Company
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "configs", "default.yaml")
@@ -314,3 +314,69 @@ class TestCapexThroughput:
         # Should be within capex remaining (10 M€) or invest_frac should be ~0
         assert est_cost <= 10.0 + 1e-3 or invest_frac < 1e-4, (
             f"invest_frac={invest_frac}, est_cost={est_cost} should respect capex_throughput=10")
+
+
+class TestTrancheLadderConfig:
+
+    def test_configurable_tranche_quantity_split(self, config):
+        prices, qty_mults = build_tranche_ladder(
+            mid_price=100.0,
+            total_qty_mult=1.0,
+            config=config,
+            price_min=config["auction"]["price_min"],
+            price_max=config["auction"]["price_max"],
+            current_year=2,
+            n_years=12,
+            bank=0.0,
+            annual_need=1.0,
+        )
+        np.testing.assert_allclose(qty_mults, np.array([0.5, 0.3, 0.2]), atol=1e-6)
+        assert np.all(np.diff(prices) >= -1e-9)
+
+    def test_t3_spread_widens_with_urgency(self, config):
+        p_low, _ = build_tranche_ladder(
+            mid_price=100.0,
+            total_qty_mult=1.0,
+            config=config,
+            price_min=config["auction"]["price_min"],
+            price_max=config["auction"]["price_max"],
+            current_year=0,
+            n_years=12,
+            bank=2.0,
+            annual_need=1.0,
+            urgency_multiplier=1.0,
+            urgency_denom=1.5,
+        )
+        p_high, _ = build_tranche_ladder(
+            mid_price=100.0,
+            total_qty_mult=1.0,
+            config=config,
+            price_min=config["auction"]["price_min"],
+            price_max=config["auction"]["price_max"],
+            current_year=11,
+            n_years=12,
+            bank=0.0,
+            annual_need=1.0,
+            urgency_multiplier=1.0,
+            urgency_denom=1.5,
+        )
+        assert p_high[2] > p_low[2]
+
+    def test_budget_drop_zeroes_t1_first(self, config):
+        prices, qty_mults = build_tranche_ladder(
+            mid_price=100.0,
+            total_qty_mult=1.0,
+            config=config,
+            price_min=config["auction"]["price_min"],
+            price_max=config["auction"]["price_max"],
+            current_year=8,
+            n_years=12,
+            bank=0.0,
+            annual_need=1.0,
+            reserve_price=config["ets"]["reserve_price"],
+            available_budget=60.0,
+        )
+        assert qty_mults[0] == pytest.approx(0.0, abs=1e-9)
+        assert qty_mults[1] >= 0.0
+        assert qty_mults[2] >= 0.0
+        assert np.all(np.diff(prices) >= -1e-9)

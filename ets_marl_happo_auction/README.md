@@ -1,6 +1,8 @@
-# ETS MARL — Auction Version (HAPPO/PPO) v8.2
+# ETS MARL — Auction Version (HAPPO/PPO) v8.2.1
 
 This is the **auction-focused version** of the carbon market simulation (forked from v7.3). It introduces a **3-tranche bid ladder** for the primary auction and replaces the bilateral secondary market with a **Uniform-Price Call Auction** (clearinghouse mechanism), mirroring how real EEX/ICE daily fixing works.
+
+**v8.2.1 improvements:** Heuristic bot tranche ladder is now configurable via `bots.tranche_qty_split` (default 50/30/20) and `bots.tranche_price_*` spread settings; T3 spread widens with urgency in late-episode years (`T3 = mid_price × (1.10 + 0.05 × urgency)` by default); and per-tranche budget dropping is implemented (drop T1 first, then scale T2/T3). The temporary single-agent ordering assert guard in auction clearing was rolled back.
 
 **v8.2 improvements:** Three-band MSR withholding aligned with EU legislative TNAC proportions (400:833:1096), corrected withholding formula (24% of total TNAC above upper threshold), rollover accounting overhaul (unsold and defaulted volumes tracked as independent streams, no double-counting), `compute_estimate_need()` unbuffered (agents learn their own bid buffer), heuristic green-seller discount removed, `qty_mult_high` default corrected 1.3→2.0, new MSR telemetry attributes on `CapSchedule`, and expanded test coverage for all three TNAC regimes.
 

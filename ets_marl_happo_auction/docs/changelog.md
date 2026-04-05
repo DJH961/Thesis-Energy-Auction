@@ -5,6 +5,40 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v8.2.1
+
+**Configurable Heuristic Tranches, Urgency-Adaptive T3 Spread, Per-Tranche Budget Dropping**
+
+### Heuristic Tranche Configurability (`heuristic_policy.py`, `ets_environment.py`, `configs/default.yaml`)
+- Added configurable bot tranche quantity split via `bots.tranche_qty_split`.
+  Default is now **50/30/20** (`[0.50, 0.30, 0.20]`) instead of hardcoded equal thirds.
+- Added configurable tranche price spread via:
+  - `bots.tranche_price_low_mult`
+  - `bots.tranche_price_high_mult`
+  - `bots.tranche_price_high_urgency_add`
+- T3 now widens with urgency using:
+  `T3 = mid_price × (tranche_price_high_mult + tranche_price_high_urgency_add × urgency)`
+  where urgency combines coverage shortfall and late-episode pressure.
+- Refactored bot 6D→10D expansion to use a shared tranche-ladder builder in
+  `heuristic_policy.py`, then consumed from `_generate_bot_auction_actions()`.
+
+### Per-Tranche Budget Dropping (`heuristic_policy.py`, `ets_environment.py`)
+- Implemented tranche-level budget fallback for bots:
+  - If tranche stack is unaffordable, **T1 is zeroed first**.
+  - If still unaffordable, **T2 and T3 are scaled proportionally**.
+- `step_auction()` now allows zero tranche multipliers (`q_mult >= 0.0`) so
+  per-tranche dropping can be represented without being forced back to `qty_mult_low`.
+
+### Rollback Note (`market_clearing_ets.py`, `test_market_clearing.py`)
+- The temporary single-agent bid-order assertion guard introduced during this patch
+  cycle was rolled back by request.
+- Related temporary tests for the guard were removed.
+
+### Config / Metadata
+- Version bumped to `8.2.1` in `pyproject.toml`, `configs/default.yaml`.
+
+---
+
 ## v8.2.0
 
 **MSR Three-Band Withholding, Rollover Accounting Fix, Unbuffered Need, Heuristic Cleanup**
