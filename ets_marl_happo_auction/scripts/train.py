@@ -954,7 +954,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 agents[i].store_transition(
                     obs1=obs1[i], obs2=obs2[i],
                     auc_raw=auction_raws[i], sec_raw=np.zeros(2, dtype=np.float32),
-                    auc_lp=auction_logps[i], sec_lp=0.0,
+                    auc_lp=auction_logps[i], sec_lp=np.zeros(1, dtype=np.float32),
                     reward=float(r_auction[i]), done=False, value=value_auc,
                     global_state=global_state,
                     phase='auction',  # auction policy trained on these rows

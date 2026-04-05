@@ -151,13 +151,15 @@ def _run_one_episode(env, agents, n_agents, n_years, config):
         _centralized = config["ppo"].get("centralized_critic", False)
         global_state = obs2.flatten() if _centralized else None
 
-        # Store auction-phase transition so auction_policy gets gradients
+        # Store auction-phase transition so auction_policy gets gradients.
+        # sec_lp placeholder must be shape (1,) to match secondary_logp entries
+        # elsewhere in the buffer (np.array() requires homogeneous shapes).
         for i in range(n_agents):
             value = agents[i].estimate_value(
                 global_state if _centralized else obs2[i])
             agents[i].store_transition(
                 obs1[i], obs2[i], auction_raws[i], np.zeros(2, dtype=np.float32),
-                auction_logps[i], 0.0, 0.0, False, value,
+                auction_logps[i], np.zeros(1, dtype=np.float32), 0.0, False, value,
                 global_state=global_state,
                 phase='auction',
             )
@@ -238,8 +240,9 @@ def test_batch_accumulation_buffer_size():
     for _ in range(4):
         _run_one_episode(env, agents, n_agents, n_years, config)
 
-    # Each episode has n_years transitions, 4 episodes → ~4*n_years
-    expected_transitions = 4 * n_years
+    # Each episode has n_years × 2 transitions (auction + secondary per year),
+    # 4 episodes → 4 * 2 * n_years total.
+    expected_transitions = 4 * 2 * n_years
     for i, agent in enumerate(agents):
         actual = len(agent.buffer)
         assert actual == expected_transitions, (
@@ -265,10 +268,14 @@ def test_gae_respects_done_flags():
     agent = agents[0]
     dones = np.array(agent.buffer.dones, dtype=np.float32)
 
-    # The last step of each episode should have done=True
-    # With 2 episodes of n_years steps each, done should be True at indices n_years-1 and 2*n_years-1
-    assert dones[n_years - 1] == 1.0, "First episode boundary should have done=True"
-    assert dones[2 * n_years - 1] == 1.0, "Second episode boundary should have done=True"
+    # The last step of each episode should have done=True.
+    # With 2 transitions per year (auction + secondary), each episode produces
+    # 2 * n_years buffer entries.  The done=True flag sits on the final
+    # secondary-phase row of each episode.
+    # Episode 1: last secondary row = index 2*n_years - 1
+    # Episode 2: last secondary row = index 4*n_years - 1
+    assert dones[2 * n_years - 1] == 1.0, "First episode boundary should have done=True"
+    assert dones[4 * n_years - 1] == 1.0, "Second episode boundary should have done=True"
 
     # Compute GAE and verify it doesn't produce NaN
     adv, ret, buf = agent.compute_gae(last_value=0.0)

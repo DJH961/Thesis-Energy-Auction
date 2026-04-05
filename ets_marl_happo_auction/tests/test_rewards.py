@@ -985,3 +985,79 @@ def test_tranche_reward_sum():
         cost_norm = float(payments[i]) / budget
         # With uniform clearing and same bids, cost should be non-negative
         assert np.isfinite(cost_norm), f"Agent {i} cost_norm is not finite: {cost_norm}"
+
+
+def test_auction_reward_normalization():
+    """
+    Deterministic clearing: assert r_auction == -(bid_cost + collateral) / annual_budget.
+
+    Uses a single-agent environment (no bots) with collateral enabled to ensure
+    a non-zero collateral_locked term, then verifies compute_auction_rewards()
+    equals exactly -(auction_payment + collateral_cost) / annual_budget ± 1e-6.
+
+    Investment, OPEX delta, and MAC costs are zeroed out by design (no invest,
+    same year so opex_delta = 0, no MAC reductions requested).
+    """
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+    # Single learning agent, no bots — deterministic and easy to reason about
+    config["companies"]["n_agents"] = 1
+    config["companies"]["n_bot_agents"] = 0
+    # Enable collateral so the collateral term is non-trivial
+    config["auction"]["collateral"]["enabled"] = True
+    config["auction"]["collateral"]["collateral_fraction"] = 0.10
+    opp_rate = 0.05
+    config["auction"]["collateral"]["opportunity_cost_rate"] = opp_rate
+    # Disable MAC reductions so mac_cost = 0
+    config["mac"]["enabled"] = False
+    # Disable investment (invest_frac action handled via action vector below)
+    # and OPEX shaping so opex_delta = 0
+    config["reward"]["opex_delta_weight"] = 0.0
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    # Bid at a single deterministic price well above reserve so collateral locks
+    bid_price = 100.0
+    qty_mult = 1.0
+    n = env.n_agents  # == 1
+    auction_actions = np.zeros((n, 10), dtype=np.float32)
+    auction_actions[:, 0] = bid_price   # p1
+    auction_actions[:, 1] = qty_mult / 3.0
+    auction_actions[:, 2] = bid_price   # p2
+    auction_actions[:, 3] = qty_mult / 3.0
+    auction_actions[:, 4] = bid_price   # p3
+    auction_actions[:, 5] = qty_mult / 3.0
+    auction_actions[:, 6] = -1.0        # no investment → invest_frac = 0
+
+    env.step_auction(auction_actions)
+
+    r_auction = env.compute_auction_rewards()
+
+    for i in range(n):
+        company = env.companies[i]
+        budget = max(company.annual_budget, 1.0)
+
+        # Components that should be non-zero
+        payment_i = float(env._phase1_payments[i])
+        coll_locked_i = float(env._collateral_locked[i])
+        coll_cost_i = coll_locked_i * opp_rate
+
+        # Components zeroed by config above
+        invest_cost_i = float(env._phase1_invest_costs[i])
+        mac_cost_i = float(env._phase1_mac_costs[i])
+        opex_delta_i = (
+            company.compute_operational_cost(env.current_year) - company.baseline_opex
+        )
+
+        expected = -(payment_i + coll_cost_i + invest_cost_i + opex_delta_i + mac_cost_i) / budget
+        np.testing.assert_allclose(
+            r_auction[i], expected, atol=1e-6,
+            err_msg=(
+                f"Agent {i}: r_auction={r_auction[i]:.8f} expected={expected:.8f} "
+                f"(payment={payment_i:.4f}, collateral={coll_cost_i:.4f}, budget={budget:.2f})"
+            ),
+        )
