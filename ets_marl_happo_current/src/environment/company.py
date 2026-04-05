@@ -125,6 +125,7 @@ class Company:
         self.mix = np.array(initial_mix, dtype=np.float64)
         assert abs(self.mix.sum() - 1.0) < 1e-6, f"Mix must sum to 1.0, got {self.mix.sum()}"
         self.initial_ef = self.weighted_emission_factor  # snapshot for ESG signal
+        self.baseline_opex = self.compute_operational_cost(current_year=0)  # snapshot of initial-mix OPEX
         self.prev_green_frac = self.green_frac
 
         # Construction queue: list of {tech_idx, frac_delta, completion_year, success, capex_spent}

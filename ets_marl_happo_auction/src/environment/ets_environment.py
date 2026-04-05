@@ -2074,18 +2074,25 @@ class ETSEnvironment(gym.Env):
                          precompliance_holdings=None,
                          old_carry_forward=None, active_mask=None):
         """
-        Reward (HAPPO-compliant, v7.3):
-            R_i = w_cost * (-cost_norm_ex_penalty) + w_green * (esg_scale * esg_raw)
+        Reward (HAPPO-compliant, v8.3):
+            R_i = w_cost * (-cost_norm_ex_penalty) + w_green * (esg_scale_i * esg_raw)
                   + green_bonus - penalty_norm - opportunity_cost
 
+        v8.3 changes:
+          - OPEX delta: only the change from baseline OPEX enters the cost signal.
+          - Per-agent normalization: /annual_budget instead of /1000 for cost, penalty,
+            opportunity cost, terminal bank value, and terminal debt penalty.
+          - Per-agent ESG scale: compensates for the divisor change to preserve the
+            50/50 ESG-to-cost balance for agents with w_green=0.5.
+
         Core signals:
-          cost_norm_ex_penalty: total_cost_ex_penalty / 1000
-          penalty_norm:         penalty_cost / 1000 (applied at full strength for ALL agents)
+          cost_norm_ex_penalty: total_cost_ex_penalty / annual_budget
+          penalty_norm:         penalty_cost / annual_budget
           green_bonus:          diminishing-returns bonus for green investment progress
           esg_raw:              saved-carbon-years formula before weighting
 
         Penalty is separated from cost and applied at full strength regardless of w_cost.
-        Terminal bonuses: log-scaled bank value /1000 + ESG terminal queue.
+        Terminal bonuses: log-scaled bank value / annual_budget + ESG terminal queue.
         """
         rewards = np.zeros(self.n_total)
         base_rewards = np.zeros(self.n_total)
@@ -2095,7 +2102,7 @@ class ETSEnvironment(gym.Env):
         reward_cfg = self.config.get("reward", {})
         esg_cfg = self.config.get("esg", {})
         esg_enabled = esg_cfg.get("enabled", False)
-        esg_scale = float(esg_cfg.get("scale", 2.0))
+        base_esg_scale = float(esg_cfg.get("scale", 2.0))
 
         beta_shaping = reward_cfg.get("shaping_beta", 10.0)
         opp_cost_rate = float(reward_cfg.get("opportunity_cost_rate", 0.05))
@@ -2115,7 +2122,9 @@ class ETSEnvironment(gym.Env):
             secondary_cost = float(trade_costs[i])
             penalty_cost = float(penalties[i])
             investment_cost = float(invest_costs[i])
-            operational_cost = company.compute_operational_cost(self.current_year)
+            # v8.3: OPEX delta — only the change from baseline enters the cost signal.
+            # Positive delta = costs rose, negative delta = OPEX savings from greening.
+            opex_delta = company.compute_operational_cost(self.current_year) - company.baseline_opex
             mac_cost_i = float(mac_costs[i])
             # NOTE: hold_fraction=0.02 (~7 days). Real EU ETS settles T+2 (~0.0055)
             # but one annual step represents ~52 real auctions; 0.02 is the balance.
@@ -2131,14 +2140,17 @@ class ETSEnvironment(gym.Env):
             budget_penalty = company.compute_budget_penalty()
             capex_penalty = company.compute_capex_penalty()
 
+            # v8.3: Per-agent financial-scale normalization using annual_budget
+            budget_divisor = max(company.annual_budget, 1.0)
+
             # Separate penalty from other costs
             # Penalty applies at full strength to ALL agents regardless of w_cost
             total_cost_ex_penalty = (auction_cost + secondary_cost + investment_cost
-                                     + operational_cost + budget_penalty + capex_penalty
+                                     + opex_delta + budget_penalty + capex_penalty
                                      + mac_cost_i + collateral_cost_i + loan_interest_cost)
 
-            cost_norm_ex_penalty = total_cost_ex_penalty / 1000.0
-            penalty_norm = penalty_cost / 1000.0
+            cost_norm_ex_penalty = total_cost_ex_penalty / budget_divisor
+            penalty_norm = penalty_cost / budget_divisor
 
             # Green investment bonus with diminishing returns
             # Scaled by (0.2 + w_green) so financial agents still get some signal
@@ -2146,18 +2158,19 @@ class ETSEnvironment(gym.Env):
             fossil_scale = max(company.fossil_frac, 0.05)
             green_bonus = beta_shaping * green_delta * fossil_scale * self.shaping_weight * (0.2 + company.w_green)
 
+            # v8.3: Per-agent ESG scale — compensates for /annual_budget divisor
+            # to preserve the ESG-to-cost ratio that was calibrated with /1000.
+            esg_scale_i = base_esg_scale * (1000.0 / budget_divisor)
+
             # ESG signal: saved-carbon-years formula
             esg_signal = 0.0
             if esg_enabled and company.initial_ef > 1e-6:
                 ef_ratio = (company.initial_ef - company.weighted_emission_factor) / company.initial_ef
                 time_ratio = remaining_years / self.n_years
                 esg_raw = ef_ratio * time_ratio * (company.annual_budget / 1000.0)
-                esg_signal = esg_scale * esg_raw
+                esg_signal = esg_scale_i * esg_raw
 
             # F1: Efficiency bonus as a shaping reward (decays with shaping_weight).
-            # Named 'efficiency_bonus' for consistency; acts as shaping (not permanent base reward).
-            # Rewards emission factor improvement regardless of w_green, proportional to
-            # remaining time and carbon price.
             efficiency_bonus = 0.0
             if company.initial_ef > 0.01:
                 ef_improvement = max(0.0, company.initial_ef - company.weighted_emission_factor)
@@ -2169,7 +2182,7 @@ class ETSEnvironment(gym.Env):
             # Cost-of-capital on allowances carried after compliance settlement.
             # NOTE: self.holdings[i] is already the post-compliance bank at this
             # point (updated in step_secondary before _compute_rewards is called).
-            opp_cost = float(self.holdings[i]) * float(clearing_price) * opp_cost_rate / 1000.0
+            opp_cost = float(self.holdings[i]) * float(clearing_price) * opp_cost_rate / budget_divisor
 
             base_reward = float(
                 company.w_cost * (-cost_norm_ex_penalty)
@@ -2200,16 +2213,13 @@ class ETSEnvironment(gym.Env):
             for i, company in enumerate(self.companies):
                 if active_mask is not None and not bool(active_mask[i]):
                     continue
+                budget_divisor = max(company.annual_budget, 1.0)
                 # Terminal bank value with 2× annual_need cap:
-                # Bank beyond 2yr of reserves gets ZERO additional terminal credit,
-                # making secondary selling immediately rational. Diminishing-returns
-                # log1p formula maps prudent hedging (~1yr need) to ~69% of linear value.
                 if terminal_bank:
                     annual_need = max(company.compute_estimate_need(), 0.1)
-                    # Cap effective bank at 2× annual need
                     capped_holdings = min(self.holdings[i], 2.0 * annual_need)
                     ratio = capped_holdings / annual_need
-                    bank_value = np.log1p(ratio) * annual_need * terminal_price / 1000.0
+                    bank_value = np.log1p(ratio) * annual_need * terminal_price / budget_divisor
                     rewards[i] += bank_value
                     base_rewards[i] += bank_value
                     terminal_bank_values[i] = bank_value
@@ -2228,7 +2238,6 @@ class ETSEnvironment(gym.Env):
                         annual_saving = (delta_ef * item["frac_delta"]
                                          * company.output_mwh / 1e6)
                         discount = gamma_discount ** years_late
-                        # Normalize by initial_ef × output_twh × n_years
                         normalizer = company.initial_ef * company.output_twh * self.n_years
                         queue_value += (annual_saving * effective_remaining * discount
                                         * terminal_price / max(normalizer, 1e-6))
@@ -2246,9 +2255,10 @@ class ETSEnvironment(gym.Env):
             for i, company in enumerate(self.companies):
                 if active_mask is not None and not bool(active_mask[i]):
                     continue
+                budget_divisor = max(company.annual_budget, 1.0)
                 # Aggressively penalize outstanding carry_forward debt
                 if company._carry_forward > 0:
-                    debt_penalty = (company._carry_forward * terminal_price * 1.5) / 1000.0
+                    debt_penalty = (company._carry_forward * terminal_price * 1.5) / budget_divisor
                     rewards[i] -= debt_penalty
                     base_rewards[i] -= debt_penalty
 

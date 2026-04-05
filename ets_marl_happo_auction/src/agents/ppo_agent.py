@@ -626,25 +626,17 @@ class PPOAgent:
                     auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
                     sec_lp_new, sec_ent = self.secondary_policy.evaluate(obs2[mb], sec_raw[mb])
 
-                    # Phase-specific credit assignment: weight auction policy loss
-                    # by a phase-1-only advantage proxy derived from auction_savings
-                    # in obs2[base+4].  Positive savings amplify the gradient for
-                    # good auction deals; negative savings dampen it.
-                    _auc_savings_idx = self.obs_dim_phase1 + 4  # obs2[base+4]
-                    _auc_savings = obs2[mb, _auc_savings_idx:_auc_savings_idx+1]  # [mb, 1]
-                    _auc_weight = (1.0 + torch.tanh(_auc_savings)).detach()  # [0, 2] range
-
                     # Per-policy PPO clipping: decomposes the joint ratio so each
                     # policy's gradient update is independently clipped.  Prevents
                     # a profitable secondary trade from incorrectly reinforcing
                     # bad auction bids (and vice versa).
+                    # v8.3: _auc_weight heuristic removed — with per-agent budget
+                    # normalization, the advantage signal is properly scaled.
                     # P11: Tighter log-ratio clamp — max ratio e^2≈7.4 (was e^10≈22026).
-                    # Prevents catastrophic loss from rare high-ratio mini-batches.
                     auc_log_ratio = torch.clamp(auc_lp_new - old_auc_lp[mb], -2.0, 2.0)
                     auc_ratio = torch.exp(auc_log_ratio)
-                    auc_adv = adv_t[mb] * _auc_weight
-                    auc_surr1 = auc_ratio * auc_adv
-                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
+                    auc_surr1 = auc_ratio * adv_t[mb]
+                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t[mb]
                     auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
 
                     sec_log_ratio = torch.clamp(sec_lp_new - old_sec_lp[mb], -2.0, 2.0)
@@ -751,6 +743,10 @@ class PPOAgent:
         """
         Extract GAE advantages and returns from the rollout buffer.
 
+        v8.3: Batch normalization of rewards inside GAE.
+        Raw rewards are stored in the buffer; normalization happens here
+        instead of at storage time, using per-batch mean/std.
+
         Returns
         -------
         adv_t : Tensor [T, 1]
@@ -786,6 +782,14 @@ class PPOAgent:
                               nan=1.0, posinf=1.0, neginf=1.0)
         values = np.nan_to_num(np.array(self.buffer.values, dtype=np.float32),
                                nan=0.0, posinf=0.0, neginf=0.0)
+
+        # v8.3: Batch normalization of rewards for GAE computation.
+        # Replaces per-step EMA normalization with batch-level standardization,
+        # giving the critic a consistent target scale across episodes.
+        mu = rewards.mean()
+        std = rewards.std()
+        rewards = (rewards - mu) / max(std, 1e-8)
+        rewards = np.clip(rewards, -10.0, 10.0)
 
         # GAE
         T = len(rewards)
@@ -897,16 +901,11 @@ class PPOAgent:
                     auc_lp_new, auc_ent = self.auction_policy.evaluate(obs1[mb], auc_raw[mb])
                     sec_lp_new, sec_ent = self.secondary_policy.evaluate(obs2[mb], sec_raw[mb])
 
-                    # Phase-specific credit assignment (same as update())
-                    _auc_savings_idx = self.obs_dim_phase1 + 4
-                    _auc_savings = obs2[mb, _auc_savings_idx:_auc_savings_idx+1]
-                    _auc_weight = (1.0 + torch.tanh(_auc_savings)).detach()
-
+                    # v8.3: _auc_weight heuristic removed (same as update())
                     auc_log_ratio = torch.clamp(auc_lp_new - old_auc_lp[mb], -2.0, 2.0)
                     auc_ratio = torch.exp(auc_log_ratio)
-                    auc_adv = weighted_adv[mb] * _auc_weight
-                    auc_surr1 = auc_ratio * auc_adv
-                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
+                    auc_surr1 = auc_ratio * weighted_adv[mb]
+                    auc_surr2 = torch.clamp(auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * weighted_adv[mb]
                     auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
 
                     sec_log_ratio = torch.clamp(sec_lp_new - old_sec_lp[mb], -2.0, 2.0)

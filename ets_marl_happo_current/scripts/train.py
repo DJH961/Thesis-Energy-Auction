@@ -945,12 +945,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             obs1_next, rewards, terminated, truncated, info = env.step_secondary(
                 secondary_actions)
 
-            # P3: Normalise rewards per-agent before storing in buffer
-            normalised_rewards = np.array([
-                agents[i].normalize_reward(rewards[i]) for i in range(n_agents)
-            ], dtype=np.float32)
+            # v7.6: Store raw rewards directly in buffer — batch normalization
+            # happens inside compute_gae(). RewardNormalizer kept for monitoring only.
+            for i in range(n_agents):
+                agents[i].normalize_reward(rewards[i])  # update stats for logging only
 
-            # Store transitions with normalised rewards
+            # Store transitions with raw rewards
             for i in range(n_agents):
                 value = agents[i].estimate_value(
                     global_state if _centralized else obs2[i])
@@ -958,7 +958,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     obs1=obs1[i], obs2=obs2[i],
                     auc_raw=auction_raws[i], sec_raw=secondary_raws[i],
                     auc_lp=auction_logps[i], sec_lp=secondary_logps[i],
-                    reward=normalised_rewards[i], done=terminated, value=value,
+                    reward=float(rewards[i]), done=terminated, value=value,
                     global_state=global_state,
                 )
 
@@ -1099,8 +1099,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     adv, ret, buf = agents[i].compute_gae(last_value=0.0)
                     gae_data.append((adv, ret, buf))
 
-                # 2. Sequential update in random order
-                order = episode_rng.permutation(n_agents).tolist()
+                # 2. Sequential update ordered by initial emission intensity (highest first).
+                # v7.6: Fixed ordering ensures highest emitters get the cleanest
+                # advantages (before ratio drift from earlier updates).
+                order = sorted(range(n_agents), key=lambda i: env.companies[i].initial_ef, reverse=True)
                 # Determine expected trajectory length for HAPPO ratio chain.
                 # Agents with mismatched T (e.g. HPP-cleared buffers) are
                 # excluded from the M-factor accumulation chain entirely.
