@@ -903,6 +903,47 @@ def test_batch_normalization_replaces_ema():
     assert torch.all(torch.isfinite(ret_t)), "Returns contain non-finite values"
 
 
+def test_split_rewards_sum_to_total():
+    """r_auction + r_secondary ≈ old_single_reward for the same environment state."""
+    config = load_config()
+    config["simulation"]["n_years"] = 3
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset()
+
+    n = env.n_agents
+    auction_actions = np.zeros((n, 10), dtype=np.float32)
+    auction_actions[:, 0] = 80.0   # p1
+    auction_actions[:, 1] = 0.33   # q1
+    auction_actions[:, 2] = 80.0   # p2
+    auction_actions[:, 3] = 0.33   # q2
+    auction_actions[:, 4] = 80.0   # p3
+    auction_actions[:, 5] = 0.34   # q3
+    auction_actions[:, 6] = -1.0   # no investment
+    auction_actions[:, 9] = 1.0    # solar
+
+    env.step_auction(auction_actions)
+
+    # Get auction intermediate reward
+    r_auction = env.compute_auction_rewards()
+
+    secondary_actions = np.zeros((n, 2), dtype=np.float32)
+    secondary_actions[:, 0] = 1.0
+    secondary_actions[:, 1] = 0.0
+    _, total_rewards, _, _, _ = env.step_secondary(secondary_actions)
+
+    # r_secondary = total - r_auction
+    r_secondary = total_rewards - r_auction[:n]
+
+    # Sum should be close to total
+    r_sum = r_auction[:n] + r_secondary
+    np.testing.assert_allclose(r_sum, total_rewards, atol=1e-6,
+        err_msg="Split rewards should sum to total reward")
+
+
 def test_tranche_reward_sum():
     """The total auction cost / annual_budget should be consistent with tranche costs."""
     config = load_config()

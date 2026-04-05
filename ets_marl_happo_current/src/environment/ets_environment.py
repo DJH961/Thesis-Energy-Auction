@@ -1509,6 +1509,41 @@ class ETSEnvironment(gym.Env):
         return obs_phase2, log
 
     # ------------------------------------------------------------------
+    # Split Rewards: Auction-phase intermediate reward (v7.6)
+    # ------------------------------------------------------------------
+
+    def compute_auction_rewards(self) -> np.ndarray:
+        """
+        Compute per-agent intermediate reward for the auction phase.
+
+        This captures costs attributable to auction-phase decisions:
+        auction payment, collateral, investment, OPEX delta, MAC cost,
+        and budget/capex penalties. Normalized by annual_budget.
+
+        Must be called after step_auction() and before step_secondary().
+
+        Returns
+        -------
+        r_auction : np.ndarray, shape (n_agents,)
+            Auction-phase reward per learning agent (negative = cost).
+        """
+        r_auction = np.zeros(self.n_agents)
+        for i in range(self.n_agents):
+            company = self.companies[i]
+            budget_divisor = max(company.annual_budget, 1.0)
+
+            auction_cost = float(self._phase1_payments[i])
+            investment_cost = float(self._phase1_invest_costs[i])
+            opex_delta = company.compute_operational_cost(self.current_year) - company.baseline_opex
+            mac_cost_i = float(self._phase1_mac_costs[i])
+            collateral_cost_i = float(self._collateral_locked[i]) * float(
+                self.config["auction"]["collateral"].get("opportunity_cost_rate", 0.05))
+
+            r_auction[i] = -(auction_cost + collateral_cost_i + investment_cost
+                             + opex_delta + mac_cost_i) / budget_divisor
+        return r_auction
+
+    # ------------------------------------------------------------------
     # Phase 2: Secondary Market + Compliance + Rewards
     # ------------------------------------------------------------------
 

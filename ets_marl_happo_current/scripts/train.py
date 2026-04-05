@@ -926,9 +926,24 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
             obs2, auction_info = env.step_auction(auction_actions)
 
+            # v7.6: Split rewards — compute auction-phase intermediate reward
+            r_auction = env.compute_auction_rewards()
+
             # MAPPO: construct global state from all agents' phase2 obs
             _centralized = config["ppo"].get("centralized_critic", False)
             global_state = obs2.flatten() if _centralized else None
+
+            # Store auction-phase transition (done=False: episode continues)
+            for i in range(n_agents):
+                value_auc = agents[i].estimate_value(
+                    global_state if _centralized else obs2[i])
+                agents[i].store_transition(
+                    obs1=obs1[i], obs2=obs2[i],
+                    auc_raw=auction_raws[i], sec_raw=np.zeros(2, dtype=np.float32),
+                    auc_lp=auction_logps[i], sec_lp=0.0,
+                    reward=float(r_auction[i]), done=False, value=value_auc,
+                    global_state=global_state,
+                )
 
             # === PHASE 2: Secondary Market ===
             secondary_actions = np.zeros((n_agents, 2), dtype=np.float32)
@@ -945,20 +960,24 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             obs1_next, rewards, terminated, truncated, info = env.step_secondary(
                 secondary_actions)
 
+            # v7.6: Split rewards — secondary reward = total reward - auction reward
+            # This ensures r_auction + r_secondary ≈ total reward.
+            r_secondary = rewards - r_auction[:n_agents]
+
             # v7.6: Store raw rewards directly in buffer — batch normalization
             # happens inside compute_gae(). RewardNormalizer kept for monitoring only.
             for i in range(n_agents):
                 agents[i].normalize_reward(rewards[i])  # update stats for logging only
 
-            # Store transitions with raw rewards
+            # Store secondary-phase transition
             for i in range(n_agents):
-                value = agents[i].estimate_value(
+                value_sec = agents[i].estimate_value(
                     global_state if _centralized else obs2[i])
                 agents[i].store_transition(
                     obs1=obs1[i], obs2=obs2[i],
                     auc_raw=auction_raws[i], sec_raw=secondary_raws[i],
                     auc_lp=auction_logps[i], sec_lp=secondary_logps[i],
-                    reward=float(rewards[i]), done=terminated, value=value,
+                    reward=float(r_secondary[i]), done=terminated, value=value_sec,
                     global_state=global_state,
                 )
 
@@ -1104,9 +1123,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 # advantages (before ratio drift from earlier updates).
                 order = sorted(range(n_agents), key=lambda i: env.companies[i].initial_ef, reverse=True)
                 # Determine expected trajectory length for HAPPO ratio chain.
+                # v7.6: With split rewards, T = 2 × n_years per episode.
                 # Agents with mismatched T (e.g. HPP-cleared buffers) are
                 # excluded from the M-factor accumulation chain entirely.
-                expected_T = episodes_per_update * n_years
+                expected_T = episodes_per_update * n_years * 2
                 cumulative_ratio = torch.ones(expected_T, 1)
 
                 for j in order:

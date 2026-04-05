@@ -51,12 +51,25 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
   importance ratio drift from earlier agents' updates. This is deterministic and aligns
   learning priority with where abatement decisions matter most.
 
-### Phase E — Tests
+### Phase E — Split Rewards / Two-Phase (`ets_environment.py`, `train.py`)
+- **`compute_auction_rewards()` method**: New method computes per-agent intermediate reward
+  after `step_auction()` completes. Collapses all tranche costs into a single auction-phase
+  reward (practical shortcut to avoid quadrupling T with per-tranche rewards):
+  `r_auction = -(auction_cost + collateral + investment + opex_delta + mac_cost) / annual_budget`.
+  Collateral normalization uses `/annual_budget`, consistent with `collateral_load_last` obs[29].
+- **Two transitions per year-step**: `train.py` now stores two buffer entries per year:
+  (1) auction-phase transition with `r_auction`, `done=False`; (2) secondary-phase transition
+  with `r_secondary = total_reward - r_auction`, `done=terminated`. This doubles T from
+  `n_years` to `2 × n_years` per episode, providing proper credit assignment to each phase.
+- **`expected_T` updated**: HAPPO ratio chain now expects `2 × n_years × episodes_per_update`.
+
+### Phase F — Tests
 - **New tests**: `test_opex_delta_zero_for_unchanged_mix`, `test_esg_cost_balance_preserved`,
-  `test_batch_normalization_replaces_ema`, `test_tranche_reward_sum`.
+  `test_batch_normalization_replaces_ema`, `test_split_rewards_sum_to_total`,
+  `test_tranche_reward_sum`.
 - **Updated**: `test_terminal_bank_uses_1000_divisor` → `test_terminal_bank_uses_budget_divisor`
   (references `/annual_budget` instead of `/1000`).
-- **All 245 tests pass**.
+- **All 246 tests pass**.
 
 ### Config / Metadata
 - `pyproject.toml`: version 8.3.0
