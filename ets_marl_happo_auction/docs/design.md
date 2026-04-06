@@ -458,6 +458,22 @@ Revenue offsets cost signal and links carbon prices to generation margins.
 Each company has an annual spending envelope for all major outlays.
 Separate capex throughput constraint models physical delivery bottlenecks.
 
+### 9.4 Budget Hardening Regime (v8.4)
+
+Annual spending is subject to a tiered penalty regime:
+- **Below 100%** (`soft_zone_start`): No penalty.
+- **100–115%** (`soft_zone_start` → `hard_cap_fraction`): Quadratic penalty
+  that scales with overshoot amount: `coef × (normalized²) × overshoot_abs`.
+- **Above 115%**: Penalty continues to grow steeply (normalized > 1).
+- **Investment hard gate**: When enabled, `step_auction()` scales down
+  investment fraction if total projected spending would exceed the hard cap.
+  This applies to the 10D action format with 3-tranche auction bids.
+
+This replaces the previous 3-tier contingency/quadratic system and provides
+clearer economic semantics: spending is free up to budget, incurs increasing
+opportunity cost in the soft zone, and is structurally prevented from running
+far above the hard cap.
+
 ## 10. Current Simplifications
 
 The model remains stylized despite expanded realism:

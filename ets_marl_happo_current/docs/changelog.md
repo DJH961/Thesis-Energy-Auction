@@ -5,6 +5,42 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.7.0
+
+**Budget Hardening, Reward Channels, Heuristic Loan-Awareness**
+
+### Phase D — Reward Channels (`ets_environment.py`)
+- **Structured reward logging**: `_last_reward_channels` and `_last_auction_reward_channels`
+  dicts populated after each year. Each dict contains named reward components
+  (cost_norm, penalty_norm, green_bonus, esg_signal, efficiency_bonus, opp_cost,
+  budget_penalty, capex_penalty, loan_interest, base_reward, shaping_reward) for
+  debugging and analysis. No change to reward computation.
+
+### Phase F — Heuristic Loan-Awareness (`heuristic_policy.py`)
+- **Loan-aware bidding**: When `loan_outstanding_norm > 0.01`, heuristic bots reduce
+  auction qty (−30%), investment (−50%), and secondary buy volume (−40%) proportional
+  to loan pressure. Prevents bots from over-extending when emergency loans are outstanding.
+- **`train.py` integration**: BC warm-start callsites pass `loan_outstanding_norm`.
+
+### Phase H — Config Tuning (`default.yaml`)
+- **Budget hardening parameters**: Added `hard_cap_fraction` (1.15), `soft_zone_start` (1.0),
+  `tiered_penalty_coef` (2.0), `investment_hard_gate` (true) to budget config section.
+
+### Phase I — Environment Fixes (`company.py`, `ets_environment.py`)
+- **Tiered budget penalty**: Replaced 3-tier contingency/quadratic/hard system with
+  clean soft-zone quadratic: zero below `soft_zone_start`, quadratic ramp in
+  [soft_zone_start, hard_cap_fraction], steep growth above. Penalty scales with
+  overshoot amount, not full budget.
+- **Investment hard gate**: Pre-investment check in `step_auction()` scales down
+  `invest_frac` if total spending would exceed `hard_cap_fraction × annual_budget`.
+
+### Phase J — Tests
+- **14 new tests** per codebase covering: reward channel population (4), heuristic
+  loan-awareness (3), tiered budget penalty (5), investment hard gate (1),
+  reward channels in integration (1). All ported to auction codebase.
+- **Current**: 260/260 tests pass.
+- **Auction**: 265/265 tests pass.
+
 ## v7.6.1
 
 **Calibration/Diagnostics + Phase-Aware Reward Pipeline Patch**

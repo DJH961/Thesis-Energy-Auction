@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v7.6.1
+# ETS MARL — Configuration v7.7.0
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
