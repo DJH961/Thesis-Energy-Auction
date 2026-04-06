@@ -728,9 +728,10 @@ class Company:
                                annual_budget: float = 1e9,
                                suspension_remaining_norm: float = 0.0,
                                collateral_load_last: float = 0.0,
-                               bid_affordability_last: float = 0.0):
+                               bid_affordability_last: float = 0.0,
+                               n_years: int = 12):
         """
-        Phase 1 observation (pre-auction): 29D base + 5*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 29D base + 6*(N-1) opponent dims.
 
         Phase G consolidation: 28D → 24D (−4 dims), then +2 safety dims = 26D,
         then +3 loan/affordability dims = 29D.
@@ -762,10 +763,10 @@ class Company:
         [25] collateral_load_last: last year's collateral locked / annual_budget
         [26] bid_affordability_last: last year's bid_total / budget_remaining (clipped [0,1])
         [27] loan_outstanding_norm: emergency loan outstanding / annual_budget
-        [28] years_under_loan_norm: remaining loan years / 12
+        [28] years_under_loan_norm: remaining loan years / n_years
 
-        Opponent dims (if opponent_modeling enabled, 5D per opponent):
-        [29..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
+        Opponent dims (if opponent_modeling enabled, 6D per opponent):
+        [29..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total, is_active) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
@@ -813,7 +814,7 @@ class Company:
             float(np.clip(collateral_load_last, 0.0, 1.0)),       # [25] collateral load last year
             float(np.clip(bid_affordability_last, 0.0, 1.0)),     # [26] bid affordability
             self.get_loan_outstanding_norm(),                      # [27] loan outstanding norm
-            float(self._years_under_loan / 12.0),                 # [28] years under loan norm
+            float(self._years_under_loan / max(n_years, 1)),                 # [28] years under loan norm
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])

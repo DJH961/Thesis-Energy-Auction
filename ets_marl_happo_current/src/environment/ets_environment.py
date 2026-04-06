@@ -22,7 +22,7 @@ Action space (Phase 1): 6D continuous
   tech_choice is derived by argmax of the 3 logits (discrete from continuous)
 
 Action space (Phase 2): 2D continuous
-  [price_multiplier, quantity]
+  [price_abs (EUR/t), quantity]
 
 Roadmap improvements (P1-P4): price MA, entropy, reward normalisation, green shaping.
 Opponent modeling: Phase 1 obs augmented with last-episode (bid/200, green_frac) for N-1 agents.
@@ -1051,14 +1051,15 @@ class ETSEnvironment(gym.Env):
             system_ef = float(np.mean([c.weighted_emission_factor for c in active_companies]))
             # Update budgets for all companies (agents + bots)
             for c in active_companies:
-                c.apply_loan_repayment()  # B4: repay before setting new budget
                 c.set_annual_budget(
                     c.compute_dynamic_budget(smoothed_price, system_ef, self.current_year)
                 )
+                c.apply_loan_repayment()  # B4: repay from fresh dynamic budget
                 c.reset_budget()
                 c.reset_capex_budget()
         else:
-            for company in self.companies:
+            active_companies = [c for c in self.companies if self._is_agent_active(c.agent_id)]
+            for company in active_companies:
                 company.apply_loan_repayment()
                 company.reset_budget()
                 company.reset_capex_budget()
@@ -1665,7 +1666,7 @@ class ETSEnvironment(gym.Env):
         ----------
         secondary_actions : np.ndarray, shape (n_learning, 2)
             Actions for learning agents only.
-            [price_multiplier, quantity] per agent.
+            [price_abs (EUR/t), quantity] per agent.
             Bot actions are generated internally via heuristic_policy.
 
         Returns
@@ -1878,6 +1879,15 @@ class ETSEnvironment(gym.Env):
             "sec_qty_actions": secondary_actions[:, 1].tolist(),  # Phase 2 action[1] (raw)
             "sec_action_sides": sec_action_sides.tolist(),         # -1=sell, 0=hold, 1=buy intent
             "liquidity_pool": liquidity_pool_info,
+            "friction_costs": [
+                float(payments[i]) + float(collateral_costs[i]) + float(self._mac_costs[i])
+                for i in range(self.n_total)
+            ],
+            "opex_savings": [
+                -(self.companies[i].compute_operational_cost(self.current_year)
+                  - self.companies[i].baseline_opex)
+                for i in range(self.n_total)
+            ],
         })
         self.episode_log.append(log)
 
@@ -2166,11 +2176,12 @@ class ETSEnvironment(gym.Env):
             collateral_cost_i = float(collateral_costs[i])
             loan_interest_cost = company.compute_green_loan_cost()
 
-            # Record spending: penalty now included in budget tracking
+            # Record spending: penalty and loan interest now included in budget tracking
             # Secondary revenue (negative cost) reduces spending, freeing up budget headroom
             company.record_spending(auction_cost + secondary_cost
                                     + investment_cost + mac_cost_i
-                                    + collateral_cost_i + penalty_cost)
+                                    + collateral_cost_i + penalty_cost
+                                    + loan_interest_cost)
             company.record_capex_spending(investment_cost)
             budget_penalty = company.compute_budget_penalty()
             capex_penalty = company.compute_capex_penalty()
@@ -2377,14 +2388,22 @@ class ETSEnvironment(gym.Env):
         return results
 
     def _compute_price_ma3(self) -> float:
-        """P1: 3-year moving average of clearing price."""
+        """P1: 3-year moving average of clearing price.
+        When auctions have failed for ≥2 consecutive years, blend toward
+        expected_price to prevent stale MA3 from misleading agents.
+        """
         if not self._price_history:
             # Fallback to AR(1) expected price (initialized at ~80€) instead
             # of last_clearing_price which may be the reserve price after a
             # failed auction.
             return self.expected_price
         window = self._price_history[-3:]
-        return float(np.mean(window))
+        ma3 = float(np.mean(window))
+        n = self._consecutive_years_without_valid_auction_clear
+        if n >= 2:
+            blend = min(1.0, (n - 1) * 0.5)
+            return (1 - blend) * ma3 + blend * self.expected_price
+        return ma3
 
     def _get_obs_phase1(self) -> np.ndarray:
         """Phase 1 observations for learning agents only.
@@ -2481,6 +2500,7 @@ class ETSEnvironment(gym.Env):
                 suspension_remaining_norm=susp_norm,
                 collateral_load_last=float(self._last_collateral_load[i]),
                 bid_affordability_last=float(self._bid_affordability[i]),
+                n_years=self.n_years,
             )
             obs_list.append(obs_i)
 

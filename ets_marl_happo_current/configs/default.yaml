@@ -27,9 +27,9 @@ tabula_rasa:
   epsilon_decay_frac: 0.50
   entropy_coef: 0.08
   entropy_decay_start_frac: 0.0     # no plateau — decay from ep 0
-  entropy_decay_window_frac: 0.85
+  entropy_decay_window_frac: 0.95
   critic_warmup_frac: 0.10
-  shaping_decay_frac: 0.20
+  shaping_decay_frac: 0.33
   hpp_warmup_frac: 0.25
   exploration_mode: "uniform"        # side-balanced uniform auction-price sampling around expected price
 
@@ -384,7 +384,7 @@ ppo:
   gae_lambda: 0.97
   clip_eps: 0.2
   entropy_coef: 0.05
-  entropy_coef_final: 0.015
+  entropy_coef_final: 0.025
   entropy_decay_start: 0     # auto: 5% of n_episodes
   entropy_decay_window: 0    # 0 = auto (80% of n_episodes)
   value_coef: 0.5

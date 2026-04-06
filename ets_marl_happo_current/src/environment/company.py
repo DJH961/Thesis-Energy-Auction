@@ -742,7 +742,8 @@ class Company:
                                annual_budget: float = 1e9,
                                suspension_remaining_norm: float = 0.0,
                                collateral_load_last: float = 0.0,
-                               bid_affordability_last: float = 0.0):
+                               bid_affordability_last: float = 0.0,
+                               n_years: int = 12):
         """
         Phase 1 observation (pre-auction): 33D base + 5*(N-1) opponent dims.
 
@@ -775,10 +776,10 @@ class Company:
              (clipped [0,1]; high → overbid risk; agents learn to stay below budget)
         [30] bid_affordability_last: last year's bid_total / budget_remaining (clipped [0,1])
         [31] loan_outstanding_norm: emergency loan outstanding / annual_budget
-        [32] years_under_loan_norm: remaining loan years / 12
+        [32] years_under_loan_norm: remaining loan years / n_years
 
-        Opponent dims (if opponent_modeling enabled, 5D per opponent):
-        [33..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
+        Opponent dims (if opponent_modeling enabled, 6D per opponent):
+        [33..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total, is_active) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
@@ -834,7 +835,7 @@ class Company:
             float(np.clip(collateral_load_last, 0.0, 1.0)),       # [29] collateral load last year
             float(np.clip(bid_affordability_last, 0.0, 1.0)),     # [30] bid affordability
             self.get_loan_outstanding_norm(),                      # [31] loan outstanding norm
-            float(self._years_under_loan / 12.0),                 # [32] years under loan norm
+            float(self._years_under_loan / max(n_years, 1)),             # [32] years under loan norm
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])

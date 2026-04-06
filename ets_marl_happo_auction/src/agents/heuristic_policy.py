@@ -398,10 +398,10 @@ def auction_action(
 
     # F1: Loan-awareness — when emergency loan outstanding, scale back qty and
     # investment to preserve cash for loan repayment.
-    if loan_outstanding_norm > 0.01:
+    if loan_outstanding_norm > 0.05:
         loan_pressure = min(loan_outstanding_norm, 1.0)
-        # Reduce qty by up to 30% proportional to loan burden
-        qty_mult *= (1.0 - 0.3 * loan_pressure)
+        # Reduce qty by up to 20% (bounded) proportional to loan burden
+        qty_mult *= (1.0 - min(0.20, 0.3 * loan_pressure))
         # Reduce investment by up to 50% proportional to loan burden
         invest_frac *= (1.0 - 0.5 * loan_pressure)
 
