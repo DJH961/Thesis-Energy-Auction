@@ -933,3 +933,58 @@ def test_split_rewards_sum_to_total():
     r_sum = r_auction[:n] + r_secondary
     np.testing.assert_allclose(r_sum, total_rewards, atol=1e-6,
         err_msg="Split rewards should sum to total reward")
+
+
+# ---------------------------------------------------------------------------
+# D: Reward channels (Feature D tests)
+# ---------------------------------------------------------------------------
+
+ACTION_DIM = 6
+
+def test_reward_channels_present():
+    """_last_reward_channels populated after step_secondary."""
+    env = load_env()
+    env.reset()
+    _run_one_year(env)
+    assert len(env._last_reward_channels) > 0
+    for i in range(min(env.n_agents, 2)):
+        ch = env._last_reward_channels[i]
+        expected_keys = {"cost_norm", "penalty_norm", "green_bonus", "esg_signal",
+                         "efficiency_bonus", "opp_cost", "budget_penalty",
+                         "capex_penalty", "loan_interest", "base_reward", "shaping_reward"}
+        assert expected_keys.issubset(ch.keys()), f"Missing keys: {expected_keys - ch.keys()}"
+
+def test_auction_reward_channels_present():
+    """_last_auction_reward_channels populated after compute_auction_rewards."""
+    env = load_env()
+    env.reset()
+    n = env.n_agents
+    auction_actions = np.zeros((n, ACTION_DIM), dtype=np.float32)
+    auction_actions[:, 0] = 80.0
+    auction_actions[:, 1] = 0.5
+    env.step_auction(auction_actions)
+    env.compute_auction_rewards()
+    assert len(env._last_auction_reward_channels) > 0
+    for i in range(min(env.n_agents, 2)):
+        ch = env._last_auction_reward_channels[i]
+        expected_keys = {"auction_cost", "collateral_cost", "investment_cost",
+                         "opex_delta", "mac_cost", "loan_interest", "capex_penalty"}
+        assert expected_keys.issubset(ch.keys()), f"Missing keys: {expected_keys - ch.keys()}"
+
+def test_reward_channels_values_finite():
+    """All reward channel values must be finite."""
+    env = load_env()
+    env.reset()
+    _run_one_year(env)
+    for i in env._last_reward_channels:
+        for k, v in env._last_reward_channels[i].items():
+            assert np.isfinite(v), f"Channel {k} for agent {i} is not finite: {v}"
+
+def test_reward_channels_reset():
+    """Channels should be cleared on reset."""
+    env = load_env()
+    env.reset()
+    _run_one_year(env)
+    assert len(env._last_reward_channels) > 0
+    env.reset()
+    assert len(env._last_reward_channels) == 0

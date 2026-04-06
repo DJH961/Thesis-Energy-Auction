@@ -315,3 +315,46 @@ class TestCapexThroughput:
         # Should be within capex remaining (10 M€) or invest_frac should be ~0
         assert est_cost <= 10.0 + 1e-3 or invest_frac < 1e-4, (
             f"invest_frac={invest_frac}, est_cost={est_cost} should respect capex_throughput=10")
+
+
+# ---------------------------------------------------------------------------
+# F: Heuristic loan-awareness tests
+# ---------------------------------------------------------------------------
+
+INVEST_IDX = 2
+
+def test_loan_awareness_reduces_qty(config):
+    """Loan-awareness should reduce bid qty when loan_outstanding_norm > 0."""
+    c = make_company(config, agent_id=0)
+    bank = 5.0
+    a_normal = auction_action(c, price_ma3=80.0, current_year=0, n_years=12,
+                               config=config, bank=bank, loan_outstanding_norm=0.0)
+    qty_normal = a_normal[1]
+    a_loan = auction_action(c, price_ma3=80.0, current_year=0, n_years=12,
+                             config=config, bank=bank, loan_outstanding_norm=0.5)
+    qty_loan = a_loan[1]
+    assert qty_loan <= qty_normal, f"Loan should reduce qty: {qty_loan} vs {qty_normal}"
+
+def test_loan_awareness_reduces_invest(config):
+    """Loan-awareness should reduce investment fraction when loan outstanding."""
+    c1 = make_company(config, agent_id=0)
+    bank = 5.0
+    a_normal = auction_action(c1, price_ma3=80.0, current_year=0, n_years=12,
+                               config=config, bank=bank, loan_outstanding_norm=0.0)
+    c2 = make_company(config, agent_id=0)
+    a_loan = auction_action(c2, price_ma3=80.0, current_year=0, n_years=12,
+                             config=config, bank=bank, loan_outstanding_norm=0.8)
+    assert a_loan[INVEST_IDX] <= a_normal[INVEST_IDX]
+
+def test_loan_awareness_secondary_reduces_buying(config):
+    """Loan-awareness should reduce secondary market buy target."""
+    c = make_company(config, agent_id=0)
+    a_normal = secondary_action(c, bank=0.5, allocation=2.0,
+                                 clearing_price=80.0, config=config,
+                                 loan_outstanding_norm=0.0)
+    a_loan = secondary_action(c, bank=0.5, allocation=2.0,
+                               clearing_price=80.0, config=config,
+                               loan_outstanding_norm=0.8)
+    # If buying, loan should reduce the buy qty (a[1] = qty, positive = buy)
+    if a_normal[1] > 0.01:
+        assert a_loan[1] <= a_normal[1] + 0.01
