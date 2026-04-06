@@ -351,13 +351,16 @@ def test_budget_penalty_on_overspend(config):
     assert penalty > 0, "Should penalize overspending"
 
 def test_budget_penalty_contingency_zone(config):
-    """5% overspend should be small but non-zero in the contingency zone."""
+    """5% overspend should be positive in the soft zone (tiered penalty)."""
     c = make_company(config, agent_id=0)
     c.reset_budget()
     c.record_spending(1.05 * c.annual_budget)
     p = c.compute_budget_penalty()
     assert p > 0.0
-    assert p < 0.2
+    # With tiered formula: coef * (normalized²) * overshoot_abs
+    # normalized = 0.05/0.15 ≈ 0.333, overshoot_abs = 0.05 * budget
+    # Must be moderate (not catastrophic) relative to budget
+    assert p < c.annual_budget * 0.05, "Soft-zone penalty should stay moderate"
 
 
 def test_budget_penalty_quadratic_zone_larger(config):
@@ -383,6 +386,7 @@ def test_investment_scaled_to_budget_hard_cap():
     """Overspend attempt above 20% should be clipped by hard_cap_multiplier."""
     cfg = load_env_config(seed=11)
     n_agents = cfg["companies"]["n_agents"]
+    cfg["budget"]["mode"] = "fixed"
     cfg["budget"]["annual_budgets"] = [100.0] * n_agents
     cfg["budget"]["hard_cap_multiplier"] = 1.20
     cfg["budget"]["capex_throughputs"] = [1e9] * n_agents
@@ -410,8 +414,10 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
     """Capex at throughput is allowed; larger request is clipped to throughput."""
     cfg = load_env_config(seed=22)
     n_agents = cfg["companies"]["n_agents"]
+    cfg["budget"]["mode"] = "fixed"
     cfg["budget"]["annual_budgets"] = [5000.0] * n_agents
     cfg["budget"]["hard_cap_multiplier"] = 10.0
+    cfg["budget"]["hard_cap_fraction"] = 10.0  # disable hard gate for this test
     cfg["technologies"]["decommission_costs"] = [0, 0, 0, 0, 0]
 
     probe_env = ETSEnvironment(cfg, seed=22)
@@ -455,35 +461,35 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
 # ---------------------------------------------------------------------------
 
 def test_obs_phase1_shape(config):
-    """Phase 1 obs should be 30D base (no opponent modeling)."""
+    """Phase 1 obs should be 33D base (no opponent modeling)."""
     c = make_company(config, agent_id=0)
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, auction_gap=1.0)
-    assert obs.shape == (30,), f"Expected 30D, got {obs.shape}"
+    assert obs.shape == (33,), f"Expected 33D, got {obs.shape}"
     assert obs.dtype == np.float32
 
 def test_obs_phase1_with_opponents(config):
-    """With opponent modeling, obs should have 30 + 5*(N-1) dims."""
+    """With opponent modeling, obs should have 33 + 6*(N-1) dims."""
     config_opp = {**config, "opponent_modeling": {"enabled": True}}
     c = make_company(config_opp, agent_id=0)
-    opponent_obs = np.zeros(5 * 3, dtype=np.float32)  # 3 opponents
+    opponent_obs = np.zeros(6 * 3, dtype=np.float32)  # 3 opponents, 6D each
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, opponent_obs=opponent_obs)
-    assert obs.shape == (30 + 15,)
+    assert obs.shape == (33 + 18,)
 
 def test_obs_phase2_extends_phase1(config):
-    """Phase 2 obs = phase1 + 8 extra dims."""
+    """Phase 2 obs = phase1 + 10 extra dims."""
     c = make_company(config, agent_id=0)
     obs1 = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0, expected_price=80.0)
     obs2 = c.get_observation_phase2(
         obs_phase1=obs1, allocation=2.0, clearing_price=80.0,
         emissions=3.0, banked=1.0, emission_shock=0.05, payment=160.0)
-    assert obs2.shape == (30 + 8,)
-    # First 30 dims should match phase1
-    np.testing.assert_array_equal(obs2[:30], obs1)
+    assert obs2.shape == (33 + 10,)
+    # First 33 dims should match phase1
+    np.testing.assert_array_equal(obs2[:33], obs1)
 
 def test_obs_values_finite(config):
     """All observation values should be finite."""
@@ -517,7 +523,7 @@ def test_obs_price_normalization(config):
 def test_public_info_keys(config):
     c = make_company(config, agent_id=0)
     info = c.get_public_info()
-    assert set(info.keys()) == {"emissions", "carry_forward", "green_frac", "fossil_frac", "queue_total"}
+    assert set(info.keys()) == {"emissions", "carry_forward", "green_frac", "fossil_frac", "queue_total", "is_active"}
 
 def test_queue_capacity_shape(config):
     c = make_company(config, agent_id=0)
@@ -587,3 +593,104 @@ def test_investment_hits_both_budgets(config):
     c.record_capex_spending(invest_cost)
     assert c.budget_spent_this_year == 50.0
     assert c.capex_spent_this_year == 50.0
+
+
+# ---------------------------------------------------------------------------
+# H+I: Tiered budget penalty & investment hard gate tests
+# ---------------------------------------------------------------------------
+
+def test_tiered_penalty_zero_below_soft_zone(config):
+    """No penalty when spending is below soft_zone_start."""
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.record_spending(0.95 * c.annual_budget)
+    assert c.compute_budget_penalty() == 0.0
+
+def test_tiered_penalty_positive_in_soft_zone(config):
+    """Positive penalty when spending is in [soft_zone_start, hard_cap_fraction]."""
+    config["budget"]["soft_zone_start"] = 1.0
+    config["budget"]["hard_cap_fraction"] = 1.15
+    config["budget"]["tiered_penalty_coef"] = 2.0
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.record_spending(1.10 * c.annual_budget)
+    p = c.compute_budget_penalty()
+    assert p > 0.0
+
+def test_tiered_penalty_quadratic_growth(config):
+    """Penalty at 10% overshoot > penalty at 5% overshoot (quadratic growth)."""
+    config["budget"]["soft_zone_start"] = 1.0
+    config["budget"]["hard_cap_fraction"] = 1.15
+    config["budget"]["tiered_penalty_coef"] = 2.0
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.record_spending(1.05 * c.annual_budget)
+    p5 = c.compute_budget_penalty()
+    c.reset_budget()
+    c.record_spending(1.10 * c.annual_budget)
+    p10 = c.compute_budget_penalty()
+    assert p10 > p5, f"Should be larger: {p10} vs {p5}"
+
+def test_tiered_penalty_steep_above_hard_cap(config):
+    """Penalty above hard_cap_fraction should be large."""
+    config["budget"]["soft_zone_start"] = 1.0
+    config["budget"]["hard_cap_fraction"] = 1.15
+    config["budget"]["tiered_penalty_coef"] = 2.0
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.record_spending(1.20 * c.annual_budget)  # above 1.15 hard cap
+    p_above = c.compute_budget_penalty()
+    c.reset_budget()
+    c.record_spending(1.14 * c.annual_budget)  # just inside soft zone
+    p_inside = c.compute_budget_penalty()
+    assert p_above > p_inside
+
+def test_tiered_penalty_respects_config(config):
+    """Custom config values should change penalty magnitude."""
+    config["budget"]["soft_zone_start"] = 0.90
+    config["budget"]["hard_cap_fraction"] = 1.10
+    config["budget"]["tiered_penalty_coef"] = 5.0
+    c = make_company(config, agent_id=0)
+    c.reset_budget()
+    c.record_spending(1.05 * c.annual_budget)
+    p = c.compute_budget_penalty()
+    assert p > 0.0
+
+def test_investment_hard_gate_clips_spending():
+    """Investment hard gate should prevent spending above hard_cap_fraction × budget."""
+    cfg = load_env_config(seed=33)
+    n = cfg["companies"]["n_agents"]
+    cfg["budget"]["annual_budgets"] = [200.0] * n
+    cfg["budget"]["hard_cap_fraction"] = 1.15
+    cfg["budget"]["investment_hard_gate"] = True
+    env = ETSEnvironment(cfg, seed=33)
+    env.reset(seed=33)
+
+    actions = np.zeros((env.n_agents, 6), dtype=np.float32)
+    actions[:, 0] = 80.0
+    actions[:, 1] = 0.3
+    actions[:, 2] = 1.0  # max investment
+    actions[:, 5] = 1.0  # solar
+    env.step_auction(actions)
+    sec = np.zeros((env.n_agents, 2), dtype=np.float32)
+    sec[:, 0] = 80.0
+    _, _, _, _, info = env.step_secondary(sec)
+    for i in range(env.n_agents):
+        invest = float(info["year_log"]["invest_costs"][i])
+        hard_limit = 1.15 * max(env.companies[i].annual_budget, 1.0)
+        assert invest <= hard_limit + 1.0, f"Agent {i}: invest {invest} > hard cap {hard_limit}"
+
+def test_reward_channels_dict_populated():
+    """After a full year, reward channels should be populated for all agents."""
+    cfg = load_env_config(seed=44)
+    env = ETSEnvironment(cfg, seed=44)
+    env.reset(seed=44)
+    n = env.n_agents
+    actions = np.zeros((n, 6), dtype=np.float32)
+    actions[:, 0] = 80.0
+    actions[:, 1] = 0.5
+    env.step_auction(actions)
+    sec = np.zeros((n, 2), dtype=np.float32)
+    sec[:, 0] = 80.0
+    env.step_secondary(sec)
+    assert len(env._last_reward_channels) >= env.n_agents

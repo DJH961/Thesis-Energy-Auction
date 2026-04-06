@@ -223,8 +223,8 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
                     suspension_remaining=int(env._suspension_remaining[i]),
                     suspension_length=suspension_length,
                     collateral_load_last=float(env._last_collateral_load[i]),
+                    loan_outstanding_norm=company.get_loan_outstanding_norm(),
                 )
-                # Expand 6D heuristic -> 10D 3-tranche: split bid into 3 equal tranches
                 p, q = h_auc[0], h_auc[1] / 3.0
                 auction_actions[i] = np.array([p, q, p, q, p, q,
                                                h_auc[2], h_auc[3], h_auc[4], h_auc[5]],
@@ -248,6 +248,7 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
                     config=config,
                     current_year=current_year,
                     n_years=n_years,
+                    loan_outstanding_norm=company.get_loan_outstanding_norm(),
                 )
                 secondary_actions[i] = h_sec
 

@@ -89,24 +89,24 @@ def _apply_per_tranche_budget_drop(prices: np.ndarray, qty_mults: np.ndarray,
     q = np.maximum(qty_mults.astype(float), 0.0)
     p = prices.astype(float)
 
-    def tranche_cost(q_mult_arr: np.ndarray) -> np.ndarray:
+    def tranche_cost(q_mult_arr: np.ndarray, p_arr: np.ndarray) -> np.ndarray:
         qty_abs = q_mult_arr * need
-        above_reserve = np.maximum(0.0, p - float(reserve_price))
-        unit = p + float(collateral_fraction) * above_reserve
+        above_reserve = np.maximum(0.0, p_arr - float(reserve_price))
+        unit = p_arr + float(collateral_fraction) * above_reserve
         return qty_abs * unit
 
-    base_cost = float(np.sum(tranche_cost(q)))
+    base_cost = float(np.sum(tranche_cost(q, p)))
     if base_cost <= budget + 1e-9:
         return q
 
     # Drop cheapest tranche first (T1 after ascending sort).
     q[0] = 0.0
-    cost_after_t1 = float(np.sum(tranche_cost(q)))
+    cost_after_t1 = float(np.sum(tranche_cost(q, p)))
     if cost_after_t1 <= budget + 1e-9:
         return q
 
     # If still too expensive, scale T2/T3 proportionally.
-    rem_cost = float(np.sum(tranche_cost(q[1:])))
+    rem_cost = float(np.sum(tranche_cost(q[1:], p[1:])))
     if rem_cost <= 1e-9:
         q[1:] = 0.0
         return q
@@ -242,6 +242,7 @@ def auction_action(
     suspension_remaining: int = 0,
     suspension_length: int = 2,
     collateral_load_last: float = 0.0,
+    loan_outstanding_norm: float = 0.0,
 ) -> np.ndarray:
     """
     Heuristic Phase-1 (auction + investment) action.
@@ -282,6 +283,9 @@ def auction_action(
     collateral_load_last : float, optional
         Last year's collateral locked / annual_budget [0, 1]. High values mean
         the agent over-committed; heuristic scales qty_mult down to avoid repeat.
+    loan_outstanding_norm : float, optional
+        Emergency loan outstanding / annual_budget [0, ∞). When > 0, the agent
+        bids more conservatively and invests less to preserve cash for repayment.
 
     Returns
     -------
@@ -392,6 +396,15 @@ def auction_action(
         terminal_horizon, price_ma3, current_year, config,
     )
 
+    # F1: Loan-awareness — when emergency loan outstanding, scale back qty and
+    # investment to preserve cash for loan repayment.
+    if loan_outstanding_norm > 0.05:
+        loan_pressure = min(loan_outstanding_norm, 1.0)
+        # Reduce qty by up to 20% (bounded) proportional to loan burden
+        qty_mult *= (1.0 - min(0.20, 0.3 * loan_pressure))
+        # Reduce investment by up to 50% proportional to loan burden
+        invest_frac *= (1.0 - 0.5 * loan_pressure)
+
     # Smooth year-to-year investment to avoid on/off oscillation
     prev = getattr(company, "prev_invest_frac", 0.0)
     invest_frac = float(np.clip(0.5 * invest_frac + 0.5 * prev, 0.0, inv["max_invest_frac"]))
@@ -416,6 +429,7 @@ def secondary_action(
     valuation_noise: float = 0.0,
     urgency_multiplier: float = 1.0,
     urgency_denom: float = 1.5,
+    loan_outstanding_norm: float = 0.0,
 ) -> np.ndarray:
     """
     Heuristic Phase-2 (secondary market) action.
@@ -473,6 +487,11 @@ def secondary_action(
         max_buy_at_price = max_spend / max(clearing_price, 1.0)
         if trade_target > max_buy_at_price:
             trade_target = max_buy_at_price
+
+    # F1: Loan-awareness — reduce buying when loan outstanding
+    if loan_outstanding_norm > 0.01 and trade_target > 0.01:
+        loan_pressure = min(loan_outstanding_norm, 1.0)
+        trade_target *= (1.0 - 0.4 * loan_pressure)
 
     # Fundamentals-based absolute price (MAC→penalty gradient)
     mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)

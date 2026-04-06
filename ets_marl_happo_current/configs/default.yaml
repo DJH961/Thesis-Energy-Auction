@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v7.6.1
+# ETS MARL — Configuration v7.7.0
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -27,9 +27,9 @@ tabula_rasa:
   epsilon_decay_frac: 0.50
   entropy_coef: 0.08
   entropy_decay_start_frac: 0.0     # no plateau — decay from ep 0
-  entropy_decay_window_frac: 0.85
+  entropy_decay_window_frac: 0.95
   critic_warmup_frac: 0.10
-  shaping_decay_frac: 0.20
+  shaping_decay_frac: 0.33
   hpp_warmup_frac: 0.25
   exploration_mode: "uniform"        # side-balanced uniform auction-price sampling around expected price
 
@@ -223,23 +223,31 @@ secondary:
 # Sources: Scope Ratings 2023, Enel/Iberdrola 2024-2027 strategic plans.
 # ----------------------------------------------------------
 budget:
+  mode: "revenue_based"
+  debt_headrooms: [350.0, 350.0, 180.0, 180.0, 50.0, 50.0, -100.0, -100.0]
+  bot_debt_headrooms: [350.0, 350.0, 180.0, 180.0, 50.0, 50.0, -100.0, -100.0]
+  budget_ema_alpha: 0.3
   annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   overspend_penalty_coef: 0.5
   contingency_zone: 0.10
   hard_cap_multiplier: 1.20
   contingency_penalty_coef: 0.05
-  # Sources: Enel/Iberdrola/RWE strategic capex plans (2024-2027) show:
-  # - 5-10% contingency buffer standard in utility capex planning
-  # - Board re-approval required >15%, effectively never granted >20%
-  # capex_overspend_coef: 1.0 — capex throughput remains true hard cap (no soft zone)
-  # Capex throughput: max annual construction spend (M€). Organizational
-  # constraint — permitting pipeline, EPC capacity, mgmt bandwidth.
-  # NOT a financial constraint (that's the unified budget).
-  # Scaled from Iberdrola/Enel RE capex per unit output.
+  # H1: Budget hardening — soft zone + hard ceiling
+  hard_cap_fraction: 1.15       # spending cannot exceed 115% of annual_budget
+  soft_zone_start: 1.00         # tiered penalty begins at 100% spend
+  tiered_penalty_coef: 2.0      # quadratic penalty coefficient in soft zone
+  # H2: Investment feasibility gate
+  investment_hard_gate: true    # block investment if would exceed hard cap
   capex_throughputs: [130.0, 130.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
   bot_capex_throughputs: [130.0, 130.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
   capex_overspend_coef: 1.0
+  emergency_loan:
+    enabled: true
+    max_loan_fraction: 0.15
+    interest_rate: 0.08
+    repayment_years: 3
+  suspension_length: 1
 
 green_finance:
   enabled: false
@@ -322,7 +330,7 @@ electricity:
 # ----------------------------------------------------------
 reward:
   normalizer_alpha: 0.01
-  opportunity_cost_rate: 0.05  # cost-of-capital on banked allowances (not a storage holding fee)
+  opportunity_cost_rate: 0.0  # H4: disabled — agents learn holding decisions through terminal value
   clip_min: -10.0
   clip_max: 10.0         # Increased from 5.0 — symmetric with clip_min to avoid asymmetric gradient compression
   shaping_beta: 7.0              # green_delta bonus weight
@@ -335,7 +343,7 @@ reward:
 
 # ----------------------------------------------------------
 # ESG signal — saved-carbon-years formula
-# esg = w_green × ef_ratio × time_ratio × (annual_budget / 1000)
+# esg = w_green × esg_scale × ef_ratio × time_ratio
 # where ef_ratio = (initial_ef - current_ef) / initial_ef
 #       time_ratio = remaining_years / n_years
 # Terminal ESG: queue items valued by γ^years_late discount
@@ -344,16 +352,16 @@ reward:
 # ----------------------------------------------------------
 esg:
   enabled: true
-  scale: 2.0
+  scale: 3.5
   # Reward = w_cost × (-cost_norm) + w_green × (esg_scale × esg_raw) + shaping
   # Financial agents (w_green=0): reward = -cost_norm
   # ESG agents (w_green=0.5): reward = 0.5×(-cost_norm) + 0.5×(esg_scaled)
   # This structurally guarantees 50/50 financial/environmental weighting.
 
 # ----------------------------------------------------------
-# Opponent modeling — 5D public info per opponent.
-# obs_dim_phase1 = 28 + 5*(N_total-1) = 103 (for 16 agents)
-# obs_dim_phase2 = phase1 + 7 = 110
+# Opponent modeling — 6D public info per opponent.
+# obs_dim_phase1 = 33 + 6*(N_total-1) = 123 (for 16 agents)
+# obs_dim_phase2 = phase1 + 10 = 133
 # ----------------------------------------------------------
 opponent_modeling:
   enabled: true
@@ -376,7 +384,7 @@ ppo:
   gae_lambda: 0.97
   clip_eps: 0.2
   entropy_coef: 0.05
-  entropy_coef_final: 0.015
+  entropy_coef_final: 0.025
   entropy_decay_start: 0     # auto: 5% of n_episodes
   entropy_decay_window: 0    # 0 = auto (80% of n_episodes)
   value_coef: 0.5

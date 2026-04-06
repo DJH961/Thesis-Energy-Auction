@@ -243,16 +243,21 @@ def settle_auction(
     payments: np.ndarray,
     agent_cash: np.ndarray,
     collateral_locked: np.ndarray,
-    suspension_length: int = 2,
+    suspension_length: int = 1,
+    max_loan_budgets: np.ndarray = None,
 ):
     """
     E4: Post-clearing settlement — check each winner can pay; handle defaults.
 
     For each winning agent, the cash available for payment is reduced by any
     collateral already locked pre-bid (margin deposit).  If the remaining cash
-    is insufficient to cover the uniform-price payment the agent defaults:
-    allocations are cancelled, collateral is forfeited, and the agent is
-    suspended for ``suspension_length`` auction rounds.
+    is insufficient to cover the uniform-price payment the agent defaults
+    unless an emergency loan can cover the shortfall.
+
+    If ``max_loan_budgets`` is provided and the shortfall is within the loan
+    limit, the agent keeps its allocation and the shortfall is recorded as a
+    loan.  Otherwise the agent defaults: allocations are cancelled, collateral
+    is forfeited, and the agent is suspended.
 
     Non-winners have their collateral returned automatically (no action needed
     — they never paid anything).
@@ -272,6 +277,8 @@ def settle_auction(
         Reduces effective cash available for the payment.
     suspension_length : int
         Number of auction rounds an agent is suspended after defaulting.
+    max_loan_budgets : np.ndarray or None, shape (n_agents,)
+        Maximum emergency loan each agent can take. If None, no loans.
 
     Returns
     -------
@@ -286,12 +293,15 @@ def settle_auction(
     suspension_steps : np.ndarray, dtype=int
         Rounds to suspend per agent (``suspension_length`` for defaulters, 0
         for all others).
+    loan_amounts : np.ndarray
+        Emergency loan taken per agent (0.0 if no loan or defaulted).
     """
     n = len(allocations)
     actual_allocations = allocations.copy()
     actual_payments = payments.copy()
     defaults_mask = np.zeros(n, dtype=bool)
     suspension_steps = np.zeros(n, dtype=int)
+    loan_amounts = np.zeros(n)
     defaulted_volume = 0.0
 
     for i in range(n):
@@ -299,12 +309,18 @@ def settle_auction(
             continue  # non-winner: collateral released automatically
         # Cash available for payment after collateral is locked
         cash_available = float(agent_cash[i]) - float(collateral_locked[i])
-        if cash_available < float(payments[i]):
-            # Default: insufficient funds → cancel allocation, forfeit collateral
-            defaults_mask[i] = True
-            defaulted_volume += float(allocations[i])
-            actual_allocations[i] = 0.0
-            actual_payments[i] = 0.0
-            suspension_steps[i] = suspension_length
+        payment = float(payments[i])
+        if cash_available < payment:
+            shortfall = payment - cash_available
+            # Try emergency loan if available
+            if max_loan_budgets is not None and shortfall <= float(max_loan_budgets[i]):
+                loan_amounts[i] = shortfall
+            else:
+                # Default: insufficient funds → cancel allocation, forfeit collateral
+                defaults_mask[i] = True
+                defaulted_volume += float(allocations[i])
+                actual_allocations[i] = 0.0
+                actual_payments[i] = 0.0
+                suspension_steps[i] = suspension_length
 
-    return actual_allocations, actual_payments, defaults_mask, defaulted_volume, suspension_steps
+    return actual_allocations, actual_payments, defaults_mask, defaulted_volume, suspension_steps, loan_amounts

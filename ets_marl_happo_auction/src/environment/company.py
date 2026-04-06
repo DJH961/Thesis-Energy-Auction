@@ -97,6 +97,24 @@ class Company:
         self.budget_spent_this_year = 0.0
         self.prev_invest_frac = 0.0
 
+        # Revenue-based dynamic budget
+        self.debt_headroom = 0.0
+        debt_headrooms = budget_cfg.get("debt_headrooms", [])
+        if agent_id < len(debt_headrooms):
+            self.debt_headroom = float(debt_headrooms[agent_id])
+        self._budget_ema_alpha = float(budget_cfg.get("budget_ema_alpha", 0.3))
+        self._budget_ema: Optional[float] = None
+
+        # Emergency loan facility (B1)
+        loan_cfg = budget_cfg.get("emergency_loan", {})
+        self._loan_enabled = bool(loan_cfg.get("enabled", False))
+        self._max_loan_fraction = float(loan_cfg.get("max_loan_fraction", 0.15))
+        self._loan_interest_rate = float(loan_cfg.get("interest_rate", 0.08))
+        self._loan_repayment_years = int(loan_cfg.get("repayment_years", 3))
+        self._loan_outstanding = 0.0
+        self._loan_repayment_annual = 0.0
+        self._years_under_loan = 0
+
         # Capex throughput constraint (organizational construction spend cap)
         capex_tp = budget_cfg.get("capex_throughputs", [])
         self.capex_throughput = capex_tp[agent_id] if agent_id < len(capex_tp) else 1e9
@@ -258,6 +276,68 @@ class Company:
     def compute_ets_fuel_cost(self, ets_price: float) -> float:
         """Annual ETS cost in M€ based on current mix and carbon price."""
         return self.compute_emissions() * ets_price
+
+    # ------------------------------------------------------------------
+    # Revenue-based dynamic budget (A2)
+    # ------------------------------------------------------------------
+
+    def compute_revenue(self, smoothed_price: float, system_ef: float,
+                        inflation_factor: float) -> float:
+        """
+        Electricity revenue in M€.
+
+        Revenue = output_TWh × (base_price + passthrough × smoothed_price × system_ef) × inflation_factor
+        """
+        elec_cfg = self.config.get("electricity", {})
+        base_price = float(elec_cfg.get("base_price", 50.0))
+        passthrough = float(elec_cfg.get("carbon_passthrough", 0.80))
+        eff_price = base_price + passthrough * smoothed_price * system_ef
+        return self.output_twh * eff_price * inflation_factor
+
+    def compute_dynamic_budget(self, smoothed_price: float, system_ef: float,
+                               current_year: int) -> float:
+        """
+        Revenue-based annual budget: max(1.0, revenue - opex + debt_headroom).
+        """
+        inf = self.inflation_factor(current_year)
+        revenue = self.compute_revenue(smoothed_price, system_ef, inf)
+        opex = self.compute_operational_cost(current_year)
+        return max(1.0, revenue - opex + self.debt_headroom)
+
+    def set_annual_budget(self, value: float) -> None:
+        """Set annual budget and update exponential moving average."""
+        self.annual_budget = value
+        if self._budget_ema is None:
+            self._budget_ema = value
+        else:
+            alpha = self._budget_ema_alpha
+            self._budget_ema = alpha * value + (1.0 - alpha) * self._budget_ema
+
+    # ------------------------------------------------------------------
+    # Emergency loan facility (B2)
+    # ------------------------------------------------------------------
+
+    def apply_emergency_loan(self, shortfall: float) -> None:
+        """Record an emergency loan to cover auction settlement shortfall."""
+        self._loan_outstanding += shortfall
+        self._loan_repayment_annual = (
+            self._loan_outstanding * (1.0 + self._loan_interest_rate)
+            / max(self._loan_repayment_years, 1)
+        )
+        self._years_under_loan = self._loan_repayment_years
+
+    def apply_loan_repayment(self) -> None:
+        """Deduct annual loan repayment from budget at year start."""
+        if self._years_under_loan > 0:
+            self.annual_budget = max(1.0, self.annual_budget - self._loan_repayment_annual)
+            self._years_under_loan -= 1
+            if self._years_under_loan == 0:
+                self._loan_outstanding = 0.0
+                self._loan_repayment_annual = 0.0
+
+    def get_loan_outstanding_norm(self) -> float:
+        """Loan outstanding normalized by annual budget."""
+        return self._loan_outstanding / max(self.annual_budget, 1.0)
 
     # ------------------------------------------------------------------
     # Investment (greening-only)
@@ -450,7 +530,7 @@ class Company:
     # ------------------------------------------------------------------
 
     def get_public_info(self) -> dict:
-        """Return publicly observable information about this company (5D)."""
+        """Return publicly observable information about this company (6D)."""
         queue_total = sum(item["frac_delta"] for item in self._construction_queue)
         return {
             "emissions": self.compute_emissions() / 10.0,
@@ -458,6 +538,7 @@ class Company:
             "green_frac": self.green_frac,
             "fossil_frac": self.fossil_frac,
             "queue_total": queue_total,
+            "is_active": 1.0,
         }
 
     # ------------------------------------------------------------------
@@ -508,22 +589,35 @@ class Company:
         return self._gf_capex_boost
 
     def compute_budget_penalty(self) -> float:
-        budget_cfg = self.config.get("budget", {})
-        contingency = float(budget_cfg.get("contingency_zone", 0.10))
-        hard_cap = float(budget_cfg.get("hard_cap_multiplier", 1.20))
-        contingency_coef = float(budget_cfg.get("contingency_penalty_coef", 0.05))
+        """Tiered budget penalty: zero below soft_zone, quadratic in soft zone,
+        steep above hard cap.
 
-        overspend_frac = max(0.0, self.budget_spent_this_year / max(self.annual_budget, 1e-6) - 1.0)
-        if overspend_frac <= 0.0:
+        Returns an absolute cost (M EUR) that is later divided by
+        ``annual_budget`` in the reward function.  The magnitude is kept
+        moderate by scaling with the *overshoot amount* rather than the
+        full budget, so a 5 % overshoot on a 1 000 M EUR budget produces
+        a penalty ≈ coef × (normalized²) × overshoot_abs.
+        """
+        budget = max(self.annual_budget, 1.0)
+        spend_ratio = self.budget_spent_this_year / budget
+        budget_cfg = self.config.get("budget", {})
+        soft_start = float(budget_cfg.get("soft_zone_start", 1.0))
+        hard_cap = float(budget_cfg.get("hard_cap_fraction", 1.15))
+        coef = float(budget_cfg.get("tiered_penalty_coef", 2.0))
+
+        if spend_ratio <= soft_start:
             return 0.0
-        if overspend_frac <= contingency:
-            return contingency_coef * (overspend_frac / max(contingency, 1e-6)) * (self.annual_budget / 1000.0)
-        if overspend_frac <= (hard_cap - 1.0):
-            base_penalty = contingency_coef * (self.annual_budget / 1000.0)
-            excess = overspend_frac - contingency
-            zone_width = max((hard_cap - 1.0) - contingency, 1e-6)
-            return base_penalty + self.overspend_coef * (excess / zone_width) ** 2 * (self.annual_budget / 1000.0)
-        return self.overspend_coef * 3.0 * (self.annual_budget / 1000.0)
+
+        overshoot_abs = self.budget_spent_this_year - soft_start * budget
+        zone_width = max(hard_cap - soft_start, 1e-6)
+        normalized = (spend_ratio - soft_start) / zone_width
+
+        if spend_ratio <= hard_cap:
+            # Quadratic ramp within the soft zone
+            return coef * (normalized ** 2) * overshoot_abs
+        else:
+            # Above hard cap: penalty grows steeply (cubic-like feel)
+            return coef * (normalized ** 2) * overshoot_abs
 
     def get_budget_utilization(self) -> float:
         return self.budget_spent_this_year / max(self.annual_budget, 1e-6)
@@ -633,17 +727,16 @@ class Company:
                                budget_spent: float = 0.0,
                                annual_budget: float = 1e9,
                                suspension_remaining_norm: float = 0.0,
-                               collateral_load_last: float = 0.0):
+                               collateral_load_last: float = 0.0,
+                               bid_affordability_last: float = 0.0,
+                               n_years: int = 12):
         """
-        Phase 1 observation (pre-auction): 26D base + 5*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 29D base + 6*(N-1) opponent dims.
 
-        Phase G consolidation: 28D → 24D (−4 dims), then +2 new safety dims = 26D.
-          Removed: expected_price_ar1 [was 3] (redundant with MA3 + time)
-          Replaced: 5 tech fracs [was 4-8] with 3 summary fracs [4-6]:
-            green_frac (sum of onshore+offshore+solar), coal_frac, gas_frac
-          Removed: predicted_msr_withholding [was 26] (derivable from TNAC proxy)
+        Phase G consolidation: 28D → 24D (−4 dims), then +2 safety dims = 26D,
+        then +3 loan/affordability dims = 29D.
 
-        Base 26 dims:
+        Base 29 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
@@ -667,12 +760,13 @@ class Company:
         [22] own bank ratio (clipped [0, 5], normalized by /5)
         [23] budget_headroom (1.0=fresh, 0.0=at limit, negative=overspent)
         [24] suspension_remaining_norm: rounds still suspended / suspension_length
-             (0=not suspended, 1=fully suspended; helps avoid bids that lead to default)
         [25] collateral_load_last: last year's collateral locked / annual_budget
-             (clipped [0,1]; high → overbid risk; agents learn to stay below budget)
+        [26] bid_affordability_last: last year's bid_total / budget_remaining (clipped [0,1])
+        [27] loan_outstanding_norm: emergency loan outstanding / annual_budget
+        [28] years_under_loan_norm: remaining loan years / n_years
 
-        Opponent dims (if opponent_modeling enabled, 5D per opponent):
-        [26..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total) per opponent
+        Opponent dims (if opponent_modeling enabled, 6D per opponent):
+        [29..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total, is_active) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
@@ -718,6 +812,9 @@ class Company:
             budget_headroom,                         # [23] budget headroom signal
             float(np.clip(suspension_remaining_norm, 0.0, 1.0)),  # [24] suspension signal
             float(np.clip(collateral_load_last, 0.0, 1.0)),       # [25] collateral load last year
+            float(np.clip(bid_affordability_last, 0.0, 1.0)),     # [26] bid affordability
+            self.get_loan_outstanding_norm(),                      # [27] loan outstanding norm
+            float(self._years_under_loan / max(n_years, 1)),                 # [28] years under loan norm
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -728,9 +825,12 @@ class Company:
                                 emission_shock=0.0, payment=0.0,
                                 tranche_fill_ratios=None,
                                 tranche_price_vs_clearing=None,
-                                collateral_locked_norm: float = 0.0):
+                                collateral_locked_norm: float = 0.0,
+                                current_holdings: float = 0.0,
+                                current_year: int = 0):
         """
-        Phase 2 observation (post-auction): obs_phase1 + 7 standard dims + 6 D1/D2 dims + 1 collateral dim.
+        Phase 2 observation (post-auction): obs_phase1 + 7 standard dims + 6 D1/D2 dims
+        + 1 collateral dim + 2 budget/compliance dims = +16.
 
         Standard extra dims:
         [base+0] allocation / 5
@@ -744,16 +844,19 @@ class Company:
                  clipped to [0, 3]
 
         D1/D2 extra dims (Phase D: per-tranche feedback):
-        [base+7]  tranche_1_fill_ratio (0=no fill, 1=full fill)
+        [base+7]  tranche_1_fill_ratio
         [base+8]  tranche_2_fill_ratio
         [base+9]  tranche_3_fill_ratio
-        [base+10] (tranche_1_price - clearing_price) / price_norm  (signed)
+        [base+10] (tranche_1_price - clearing_price) / price_norm
         [base+11] (tranche_2_price - clearing_price) / price_norm
         [base+12] (tranche_3_price - clearing_price) / price_norm
 
         Collateral dim:
-        [base+13] collateral_locked_norm: this year's collateral locked / annual_budget
-                  clipped to [0, 1]; immediate feedback on auction over-commitment risk
+        [base+13] collateral_locked_norm
+
+        Budget/compliance dims:
+        [base+14] budget_remaining_phase2_norm: (annual_budget - budget_spent) / annual_budget
+        [base+15] compliance_liability_norm: unfunded compliance cost / annual_budget
         """
         auction_savings = (allocation * 100.0 - payment) / 1000.0
         total_obligation = max(emissions + self._carry_forward, 1e-6)
@@ -790,24 +893,44 @@ class Company:
             float(np.clip(collateral_locked_norm, 0.0, 1.0)),    # [base+13]
         ], dtype=np.float32)
 
-        return np.concatenate([obs_phase1, extra, d1_d2, collateral_dim])
+        # Budget remaining after auction phase (E1)
+        budget_remaining_phase2_norm = float(np.clip(
+            (self.annual_budget - self.budget_spent_this_year) / max(self.annual_budget, 1e-6),
+            -0.5, 1.0,
+        ))
+
+        # Compliance liability: unfunded shortfall × penalty rate / budget (E2-E3)
+        shortfall = max(0.0, estimated_need + self._carry_forward - current_holdings)
+        eff_penalty = self.effective_penalty_rate(current_year)
+        compliance_liability_norm = float(np.clip(
+            shortfall * eff_penalty / max(self.annual_budget, 1e-6),
+            0.0, 2.0,
+        ))
+
+        budget_compliance = np.array([
+            budget_remaining_phase2_norm,                         # [base+14]
+            compliance_liability_norm,                            # [base+15]
+        ], dtype=np.float32)
+
+        return np.concatenate([obs_phase1, extra, d1_d2, collateral_dim, budget_compliance])
 
     @property
     def obs_dim_phase1(self) -> int:
-        """26 base dims (Phase G 24D + 2 new safety dims) + 5*(N_total-1) opponent dims.
-        N_total = learning agents + bot agents (all market participants).
-        Phase G removed: expected_price_ar1 (was [3]), two tech fracs (5→3),
-        predicted_msr_withholding (was [26]). Net: 28-4+2 = 26 base dims.
-        New dims: suspension_remaining_norm [24], collateral_load_last [25]."""
+        """29 base dims (Phase G 24D + 2 safety dims + 3 loan/affordability dims)
+        + 6*(N_total-1) opponent dims.
+        New dims: bid_affordability_last [26], loan_outstanding_norm [27],
+        years_under_loan_norm [28].
+        Opponent dims: emissions, carry_forward, green_frac, fossil_frac, queue_total, is_active."""
         if self._opponent_modeling and self._n_total > 1:
-            return 26 + 5 * (self._n_total - 1)
-        return 26
+            return 29 + 6 * (self._n_total - 1)
+        return 29
 
     @property
     def obs_dim_phase2(self) -> int:
-        """obs_dim_phase1 + 7 (standard) + 6 (D1/D2 tranche feedback) + 1 (collateral_locked_norm).
-        Total Phase 2 base = 26 + 7 + 6 + 1 = 40 dims (+ opponent modeling if enabled)."""
-        return self.obs_dim_phase1 + 14  # 7 standard + 6 D1/D2 + 1 collateral
+        """obs_dim_phase1 + 7 (standard) + 6 (D1/D2 tranche feedback) + 1 (collateral)
+        + 2 (budget_remaining_phase2_norm, compliance_liability_norm).
+        Total Phase 2 base = 29 + 16 = 45 dims (+ opponent modeling if enabled)."""
+        return self.obs_dim_phase1 + 16  # 7 standard + 6 D1/D2 + 1 collateral + 2 budget/compliance
 
     # ------------------------------------------------------------------
     # Reset
@@ -827,3 +950,7 @@ class Company:
         self._carry_forward = 0.0
         self._inflation_rates_by_year = {}
         self._inflation_factor_by_year = {0: 1.0}
+        self._budget_ema = None
+        self._loan_outstanding = 0.0
+        self._loan_repayment_annual = 0.0
+        self._years_under_loan = 0

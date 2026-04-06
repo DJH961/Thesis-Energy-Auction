@@ -5,6 +5,77 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.7.0
+
+**Revenue-Based Budget, Emergency Loans, Observation Enrichment, Budget Hardening, Reward Channels, Heuristic Loan-Awareness**
+
+### Phase A — Revenue-Based Dynamic Budget (`company.py`, `ets_environment.py`, `default.yaml`)
+- **Dynamic budget mode**: `budget.mode: revenue_based` computes annual budgets from
+  `Company.compute_revenue()` (electricity revenue with carbon-cost passthrough) minus
+  operating costs plus archetype-specific `debt_headroom`. EMA smoothing (`ema_alpha=0.3`)
+  prevents erratic year-to-year swings.
+- **`compute_dynamic_budget()`**: Called in `step_auction()` before any budget-gated decisions.
+  Uses MA3-smoothed carbon price and system-average emission factor for revenue estimation.
+- **Config**: `budget.mode`, `budget.debt_headrooms` (per-agent), `budget.bot_debt_headrooms`,
+  `budget.ema_alpha`.
+
+### Phase B — Emergency Loan System (`company.py`, `market_clearing_ets.py`, `ets_environment.py`)
+- **Loan-backed default prevention**: When an agent would default at auction settlement,
+  an emergency loan covers the shortfall (up to `max_loan_fraction × annual_budget`).
+  Prevents immediate suspension while imposing financial cost.
+- **Loan tracking**: `Company._loan_outstanding`, `_loan_repayment_annual`,
+  `_years_under_loan`. Interest accrues at `loan_interest_rate` (default 8%).
+  Annual repayment deducted at year start via `apply_loan_repayment()`.
+- **`settle_auction()` integration**: Accepts `max_loan_budgets` array. Shortfall within
+  loan limit triggers `apply_emergency_loan()` instead of default/suspension.
+- **Config**: `budget.emergency_loan.enabled`, `budget.emergency_loan.max_loan_fraction`,
+  `budget.emergency_loan.interest_rate`.
+
+### Phase C — Pre-Bid Warning and Observation Enrichment (`company.py`)
+- **Phase 1 obs extended** from 30D to 33D with three new financial-awareness dims:
+  - `[30]` `bid_affordability_last`: last year's bid total / remaining budget (clipped [0,1])
+  - `[31]` `loan_outstanding_norm`: emergency loan / annual_budget
+  - `[32]` `years_under_loan_norm`: years under active loan / 5
+- **Phase 2 obs extended** from +8 to +10 with two compliance-awareness dims:
+  - `budget_remaining_phase2_norm`: remaining annual budget after auction / annual_budget
+  - `compliance_liability_norm`: (emissions + carry_forward − bank − allocation) / annual_budget
+
+### Phase E — Compliance Reserve Signaling
+- Compliance liability signal included in Phase 2 enrichment (see Phase C above).
+  Allows secondary market policy to see impending shortfall before compliance settlement.
+
+### Phase D — Reward Channels (`ets_environment.py`)
+- **Structured reward logging**: `_last_reward_channels` and `_last_auction_reward_channels`
+  dicts populated after each year. Each dict contains named reward components
+  (cost_norm, penalty_norm, green_bonus, esg_signal, efficiency_bonus, opp_cost,
+  budget_penalty, capex_penalty, loan_interest, base_reward, shaping_reward) for
+  debugging and analysis. No change to reward computation.
+
+### Phase F — Heuristic Loan-Awareness (`heuristic_policy.py`)
+- **Loan-aware bidding**: When `loan_outstanding_norm > 0.01`, heuristic bots reduce
+  auction qty (−30%), investment (−50%), and secondary buy volume (−40%) proportional
+  to loan pressure. Prevents bots from over-extending when emergency loans are outstanding.
+- **`train.py` integration**: BC warm-start callsites pass `loan_outstanding_norm`.
+
+### Phase H — Config Tuning (`default.yaml`)
+- **Budget hardening parameters**: Added `hard_cap_fraction` (1.15), `soft_zone_start` (1.0),
+  `tiered_penalty_coef` (2.0), `investment_hard_gate` (true) to budget config section.
+
+### Phase I — Environment Fixes (`company.py`, `ets_environment.py`)
+- **Tiered budget penalty**: Replaced 3-tier contingency/quadratic/hard system with
+  clean soft-zone quadratic: zero below `soft_zone_start`, quadratic ramp in
+  [soft_zone_start, hard_cap_fraction], steep growth above. Penalty scales with
+  overshoot amount, not full budget.
+- **Investment hard gate**: Pre-investment check in `step_auction()` scales down
+  `invest_frac` if total spending would exceed `hard_cap_fraction × annual_budget`.
+
+### Phase J — Tests
+- **14 new tests** per codebase covering: reward channel population (4), heuristic
+  loan-awareness (3), tiered budget penalty (5), investment hard gate (1),
+  reward channels in integration (1). All ported to auction codebase.
+- **Current**: 260/260 tests pass.
+- **Auction**: 265/265 tests pass.
+
 ## v7.6.1
 
 **Calibration/Diagnostics + Phase-Aware Reward Pipeline Patch**
