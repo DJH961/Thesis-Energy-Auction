@@ -7,7 +7,7 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ## v8.4.0
 
-**Budget Hardening, Reward Channels, Heuristic Loan-Awareness**
+**Revenue-Based Budget, Emergency Loans, Observation Enrichment, Budget Hardening, Reward Channels, Heuristic Loan-Awareness**
 
 ### Phase A — Revenue-Based Dynamic Budget (`company.py`, `ets_environment.py`, `default.yaml`)
 - **Dynamic budget mode**: `budget.mode: revenue_based` computes annual budgets from

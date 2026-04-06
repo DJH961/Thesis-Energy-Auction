@@ -353,8 +353,8 @@ Phase 2 appends **16** features to Phase 1:
 - `[base+11]` (tranche 2 price − clearing price) / price_norm
 - `[base+12]` (tranche 3 price − clearing price) / price_norm
 
-**Auction cost + compliance awareness (3 dims):**
-- `[base+13]` auction_cost_norm
+**Collateral + compliance awareness (3 dims):**
+- `[base+13]` collateral_locked_norm: this year's collateral locked / annual_budget
 - `[base+14]` budget_remaining_phase2_norm: remaining annual budget after auction / annual_budget
 - `[base+15]` compliance_liability_norm: (emissions + carry_forward − bank − allocation) / annual_budget
 
@@ -366,7 +366,7 @@ With 16 total participants (no opponent modeling): 29D Phase 1, **45D** Phase 2.
 
 ## 7. Reward Design (Current)
 
-**Reward channel logging (Phase D):** After each year, `_last_reward_channels` and
+**Reward channel logging:** After each year, `_last_reward_channels` and
 `_last_auction_reward_channels` dicts are populated with named components (cost_norm,
 penalty_norm, green_bonus, esg_signal, efficiency_bonus, opp_cost, budget_penalty,
 capex_penalty, loan_interest, base_reward, shaping_reward). These are for
@@ -505,7 +505,7 @@ Revenue offsets cost signal and links carbon prices to generation margins.
 Each company has an annual spending envelope for all major outlays.
 Separate capex throughput constraint models physical delivery bottlenecks.
 
-### 9.4 Budget Hardening Regime (v8.4)
+### 9.4 Budget Hardening Regime
 
 Annual spending is subject to a tiered penalty regime:
 - **Below 100%** (`soft_zone_start`): No penalty.
