@@ -97,7 +97,7 @@ The agents use **HAPPO (Heterogeneous-Agent PPO)**, a multi-agent reinforcement 
 The reward signal balances:
 - **Revenue** from selling electricity (including carbon cost passthrough)
 - **Total costs** including allowances, trading, investing, operations, MAC, and penalties (folded into one cost signal)
-- **Bid collateral opportunity cost** on overbidding spread (`auction.collateral`): `rate × hold_fraction × max(0, bid - clearing) × qty_won`
+- **Bid collateral cost** on overbidding spread (`auction.collateral`): `rate × hold_fraction × max(0, bid - clearing) × qty_won`
 - **Opportunity cost of capital** on post-compliance banked allowances (`reward.opportunity_cost_rate`)
 - **Green investment shaping** — bonus for increasing green fraction (decays over training), scaled by (0.2 + w_green)
 - **ESG signal** — saved-carbon-years formula: `w_green × ef_ratio × time_ratio × (budget/1000)`, rewarding early emission reductions more than late ones
@@ -264,7 +264,7 @@ The most important settings you might want to change:
 | `penalty.rate` | 138.75 | Fine per excess tonne of CO2 (€), base level at simulation year-0 (2026) |
 | `tabula_rasa.enabled` | false | Enables no-anchor tabula-rasa overrides with side-balanced under/over expected-price exploration |
 | `auction.collateral.enabled` | true | Enables EU ETS-style bid collateral opportunity-cost term on overbids |
-| `auction.collateral.opportunity_cost_rate` | 0.05 | Annualized cost-of-capital rate applied to locked collateral |
+| `auction.collateral.collateral_rate` | 0.05 | Annualized cost-of-capital rate applied to locked collateral |
 | `auction.collateral.hold_fraction` | 0.02 | Fraction of year collateral lock-up used in annualized model (~7 days) |
 | `auction.collateral.min_qty_floor_frac` | 0.5 | Minimum coverage floor used by pre-auction collateral affordability clip |
 | `green_finance.enabled` | false | Enables green-only loan/capex throughput boost during investment clipping |

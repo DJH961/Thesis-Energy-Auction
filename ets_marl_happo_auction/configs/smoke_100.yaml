@@ -182,7 +182,7 @@ auction:
   # If collateral > max_collateral_budget_share × available_budget → scale bids down.
   collateral:
     enabled: true
-    opportunity_cost_rate: 0.05
+    collateral_rate: 0.05
     # hold_fraction=0.02 (~7 days). Real EU ETS settles T+2 (~0.0055) but one
     # annual auction step represents ~52 real auctions; 0.02 balances real
     # settlement mechanics with yearly simulation granularity.

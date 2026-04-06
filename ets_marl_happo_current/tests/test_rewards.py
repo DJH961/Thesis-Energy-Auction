@@ -176,7 +176,7 @@ def test_collateral_cost_logged_matches_formula():
     yl = info.get("year_log", {})
     collateral = np.array(yl.get("collateral_costs", []), dtype=float)
 
-    rate = float(config["auction"]["collateral"]["opportunity_cost_rate"])
+    rate = float(config["auction"]["collateral"]["collateral_rate"])
     # New formula: collateral_cost = rate × collateral_locked (stored in step_auction)
     expected = rate * env._collateral_locked
 

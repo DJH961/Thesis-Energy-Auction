@@ -186,8 +186,8 @@ def test_collateral_cost_logged_matches_formula():
     yl = info.get("year_log", {})
     collateral = np.array(yl.get("collateral_costs", []), dtype=float)
 
-    rate = float(config["auction"]["collateral"]["opportunity_cost_rate"])
-    # New formula: collateral_cost = rate × collateral_locked (stored in step_auction)
+    rate = float(config["auction"]["collateral"]["collateral_rate"])
+    # New formula: collateral_cost = collateral_rate × collateral_locked (stored in step_auction)
     expected = rate * env._collateral_locked
 
     assert collateral.shape[0] == env.n_total
@@ -1021,7 +1021,7 @@ def test_auction_reward_normalization():
     config["auction"]["collateral"]["enabled"] = True
     config["auction"]["collateral"]["collateral_fraction"] = 0.10
     opp_rate = 0.05
-    config["auction"]["collateral"]["opportunity_cost_rate"] = opp_rate
+    config["auction"]["collateral"]["collateral_rate"] = opp_rate
     # Disable MAC reductions so mac_cost = 0
     config["mac"]["enabled"] = False
     # Disable investment (invest_frac action handled via action vector below)

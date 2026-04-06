@@ -1621,14 +1621,14 @@ class ETSEnvironment(gym.Env):
         r_auction = np.zeros(self.n_agents)
         for i in range(self.n_agents):
             company = self.companies[i]
-            budget_divisor = max(company._budget_ema if company._budget_ema is not None else company.annual_budget, 1.0)
+            budget_divisor = max(company.annual_budget, 1.0)
 
             auction_cost = float(self._phase1_payments[i])
             investment_cost = float(self._phase1_invest_costs[i])
             opex_delta = company.compute_operational_cost(self.current_year) - company.baseline_opex
             mac_cost_i = float(self._phase1_mac_costs[i])
             collateral_cost_i = float(self._collateral_locked[i]) * float(
-                self.config["auction"]["collateral"].get("opportunity_cost_rate", 0.05))
+                self.config["auction"]["collateral"].get("collateral_rate", 0.05))
             loan_interest_cost = float(company.compute_green_loan_cost())
             # loan_interest_cost is recorded in _compute_rewards() via record_spending(); not double-counted here
 
@@ -1755,7 +1755,7 @@ class ETSEnvironment(gym.Env):
         # Holdings after secondary market
         holdings = self.holdings + allocations + trade_qtys
 
-        # Collateral opportunity cost: rate × locked collateral from Phase 1 (E2/E4).
+        # Collateral cost: rate × locked collateral from Phase 1 (E2/E4).
         # self._collateral_locked is computed in step_auction() as:
         #   collateral_fraction × max(0, bid_price − reserve) × bid_qty
         # Charging rate × locked_amount is equivalent to the financing cost of
@@ -1763,7 +1763,7 @@ class ETSEnvironment(gym.Env):
         collateral_costs = np.zeros(self.n_total)
         collateral_cfg = self.config.get("auction", {}).get("collateral", {})
         if collateral_cfg.get("enabled", False):
-            rate = float(collateral_cfg.get("opportunity_cost_rate", 0.0))
+            rate = float(collateral_cfg.get("collateral_rate", 0.05))
             collateral_costs = rate * self._collateral_locked
             collateral_costs[~active_mask] = 0.0
 
@@ -2196,7 +2196,7 @@ class ETSEnvironment(gym.Env):
             capex_penalty = company.compute_capex_penalty()
 
             # v7.7: Per-agent financial-scale normalization using EMA budget
-            budget_divisor = max(company._budget_ema if company._budget_ema is not None else company.annual_budget, 1.0)
+            budget_divisor = max(company.annual_budget, 1.0)
 
             # Separate penalty from other costs
             # Penalty applies at full strength to ALL agents regardless of w_cost
