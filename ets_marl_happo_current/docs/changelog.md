@@ -9,6 +9,41 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 **Budget Hardening, Reward Channels, Heuristic Loan-Awareness**
 
+### Phase A — Revenue-Based Dynamic Budget (`company.py`, `ets_environment.py`, `default.yaml`)
+- **Dynamic budget mode**: `budget.mode: revenue_based` computes annual budgets from
+  `Company.compute_revenue()` (electricity revenue with carbon-cost passthrough) minus
+  operating costs plus archetype-specific `debt_headroom`. EMA smoothing (`ema_alpha=0.3`)
+  prevents erratic year-to-year swings.
+- **`compute_dynamic_budget()`**: Called in `step_auction()` before any budget-gated decisions.
+  Uses MA3-smoothed carbon price and system-average emission factor for revenue estimation.
+- **Config**: `budget.mode`, `budget.debt_headrooms` (per-agent), `budget.bot_debt_headrooms`,
+  `budget.ema_alpha`.
+
+### Phase B — Emergency Loan System (`company.py`, `market_clearing_ets.py`, `ets_environment.py`)
+- **Loan-backed default prevention**: When an agent would default at auction settlement,
+  an emergency loan covers the shortfall (up to `max_loan_fraction × annual_budget`).
+  Prevents immediate suspension while imposing financial cost.
+- **Loan tracking**: `Company._loan_outstanding`, `_loan_repayment_annual`,
+  `_years_under_loan`. Interest accrues at `loan_interest_rate` (default 8%).
+  Annual repayment deducted at year start via `apply_loan_repayment()`.
+- **`settle_auction()` integration**: Accepts `max_loan_budgets` array. Shortfall within
+  loan limit triggers `apply_emergency_loan()` instead of default/suspension.
+- **Config**: `budget.emergency_loan.enabled`, `budget.emergency_loan.max_loan_fraction`,
+  `budget.emergency_loan.interest_rate`.
+
+### Phase C — Pre-Bid Warning and Observation Enrichment (`company.py`)
+- **Phase 1 obs extended** from 30D to 33D with three new financial-awareness dims:
+  - `[30]` `bid_affordability_last`: last year's bid total / remaining budget (clipped [0,1])
+  - `[31]` `loan_outstanding_norm`: emergency loan / annual_budget
+  - `[32]` `years_under_loan_norm`: years under active loan / 5
+- **Phase 2 obs extended** from +8 to +10 with two compliance-awareness dims:
+  - `budget_remaining_phase2_norm`: remaining annual budget after auction / annual_budget
+  - `compliance_liability_norm`: (emissions + carry_forward − bank − allocation) / annual_budget
+
+### Phase E — Compliance Reserve Signaling
+- Compliance liability signal included in Phase 2 enrichment (see Phase C above).
+  Allows secondary market policy to see impending shortfall before compliance settlement.
+
 ### Phase D — Reward Channels (`ets_environment.py`)
 - **Structured reward logging**: `_last_reward_channels` and `_last_auction_reward_channels`
   dicts populated after each year. Each dict contains named reward components

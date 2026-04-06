@@ -18,7 +18,7 @@ This document describes the **ETS MARL** simulation: a stylised multi-agent rein
 
 ## 1. Scope and Purpose
 
-This document describes the active architecture in `ets_marl_happo_current`.
+This document describes the active architecture in `ets_marl_happo_auction`.
 It supersedes earlier DDPG-era notes and reflects the current HAPPO/PPO setup,
 two-phase decision process, technology-resolved companies, bot participants,
 and reward/economic mechanisms used in training and evaluation.
@@ -220,21 +220,57 @@ If enabled, shortfall carries to next year, with optional cap multiplier to prev
 If carbon price exceeds MAC threshold, company can temporarily switch part of coal dispatch to gas.
 This lowers emissions in-year but adds MAC cost. It does not permanently alter long-run technology mix.
 
+### 4.6 Revenue-based dynamic budget
+
+When `budget.mode` is set to `revenue_based`, annual budgets are computed dynamically
+from electricity revenue rather than being fixed at episode start:
+
+$$
+\text{budget}_t = \text{EMA}\bigl(\text{revenue}_t - \text{opex}_t + \text{debt\_headroom}_i,\;\alpha\bigr)
+$$
+
+where `revenue` comes from `Company.compute_revenue()` (electricity sales with carbon-cost
+passthrough using MA3-smoothed carbon price and system-average emission factor), and
+`debt_headroom` is an archetype-specific buffer configured per agent. EMA smoothing
+(`ema_alpha`, default 0.3) prevents erratic year-to-year budget swings.
+
+When `budget.mode` is `fixed` (default), the original static annual budget is used unchanged.
+
+### 4.7 Emergency loan system
+
+When enabled (`budget.emergency_loan.enabled`), agents facing auction default receive an
+emergency loan instead of immediate suspension:
+
+- **Trigger**: Shortfall at auction settlement exceeds remaining budget but falls within
+  `max_loan_fraction × annual_budget`.
+- **Mechanics**: `apply_emergency_loan(shortfall)` adds the shortfall (plus accrued interest
+  at `loan_interest_rate`, default 8%) to `_loan_outstanding`. Annual repayment is deducted
+  at year start via `apply_loan_repayment()`.
+- **Tracking**: `_loan_outstanding`, `_loan_repayment_annual`, `_years_under_loan` are
+  maintained on the `Company` object and exposed in observations (see §6).
+- **Heuristic loan-awareness**: Bots with outstanding loans reduce auction quantity (−30%),
+  investment (−50%), and secondary buy volume (−40%).
+
 ## 5. Two-Phase Yearly Decision Process
 
 Each simulation year is split into two decisions.
 
 ### Phase 1: Auction + Investment
 
-Action vector (6D):
-1. Bid price (EUR/t)
-2. Quantity multiplier on estimated need
-3. Invest fraction
-4. Onshore logit
-5. Offshore logit
-6. Solar logit
+Action vector (10D):
+1. Tranche 1 bid price (EUR/t)
+2. Tranche 1 bid quantity
+3. Tranche 2 bid price (EUR/t)
+4. Tranche 2 bid quantity
+5. Tranche 3 bid price (EUR/t)
+6. Tranche 3 bid quantity
+7. Invest fraction
+8. Onshore logit
+9. Offshore logit
+10. Solar logit
 
 Technology choice is `argmax(logits)`.
+Tranches are sorted ascending by price (B1 invariant) before clearing.
 
 ### Phase 2: Secondary market
 
@@ -249,12 +285,7 @@ Participants can sell from current allocation plus bank (no short selling beyond
 
 ### 6.1 Phase 1 observation
 
-Base dimension: **24** (v8.1, after Phase G consolidation from 28D).
-
-Consolidated from 28D by removing:
-- `expected_price_ar1` (redundant with MA3 + time signal)
-- 2 raw technology fraction dims (5 → 3 summary fracs)
-- `predicted_msr_withholding` (derivable from TNAC proxy)
+Base dimension: **29**.
 
 Includes:
 - `[0]` time (normalized by n_years)
@@ -279,11 +310,16 @@ Includes:
 - `[21]` MSR reserve signal (msr_reserve / cap_t)
 - `[22]` own bank ratio (clipped [0,5], normalized /5)
 - `[23]` budget headroom (1 – budget_spent / annual_budget)
+- `[24]` collateral load last (collateral / annual_budget)
+- `[25]` safety dim
+- `[26]` bid_affordability_last: last year's bid total / remaining budget (clipped [0,1])
+- `[27]` loan_outstanding_norm: emergency loan / annual_budget
+- `[28]` years_under_loan_norm: years under active loan / 5
 
 If opponent modeling is enabled:
 
 $$
-\text{obsDimPhase1} = 24 + 5 \cdot (N_{total} - 1)
+\text{obsDimPhase1} = 29 + 5 \cdot (N_{total} - 1)
 $$
 
 Each opponent contributes a public 5D tuple:
@@ -294,11 +330,11 @@ Each opponent contributes a public 5D tuple:
 - total queue size
 
 With 16 total participants:
-- Phase 1 dimension = 24 + 5×15 = **99D**
+- Phase 1 dimension = 29 + 5×15 = **104D**
 
 ### 6.2 Phase 2 observation
 
-Phase 2 appends 13 features to Phase 1:
+Phase 2 appends **16** features to Phase 1:
 
 **Standard 7 dims:**
 - allocation / 5
@@ -309,7 +345,7 @@ Phase 2 appends 13 features to Phase 1:
 - coverage ratio: (bank + allocation) / obligation, clipped [0,3], /3
 - normalized carry-forward: carry_forward / estimated_need, clipped [0,3]
 
-**D1/D2 — 6 per-tranche feedback dims (v8.1, auction only):**
+**D1/D2 — 6 per-tranche feedback dims (auction only):**
 - `[base+7]` tranche 1 fill ratio (0 = no fill, 1 = full fill)
 - `[base+8]` tranche 2 fill ratio
 - `[base+9]` tranche 3 fill ratio
@@ -317,13 +353,24 @@ Phase 2 appends 13 features to Phase 1:
 - `[base+11]` (tranche 2 price − clearing price) / price_norm
 - `[base+12]` (tranche 3 price − clearing price) / price_norm
 
+**Auction cost + compliance awareness (3 dims):**
+- `[base+13]` auction_cost_norm
+- `[base+14]` budget_remaining_phase2_norm: remaining annual budget after auction / annual_budget
+- `[base+15]` compliance_liability_norm: (emissions + carry_forward − bank − allocation) / annual_budget
+
 $$
-\text{obsDimPhase2} = \text{obsDimPhase1} + 13
+\text{obsDimPhase2} = \text{obsDimPhase1} + 16
 $$
 
-With 16 total participants (no opponent modeling): 24D Phase 1, **37D** Phase 2.
+With 16 total participants (no opponent modeling): 29D Phase 1, **45D** Phase 2.
 
 ## 7. Reward Design (Current)
+
+**Reward channel logging (Phase D):** After each year, `_last_reward_channels` and
+`_last_auction_reward_channels` dicts are populated with named components (cost_norm,
+penalty_norm, green_bonus, esg_signal, efficiency_bonus, opp_cost, budget_penalty,
+capex_penalty, loan_interest, base_reward, shaping_reward). These are for
+debugging/analysis only and do not affect reward computation.
 
 Per-agent reward is split into a **base reward** and a **shaping reward** that decays
 over training:
