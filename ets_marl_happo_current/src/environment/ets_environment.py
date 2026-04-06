@@ -1630,6 +1630,7 @@ class ETSEnvironment(gym.Env):
             collateral_cost_i = float(self._collateral_locked[i]) * float(
                 self.config["auction"]["collateral"].get("opportunity_cost_rate", 0.05))
             loan_interest_cost = float(company.compute_green_loan_cost())
+            # loan_interest_cost is recorded in _compute_rewards() via record_spending(); not double-counted here
 
             projected_capex_spend = float(company.capex_spent_this_year + investment_cost)
             capex_overshoot = max(0.0, projected_capex_spend - float(company.capex_throughput))
@@ -1639,9 +1640,11 @@ class ETSEnvironment(gym.Env):
             else:
                 capex_penalty = 0.0
 
-            r_auction[i] = -(auction_cost + collateral_cost_i + investment_cost
-                             + opex_delta + mac_cost_i + loan_interest_cost
-                             + capex_penalty) / budget_divisor
+            total_cost = (auction_cost + collateral_cost_i + investment_cost
+                          + opex_delta + mac_cost_i + loan_interest_cost
+                          + capex_penalty)
+            baseline_cost = company.compute_estimate_need() * self._phase1_clearing_price / budget_divisor
+            r_auction[i] = -(total_cost / budget_divisor) + baseline_cost
 
             self._last_auction_reward_channels[i] = {
                 "auction_cost": float(auction_cost / budget_divisor),
@@ -1651,6 +1654,7 @@ class ETSEnvironment(gym.Env):
                 "mac_cost": float(mac_cost_i / budget_divisor),
                 "loan_interest": float(loan_interest_cost / budget_divisor),
                 "capex_penalty": float(capex_penalty / budget_divisor),
+                "baseline_cost": float(baseline_cost),
             }
         return r_auction
 
@@ -1888,6 +1892,11 @@ class ETSEnvironment(gym.Env):
                   - self.companies[i].baseline_opex)
                 for i in range(self.n_total)
             ],
+            "compliance_costs": [
+                float(payments[i]) + float(trade_costs[i])
+                for i in range(self.n_total)
+            ],
+            "investment_costs": invest_costs.tolist(),
         })
         self.episode_log.append(log)
 
@@ -2198,6 +2207,10 @@ class ETSEnvironment(gym.Env):
             cost_norm_ex_penalty = total_cost_ex_penalty / budget_divisor
             penalty_norm = penalty_cost / budget_divisor
 
+            # Baseline-relative normalization: subtract expected cost at market price
+            baseline_cost = company.compute_estimate_need() * clearing_price / budget_divisor
+            cost_norm_ex_penalty -= baseline_cost
+
             # Green investment bonus with diminishing returns
             # Scaled by (0.2 + w_green) so financial agents still get some signal
             green_delta = max(0.0, company.green_frac - company.prev_green_frac)
@@ -2245,6 +2258,7 @@ class ETSEnvironment(gym.Env):
                 "budget_penalty": float(budget_penalty / budget_divisor),
                 "capex_penalty": float(capex_penalty / budget_divisor),
                 "loan_interest": float(loan_interest_cost / budget_divisor),
+                "baseline_cost": float(baseline_cost),
                 "base_reward": float(base_reward),
                 "shaping_reward": float(shaping_reward),
             }
@@ -2453,6 +2467,7 @@ class ETSEnvironment(gym.Env):
                         "green_frac": 0.0,
                         "fossil_frac": 0.0,
                         "queue_total": 0.0,
+                        "is_active": 0.0,
                     })
 
         obs_list = []

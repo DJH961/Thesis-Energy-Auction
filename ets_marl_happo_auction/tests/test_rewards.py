@@ -1065,6 +1065,8 @@ def test_auction_reward_normalization():
         )
 
         expected = -(payment_i + coll_cost_i + invest_cost_i + opex_delta_i + mac_cost_i) / budget
+        baseline = company.compute_estimate_need() * env._phase1_clearing_price / budget
+        expected += baseline
         np.testing.assert_allclose(
             r_auction[i], expected, atol=1e-6,
             err_msg=(
