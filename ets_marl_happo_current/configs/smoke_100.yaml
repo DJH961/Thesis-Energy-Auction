@@ -223,23 +223,25 @@ secondary:
 # Sources: Scope Ratings 2023, Enel/Iberdrola 2024-2027 strategic plans.
 # ----------------------------------------------------------
 budget:
+  mode: "revenue_based"
+  debt_headrooms: [350.0, 350.0, 180.0, 180.0, 50.0, 50.0, -100.0, -100.0]
+  bot_debt_headrooms: [350.0, 350.0, 180.0, 180.0, 50.0, 50.0, -100.0, -100.0]
+  budget_ema_alpha: 0.3
   annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   overspend_penalty_coef: 0.5
   contingency_zone: 0.10
   hard_cap_multiplier: 1.20
   contingency_penalty_coef: 0.05
-  # Sources: Enel/Iberdrola/RWE strategic capex plans (2024-2027) show:
-  # - 5-10% contingency buffer standard in utility capex planning
-  # - Board re-approval required >15%, effectively never granted >20%
-  # capex_overspend_coef: 1.0 — capex throughput remains true hard cap (no soft zone)
-  # Capex throughput: max annual construction spend (M€). Organizational
-  # constraint — permitting pipeline, EPC capacity, mgmt bandwidth.
-  # NOT a financial constraint (that's the unified budget).
-  # Scaled from Iberdrola/Enel RE capex per unit output.
   capex_throughputs: [130.0, 130.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
   bot_capex_throughputs: [130.0, 130.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
   capex_overspend_coef: 1.0
+  emergency_loan:
+    enabled: true
+    max_loan_fraction: 0.15
+    interest_rate: 0.08
+    repayment_years: 3
+  suspension_length: 1
 
 green_finance:
   enabled: false

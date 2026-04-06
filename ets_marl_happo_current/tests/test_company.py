@@ -383,6 +383,7 @@ def test_investment_scaled_to_budget_hard_cap():
     """Overspend attempt above 20% should be clipped by hard_cap_multiplier."""
     cfg = load_env_config(seed=11)
     n_agents = cfg["companies"]["n_agents"]
+    cfg["budget"]["mode"] = "fixed"
     cfg["budget"]["annual_budgets"] = [100.0] * n_agents
     cfg["budget"]["hard_cap_multiplier"] = 1.20
     cfg["budget"]["capex_throughputs"] = [1e9] * n_agents
@@ -410,6 +411,7 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
     """Capex at throughput is allowed; larger request is clipped to throughput."""
     cfg = load_env_config(seed=22)
     n_agents = cfg["companies"]["n_agents"]
+    cfg["budget"]["mode"] = "fixed"
     cfg["budget"]["annual_budgets"] = [5000.0] * n_agents
     cfg["budget"]["hard_cap_multiplier"] = 10.0
     cfg["technologies"]["decommission_costs"] = [0, 0, 0, 0, 0]
@@ -455,35 +457,35 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
 # ---------------------------------------------------------------------------
 
 def test_obs_phase1_shape(config):
-    """Phase 1 obs should be 30D base (no opponent modeling)."""
+    """Phase 1 obs should be 33D base (no opponent modeling)."""
     c = make_company(config, agent_id=0)
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, auction_gap=1.0)
-    assert obs.shape == (30,), f"Expected 30D, got {obs.shape}"
+    assert obs.shape == (33,), f"Expected 33D, got {obs.shape}"
     assert obs.dtype == np.float32
 
 def test_obs_phase1_with_opponents(config):
-    """With opponent modeling, obs should have 30 + 5*(N-1) dims."""
+    """With opponent modeling, obs should have 33 + 5*(N-1) dims."""
     config_opp = {**config, "opponent_modeling": {"enabled": True}}
     c = make_company(config_opp, agent_id=0)
     opponent_obs = np.zeros(5 * 3, dtype=np.float32)  # 3 opponents
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, opponent_obs=opponent_obs)
-    assert obs.shape == (30 + 15,)
+    assert obs.shape == (33 + 15,)
 
 def test_obs_phase2_extends_phase1(config):
-    """Phase 2 obs = phase1 + 8 extra dims."""
+    """Phase 2 obs = phase1 + 10 extra dims."""
     c = make_company(config, agent_id=0)
     obs1 = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0, expected_price=80.0)
     obs2 = c.get_observation_phase2(
         obs_phase1=obs1, allocation=2.0, clearing_price=80.0,
         emissions=3.0, banked=1.0, emission_shock=0.05, payment=160.0)
-    assert obs2.shape == (30 + 8,)
-    # First 30 dims should match phase1
-    np.testing.assert_array_equal(obs2[:30], obs1)
+    assert obs2.shape == (33 + 10,)
+    # First 33 dims should match phase1
+    np.testing.assert_array_equal(obs2[:33], obs1)
 
 def test_obs_values_finite(config):
     """All observation values should be finite."""
