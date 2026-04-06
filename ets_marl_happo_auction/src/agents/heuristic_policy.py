@@ -89,24 +89,24 @@ def _apply_per_tranche_budget_drop(prices: np.ndarray, qty_mults: np.ndarray,
     q = np.maximum(qty_mults.astype(float), 0.0)
     p = prices.astype(float)
 
-    def tranche_cost(q_mult_arr: np.ndarray) -> np.ndarray:
+    def tranche_cost(q_mult_arr: np.ndarray, p_arr: np.ndarray) -> np.ndarray:
         qty_abs = q_mult_arr * need
-        above_reserve = np.maximum(0.0, p - float(reserve_price))
-        unit = p + float(collateral_fraction) * above_reserve
+        above_reserve = np.maximum(0.0, p_arr - float(reserve_price))
+        unit = p_arr + float(collateral_fraction) * above_reserve
         return qty_abs * unit
 
-    base_cost = float(np.sum(tranche_cost(q)))
+    base_cost = float(np.sum(tranche_cost(q, p)))
     if base_cost <= budget + 1e-9:
         return q
 
     # Drop cheapest tranche first (T1 after ascending sort).
     q[0] = 0.0
-    cost_after_t1 = float(np.sum(tranche_cost(q)))
+    cost_after_t1 = float(np.sum(tranche_cost(q, p)))
     if cost_after_t1 <= budget + 1e-9:
         return q
 
     # If still too expensive, scale T2/T3 proportionally.
-    rem_cost = float(np.sum(tranche_cost(q[1:])))
+    rem_cost = float(np.sum(tranche_cost(q[1:], p[1:])))
     if rem_cost <= 1e-9:
         q[1:] = 0.0
         return q

@@ -184,6 +184,8 @@ class ETSEnvironment(gym.Env):
         # Per-agent collateral load from PREVIOUS year: collateral_locked / annual_budget.
         # Exposed in Phase 1 obs so agents learn to avoid over-committing and defaulting.
         self._last_collateral_load = np.zeros(self.n_total)
+        # C2: Per-agent bid affordability from PREVIOUS year
+        self._bid_affordability = np.zeros(self.n_total)
 
         # Dynamic reserve tracking
         self._last_effective_reserve = config["ets"].get("reserve_price", 0.0)
@@ -464,6 +466,7 @@ class ETSEnvironment(gym.Env):
         self._defaulted_volume_pending = 0.0
         self._collateral_locked = np.zeros(self.n_total)
         self._last_collateral_load = np.zeros(self.n_total)
+        self._bid_affordability = np.zeros(self.n_total)
 
         if self._fade_enabled:
             n_active_bots = self._resolve_fade_active_bots(self.current_episode)
@@ -1122,8 +1125,29 @@ class ETSEnvironment(gym.Env):
         # 2. Apply matured investments + reset annual budget
         for company in self.companies:
             company.apply_matured_investments(year)
-            company.reset_budget()
-            company.reset_capex_budget()
+
+        # ---- Revenue-based dynamic budget (A3) ----
+        budget_mode = self.config.get("budget", {}).get("mode", "fixed")
+        if budget_mode == "revenue_based":
+            init_p = self.config["price"]["initial_expected"]
+            hist = list(self._price_history)
+            while len(hist) < 3:
+                hist.insert(0, init_p)
+            smoothed_price = float(np.mean(hist[-3:]))
+            active_companies = [c for c in self.companies if self._is_agent_active(c.agent_id)]
+            system_ef = float(np.mean([c.weighted_emission_factor for c in active_companies]))
+            for c in active_companies:
+                c.apply_loan_repayment()  # B4: repay before setting new budget
+                c.set_annual_budget(
+                    c.compute_dynamic_budget(smoothed_price, system_ef, self.current_year)
+                )
+                c.reset_budget()
+                c.reset_capex_budget()
+        else:
+            for company in self.companies:
+                company.apply_loan_repayment()
+                company.reset_budget()
+                company.reset_capex_budget()
 
         # 3. Compute TNAC and auction volume
         cap_t = self.cap_schedule.get_cap(year)
@@ -1444,20 +1468,37 @@ class ETSEnvironment(gym.Env):
         )
 
         # E4: Post-clearing settlement — check each winner can pay; handle defaults.
-        suspension_length = int(self.config["auction"].get("suspension_length", 2))
+        suspension_length = int(self.config.get("budget", {}).get(
+            "suspension_length",
+            self.config["auction"].get("suspension_length", 1),
+        ))
         agent_cash = np.array([
             max(0.0, float(c.annual_budget - c.budget_spent_this_year))
             for c in self.companies
         ])
+        # B3: Compute max emergency loan budgets per agent
+        loan_cfg = self.config.get("budget", {}).get("emergency_loan", {})
+        if loan_cfg.get("enabled", False):
+            max_loan_frac = float(loan_cfg.get("max_loan_fraction", 0.15))
+            max_loan_budgets = np.array([
+                max_loan_frac * float(c.annual_budget) for c in self.companies
+            ])
+        else:
+            max_loan_budgets = None
         (allocations, payments,
          defaults_mask, defaulted_volume,
-         suspension_steps) = settle_auction(
+         suspension_steps, loan_amounts) = settle_auction(
             allocations=allocations,
             payments=payments,
             agent_cash=agent_cash,
             collateral_locked=collateral_locked,
             suspension_length=suspension_length,
+            max_loan_budgets=max_loan_budgets,
         )
+        # B4: Apply emergency loans to companies
+        for i in range(self.n_total):
+            if loan_amounts[i] > 0:
+                self.companies[i].apply_emergency_loan(loan_amounts[i])
         # Apply defaults: exhaust remaining annual budget (signals insolvency).
         # Collateral is forfeited implicitly: settle_auction already zeroed the allocation
         # so no allowances are received, but the locked collateral amount is not returned.
@@ -1620,6 +1661,18 @@ class ETSEnvironment(gym.Env):
         self._phase1_mac_costs = mac_costs
         self._phase1_log = log
 
+        # C2: Compute bid affordability for next year's observation
+        bid_prices = self._phase1_bid_prices
+        bid_qtys = self._phase1_bid_quantities
+        coll_frac_c2 = float(coll_cfg.get("collateral_fraction",
+                                           coll_cfg.get("opportunity_cost_rate", 0.05)
+                                           * coll_cfg.get("hold_fraction", 0.02)))
+        for i in range(self.n_total):
+            c = self.companies[i]
+            budget_remaining = max(c.annual_budget - c.budget_spent_this_year, 1e-6)
+            bid_total = bid_prices[i] * bid_qtys[i] * (1.0 + coll_frac_c2)
+            self._bid_affordability[i] = float(np.clip(bid_total / budget_remaining, 0.0, 1.0))
+
         # D1: Compute per-tranche fill ratios for each learning agent
         # This uses an analytic reconstruction: given clearing_price and each
         # tranche's (price, qty) pair, compute expected fill without re-running clearing.
@@ -1648,6 +1701,8 @@ class ETSEnvironment(gym.Env):
                     self._collateral_locked[i] / max(self.companies[i].annual_budget, 1e-6),
                     0.0, 1.0,
                 )),
+                current_holdings=float(self.holdings[i] + allocations[i]),
+                current_year=year,
             )
             for i in range(self.n_agents)
         ])
@@ -2576,6 +2631,7 @@ class ETSEnvironment(gym.Env):
                 annual_budget=float(c.annual_budget),
                 suspension_remaining_norm=susp_norm,
                 collateral_load_last=float(self._last_collateral_load[i]),
+                bid_affordability_last=float(self._bid_affordability[i]),
             )
             obs_list.append(obs_i)
 

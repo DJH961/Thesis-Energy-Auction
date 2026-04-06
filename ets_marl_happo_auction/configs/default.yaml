@@ -235,6 +235,10 @@ secondary:
 # Sources: Scope Ratings 2023, Enel/Iberdrola 2024-2027 strategic plans.
 # ----------------------------------------------------------
 budget:
+  mode: "revenue_based"
+  debt_headrooms: [350.0, 350.0, 180.0, 180.0, 50.0, 50.0, -100.0, -100.0]
+  bot_debt_headrooms: [350.0, 350.0, 180.0, 180.0, 50.0, 50.0, -100.0, -100.0]
+  budget_ema_alpha: 0.3
   annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   overspend_penalty_coef: 0.5
@@ -252,6 +256,12 @@ budget:
   capex_throughputs: [130.0, 130.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
   bot_capex_throughputs: [130.0, 130.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
   capex_overspend_coef: 1.0
+  emergency_loan:
+    enabled: true
+    max_loan_fraction: 0.15
+    interest_rate: 0.08
+    repayment_years: 3
+  suspension_length: 1
 
 green_finance:
   enabled: false
