@@ -601,7 +601,15 @@ class Company:
         return self._gf_capex_boost
 
     def compute_budget_penalty(self) -> float:
-        """Tiered budget penalty: zero below soft_zone, quadratic in soft zone, hard block above cap."""
+        """Tiered budget penalty: zero below soft_zone, quadratic in soft zone,
+        steep above hard cap.
+
+        Returns an absolute cost (M EUR) that is later divided by
+        ``annual_budget`` in the reward function.  The magnitude is kept
+        moderate by scaling with the *overshoot amount* rather than the
+        full budget, so a 5 % overshoot on a 1 000 M EUR budget produces
+        a penalty ≈ coef × (normalized²) × overshoot_abs.
+        """
         budget = max(self.annual_budget, 1.0)
         spend_ratio = self.budget_spent_this_year / budget
         budget_cfg = self.config.get("budget", {})
@@ -611,17 +619,17 @@ class Company:
 
         if spend_ratio <= soft_start:
             return 0.0
-        elif spend_ratio <= hard_cap:
-            overshoot = spend_ratio - soft_start
-            zone_width = max(hard_cap - soft_start, 1e-6)
-            normalized = overshoot / zone_width
-            return coef * (normalized ** 2) * budget
+
+        overshoot_abs = self.budget_spent_this_year - soft_start * budget
+        zone_width = max(hard_cap - soft_start, 1e-6)
+        normalized = (spend_ratio - soft_start) / zone_width
+
+        if spend_ratio <= hard_cap:
+            # Quadratic ramp within the soft zone
+            return coef * (normalized ** 2) * overshoot_abs
         else:
-            # Above hard cap: quadratic continues (normalized > 1 → penalty grows steeply)
-            overshoot = spend_ratio - soft_start
-            zone_width = max(hard_cap - soft_start, 1e-6)
-            normalized = overshoot / zone_width
-            return coef * (normalized ** 2) * budget
+            # Above hard cap: penalty grows steeply (cubic-like feel)
+            return coef * (normalized ** 2) * overshoot_abs
 
     def get_budget_utilization(self) -> float:
         return self.budget_spent_this_year / max(self.annual_budget, 1e-6)

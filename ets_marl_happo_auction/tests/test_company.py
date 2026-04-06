@@ -351,13 +351,16 @@ def test_budget_penalty_on_overspend(config):
     assert penalty > 0, "Should penalize overspending"
 
 def test_budget_penalty_contingency_zone(config):
-    """5% overspend should be small but non-zero in the contingency zone."""
+    """5% overspend should be positive in the soft zone (tiered penalty)."""
     c = make_company(config, agent_id=0)
     c.reset_budget()
     c.record_spending(1.05 * c.annual_budget)
     p = c.compute_budget_penalty()
     assert p > 0.0
-    assert p < 0.2
+    # With tiered formula: coef * (normalized²) * overshoot_abs
+    # normalized = 0.05/0.15 ≈ 0.333, overshoot_abs = 0.05 * budget
+    # Must be moderate (not catastrophic) relative to budget
+    assert p < c.annual_budget * 0.05, "Soft-zone penalty should stay moderate"
 
 
 def test_budget_penalty_quadratic_zone_larger(config):
@@ -419,6 +422,7 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
     n_agents = cfg["companies"]["n_agents"]
     cfg["budget"]["annual_budgets"] = [5000.0] * n_agents
     cfg["budget"]["hard_cap_multiplier"] = 10.0
+    cfg["budget"]["hard_cap_fraction"] = 10.0  # disable hard gate for this test
     cfg["technologies"]["decommission_costs"] = [0, 0, 0, 0, 0]
 
     probe_env = ETSEnvironment(cfg, seed=22)
