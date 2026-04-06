@@ -617,7 +617,7 @@ class Company:
             normalized = overshoot / zone_width
             return coef * (normalized ** 2) * budget
         else:
-            # Above hard cap: large penalty
+            # Above hard cap: quadratic continues (normalized > 1 → penalty grows steeply)
             overshoot = spend_ratio - soft_start
             zone_width = max(hard_cap - soft_start, 1e-6)
             normalized = overshoot / zone_width
