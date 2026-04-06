@@ -252,6 +252,10 @@ class ETSEnvironment(gym.Env):
         # Logging
         self.episode_log: List[dict] = []
 
+        # Reward channel diagnostics
+        self._last_reward_channels: dict = {}
+        self._last_auction_reward_channels: dict = {}
+
     # ------------------------------------------------------------------
     # Training loop interface
     # ------------------------------------------------------------------
@@ -467,6 +471,10 @@ class ETSEnvironment(gym.Env):
         self._collateral_locked = np.zeros(self.n_total)
         self._last_collateral_load = np.zeros(self.n_total)
         self._bid_affordability = np.zeros(self.n_total)
+
+        # Reward channel diagnostics
+        self._last_reward_channels = {}
+        self._last_auction_reward_channels = {}
 
         if self._fade_enabled:
             n_active_bots = self._resolve_fade_active_bots(self.current_episode)
@@ -1811,6 +1819,16 @@ class ETSEnvironment(gym.Env):
             r_auction[i] = -(auction_cost + collateral_cost_i + investment_cost
                              + opex_delta + mac_cost_i + loan_interest_cost
                              + capex_penalty) / budget_divisor
+
+            self._last_auction_reward_channels[i] = {
+                "auction_cost": float(auction_cost / budget_divisor),
+                "collateral_cost": float(collateral_cost_i / budget_divisor),
+                "investment_cost": float(investment_cost / budget_divisor),
+                "opex_delta": float(opex_delta / budget_divisor),
+                "mac_cost": float(mac_cost_i / budget_divisor),
+                "loan_interest": float(loan_interest_cost / budget_divisor),
+                "capex_penalty": float(capex_penalty / budget_divisor),
+            }
         return r_auction
 
     # ------------------------------------------------------------------
@@ -2370,6 +2388,20 @@ class ETSEnvironment(gym.Env):
             base_rewards[i] = base_reward
             shaping_rewards[i] = shaping_reward
             rewards[i] = base_reward + shaping_reward
+
+            self._last_reward_channels[i] = {
+                "cost_norm": float(cost_norm_ex_penalty),
+                "penalty_norm": float(penalty_norm),
+                "green_bonus": float(green_bonus),
+                "esg_signal": float(esg_signal),
+                "efficiency_bonus": float(efficiency_bonus),
+                "opp_cost": float(opp_cost),
+                "budget_penalty": float(budget_penalty / budget_divisor),
+                "capex_penalty": float(capex_penalty / budget_divisor),
+                "loan_interest": float(loan_interest_cost / budget_divisor),
+                "base_reward": float(base_reward),
+                "shaping_reward": float(shaping_reward),
+            }
 
         # Terminal value bonuses (final year only)
         is_final_year = self.current_year >= self.n_years - 1
