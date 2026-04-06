@@ -359,7 +359,7 @@ electricity:
 # ----------------------------------------------------------
 reward:
   normalizer_alpha: 0.01
-  opportunity_cost_rate: 0.05  # cost-of-capital on banked allowances (not a storage holding fee)
+  opportunity_cost_rate: 0.0  # H4: disabled — agents learn holding decisions through terminal value
   clip_min: -10.0
   clip_max: 10.0         # Increased from 5.0 — symmetric with clip_min to avoid asymmetric gradient compression
   shaping_beta: 7.0              # green_delta bonus weight
@@ -372,7 +372,7 @@ reward:
 
 # ----------------------------------------------------------
 # ESG signal — saved-carbon-years formula
-# esg = w_green × ef_ratio × time_ratio × (annual_budget / 1000)
+# esg = w_green × esg_scale × ef_ratio × time_ratio
 # where ef_ratio = (initial_ef - current_ef) / initial_ef
 #       time_ratio = remaining_years / n_years
 # Terminal ESG: queue items valued by γ^years_late discount
@@ -381,16 +381,16 @@ reward:
 # ----------------------------------------------------------
 esg:
   enabled: true
-  scale: 2.0
+  scale: 3.5
   # Reward = w_cost × (-cost_norm) + w_green × (esg_scale × esg_raw) + shaping
   # Financial agents (w_green=0): reward = -cost_norm
   # ESG agents (w_green=0.5): reward = 0.5×(-cost_norm) + 0.5×(esg_scaled)
   # This structurally guarantees 50/50 financial/environmental weighting.
 
 # ----------------------------------------------------------
-# Opponent modeling — 5D public info per opponent.
-# obs_dim_phase1 = 28 + 5*(N_total-1) = 103 (for 16 agents)
-# obs_dim_phase2 = phase1 + 7 = 110
+# Opponent modeling — 6D public info per opponent.
+# obs_dim_phase1 = 29 + 6*(N_total-1) = 119 (for 16 agents)
+# obs_dim_phase2 = phase1 + 16 = 135
 # ----------------------------------------------------------
 opponent_modeling:
   enabled: true

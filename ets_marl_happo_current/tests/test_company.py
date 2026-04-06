@@ -470,14 +470,14 @@ def test_obs_phase1_shape(config):
     assert obs.dtype == np.float32
 
 def test_obs_phase1_with_opponents(config):
-    """With opponent modeling, obs should have 33 + 5*(N-1) dims."""
+    """With opponent modeling, obs should have 33 + 6*(N-1) dims."""
     config_opp = {**config, "opponent_modeling": {"enabled": True}}
     c = make_company(config_opp, agent_id=0)
-    opponent_obs = np.zeros(5 * 3, dtype=np.float32)  # 3 opponents
+    opponent_obs = np.zeros(6 * 3, dtype=np.float32)  # 3 opponents, 6D each
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, opponent_obs=opponent_obs)
-    assert obs.shape == (33 + 15,)
+    assert obs.shape == (33 + 18,)
 
 def test_obs_phase2_extends_phase1(config):
     """Phase 2 obs = phase1 + 10 extra dims."""
@@ -523,7 +523,7 @@ def test_obs_price_normalization(config):
 def test_public_info_keys(config):
     c = make_company(config, agent_id=0)
     info = c.get_public_info()
-    assert set(info.keys()) == {"emissions", "carry_forward", "green_frac", "fossil_frac", "queue_total"}
+    assert set(info.keys()) == {"emissions", "carry_forward", "green_frac", "fossil_frac", "queue_total", "is_active"}
 
 def test_queue_capacity_shape(config):
     c = make_company(config, agent_id=0)

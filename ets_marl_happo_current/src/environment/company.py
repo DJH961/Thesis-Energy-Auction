@@ -543,7 +543,7 @@ class Company:
     # ------------------------------------------------------------------
 
     def get_public_info(self) -> dict:
-        """Return publicly observable information about this company (5D)."""
+        """Return publicly observable information about this company (6D)."""
         queue_total = sum(item["frac_delta"] for item in self._construction_queue)
         return {
             "emissions": self.compute_emissions() / 10.0,
@@ -551,6 +551,7 @@ class Company:
             "green_frac": self.green_frac,
             "fossil_frac": self.fossil_frac,
             "queue_total": queue_total,
+            "is_active": 1.0,
         }
 
     # ------------------------------------------------------------------
@@ -910,7 +911,7 @@ class Company:
 
     @property
     def obs_dim_phase1(self) -> int:
-        """33 base dims + 5*(N_total-1) opponent dims when opponent modeling is enabled.
+        """33 base dims + 6*(N_total-1) opponent dims when opponent modeling is enabled.
         N_total = learning agents + bot agents (all market participants).
         Base dims include carry-forward at [20], TNAC proxy at [21],
         effective reserve at [22], THIS YEAR's auction volume ratio at [23],
@@ -918,9 +919,10 @@ class Company:
         MSR withholding at [26], budget headroom at [27],
         suspension_remaining_norm at [28], collateral_load_last at [29],
         bid_affordability_last at [30], loan_outstanding_norm at [31],
-        years_under_loan_norm at [32]."""
+        years_under_loan_norm at [32].
+        Opponent dims: emissions, carry_forward, green_frac, fossil_frac, queue_total, is_active."""
         if self._opponent_modeling and self._n_total > 1:
-            return 33 + 5 * (self._n_total - 1)
+            return 33 + 6 * (self._n_total - 1)
         return 33
 
     @property

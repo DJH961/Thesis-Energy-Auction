@@ -530,7 +530,7 @@ class Company:
     # ------------------------------------------------------------------
 
     def get_public_info(self) -> dict:
-        """Return publicly observable information about this company (5D)."""
+        """Return publicly observable information about this company (6D)."""
         queue_total = sum(item["frac_delta"] for item in self._construction_queue)
         return {
             "emissions": self.compute_emissions() / 10.0,
@@ -538,6 +538,7 @@ class Company:
             "green_frac": self.green_frac,
             "fossil_frac": self.fossil_frac,
             "queue_total": queue_total,
+            "is_active": 1.0,
         }
 
     # ------------------------------------------------------------------
@@ -915,11 +916,12 @@ class Company:
     @property
     def obs_dim_phase1(self) -> int:
         """29 base dims (Phase G 24D + 2 safety dims + 3 loan/affordability dims)
-        + 5*(N_total-1) opponent dims.
+        + 6*(N_total-1) opponent dims.
         New dims: bid_affordability_last [26], loan_outstanding_norm [27],
-        years_under_loan_norm [28]."""
+        years_under_loan_norm [28].
+        Opponent dims: emissions, carry_forward, green_frac, fossil_frac, queue_total, is_active."""
         if self._opponent_modeling and self._n_total > 1:
-            return 29 + 5 * (self._n_total - 1)
+            return 29 + 6 * (self._n_total - 1)
         return 29
 
     @property

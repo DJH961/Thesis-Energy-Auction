@@ -810,10 +810,10 @@ def test_opex_delta_zero_for_unchanged_mix():
 
 
 def test_esg_cost_balance_preserved():
-    """For an ESG agent (w_green=0.5), cost and ESG signals are within 5× of each other."""
+    """For an ESG agent (w_green=0.5), esg_scale_i = base_esg_scale directly (no budget compensation)."""
     config = load_config()
     config["esg"]["enabled"] = True
-    config["esg"]["scale"] = 2.0
+    config["esg"]["scale"] = 3.5
     config["simulation"]["n_years"] = 12
     config["warm_start"]["enabled"] = False
     config["uncertainty"]["enabled"] = False
@@ -826,20 +826,21 @@ def test_esg_cost_balance_preserved():
 
     _run_one_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.05)
 
+    base_esg_scale = float(config["esg"]["scale"])
     for i in range(1, min(8, env.n_agents), 2):
         company = env.companies[i]
         if company.w_green < 0.4:
             continue
-        budget_divisor = max(company.annual_budget, 1.0)
-        base_esg_scale = float(config["esg"]["scale"])
-        esg_scale_i = base_esg_scale * (1000.0 / budget_divisor)
-
-        assert esg_scale_i > 0, f"Agent {i} has non-positive esg_scale_i={esg_scale_i}"
-        assert company.initial_ef > 0.01, f"Agent {i} has zero initial_ef"
-        # Verify the product esg_scale_i × (budget/1000) = base_esg_scale
-        product = esg_scale_i * (budget_divisor / 1000.0)
-        assert abs(product - base_esg_scale) < 1e-6, (
-            f"Agent {i}: esg_scale_i × (budget/1000) = {product}, expected {base_esg_scale}")
+        ch = env._last_reward_channels.get(i, {})
+        if company.initial_ef > 0.01:
+            ef_ratio = (company.initial_ef - company.weighted_emission_factor) / company.initial_ef
+            remaining = max(1, env.n_years - env.current_year + 1)
+            time_ratio = remaining / env.n_years
+            expected_esg = base_esg_scale * ef_ratio * time_ratio
+            actual_esg = ch.get("esg_signal", 0.0)
+            if ef_ratio > 0.01:
+                assert abs(actual_esg - expected_esg) < 0.5, (
+                    f"Agent {i}: esg_signal={actual_esg}, expected≈{expected_esg}")
 
 
 def test_batch_normalization_replaces_ema():
@@ -1049,7 +1050,7 @@ def test_auction_reward_normalization():
 
     for i in range(n):
         company = env.companies[i]
-        budget = max(company.annual_budget, 1.0)
+        budget = max(company._budget_ema if company._budget_ema is not None else company.annual_budget, 1.0)
 
         # Components that should be non-zero
         payment_i = float(env._phase1_payments[i])
@@ -1088,7 +1089,7 @@ def test_reward_channels_present():
     for i in range(min(env.n_agents, 2)):
         ch = env._last_reward_channels[i]
         expected_keys = {"cost_norm", "penalty_norm", "green_bonus", "esg_signal",
-                         "efficiency_bonus", "opp_cost", "budget_penalty",
+                         "efficiency_bonus", "budget_penalty",
                          "capex_penalty", "loan_interest", "base_reward", "shaping_reward"}
         assert expected_keys.issubset(ch.keys()), f"Missing keys: {expected_keys - ch.keys()}"
 

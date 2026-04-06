@@ -340,9 +340,10 @@ class ETSEnvironment(gym.Env):
             base_reserve = max(abs_floor, discount * ma3)
 
         # If auctions have failed for consecutive years, decay the effective reserve
-        # by 20% per year toward the absolute floor.
+        # exponentially toward the absolute floor: decay = 0.8^n_consecutive_failures.
         if self._consecutive_years_without_valid_auction_clear >= 2:
-            return max(abs_floor, abs_floor + (base_reserve - abs_floor) * 0.8)
+            decay = 0.8 ** self._consecutive_years_without_valid_auction_clear
+            return max(abs_floor, abs_floor + (base_reserve - abs_floor) * decay)
 
         return base_reserve
 
@@ -1619,7 +1620,7 @@ class ETSEnvironment(gym.Env):
         r_auction = np.zeros(self.n_agents)
         for i in range(self.n_agents):
             company = self.companies[i]
-            budget_divisor = max(company.annual_budget, 1.0)
+            budget_divisor = max(company._budget_ema if company._budget_ema is not None else company.annual_budget, 1.0)
 
             auction_cost = float(self._phase1_payments[i])
             investment_cost = float(self._phase1_invest_costs[i])
@@ -2140,7 +2141,6 @@ class ETSEnvironment(gym.Env):
         base_esg_scale = float(esg_cfg.get("scale", 2.0))
 
         beta_shaping = reward_cfg.get("shaping_beta", 10.0)
-        opp_cost_rate = float(reward_cfg.get("opportunity_cost_rate", 0.05))
 
         if mac_costs is None:
             mac_costs = np.zeros(self.n_total)
@@ -2175,8 +2175,8 @@ class ETSEnvironment(gym.Env):
             budget_penalty = company.compute_budget_penalty()
             capex_penalty = company.compute_capex_penalty()
 
-            # v7.6: Per-agent financial-scale normalization using annual_budget
-            budget_divisor = max(company.annual_budget, 1.0)
+            # v7.7: Per-agent financial-scale normalization using EMA budget
+            budget_divisor = max(company._budget_ema if company._budget_ema is not None else company.annual_budget, 1.0)
 
             # Separate penalty from other costs
             # Penalty applies at full strength to ALL agents regardless of w_cost
@@ -2193,16 +2193,15 @@ class ETSEnvironment(gym.Env):
             fossil_scale = max(company.fossil_frac, 0.05)
             green_bonus = beta_shaping * green_delta * fossil_scale * self.shaping_weight * (0.2 + company.w_green)
 
-            # v7.6: Per-agent ESG scale — compensates for /annual_budget divisor
-            # to preserve the ESG-to-cost ratio that was calibrated with /1000.
-            esg_scale_i = base_esg_scale * (1000.0 / budget_divisor)
+            # v7.7: ESG scale is just base_esg_scale (no per-agent budget compensation)
+            esg_scale_i = base_esg_scale
 
             # ESG signal: saved-carbon-years formula
             esg_signal = 0.0
             if esg_enabled and company.initial_ef > 1e-6:
                 ef_ratio = (company.initial_ef - company.weighted_emission_factor) / company.initial_ef
                 time_ratio = remaining_years / self.n_years
-                esg_raw = ef_ratio * time_ratio * (company.annual_budget / 1000.0)
+                esg_raw = ef_ratio * time_ratio
                 esg_signal = esg_scale_i * esg_raw
 
             # F1: Efficiency bonus as a shaping reward (decays with shaping_weight).
@@ -2215,16 +2214,10 @@ class ETSEnvironment(gym.Env):
                 price_weight = clearing_price / 100.0
                 efficiency_bonus = 1.5 * ef_improvement_ratio * time_weight * price_weight * self.shaping_weight
 
-            # Cost-of-capital on allowances carried after compliance settlement.
-            # NOTE: self.holdings[i] is already the post-compliance bank at this
-            # point (updated in step_secondary before _compute_rewards is called).
-            opp_cost = float(self.holdings[i]) * float(clearing_price) * opp_cost_rate / budget_divisor
-
             base_reward = float(
                 company.w_cost * (-cost_norm_ex_penalty)
                 + company.w_green * esg_signal
                 - penalty_norm  # penalty at full strength for all agents
-                - opp_cost
             )
             shaping_reward = float(green_bonus + efficiency_bonus)
 
@@ -2238,7 +2231,6 @@ class ETSEnvironment(gym.Env):
                 "green_bonus": float(green_bonus),
                 "esg_signal": float(esg_signal),
                 "efficiency_bonus": float(efficiency_bonus),
-                "opp_cost": float(opp_cost),
                 "budget_penalty": float(budget_penalty / budget_divisor),
                 "capex_penalty": float(capex_penalty / budget_divisor),
                 "loan_interest": float(loan_interest_cost / budget_divisor),
@@ -2275,7 +2267,6 @@ class ETSEnvironment(gym.Env):
                     ratio = capped_holdings / annual_need
                     bank_value = np.log1p(ratio) * annual_need * terminal_price / budget_divisor
                     rewards[i] += bank_value
-                    base_rewards[i] += bank_value
                     terminal_bank_values[i] = bank_value
 
                 # Terminal queue value: ESG from queue items with γ^years_late discount
@@ -2459,6 +2450,7 @@ class ETSEnvironment(gym.Env):
                             pi["green_frac"],
                             pi["fossil_frac"],
                             pi["queue_total"],
+                            pi.get("is_active", 1.0),
                         ])
                 opponent_obs = np.array(opp_parts, dtype=np.float32)
             else:

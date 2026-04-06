@@ -436,14 +436,14 @@ def test_burnin_prev_ma3_seeded():
 # ---------------------------------------------------------------------------
 
 def test_p8_obs_dims():
-    """Phase 1 obs should be 33D base (+ 5*(N_total-1) opponent dims) with opponent modeling.
+    """Phase 1 obs should be 33D base (+ 6*(N_total-1) opponent dims) with opponent modeling.
     N_total = learning + bot agents."""
     env = load_env()
     obs, _ = env.reset()
     n_agents = env.config["companies"]["n_agents"]
     n_total = n_agents + env.config["companies"].get("n_bot_agents", 0)
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
-    expected_p1 = 33 + (5 * (n_total - 1) if opp_enabled else 0)
+    expected_p1 = 33 + (6 * (n_total - 1) if opp_enabled else 0)
     expected_p2 = expected_p1 + 10  # +10: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm, collateral_locked_norm, budget_remaining_phase2_norm, compliance_liability_norm
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
