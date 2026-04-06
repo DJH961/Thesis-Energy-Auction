@@ -233,6 +233,12 @@ budget:
   contingency_zone: 0.10
   hard_cap_multiplier: 1.20
   contingency_penalty_coef: 0.05
+  # H1: Budget hardening — soft zone + hard ceiling
+  hard_cap_fraction: 1.15       # spending cannot exceed 115% of annual_budget
+  soft_zone_start: 1.00         # tiered penalty begins at 100% spend
+  tiered_penalty_coef: 2.0      # quadratic penalty coefficient in soft zone
+  # H2: Investment feasibility gate
+  investment_hard_gate: true    # block investment if would exceed hard cap
   capex_throughputs: [130.0, 130.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
   bot_capex_throughputs: [130.0, 130.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
   capex_overspend_coef: 1.0

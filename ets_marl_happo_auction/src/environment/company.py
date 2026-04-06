@@ -588,22 +588,27 @@ class Company:
         return self._gf_capex_boost
 
     def compute_budget_penalty(self) -> float:
+        """Tiered budget penalty: zero below soft_zone, quadratic in soft zone, hard block above cap."""
+        budget = max(self.annual_budget, 1.0)
+        spend_ratio = self.budget_spent_this_year / budget
         budget_cfg = self.config.get("budget", {})
-        contingency = float(budget_cfg.get("contingency_zone", 0.10))
-        hard_cap = float(budget_cfg.get("hard_cap_multiplier", 1.20))
-        contingency_coef = float(budget_cfg.get("contingency_penalty_coef", 0.05))
+        soft_start = float(budget_cfg.get("soft_zone_start", 1.0))
+        hard_cap = float(budget_cfg.get("hard_cap_fraction", 1.15))
+        coef = float(budget_cfg.get("tiered_penalty_coef", 2.0))
 
-        overspend_frac = max(0.0, self.budget_spent_this_year / max(self.annual_budget, 1e-6) - 1.0)
-        if overspend_frac <= 0.0:
+        if spend_ratio <= soft_start:
             return 0.0
-        if overspend_frac <= contingency:
-            return contingency_coef * (overspend_frac / max(contingency, 1e-6)) * (self.annual_budget / 1000.0)
-        if overspend_frac <= (hard_cap - 1.0):
-            base_penalty = contingency_coef * (self.annual_budget / 1000.0)
-            excess = overspend_frac - contingency
-            zone_width = max((hard_cap - 1.0) - contingency, 1e-6)
-            return base_penalty + self.overspend_coef * (excess / zone_width) ** 2 * (self.annual_budget / 1000.0)
-        return self.overspend_coef * 3.0 * (self.annual_budget / 1000.0)
+        elif spend_ratio <= hard_cap:
+            overshoot = spend_ratio - soft_start
+            zone_width = max(hard_cap - soft_start, 1e-6)
+            normalized = overshoot / zone_width
+            return coef * (normalized ** 2) * budget
+        else:
+            # Above hard cap: large penalty
+            overshoot = spend_ratio - soft_start
+            zone_width = max(hard_cap - soft_start, 1e-6)
+            normalized = overshoot / zone_width
+            return coef * (normalized ** 2) * budget
 
     def get_budget_utilization(self) -> float:
         return self.budget_spent_this_year / max(self.annual_budget, 1e-6)

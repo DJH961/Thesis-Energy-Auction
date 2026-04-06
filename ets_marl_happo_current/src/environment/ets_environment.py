@@ -1448,6 +1448,20 @@ class ETSEnvironment(gym.Env):
             total_proj_cost = capex_cost + _estimate_decommission_cost(company, invest_frac)
             budget_clipped = False
             capex_clipped = False
+
+            # I2: Investment hard gate — block if would exceed hard cap
+            if budget_cfg.get("investment_hard_gate", True):
+                hard_cap_frac = float(budget_cfg.get("hard_cap_fraction", 1.15))
+                hard_cap_abs = hard_cap_frac * max(company.annual_budget, 1.0)
+                if company.budget_spent_this_year + total_proj_cost > hard_cap_abs:
+                    available = max(0.0, hard_cap_abs - company.budget_spent_this_year)
+                    if total_proj_cost > 1e-6:
+                        scale = available / total_proj_cost
+                        invest_frac *= scale
+                        capex_cost = company.compute_investment_cost(tech_idx, invest_frac, year)
+                        total_proj_cost = capex_cost + _estimate_decommission_cost(company, invest_frac)
+                        budget_clipped = True
+
             if total_proj_cost > budget_remaining and total_proj_cost > 1e-6:
                 invest_frac *= budget_remaining / total_proj_cost
                 capex_cost = company.compute_investment_cost(tech_idx, invest_frac, year)
