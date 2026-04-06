@@ -383,7 +383,9 @@ def test_investment_scaled_to_budget_hard_cap():
     """Overspend attempt above 20% should be clipped by hard_cap_multiplier."""
     cfg = load_env_config(seed=11)
     n_agents = cfg["companies"]["n_agents"]
+    cfg["budget"]["mode"] = "fixed"  # prevent dynamic budget from overriding
     cfg["budget"]["annual_budgets"] = [100.0] * n_agents
+    cfg["budget"]["bot_annual_budgets"] = [100.0] * n_agents
     cfg["budget"]["hard_cap_multiplier"] = 1.20
     cfg["budget"]["capex_throughputs"] = [1e9] * n_agents
 
@@ -465,36 +467,36 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
 # ---------------------------------------------------------------------------
 
 def test_obs_phase1_shape(config):
-    """Phase 1 obs should be 26D base after Phase G consolidation + 2 safety dims (no opponent modeling)."""
+    """Phase 1 obs should be 29D base after Phase G + safety + C1 dims (no opponent modeling)."""
     c = make_company(config, agent_id=0)
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, auction_gap=1.0)
-    assert obs.shape == (26,), f"Expected 26D (Phase G + safety dims), got {obs.shape}"
+    assert obs.shape == (29,), f"Expected 29D (Phase G + safety + C1 dims), got {obs.shape}"
     assert obs.dtype == np.float32
 
 def test_obs_phase1_with_opponents(config):
-    """With opponent modeling, obs should have 26 + 5*(N-1) dims (Phase G: 24 base + 2 new)."""
+    """With opponent modeling, obs should have 29 + 5*(N-1) dims (Phase G + safety + C1)."""
     config_opp = {**config, "opponent_modeling": {"enabled": True}}
     c = make_company(config_opp, agent_id=0)
     opponent_obs = np.zeros(5 * 3, dtype=np.float32)  # 3 opponents
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, opponent_obs=opponent_obs)
-    assert obs.shape == (26 + 15,)
+    assert obs.shape == (29 + 15,)
 
 def test_obs_phase2_extends_phase1(config):
-    """Phase 2 obs = phase1 + 7 standard dims + 6 D1/D2 dims + 1 collateral dim = phase1 + 14 dims."""
+    """Phase 2 obs = phase1 + 7 standard + 6 D1/D2 + 1 collateral + 2 E1/E2 = phase1 + 16 dims."""
     c = make_company(config, agent_id=0)
     obs1 = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0, expected_price=80.0)
     obs2 = c.get_observation_phase2(
         obs_phase1=obs1, allocation=2.0, clearing_price=80.0,
         emissions=3.0, banked=1.0, emission_shock=0.05, payment=160.0)
-    # Phase G: 26 base + 14 extra (7 standard + 6 D1/D2 + 1 collateral)
-    assert obs2.shape == (26 + 14,), f"Expected {26+14}D, got {obs2.shape}"
-    # First 26 dims should match phase1
-    np.testing.assert_array_equal(obs2[:26], obs1)
+    # Phase G: 29 base + 16 extra (7 standard + 6 D1/D2 + 1 collateral + 2 E1/E2)
+    assert obs2.shape == (29 + 16,), f"Expected {29+16}D, got {obs2.shape}"
+    # First 29 dims should match phase1
+    np.testing.assert_array_equal(obs2[:29], obs1)
 
 def test_obs_values_finite(config):
     """All observation values should be finite."""
