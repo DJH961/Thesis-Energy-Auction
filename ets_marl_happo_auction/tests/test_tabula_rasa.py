@@ -60,7 +60,7 @@ def test_tabula_rasa_schedule_overrides(monkeypatch):
     n_ep = resolved["simulation"]["n_episodes"]
 
     assert resolved["ppo"]["critic_warmup_episodes"] == int(0.10 * n_ep)
-    assert resolved["reward"]["shaping_decay_episode"] == int(0.20 * n_ep)
+    assert resolved["reward"]["shaping_decay_episode"] == int(0.33 * n_ep)
     assert resolved["exploration"]["epsilon_decay_episodes"] == int(0.50 * n_ep)
     assert resolved["exploration"]["mode"] == "uniform"
 

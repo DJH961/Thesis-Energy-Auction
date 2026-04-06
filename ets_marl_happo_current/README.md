@@ -114,6 +114,10 @@ The reward signal balances:
 - **Auction bid collateral**: overbids above clearing incur a real capital lock-up cost on awarded quantity (`auction.collateral.enabled`)
 - **Collateral affordability guardrail**: if collateral lock-up is unaffordable, bids are clipped in two steps (quantity first, then price if needed) to preserve feasible participation
 - **Budget headroom observation**: Phase-1 dim `[27]` reports current annual budget headroom (`1.0` fresh, `0.0` at limit, negative overspend)
+- **Revenue-based dynamic budget**: When `budget.mode: revenue_based`, annual budgets are computed from `Company.compute_revenue()` (electricity revenue with carbon-cost passthrough) minus operating costs plus archetype-specific debt headroom. EMA smoothing prevents erratic year-to-year swings.
+- **Emergency loan system**: When a company faces auction default, an emergency loan covers the shortfall (up to `max_loan_fraction × annual_budget`) instead of immediate suspension. Loans carry interest (default 8%) with annual repayment deducted at year start.
+- **Budget hardening**: Tiered penalty regime — free spending up to 100% of budget, quadratic penalty in [100%, 115%], steep growth above. Investment hard gate scales down `invest_frac` if total projected spending would exceed the hard cap.
+- **Heuristic loan-awareness**: Bots with emergency loans reduce auction quantity (−30%), investment (−50%), and secondary buy volume (−40%) proportional to loan pressure.
 - **Carry-forward**: Non-compliance shortfall is added to next year's obligation (capped at 2.0x, allowing larger debt accumulation)
 - **Hidden burn-in warm-start**: A configurable pre-period (`warm_start.burnin_enabled`) seeds realistic bank holdings, MSR reserve, and MA3 history before year 0
 - **Fundamentals-based heuristic**: Bot bidding uses MAC→penalty gradient (`mac_cost + urgency × (penalty - mac_cost)`), removing dependence on price moving average
@@ -271,6 +275,13 @@ The most important settings you might want to change:
 | `reward.terminal_bank_value` | true | Value banked allowances at episode end |
 | `reward.terminal_queue_value` | true | Value in-construction projects at episode end |
 | `reward.terminal_payoff_years` | 5 | Horizon for terminal queue value NPV calculation |
+| `budget.mode` | `revenue_based` | Budget calculation method (`revenue_based` or `fixed`) |
+| `budget.emergency_loan.enabled` | `true` | Emergency loans prevent auction defaults |
+| `budget.emergency_loan.max_loan_fraction` | 0.5 | Max loan as fraction of annual budget |
+| `budget.emergency_loan.interest_rate` | 0.08 | Annual interest rate on emergency loans |
+| `budget.hard_cap_fraction` | 1.15 | Hard cap on spending as fraction of budget |
+| `budget.soft_zone_start` | 1.0 | Budget fraction where soft penalty begins |
+| `budget.investment_hard_gate` | `true` | Scale investment if would exceed hard cap |
 
 ## Understanding the Output
 

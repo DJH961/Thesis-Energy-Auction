@@ -188,6 +188,37 @@ If enabled, shortfall carries to next year, with optional cap multiplier to prev
 If carbon price exceeds MAC threshold, company can temporarily switch part of coal dispatch to gas.
 This lowers emissions in-year but adds MAC cost. It does not permanently alter long-run technology mix.
 
+### 4.6 Revenue-based dynamic budget
+
+When `budget.mode` is set to `revenue_based`, annual budgets are computed dynamically
+from electricity revenue rather than being fixed at episode start:
+
+$$
+\text{budget}_t = \text{EMA}\bigl(\text{revenue}_t - \text{opex}_t + \text{debt\_headroom}_i,\;\alpha\bigr)
+$$
+
+where `revenue` comes from `Company.compute_revenue()` (electricity sales with carbon-cost
+passthrough using MA3-smoothed carbon price and system-average emission factor), and
+`debt_headroom` is an archetype-specific buffer configured per agent. EMA smoothing
+(`ema_alpha`, default 0.3) prevents erratic year-to-year budget swings.
+
+When `budget.mode` is `fixed` (default), the original static annual budget is used unchanged.
+
+### 4.7 Emergency loan system
+
+When enabled (`budget.emergency_loan.enabled`), agents facing auction default receive an
+emergency loan instead of immediate suspension:
+
+- **Trigger**: Shortfall at auction settlement exceeds remaining budget but falls within
+  `max_loan_fraction × annual_budget`.
+- **Mechanics**: `apply_emergency_loan(shortfall)` adds the shortfall (plus accrued interest
+  at `loan_interest_rate`, default 8%) to `_loan_outstanding`. Annual repayment is deducted
+  at year start via `apply_loan_repayment()`.
+- **Tracking**: `_loan_outstanding`, `_loan_repayment_annual`, `_years_under_loan` are
+  maintained on the `Company` object and exposed in observations (see §6).
+- **Heuristic loan-awareness**: Bots with outstanding loans reduce auction quantity (−30%),
+  investment (−50%), and secondary buy volume (−40%).
+
 ## 5. Two-Phase Yearly Decision Process
 
 Each simulation year is split into two decisions.
@@ -217,7 +248,7 @@ Participants can sell from current allocation plus bank (no short selling beyond
 
 ### 6.1 Phase 1 observation
 
-Base dimension: 28.
+Base dimension: **33**.
 
 Includes:
 - time and cap
@@ -228,11 +259,17 @@ Includes:
 - TNAC proxy
 - effective reserve signal
 - secondary volume and profit signal
+- `[27]` budget headroom (1 – budget_spent / annual_budget)
+- `[28]` safety/collateral dims
+- `[29]` collateral load last
+- `[30]` bid_affordability_last: last year's bid total / remaining budget (clipped [0,1])
+- `[31]` loan_outstanding_norm: emergency loan / annual_budget
+- `[32]` years_under_loan_norm: years under active loan / 5
 
 If opponent modeling is enabled:
 
 $$
-obsDimPhase1 = 28 + 5 (N_{total} - 1)
+obsDimPhase1 = 33 + 5 (N_{total} - 1)
 $$
 
 Each opponent contributes public 5D tuple:
@@ -243,11 +280,11 @@ Each opponent contributes public 5D tuple:
 - total queue size
 
 With 16 total participants:
-- phase 1 dimension = 103
+- phase 1 dimension = 33 + 5×15 = **108**
 
 ### 6.2 Phase 2 observation
 
-Phase 2 appends 7 auction-result features to phase 1:
+Phase 2 appends **10** auction-result and compliance-awareness features to phase 1:
 - allocation
 - clearing price
 - net compliance position
@@ -255,15 +292,24 @@ Phase 2 appends 7 auction-result features to phase 1:
 - auction savings proxy
 - coverage ratio
 - normalized carry-forward
+- collateral_locked_norm: this year's collateral locked / annual_budget
+- budget_remaining_phase2_norm: remaining annual budget after auction / annual_budget
+- compliance_liability_norm: (emissions + carry_forward − bank − allocation) / annual_budget
 
 $$
-obsDimPhase2 = obsDimPhase1 + 7
+obsDimPhase2 = obsDimPhase1 + 10
 $$
 
 With 16 total participants:
-- phase 2 dimension = 110
+- phase 2 dimension = **118**
 
 ## 7. Reward Design (v7.4)
+
+**Reward channel logging:** After each year, `_last_reward_channels` and
+`_last_auction_reward_channels` dicts are populated with named components (cost_norm,
+penalty_norm, green_bonus, esg_signal, efficiency_bonus, opp_cost, budget_penalty,
+capex_penalty, loan_interest, base_reward, shaping_reward). These are for
+debugging/analysis only and do not affect reward computation.
 
 Per-agent reward is split into a **base reward** and a **shaping reward** that decays
 over training:
@@ -390,6 +436,21 @@ Revenue offsets cost signal and links carbon prices to generation margins.
 
 Each company has an annual spending envelope for all major outlays.
 Separate capex throughput constraint models physical delivery bottlenecks.
+
+### 9.4 Budget Hardening Regime
+
+Annual spending is subject to a tiered penalty regime:
+- **Below 100%** (`soft_zone_start`): No penalty.
+- **100–115%** (`soft_zone_start` → `hard_cap_fraction`): Quadratic penalty
+  that scales with overshoot amount: `coef × (normalized²) × overshoot_abs`.
+- **Above 115%**: Penalty continues to grow steeply (normalized > 1).
+- **Investment hard gate**: When enabled, `step_auction()` scales down
+  investment fraction if total projected spending would exceed the hard cap.
+
+This replaces the previous 3-tier contingency/quadratic system and provides
+clearer economic semantics: spending is free up to budget, incurs increasing
+opportunity cost in the soft zone, and is structurally prevented from running
+far above the hard cap.
 
 ## 10. Current Simplifications
 

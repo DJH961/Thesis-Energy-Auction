@@ -37,6 +37,7 @@ class AuctionPolicy(nn.Module):
     def __init__(self, obs_dim, action_dim, hidden_size, action_low, action_high,
                  log_std_min=-2.0, log_std_max=1.0, action_anchors=None):
         super().__init__()
+        self.layer_norm = nn.LayerNorm(obs_dim)
         self.fc1 = nn.Linear(obs_dim, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
 
@@ -67,6 +68,7 @@ class AuctionPolicy(nn.Module):
     def forward(self, obs):
         obs = obs.to(self.action_scale.device)
         obs = torch.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
+        obs = self.layer_norm(obs)
         x = F.relu(self.fc1(obs))
         x = F.relu(self.fc2(x))
         mean = self._compute_mean(x)
@@ -129,6 +131,7 @@ class SecondaryPolicy(nn.Module):
     def __init__(self, obs_dim, action_dim, hidden_size, action_low, action_high,
                  log_std_min=-2.0, log_std_max=1.0, action_anchors=None):
         super().__init__()
+        self.layer_norm = nn.LayerNorm(obs_dim)
         self.fc1 = nn.Linear(obs_dim, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
         self.mean_head = nn.Linear(hidden_size, action_dim)
@@ -146,6 +149,7 @@ class SecondaryPolicy(nn.Module):
     def forward(self, obs):
         obs = obs.to(self.action_scale.device)
         obs = torch.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
+        obs = self.layer_norm(obs)
         x = F.relu(self.fc1(obs))
         x = F.relu(self.fc2(x))
         mean = self.mean_head(x)
