@@ -738,6 +738,13 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"penalty_A{i+1}", f"shortfall_A{i+1}", f"queue_size_A{i+1}",
                       f"actor_loss_A{i+1}", f"critic_loss_A{i+1}", f"bid_price_A{i+1}"]
     ep_fields += ["secondary_volume", "secondary_avg_price", "secondary_match_rate"]
+    ep_fields += [
+        "ep_mean_clearing_price",
+        "ep_mean_coal_coverage_ratio",
+        "ep_default_count",
+        "ep_mean_bid_qty_mult",
+        "ep_mean_coal_budget_headroom",
+    ]
     for i in range(n_total_agents):
         ep_fields += [f"sec_buy_vol_A{i+1}", f"sec_sell_vol_A{i+1}",
                       f"sec_buy_avg_px_A{i+1}", f"sec_sell_avg_px_A{i+1}",
