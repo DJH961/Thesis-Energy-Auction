@@ -34,10 +34,16 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 - **Compliance-priority investment**: `invest_frac` scaled down by post-compliance budget headroom.
 - **Secondary**: `spend_frac = 0.9` when `carry_forward > 0.01`.
 
-### E2 — Collateral Warning Counter (`ets_environment.py`)
-- `self._collateral_warning_count: np.ndarray` added to `__init__` and `reset()`.
-  Incremented for each agent when collateral exceeds `max_collateral_budget_share * budget_remaining`.
-  `warnings.warn()` diagnostic emitted; bid quantities not modified.
+### E2 — Collateral Clip Safety Net (`ets_environment.py`)
+- Collateral clip gating in `step_auction()` uses expected-clearing sizing:
+  `expected_clearing = max(effective_reserve, price_ma3)`,
+  `expected_collateral = collateral_fraction * max(0, bid_price - expected_clearing) * bid_qty`.
+- If `expected_collateral > max_collateral_budget_share * budget_remaining`, bids are rescaled.
+- `self._collateral_clip_events` (agent_id → count) is reset each episode, incremented when clip
+  fires, and logged at episode end via `year_log["collateral_clip_events_episode"]` and
+  `year_log["collateral_clip_rate_episode"]`.
+- Validation expectation: bot-only runs should have ~0 clip events; non-zero indicates a
+  heuristic/environment mismatch.
 
 ### Config Updates (`configs/default.yaml`)
 - `electricity.base_price`: 50.0 → 55.0

@@ -233,6 +233,7 @@ class ETSEnvironment(gym.Env):
         self._bid_affordability = np.zeros(self.n_total)
         # E2: Collateral warning counter — cumulative per-agent count of collateral warnings
         self._collateral_warning_count: np.ndarray = np.zeros(self.n_total, dtype=int)
+        self._collateral_clip_events: dict[int, int] = {}
 
         # Dynamic reserve tracking
         self._last_effective_reserve = config["ets"].get("reserve_price", 0.0)
@@ -481,6 +482,7 @@ class ETSEnvironment(gym.Env):
         self._last_collateral_load = np.zeros(self.n_total)
         self._bid_affordability = np.zeros(self.n_total)
         self._collateral_warning_count = np.zeros(self.n_total, dtype=int)
+        self._collateral_clip_events = {i: 0 for i in range(self.n_total)}
         self._current_marginal_ef = 0.0
         self._build_episode_inflation_path()
 
@@ -1303,10 +1305,15 @@ class ETSEnvironment(gym.Env):
                     if bid_actions[i, 1] > max_notional_qty:
                         bid_actions[i, 1] = max_notional_qty
 
-        # E2: Solvency sanity check (softened — fixed heuristic is self-consistent).
-        # The heuristic's WTP formula already ensures bid value stays within available budget.
-        # This block now only logs a warning when collateral would exceed budget threshold.
-        # It no longer reshapes bids to avoid double-penalising well-intentioned bids.
+        # Compute effective reserve price (dynamic or static)
+        effective_reserve = self._compute_dynamic_reserve()
+        self._last_effective_reserve = effective_reserve
+        expected_clearing = max(effective_reserve, float(self._compute_price_ma3()))
+
+        # This clip exists as a training-stability safety net for learning agents during
+        # exploration, not as an economic mechanism. The heuristic policy is self-consistent
+        # and should not trigger it. If clip events fire for bot-only runs, this indicates a
+        # heuristic/env mismatch.
         coll_cfg = self.config.get("auction", {}).get("collateral", {})
         if coll_cfg.get("enabled", True):
             coll_frac = float(coll_cfg.get("collateral_fraction",
@@ -1326,17 +1333,13 @@ class ETSEnvironment(gym.Env):
                         0.0,
                         float(company.annual_budget - company.budget_spent_this_year),
                     )
-                    collateral = coll_frac * bid_p * bid_q
+                    above_clearing = max(0.0, bid_p - expected_clearing)
+                    collateral = coll_frac * above_clearing * bid_q
                     max_collateral = max_coll_share * budget_remaining
                     if collateral > max_collateral and max_collateral > 0 and budget_remaining > 1.0:
-                        # Log solvency warning; do not reshape bid (heuristic is self-consistent)
-                        self._collateral_warning_count[i] += 1
-                        warnings.warn(
-                            f"[E2] Agent {i} collateral {collateral:.1f} > "
-                            f"max {max_collateral:.1f} (budget_remaining={budget_remaining:.1f}); "
-                            f"skipping bid rescale (heuristic WTP is self-consistent).",
-                            stacklevel=2,
-                        )
+                        scale = max_collateral / max(collateral, 1e-9)
+                        bid_actions[i, 1] *= scale
+                        self._collateral_clip_events[i] = self._collateral_clip_events.get(i, 0) + 1
 
         self._phase1_bid_prices = bid_actions[:, 0].copy()
         self._phase1_bid_quantities = bid_actions[:, 1].copy()  # Mt after multiplier expansion
@@ -1347,10 +1350,6 @@ class ETSEnvironment(gym.Env):
             if self._suspension_remaining[i] > 0:
                 bid_actions[i, 1] = 0.0  # zero quantity → filtered by valid_mask in clearing
                 self._suspension_remaining[i] -= 1
-
-        # Compute effective reserve price (dynamic or static)
-        effective_reserve = self._compute_dynamic_reserve()
-        self._last_effective_reserve = effective_reserve
 
         # E4: Pre-bid collateral locking — fraction of margin above reserve.
         # Reduces effective cash available when checking ability to settle payment.
@@ -2074,6 +2073,13 @@ class ETSEnvironment(gym.Env):
         self.current_year += 1
         terminated = self.current_year >= self.n_years
         self.episode_done = terminated
+        if terminated:
+            years_completed = max(self.current_year, 1)
+            log["collateral_clip_events_episode"] = dict(self._collateral_clip_events)
+            log["collateral_clip_rate_episode"] = {
+                i: float(self._collateral_clip_events.get(i, 0)) / float(years_completed)
+                for i in range(self.n_total)
+            }
 
         obs_next = self._get_obs_phase1()   # shape (n_agents, obs_dim)
         # F2: Compute per-agent diagnostic scores and expose via info dict

@@ -52,6 +52,11 @@ class TestComplianceValidation:
         """Run 1 episode, check coal coverage >= 0.95, zero defaults, price in [40,150]."""
         episode_log, env = run_one_episode_heuristic(config)
         assert len(episode_log) > 0, "Episode log must not be empty"
+        total_clip_events = sum(env._collateral_clip_events.values())
+        assert total_clip_events == 0, (
+            "Bot-only run should have ~0 collateral clip events; non-zero indicates "
+            "heuristic/env mismatch."
+        )
 
         n_bots = config["companies"].get("n_bot_agents", 8)
         n_agents = 0  # we set n_agents=0 above
