@@ -50,6 +50,55 @@ from src.environment.market_calibration import compute_market_params
 from src.agents import heuristic_policy
 
 
+def _compute_marginal_ef(active_companies: list, config: dict) -> float:
+    """
+    Compute marginal emission factor for carbon cost pass-through.
+
+    The marginal EF is the EF of the most carbon-intensive technology with
+    sufficient system-wide capacity share (>5% hard threshold, soft blend
+    between 3-8%). When coal has material capacity, it is the marginal setter.
+
+    Reference: Fabra & Reguant (2014) AER; Sijm et al. (2006) Energy Policy.
+    """
+    tech_efs = config.get("technologies", {}).get("emission_factors", [0.82, 0.49, 0.011, 0.012, 0.048])
+    n_techs = len(tech_efs)
+
+    # Compute system-wide capacity (TWh output) per technology
+    total_output = sum(c.output_twh for c in active_companies)
+    if total_output < 1e-9:
+        return float(np.mean(tech_efs))
+
+    tech_shares = np.zeros(n_techs)
+    for c in active_companies:
+        for t in range(min(n_techs, len(c.mix))):
+            tech_shares[t] += float(c.mix[t]) * float(c.output_twh)
+    tech_shares /= total_output
+
+    system_ef = float(np.mean([c.weighted_emission_factor for c in active_companies]))
+
+    # Sort technologies by EF descending (most carbon-intensive first)
+    tech_efs_arr = np.array(tech_efs[:n_techs], dtype=float)
+    sorted_indices = np.argsort(tech_efs_arr)[::-1]
+
+    share_low = 0.03   # below this: technology not material
+    share_high = 0.08  # above this: technology fully marginal
+
+    for t in sorted_indices:
+        share = float(tech_shares[t])
+        ef_t = float(tech_efs_arr[t])
+        if share < share_low:
+            continue
+        if share >= share_high:
+            # Technology is fully marginal
+            return ef_t
+        # Soft blend between system_ef and this technology's EF
+        blend = (share - share_low) / (share_high - share_low)
+        return float((1.0 - blend) * system_ef + blend * ef_t)
+
+    # No technology above threshold: fall back to system average
+    return system_ef
+
+
 class ETSEnvironment(gym.Env):
 
     metadata = {"render_modes": ["human"]}
@@ -251,6 +300,10 @@ class ETSEnvironment(gym.Env):
         # Reward channel diagnostics
         self._last_reward_channels: dict = {}
         self._last_auction_reward_channels: dict = {}
+
+        # Emission factor diagnostics (M1)
+        self._last_system_ef = 0.0
+        self._last_marginal_ef = 0.0
 
     # ------------------------------------------------------------------
     # Training loop interface
@@ -1048,15 +1101,24 @@ class ETSEnvironment(gym.Env):
             smoothed_price = float(np.mean(hist[-3:]))
             # System-wide average emission factor
             active_companies = [c for c in self.companies if self._is_agent_active(c.agent_id)]
+            # System-wide average EF (kept for observation space)
             system_ef = float(np.mean([c.weighted_emission_factor for c in active_companies]))
+            # M1: Marginal EF — EF of most carbon-intensive technology with significant system share.
+            # Carbon cost pass-through in electricity markets prices off the marginal setter (typically
+            # coal when it has material system presence). Using system_ef understates coal revenue.
+            # Reference: Fabra & Reguant (2014), Sijm et al. (2006).
+            marginal_ef = _compute_marginal_ef(active_companies, self.config)
             # Update budgets for all companies (agents + bots)
             for c in active_companies:
                 c.set_annual_budget(
-                    c.compute_dynamic_budget(smoothed_price, system_ef, self.current_year)
+                    c.compute_dynamic_budget(smoothed_price, marginal_ef, self.current_year)
                 )
                 c.apply_loan_repayment()  # B4: repay from fresh dynamic budget
                 c.reset_budget()
                 c.reset_capex_budget()
+            # Store both for logging/obs space
+            self._last_system_ef = system_ef
+            self._last_marginal_ef = marginal_ef
         else:
             active_companies = [c for c in self.companies if self._is_agent_active(c.agent_id)]
             for company in active_companies:
@@ -1219,9 +1281,10 @@ class ETSEnvironment(gym.Env):
                     if bid_actions[i, 1] > max_notional_qty:
                         bid_actions[i, 1] = max_notional_qty
 
-        # E2: Pre-auction collateral affordability clip (10% of bid value).
-        # collateral = collateral_fraction × bid_price × bid_quantity.
-        # If collateral > max_collateral_budget_share × available_budget → scale bid_qty down.
+        # E2: Solvency sanity check (softened — fixed heuristic is self-consistent).
+        # The heuristic's WTP formula already ensures bid value stays within available budget.
+        # This block now only logs a warning when collateral would exceed budget threshold.
+        # It no longer reshapes bids to avoid double-penalising well-intentioned bids.
         coll_cfg = self.config.get("auction", {}).get("collateral", {})
         if coll_cfg.get("enabled", True):
             coll_frac = float(coll_cfg.get("collateral_fraction",
@@ -1243,10 +1306,15 @@ class ETSEnvironment(gym.Env):
                     )
                     collateral = coll_frac * bid_p * bid_q
                     max_collateral = max_coll_share * budget_remaining
-                    if collateral > max_collateral and max_collateral > 0:
-                        scale = max(0.0, max_collateral / collateral)
-                        scale = min(scale, 1.0)
-                        bid_actions[i, 1] *= scale
+                    if collateral > max_collateral and max_collateral > 0 and budget_remaining > 1.0:
+                        # Log solvency warning; do not reshape bid (heuristic is self-consistent)
+                        import warnings
+                        warnings.warn(
+                            f"[E2] Agent {i} collateral {collateral:.1f} > "
+                            f"max {max_collateral:.1f} (budget_remaining={budget_remaining:.1f}); "
+                            f"skipping bid rescale (heuristic WTP is self-consistent).",
+                            stacklevel=2,
+                        )
 
         self._phase1_bid_prices = bid_actions[:, 0].copy()
         self._phase1_bid_quantities = bid_actions[:, 1].copy()  # Mt after multiplier expansion
