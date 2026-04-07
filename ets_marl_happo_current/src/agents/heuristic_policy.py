@@ -37,8 +37,9 @@ auction_action (WTP-based):
         boosted by max(0, 1 - supply_ratio) * 0.3.
         Budget-aware: bid price degrades gracefully when funds are tight.
     - qty_mult: physical compliance need + urgency safety buffer.
-        annual_need = compute_estimate_need() + carry_forward
+        annual_need = compute_estimate_need() + _carry_forward  (minimum compliance need)
         qty_target = annual_need + carry_fwd + 0.1 * annual_need * urgency
+        (carry_fwd added again as an intentional over-buying buffer when in debt)
         qty_mult = clip(qty_target / annual_need, low, high)
     - invest_frac: NPV-gated (properly discounted) with compliance-priority clip.
         annuity_factor = (1 - (1 + r)^-horizon) / r  where r = discount_rate
@@ -182,6 +183,7 @@ def auction_action(
     wtp = min(wtp_penalty_cap, wtp_urgency)
     carry_fwd = max(0.0, float(company._carry_forward))
     qty_target_for_price = annual_need + carry_fwd + 0.1 * annual_need * urgency
+    # carry_fwd is intentionally added again as an over-buying safety buffer when in debt
     qty_for_price = float(np.clip(qty_target_for_price,
         aq.get("qty_mult_low", 0.3) * annual_need,
         aq.get("qty_mult_high", 2.0) * annual_need))
@@ -192,6 +194,7 @@ def auction_action(
     # --- Qty target: physical compliance need + urgency safety buffer ---
     remaining_years = max(1, n_years - current_year)
     qty_target = annual_need + carry_fwd + 0.1 * annual_need * urgency
+    # carry_fwd is intentionally added again as an over-buying safety buffer when in debt
     # Clip to action-space bounds (never below zero unless suspended)
     qty_mult = qty_target / max(annual_need, 1e-6)
     qty_mult = float(np.clip(qty_mult, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0)))
