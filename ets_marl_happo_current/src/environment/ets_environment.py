@@ -1308,7 +1308,8 @@ class ETSEnvironment(gym.Env):
         # Compute effective reserve price (dynamic or static)
         effective_reserve = self._compute_dynamic_reserve()
         self._last_effective_reserve = effective_reserve
-        expected_clearing = max(effective_reserve, float(self._compute_price_ma3()))
+        price_ma3 = self._compute_price_ma3()
+        expected_clearing = max(effective_reserve, price_ma3)
 
         # This clip exists as a training-stability safety net for learning agents during
         # exploration, not as an economic mechanism. The heuristic policy is self-consistent
