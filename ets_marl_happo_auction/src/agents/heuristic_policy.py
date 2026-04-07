@@ -355,8 +355,12 @@ def auction_action(
                                         coll_cfg_h.get("opportunity_cost_rate", 0.05)
                                         * coll_cfg_h.get("hold_fraction", 0.02)))
     if h_coll_frac > 0.0 and bid_price > 1e-6 and available_budget > 0.0:
-        above_reserve = max(0.0, bid_price - float(reserve_price))
-        denom = bid_price + h_coll_frac * above_reserve
+        # Payment estimated at expected clearing price (≈ market_anchor), not bid_price.
+        # Bots settle at clearing_price ≤ bid_price; using bid_price for both dramatically
+        # under-estimates affordable quantity (especially for coal bots bidding near penalty).
+        expected_payment = max(market_anchor, float(reserve_price) + 1.0)
+        above_reserve_coll = max(0.0, bid_price - float(reserve_price))
+        denom = expected_payment + h_coll_frac * above_reserve_coll
         max_safe_qty = available_budget / max(denom, 1e-6)
         if qty_mult * annual_need > max_safe_qty:
             qty_mult = max_safe_qty / max(annual_need, 1e-6)
@@ -477,13 +481,16 @@ def secondary_action(
     if company._carry_forward > 0.01:
         trade_target = max(0.0, trade_target)
 
-    # C2: Budget headroom check — scale down buy qty if budget is tight
+    # C2: Budget headroom check — scale down buy qty if budget is tight.
+    # When already short (compliance debt), allow 60% of remaining budget to
+    # accelerate debt recovery; otherwise keep the conservative 30% cap.
     budget_remaining = max(
         0.0,
         float(company.annual_budget - company.budget_spent_this_year),
     )
     if trade_target > 0.01 and budget_remaining > 0:
-        max_spend = budget_remaining * 0.3  # use at most 30% of remaining budget in secondary
+        spend_frac = 0.6 if current_position < 0 else 0.3
+        max_spend = budget_remaining * spend_frac
         max_buy_at_price = max_spend / max(clearing_price, 1.0)
         if trade_target > max_buy_at_price:
             trade_target = max_buy_at_price

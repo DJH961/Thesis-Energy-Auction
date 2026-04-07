@@ -590,13 +590,16 @@ class Company:
 
     def compute_budget_penalty(self) -> float:
         """Tiered budget penalty: zero below soft_zone, quadratic in soft zone,
-        steep above hard cap.
+        steeper above hard cap, with an absolute ceiling to prevent explosive growth.
 
         Returns an absolute cost (M EUR) that is later divided by
         ``annual_budget`` in the reward function.  The magnitude is kept
         moderate by scaling with the *overshoot amount* rather than the
         full budget, so a 5 % overshoot on a 1 000 M EUR budget produces
         a penalty ≈ coef × (normalized²) × overshoot_abs.
+
+        Capped at ``max_penalty_budget_mult × budget`` to prevent
+        quadratic explosion from dominating the reward signal.
         """
         budget = max(self.annual_budget, 1.0)
         spend_ratio = self.budget_spent_this_year / budget
@@ -604,6 +607,7 @@ class Company:
         soft_start = float(budget_cfg.get("soft_zone_start", 1.0))
         hard_cap = float(budget_cfg.get("hard_cap_fraction", 1.15))
         coef = float(budget_cfg.get("tiered_penalty_coef", 2.0))
+        max_penalty_mult = float(budget_cfg.get("max_penalty_budget_mult", 2.0))
 
         if spend_ratio <= soft_start:
             return 0.0
@@ -614,10 +618,12 @@ class Company:
 
         if spend_ratio <= hard_cap:
             # Quadratic ramp within the soft zone
-            return coef * (normalized ** 2) * overshoot_abs
+            raw = coef * (normalized ** 2) * overshoot_abs
         else:
-            # Above hard cap: penalty grows steeply (cubic-like feel)
-            return coef * (normalized ** 2) * overshoot_abs
+            # Above hard cap: cubic-like (extra × normalized factor)
+            raw = coef * (normalized ** 3) * overshoot_abs
+
+        return min(raw, max_penalty_mult * budget)
 
     def get_budget_utilization(self) -> float:
         return self.budget_spent_this_year / max(self.annual_budget, 1e-6)

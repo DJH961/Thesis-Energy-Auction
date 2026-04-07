@@ -2357,11 +2357,14 @@ class ETSEnvironment(gym.Env):
             collateral_cost_i = float(collateral_costs[i])
             loan_interest_cost = company.compute_green_loan_cost()
 
-            # Record spending: penalty and loan interest now included in budget tracking
-            # Secondary revenue (negative cost) reduces spending, freeing up budget headroom
+            # Record spending: operational costs only (no non-compliance penalty).
+            # Non-compliance penalty is a regulatory fine, not operational spending —
+            # including it in budget tracking caused a death-spiral: penalty → budget
+            # overshoot → budget_penalty explosion → carry-forward amplification.
+            # Penalty already penalises the agent directly via penalty_norm in the reward.
             company.record_spending(auction_cost + secondary_cost
                                     + investment_cost + mac_cost_i
-                                    + collateral_cost_i + penalty_cost
+                                    + collateral_cost_i
                                     + loan_interest_cost)
             company.record_capex_spending(investment_cost)
             budget_penalty = company.compute_budget_penalty()
