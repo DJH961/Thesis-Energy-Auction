@@ -92,10 +92,11 @@ def test_reserve_price():
     Only 1 valid bid for 1.0 Mt vs q_cap=3.0.
     Default cancel_under_subscribed=False: sells 1.0 Mt to A0."""
     bids = make_bids([(80, 1.0), (30, 1.0), (20, 1.0)])
-    _, alloc, _, stats = market_clearing_ets(bids, q_cap=3.0, reserve_price=50.0)
+    price, alloc, _, stats = market_clearing_ets(bids, q_cap=3.0, reserve_price=50.0)
 
     # Under-subscribed but default=False: auction proceeds, sells what was demanded
     assert stats["auction_failed"] is False
+    assert price == pytest.approx(80.0)
     assert alloc[0] == pytest.approx(1.0)
     assert alloc[1] == pytest.approx(0.0)
     assert alloc[2] == pytest.approx(0.0)
@@ -293,8 +294,28 @@ def test_under_subscription_proceeds_by_default():
     price, alloc, pay, stats = market_clearing_ets(bids, q_cap=5.0)
 
     assert stats["auction_failed"] is False
+    assert price == pytest.approx(60.0)
     assert alloc.sum() == pytest.approx(3.0, abs=1e-6)
     assert stats["unsold"] == pytest.approx(2.0, abs=1e-6)
+
+
+def test_under_subscription_uses_lowest_submitted_bid_even_with_holding_cap():
+    """When under-subscribed and proceeding, price uses the lowest submitted valid bid."""
+    bids = np.array([
+        [0, 10.0, 100.0],
+        [0, 5.0, 40.0],
+    ], dtype=float)
+    price, alloc, pay, stats = market_clearing_ets(
+        bids,
+        q_cap=20.0,
+        max_agent_share=0.25,
+        n_agents=1,
+    )
+
+    assert stats["auction_failed"] is False
+    assert alloc.sum() == pytest.approx(5.0, abs=1e-6)
+    assert price == pytest.approx(40.0, abs=1e-6)
+    assert pay[0] == pytest.approx(alloc[0] * 40.0, abs=1e-6)
 
 
 def test_exact_subscription_succeeds():

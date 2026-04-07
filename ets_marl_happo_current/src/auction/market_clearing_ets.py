@@ -126,12 +126,14 @@ def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0
         return reserve_price, allocations, payments, stats
 
     total_demand = valid_bids[:, 1].sum()
+    is_under_subscribed = total_demand < q_cap - 1e-9
+    lowest_submitted_price = float(np.min(valid_bids[:, 2]))
 
     # --- Under-subscription check (Article 7(6) of Reg. 1031/2010) ---
     # If total valid demand does not reach the supply, the auction is
     # cancelled and no allowances are sold.  Disabled by default for
     # RL training (early agents bid too little → uninformative signal).
-    if cancel_under_subscribed and total_demand < q_cap - 1e-9:
+    if cancel_under_subscribed and is_under_subscribed:
         stats = {
             "clearing_price": reserve_price,
             "total_demand": total_demand,
@@ -176,6 +178,11 @@ def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0
     # --- Aggregate allocations back to agents ---
     for i, (agent_id, _, _) in enumerate(sorted_bids):
         allocations[int(agent_id)] += alloc_per_bid[i]
+
+    # When auction proceeds while under-subscribed, clear at the lowest
+    # submitted valid bid rather than the reserve/minimum fallback.
+    if is_under_subscribed:
+        clearing_price = lowest_submitted_price
 
     # --- Compute payments (uniform price) ---
     payments = allocations * clearing_price
