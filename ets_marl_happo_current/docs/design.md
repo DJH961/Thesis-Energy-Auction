@@ -46,6 +46,12 @@ All winners pay the same clearing price (the marginal accepted bid).
 - Bids below effective reserve are rejected.
 - Tie-breaks at identical prices are randomized (not pro-rata).
 - Optional per-agent holding limit is supported via `max_agent_share`.
+- A collateral safety-net clip rescales bids when
+  `collateral_fraction × max(0, bid_price − max(effective_reserve, price_ma3)) × bid_qty`
+  exceeds `max_collateral_budget_share × remaining_budget`.
+- The collateral clip is for training stability during exploration (not an economic mechanism);
+  bot-only runs should have near-zero clip events, and non-zero events indicate
+  heuristic/environment mismatch.
 - If enabled, under-subscription can cancel the auction; default behavior is to clear partial demand.
 - Unsold volume is either:
   - rolled into next year's auction supply, or

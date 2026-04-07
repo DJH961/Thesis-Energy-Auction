@@ -173,16 +173,22 @@ class TestAuctionAction:
         assert action[0] <= min(config["auction"]["price_max"], 1.8 * penalty) + 1e-6
 
     def test_year12_bid_bounds(self, config):
-        """Near terminal years, bids should remain within calibrated [130, 230] EUR/t range."""
+        """Near terminal years, bids must be at least reserve_price+1 and below price_max.
+
+        With the dual-ceiling WTP (economic + budget ceilings), the budget ceiling may bind
+        for well-covered agents, so the lower bound is reserve_price+1 rather than a fixed
+        calibration target.
+        """
         c = make_company(config, agent_id=0)
         annual_need = max(c.compute_estimate_need(), 1e-6)
         banks = np.linspace(0.5 * annual_need, 2.0 * annual_need, num=30)
+        reserve_price = float(config["ets"]["reserve_price"])
         bids = [
             float(auction_action(c, price_ma3=160.0, current_year=11, n_years=12, config=config, bank=b)[0])
             for b in banks
         ]
-        assert min(bids) >= 130.0
-        assert max(bids) <= 230.0
+        assert min(bids) >= reserve_price + 1.0
+        assert max(bids) <= float(config["auction"]["price_max"])
 
 
 # ---------------------------------------------------------------------------

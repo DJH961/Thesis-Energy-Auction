@@ -597,7 +597,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     eff_pretrain_cfg = dict(pretrain_cfg)
     pretrain_eps_eff, pretrain_eps_auto = _resolve_auto_episode_count(
         pretrain_cfg.get("episodes", 0), n_episodes,
-        frac=0.04, min_count=40, max_count=800,
+        frac=0.04, min_count=40, max_count=2000,
     )
     pretrain_epochs_eff, pretrain_epochs_auto = _resolve_auto_episode_count(
         pretrain_cfg.get("epochs", 0), n_episodes,
@@ -769,7 +769,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     yr_fields = ["episode", "year", "cap", "auction_volume", "tnac",
                  "clearing_price", "secondary_price", "msr_reserve",
                  "msr_total_cancelled", "msr_withhold_this_year", "msr_release_this_year",
-                 "inflation_rate", "inflation_factor"]
+                 "inflation_rate", "inflation_factor", "marginal_ef_used"]
     for i in range(n_total_agents):
         yr_fields += [f"bank_start_A{i+1}", f"alloc_A{i+1}", f"emissions_A{i+1}",
                       f"trade_qty_A{i+1}", f"trade_cost_A{i+1}", f"green_frac_A{i+1}",
@@ -797,7 +797,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       # F: Diagnostic scores (F2)
                       f"diag_S_financial_A{i+1}",
                       f"diag_S_green_A{i+1}",
-                      f"diag_S_composite_A{i+1}"]
+                      f"diag_S_composite_A{i+1}",
+                      f"wtp_economic_A{i+1}",
+                      f"wtp_budget_A{i+1}",
+                      f"wtp_binding_A{i+1}",
+                      f"invest_frac_pre_clip_A{i+1}",
+                      f"invest_frac_post_clip_A{i+1}",
+                      f"available_budget_A{i+1}",
+                      f"compliance_share_of_available_A{i+1}"]
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -1051,6 +1058,16 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 yr_row[f"bid_coverage_A{i+1}"] = round(_get("bid_coverages", default=0.0), 4)
                 yr_row[f"bid_to_reserve_A{i+1}"] = round(_get("bid_to_reserve_ratio", default=0.0), 4)
                 yr_row[f"invest_tech_choice_A{i+1}"] = int(_get("invest_tech_choices", default=-1))
+                # Per-bot compliance diagnostics
+                pad = yl.get("per_agent_diag", {})
+                agent_diag = pad.get(i, {})
+                yr_row[f"wtp_economic_A{i+1}"] = round(float(agent_diag.get("wtp_economic", agent_diag.get("wtp", float("nan")))), 4) if not np.isnan(agent_diag.get("wtp_economic", agent_diag.get("wtp", float("nan")))) else None
+                yr_row[f"wtp_budget_A{i+1}"] = round(float(agent_diag.get("wtp_budget", float("nan"))), 4) if not np.isnan(float(agent_diag.get("wtp_budget", float("nan")))) else None
+                yr_row[f"wtp_binding_A{i+1}"] = str(agent_diag.get("wtp_binding", ""))
+                yr_row[f"invest_frac_pre_clip_A{i+1}"] = round(float(agent_diag.get("invest_frac_pre_compliance_clip", float("nan"))), 6) if not np.isnan(float(agent_diag.get("invest_frac_pre_compliance_clip", float("nan")))) else None
+                yr_row[f"invest_frac_post_clip_A{i+1}"] = round(float(agent_diag.get("invest_frac_post_compliance_clip", float("nan"))), 6) if not np.isnan(float(agent_diag.get("invest_frac_post_compliance_clip", float("nan")))) else None
+                yr_row[f"available_budget_A{i+1}"] = round(float(agent_diag.get("available_budget", float("nan"))), 2) if not np.isnan(float(agent_diag.get("available_budget", float("nan")))) else None
+                yr_row[f"compliance_share_of_available_A{i+1}"] = round(float(agent_diag.get("compliance_cost_share_of_budget", float("nan"))), 4) if not np.isnan(float(agent_diag.get("compliance_cost_share_of_budget", float("nan")))) else None
             # F3: Diagnostic scores (one set per learning agent)
             try:
                 diag_scores = env.compute_diagnostic_score()
@@ -1067,6 +1084,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                         ep_diag_accumulator[aid]["count"] += 1
             except Exception:
                 pass  # diagnostic scoring is non-critical
+            yr_row["marginal_ef_used"] = round(float(yl.get("marginal_ef_used", getattr(env, "_last_marginal_ef", 0.0))), 4)
             yr_writer.writerow(yr_row)
 
             obs1 = obs1_next
@@ -1508,6 +1526,41 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         price_std = float(np.std(prices_ep)) if len(prices_ep) > 1 else 0.0
 
+        # ── Per-episode summary diagnostics (validation sequence, Run 1/2) ──
+        # Coal bot indices: bots B1=n_agents, B2=n_agents+1 (coal-heavy mix)
+        coal_bot_indices = [n_agents, n_agents + 1] if n_bot_agents >= 2 else []
+        ep_mean_clearing = float(np.mean(prices_ep)) if prices_ep else 0.0
+
+        # Mean coverage ratio for coal bots (post-compliance, from per_agent_diag)
+        coal_coverages = []
+        for yl in env.episode_log:
+            pad = yl.get("per_agent_diag", {})
+            for ci in coal_bot_indices:
+                if ci in pad and "coverage_ratio_post_compliance" in pad[ci]:
+                    coal_coverages.append(float(pad[ci]["coverage_ratio_post_compliance"]))
+        ep_mean_coal_coverage = float(np.mean(coal_coverages)) if coal_coverages else float("nan")
+
+        # Default count for this episode
+        ep_default_count = sum(
+            yl.get("auction_stats", {}).get("defaults", 0) for yl in env.episode_log
+        )
+
+        # Mean bid qty_mult across all agents
+        all_bid_mults = []
+        for yl in env.episode_log:
+            bmults = yl.get("bid_qty_multipliers", [])
+            all_bid_mults.extend([float(v) for v in bmults if v > 0])
+        ep_mean_bid_qty_mult = float(np.mean(all_bid_mults)) if all_bid_mults else float("nan")
+
+        # Mean coal-bot budget headroom after compliance (available budget at end of year)
+        coal_headrooms = []
+        for i, company in enumerate(env.companies):
+            if i in coal_bot_indices:
+                coal_headrooms.append(
+                    max(0.0, float(company.annual_budget - company.budget_spent_this_year))
+                )
+        ep_mean_coal_budget_headroom = float(np.mean(coal_headrooms)) if coal_headrooms else float("nan")
+
         ep_row = {
             "episode": episode,
             "clearing_price_last": last_log.get("clearing_price", 0),
@@ -1523,6 +1576,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             "price_start": round(price_start, 2),
             "price_peak": round(price_peak, 2),
             "price_std": round(price_std, 2),
+            # Per-episode summary diagnostics
+            "ep_mean_clearing_price": round(ep_mean_clearing, 2),
+            "ep_mean_coal_coverage_ratio": round(ep_mean_coal_coverage, 4) if not np.isnan(ep_mean_coal_coverage) else None,
+            "ep_default_count": ep_default_count,
+            "ep_mean_bid_qty_mult": round(ep_mean_bid_qty_mult, 4) if not np.isnan(ep_mean_bid_qty_mult) else None,
+            "ep_mean_coal_budget_headroom": round(ep_mean_coal_budget_headroom, 2) if not np.isnan(ep_mean_coal_budget_headroom) else None,
         }
         for i in range(n_total_agents):
             # Post-warmstart initial bank for "Holdings by Year" plot

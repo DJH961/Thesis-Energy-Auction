@@ -27,21 +27,25 @@ or secondary pricing formulas.
 
 Design rationale
 ----------------
-auction_action (fundamentals-based):
+auction_action (WTP-based):
     - market_anchor = max(mac_cost, price_ma3)
-    - bid_price = market_anchor + urgency * (penalty_rate - market_anchor)
-        where urgency = max(0.0, 1.0 - coverage_ratio / 1.5).
+    - bid_price: WTP (willingness-to-pay) formula.
+        wtp = min(0.95 * penalty_rate, market_anchor + urgency * (penalty_rate - market_anchor))
+        bid_price = min(wtp, available / max(qty_for_price, 1e-6))
+        where urgency = max(0.0, 1.0 - coverage_ratio / urgency_denom).
         If supply is restricted (auction_volume/cap_t < 0.8), urgency is
         boosted by max(0, 1 - supply_ratio) * 0.3.
-        Covered agents bid near market anchor, desperate agents bid near penalty.
-    - bid_price ceiling before clip: 1.8 * penalty_rate.
-    - qty_mult: target-bank logic.
-        target_bank = annual_need * min(remaining_years, 2) * 0.5
-        qty_mult = clip((annual_need - bank + target_bank) / annual_need, low, high)
-    - invest_frac: NPV-gated (properly discounted).
+        Budget-aware: bid price degrades gracefully when funds are tight.
+    - qty_mult: physical compliance need + urgency safety buffer.
+        annual_need = compute_estimate_need() + _carry_forward  (minimum compliance need)
+        qty_target = annual_need + carry_fwd + 0.1 * annual_need * urgency
+        (carry_fwd added again as an intentional over-buying buffer when in debt)
+        qty_mult = clip(qty_target / annual_need, low, high)
+    - invest_frac: NPV-gated (properly discounted) with compliance-priority clip.
         annuity_factor = (1 - (1 + r)^-horizon) / r  where r = discount_rate
         avoided_carbon_npv = emission_reduction * price * annuity_factor
-        invest proportional to NPV (higher for green agents).
+        invest proportional to NPV (higher for green agents), then scaled down
+        by post-compliance budget headroom to prevent overspending.
     - tech choice: maximize (remaining_years - delay + terminal_horizon)
         * capacity_factor / capex  (effective payoff metric).
 
@@ -161,8 +165,9 @@ def auction_action(
     # --- Coverage ratio ---
     annual_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
     coverage_ratio = max(bank / annual_need, 0.0)
+    available = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
 
-    # --- Bid price (fundamentals-based: MAC→penalty gradient) ---
+    # --- Bid price (WTP-based: willingness-to-pay bounded by penalty cap) ---
     mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
     urgency = max(0.0, 1.0 - coverage_ratio / urgency_denom)
     urgency_boost = 0.0
@@ -172,51 +177,37 @@ def auction_action(
             urgency_boost = max(0.0, 1.0 - supply_ratio) * 0.3
     urgency = min(1.0, (urgency + urgency_boost) * urgency_multiplier)
     market_anchor = max(mac_cost, price_ma3) + valuation_noise
-    bid_price = market_anchor + urgency * (penalty_rate - market_anchor)
-    bid_price = min(bid_price, 1.8 * penalty_rate)
-    bid_price = float(np.clip(
-        max(reserve_price + 5.0, bid_price),
-        aq["price_min"], aq["price_max"],
-    ))
+    # --- C1: Target quantity (needed early for wtp_budget ceiling) ---
+    carry_fwd = max(0.0, float(company._carry_forward))
+    qty_target_raw = annual_need + carry_fwd + 0.1 * annual_need * urgency
+    qty_mult_raw = qty_target_raw / max(annual_need, 1e-6)
+    qty_mult_clipped = float(np.clip(qty_mult_raw, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0)))
+    qty_clipped = qty_mult_clipped * annual_need  # EUR-denominator for wtp_budget
 
-    # --- Quantity multiplier (target-bank logic) ---
+    # --- C1: Mid bid price — dual-ceiling WTP ---
+    # Economic ceiling: penalty + expected future price incentivises buying before penalty
+    expected_future_price = price_ma3
+    wtp_economic = market_anchor + urgency * max(0.0, penalty_rate + expected_future_price - market_anchor)
+    wtp_economic = min(wtp_economic, penalty_rate + expected_future_price - 1.0)
+    # Budget ceiling: agent cannot commit more than max_compliance_share of available budget to compliance
+    max_compliance_share = config.get("bots", {}).get("max_compliance_share", 0.70)
+    wtp_budget = max_compliance_share * available / max(qty_clipped, 1e-6)
+    bid_price = max(min(wtp_economic, wtp_budget), float(reserve_price) + 1.0)
+    bid_price = float(np.clip(bid_price, aq["price_min"], aq["price_max"]))
+    # Store for diagnostics
+    company._last_wtp_economic = float(wtp_economic)
+    company._last_wtp_budget = float(wtp_budget)
+    company._last_wtp_binding = "economic" if wtp_economic <= wtp_budget else "budget"
+    company._last_bid_price_heuristic = bid_price
+
+    # --- Qty target: physical compliance need + urgency safety buffer ---
     remaining_years = max(1, n_years - current_year)
-    target_bank = annual_need * min(remaining_years, 2) * 0.5
-    qty_mult = (annual_need - bank + target_bank) / max(annual_need, 0.1)
-    qty_mult = float(np.clip(
-        qty_mult, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0),
-    ))
-
-    # E3: Pre-bid budget awareness.
-    # Use a settlement-consistent cap so payment + collateral cannot exceed
-    # available budget, preventing bot defaults by construction.
-    available_budget = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
-    coll_cfg_h = aq.get("collateral", {})
-    h_coll_frac = float(coll_cfg_h.get("collateral_fraction",
-                                        coll_cfg_h.get("opportunity_cost_rate", 0.05)
-                                        * coll_cfg_h.get("hold_fraction", 0.02)))
-    if h_coll_frac > 0.0 and bid_price > 1e-6 and available_budget > 0.0:
-        # Payment estimated at expected clearing price (≈ market_anchor), not bid_price.
-        # Bots settle at clearing_price ≤ bid_price; using bid_price for both dramatically
-        # under-estimates affordable quantity (especially for coal bots bidding near penalty).
-        expected_payment = max(market_anchor, float(reserve_price) + 1.0)
-        above_reserve_coll = max(0.0, bid_price - float(reserve_price))
-        denom = expected_payment + h_coll_frac * above_reserve_coll
-        max_safe_qty = available_budget / max(denom, 1e-6)
-        if qty_mult * annual_need > max_safe_qty:
-            qty_mult = max_safe_qty / max(annual_need, 1e-6)
-
-    # Collateral load safety: if last year's collateral locked was a large share
-    # of the budget, scale back qty_mult proportionally to stay inside limits and
-    # avoid a repeat default/suspension.  Linear fade: no reduction at 0.25,
-    # full 50% reduction at 1.0.
-    if collateral_load_last > 0.25:
-        coll_penalty = min(0.5, (collateral_load_last - 0.25) / 0.75 * 0.5)
-        qty_mult *= (1.0 - coll_penalty)
-
-    # Final clip: clamp to [0, high] after budget constraints (budget constraint can reduce
-    # below qty_mult_low when funds are tight; we allow 0 rather than force a default bid).
-    qty_mult = float(np.clip(qty_mult, 0.0, aq.get("qty_mult_high", 2.0)))
+    qty_target = qty_target_raw  # already computed above for wtp_budget ceiling
+    # carry_fwd is intentionally added again as an over-buying safety buffer when in debt
+    # Clip to action-space bounds (never below zero unless suspended)
+    qty_mult = qty_mult_clipped
+    # Store for diagnostics
+    company._last_qty_target = float(qty_target)
 
     # --- Investment fraction (NPV-gated) ---
     terminal_horizon = config.get("reward", {}).get("terminal_payoff_years", 5)
@@ -282,6 +273,23 @@ def auction_action(
     if est_cost > capex_remaining and est_cost > 1e-6:
         invest_frac *= capex_remaining / est_cost
         invest_frac = max(0.0, invest_frac)
+
+    # Compliance-priority investment: scale invest_frac down by post-compliance headroom.
+    # Degrades investment gracefully under budget stress (coal bots invest less, funded bots invest fully).
+    # Expected settlement ≈ mac_cost (market equilibrium anchor), not bid_price or price_ma3.
+    invest_frac_pre_clip = invest_frac
+    est_invest_cost = company.compute_investment_cost(best_tech, invest_frac, current_year)
+    safety_reserve = 0.05 * float(company.annual_budget)
+    expected_settlement_price = max(float(reserve_price), mac_cost)
+    expected_compliance_cost = qty_mult * annual_need * expected_settlement_price
+    post_compliance_headroom = max(0.0, available - expected_compliance_cost - safety_reserve)
+    if est_invest_cost > 1e-6 and invest_frac > 1e-9:
+        capex_per_unit_frac = est_invest_cost / invest_frac
+        invest_frac = min(invest_frac, post_compliance_headroom / max(capex_per_unit_frac, 1e-9))
+    invest_frac = max(0.0, invest_frac)
+    # Store pre/post for diagnostics
+    company._last_invest_frac_pre_compliance_clip = invest_frac_pre_clip
+    company._last_invest_frac_post_compliance_clip = invest_frac
 
     # F1: Loan-awareness — when emergency loan outstanding, scale back qty and
     # investment to preserve cash for loan repayment.
@@ -362,7 +370,12 @@ def secondary_action(
         float(company.annual_budget - company.budget_spent_this_year),
     )
     if trade_target > 0.01 and budget_remaining > 0:
-        spend_frac = 0.6 if current_position < 0 else 0.3
+        if company._carry_forward > 0.01:
+            spend_frac = 0.9  # aggressive recovery when carry_forward debt exists
+        elif current_position < 0:
+            spend_frac = 0.6
+        else:
+            spend_frac = 0.3
         max_spend = budget_remaining * spend_frac
         max_buy_at_price = max_spend / max(clearing_price, 1.0)
         if trade_target > max_buy_at_price:

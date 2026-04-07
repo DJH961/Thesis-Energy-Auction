@@ -251,4 +251,4 @@ def test_tabula_rasa_disabled_no_effect(monkeypatch):
     resolved = _capture_config_after_train_overrides(monkeypatch, cfg)
     assert resolved["pretrain"]["enabled"] is True
     assert resolved["ppo"]["kl_anchor_beta"] == pytest.approx(0.5)
-    assert resolved["exploration"]["auction_anchors"] == [75.0, 0.33, 80.0, 0.33, 85.0, 0.33, 0.03, 0.3, -0.5, 0.5]
+    assert resolved["exploration"]["auction_anchors"] == [75.0, 0.40, 80.0, 0.40, 85.0, 0.40, 0.03, 0.3, -0.5, 0.5]

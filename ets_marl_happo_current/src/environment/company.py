@@ -281,19 +281,19 @@ class Company:
     # Revenue-based dynamic budget (A2)
     # ------------------------------------------------------------------
 
-    def compute_revenue(self, smoothed_price: float, system_ef: float,
+    def compute_revenue(self, marginal_ef: float, carbon_price: float,
                         inflation_factor: float) -> float:
         """
         Electricity revenue in M€.
 
-        Revenue = output_TWh × (base_price + passthrough × smoothed_price × system_ef) × inflation_factor
+        Revenue = output_TWh × (base_price + passthrough × carbon_price × marginal_ef) × inflation_factor
 
         Parameters
         ----------
-        smoothed_price : float
-            Moving-average carbon price (EUR/tCO2).
-        system_ef : float
-            System-wide average emission factor (tCO2/MWh).
+        marginal_ef : float
+            Marginal emission factor of the price-setting technology (tCO2/MWh).
+        carbon_price : float
+            Carbon price used for cost pass-through (EUR/tCO2).
         inflation_factor : float
             Cumulative inflation from year 0.
 
@@ -302,10 +302,10 @@ class Company:
         elec_cfg = self.config.get("electricity", {})
         base_price = float(elec_cfg.get("base_price", 50.0))
         passthrough = float(elec_cfg.get("carbon_passthrough", 0.80))
-        eff_price = base_price + passthrough * smoothed_price * system_ef
-        return self.output_twh * eff_price * inflation_factor
+        marginal_price = base_price + passthrough * carbon_price * marginal_ef
+        return self.output_twh * marginal_price * inflation_factor
 
-    def compute_dynamic_budget(self, smoothed_price: float, system_ef: float,
+    def compute_dynamic_budget(self, carbon_price: float, marginal_ef: float,
                                current_year: int) -> float:
         """
         Revenue-based annual budget: max(1.0, revenue - opex + debt_headroom).
@@ -313,7 +313,7 @@ class Company:
         Ensures every agent can afford at least minimal participation.
         """
         inf = self.inflation_factor(current_year)
-        revenue = self.compute_revenue(smoothed_price, system_ef, inf)
+        revenue = self.compute_revenue(marginal_ef, carbon_price, inf)
         opex = self.compute_operational_cost(current_year)
         return max(1.0, revenue - opex + self.debt_headroom)
 

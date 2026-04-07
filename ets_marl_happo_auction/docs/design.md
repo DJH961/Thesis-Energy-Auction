@@ -55,13 +55,17 @@ All winners pay the same uniform clearing price (the marginal accepted bid).
 
 Before each auction, a collateral affordability check scales down bids if:
 ```
-collateral = collateral_fraction × wavg_price × total_qty
-           > max_collateral_budget_share × remaining_budget
+expected_clearing = max(effective_reserve, price_ma3)
+expected_collateral = collateral_fraction × max(0, wavg_price − expected_clearing) × total_qty
+expected_collateral > max_collateral_budget_share × remaining_budget
 ```
 - `collateral_fraction: 0.10` (10% — mid-range of real EUA exchange initial margin 5–15%)
 - `max_collateral_budget_share: 0.50` (collateral can use at most 50% of remaining budget)
 - E4 config also registers `leverage_multiplier: 3.0`, `suspension_length: 2`,
   `carry_forward_defaults: true` for future enforcement.
+- This clip is a training-stability safety net for learning-agent exploration, not an
+  economic mechanism; bot-only runs should have near-zero clip events. Non-zero clip events
+  in bot-only runs indicate a heuristic/environment mismatch that should be debugged.
 
 ### 2.3 Practical clearing details in code
 
