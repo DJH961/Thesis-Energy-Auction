@@ -3,6 +3,7 @@
 import csv
 import os
 import sys
+import warnings
 from pathlib import Path
 
 import yaml
@@ -26,7 +27,7 @@ def test_training_smoke_runs_10_episodes(tmp_path):
     seed = 7
 
     cfg["simulation"]["n_episodes"] = n_episodes
-    cfg["simulation"]["n_years"] = 3
+    cfg["simulation"]["n_years"] = 4
     cfg["logging"]["results_dir"] = str(tmp_path / "results")
     cfg["logging"]["log_interval"] = max(10, n_episodes)
     cfg["logging"]["save_interval"] = 500
@@ -35,7 +36,13 @@ def test_training_smoke_runs_10_episodes(tmp_path):
     cfg["pretrain"]["episodes"] = 0
     cfg["pretrain"]["epochs"] = 0
 
-    train_mod.train_one_seed(cfg, seed=seed)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"\[ETSEnvironment\] Weak scarcity: cap drops only .*",
+            category=UserWarning,
+        )
+        train_mod.train_one_seed(cfg, seed=seed)
 
     ep_log = Path(cfg["logging"]["results_dir"]) / f"training_log_s{seed}.csv"
     assert ep_log.exists()
