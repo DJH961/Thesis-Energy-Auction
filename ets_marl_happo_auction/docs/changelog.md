@@ -7,57 +7,62 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ## v8.5.0
 
-**Heuristic Refactor (WTP Bidding + Compliance-Priority Investment), Marginal EF Revenue, Softened Collateral Re-clip, BC Warm-Start Enhancement, Diagnostics, Held Curriculum Items**
+**Dual-Ceiling WTP Heuristic, Marginal EF Revenue (instance method), Compliance-Priority Investment, Collateral Warning Counter, Enhanced Diagnostics, Config Updates, Smoke Tests**
 
 ### M1 — Marginal EF for Revenue Computation (`ets_environment.py`, `company.py`)
-- **`_compute_marginal_ef()`**: New module-level function. Computes the emission factor of the
-  most carbon-intensive technology with ≥5% system-wide capacity share (soft blend 3–8%).
-  When coal has material system presence it becomes the marginal price setter.
+- **`_compute_marginal_ef()`**: Moved from module-level function to ETSEnvironment instance
+  method. Computes the emission factor of the most carbon-intensive technology with ≥5%
+  system-wide capacity share (soft blend 3–8%). Stores result as `self._current_marginal_ef`.
   Reference: Fabra & Reguant (2014) AER; Sijm et al. (2006) Energy Policy.
-- **Revenue computation fix**: `compute_dynamic_budget()` now receives `marginal_ef` instead of
-  `system_ef`. Coal-heavy portfolios earn higher revenue when coal is the marginal price setter,
-  substantially improving coal-bot compliance and budget headroom.
-- **`system_ef` preserved for observation space**: Agents still observe the system-wide average.
-- **Logging**: `self._last_system_ef` and `self._last_marginal_ef` stored each budget cycle.
+- **`compute_revenue()` signature updated**: Parameters renamed to `(marginal_ef, carbon_price,
+  inflation_factor)`. Formula: `marginal_price = base_price + passthrough * carbon_price * marginal_ef`;
+  `revenue = output_twh * marginal_price * inflation_factor`.
+- **`compute_dynamic_budget()` updated**: New signature `(carbon_price, marginal_ef, current_year)`.
+  `carbon_price_for_budget = self._price_ma3 if > 0 else config["price"]["initial_expected"]`.
+- **Logging**: `self._last_system_ef`, `self._last_marginal_ef`, `self._current_marginal_ef` stored.
 
 ### Heuristic Refactor — `heuristic_policy.py`
-- **WTP bid price**: Replaced MAC→penalty gradient with budget-aware WTP formula:
-  `wtp = min(0.95 * penalty_rate, market_anchor + urgency * (penalty_rate - market_anchor))`
-  `bid_price = min(wtp, available / max(qty, 1e-6))`, floored at `reserve_price + 1.0`.
-- **Physical-need quantity**: Replaced target-bank formula with:
-  `qty_target = annual_need + carry_fwd + 0.1 * annual_need * urgency`.
-  Clips to `[qty_mult_low, qty_mult_high]` action-space bounds only; never budget-clipped.
-- **Removed collateral-double-counting blocks**: Deleted E3 `max_safe_qty` block and
-  `collateral_load_last > 0.25` qty fade block. Heuristic is now self-consistent with WTP.
-- **Compliance-priority investment**: After NPV gate, `invest_frac` is scaled by
-  post-compliance budget headroom: bots with tight budgets invest less; well-funded bots invest fully.
-  Stores `_last_invest_frac_pre_compliance_clip` and `_last_invest_frac_post_compliance_clip`
-  on company for diagnostics.
-- **Secondary market**: When `carry_forward > 0.01`, `spend_frac` raised to 0.9 (from 0.6/0.3)
-  for aggressive debt recovery.
-- **Diagnostic storage on company**: `_last_wtp`, `_last_bid_price_heuristic`, `_last_qty_target`.
+- **Dual-ceiling WTP bid price**: Replaces the previous single-ceiling formula with two ceilings:
+  - `wtp_economic = market_anchor + urgency * max(0, penalty_rate + expected_future_price - market_anchor)`
+    capped at `(penalty_rate + expected_future_price - 1.0)`.
+  - `wtp_budget = max_compliance_share * available / max(qty_clipped, 1e-6)` where
+    `max_compliance_share = config["bots"]["max_compliance_share"]` (default 0.70).
+  - `bid_price = max(min(wtp_economic, wtp_budget), reserve_price + 1.0)`.
+  - Stores `_last_wtp_economic`, `_last_wtp_budget`, `_last_wtp_binding` on company.
+- **Qty target computed before bid price** to provide denominator for `wtp_budget` ceiling.
+- **Physical-need quantity**: `qty_target = annual_need + carry_fwd + 0.1 * annual_need * urgency`.
+- **Compliance-priority investment**: `invest_frac` scaled down by post-compliance budget headroom.
+- **Secondary**: `spend_frac = 0.9` when `carry_forward > 0.01`.
 
-### E2 Softened — Collateral Re-clip (`ets_environment.py`)
-- Collateral affordability block changed from bid-quantity scalpel to solvency warning.
-  The fixed heuristic's WTP formula already ensures bids stay within available budget.
-  Now logs a `warnings.warn()` diagnostic when collateral would exceed budget threshold
-  (only when `budget_remaining > 1.0`), without reshaping bids.
+### E2 — Collateral Warning Counter (`ets_environment.py`)
+- `self._collateral_warning_count: np.ndarray` added to `__init__` and `reset()`.
+  Incremented for each agent when collateral exceeds `max_collateral_budget_share * budget_remaining`.
+  `warnings.warn()` diagnostic emitted; bid quantities not modified.
 
 ### Config Updates (`configs/default.yaml`)
-- **Debt headrooms**: +50 M€ for coal agents (0-1) and gas agents (2-3):
-  `[400, 400, 230, 230, 50, 50, -100, -100]` (was `[350, 350, 180, 180, ...]`).
-- **BC pretrain max raised** to 2000 episodes (was 800). `train.py` `max_count` updated.
-- **Auction qty anchor biased** to 0.40/tranche (total qty_mult ≈ 1.2, was 0.33/tranche).
+- `electricity.base_price`: 50.0 → 55.0
+- `electricity.carbon_passthrough`: 0.80 → 0.90
+- `bots.max_compliance_share: 0.70` added (dual-ceiling WTP budget fraction).
+- **Debt headrooms**: `[400, 400, 230, 230, 50, 50, -100, -100]`.
+- **BC pretrain max**: 2000 episodes.
 
 ### Diagnostics (`ets_environment.py`, `train.py`)
-- **Per-agent per-year** `log["per_agent_diag"]` dict added to `step_secondary` log:
-  `wtp`, `bid_price`, `bid_qty`, `qty_target`, `expected_clearing_ma3`, `actual_clearing`,
-  `actual_pay`, `coverage_ratio_post_compliance`, `marginal_ef`, `system_ef`, `revenue`,
-  `compliance_cost_share_of_budget`, `invest_frac_pre/post_compliance_clip`.
-  Stored as `env._last_per_agent_diag`.
-- **Per-episode summary** fields added to `ep_row` in `train.py`:
-  `ep_mean_clearing_price`, `ep_mean_coal_coverage_ratio`, `ep_default_count`,
-  `ep_mean_bid_qty_mult`, `ep_mean_coal_budget_headroom`.
+- **`per_agent_diag`** extended with: `wtp_economic`, `wtp_budget`, `wtp_binding`,
+  `available_budget`, `compliance_cost_share_of_budget`.
+- **`log["marginal_ef_used"]`** added to step log.
+- **Year-log CSV** (`train.py`): 7 new per-agent fields per bot per year:
+  `wtp_economic`, `wtp_budget`, `wtp_binding`,
+  `invest_frac_pre_clip`, `invest_frac_post_clip`,
+  `available_budget`, `compliance_share_of_available`.
+  Plus env-level: `marginal_ef_used`.
+
+### Tests (`tests/test_compliance_validation.py`)
+- New smoke test: runs 1 heuristic-only episode, asserts coal-bot coverage ≥ 0.85,
+  zero defaults, clearing price above reserve, and within [30, 200] EUR/t.
+
+### Item 7 — Loan Ordering Verified (`auction_settlement.py`)
+- Confirmed: loan eligibility check fires **before** the default/suspension branch.
+  No code change required; ordering is already correct.
 
 ### Held for Next Iteration (not enabled) — `configs/default.yaml`
 - `coverage_shaping` block (disabled): post-auction coverage bonus decaying over 30% of training.
