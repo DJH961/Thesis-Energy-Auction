@@ -190,6 +190,9 @@ def auction_action(
     bid_price = min(wtp, available / max(qty_for_price, 1e-6))
     bid_price = max(bid_price, float(reserve_price) + 1.0)
     bid_price = float(np.clip(bid_price, aq["price_min"], aq["price_max"]))
+    # Store for diagnostics
+    company._last_wtp = float(wtp)
+    company._last_bid_price_heuristic = bid_price
 
     # --- Qty target: physical compliance need + urgency safety buffer ---
     remaining_years = max(1, n_years - current_year)
@@ -198,6 +201,8 @@ def auction_action(
     # Clip to action-space bounds (never below zero unless suspended)
     qty_mult = qty_target / max(annual_need, 1e-6)
     qty_mult = float(np.clip(qty_mult, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0)))
+    # Store for diagnostics
+    company._last_qty_target = float(qty_target)
 
     # --- Investment fraction (NPV-gated) ---
     terminal_horizon = config.get("reward", {}).get("terminal_payoff_years", 5)

@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v8.4.0
+# ETS MARL — Configuration v8.5.0
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -236,8 +236,10 @@ secondary:
 # ----------------------------------------------------------
 budget:
   mode: "revenue_based"
-  debt_headrooms: [350.0, 350.0, 180.0, 180.0, 50.0, 50.0, -100.0, -100.0]
-  bot_debt_headrooms: [350.0, 350.0, 180.0, 180.0, 50.0, 50.0, -100.0, -100.0]
+  # Increased by ~50 M€ for coal (agents 0-1) and gas (agents 2-3) to improve
+  # compliance and budget performance under marginal-EF revenue computation.
+  debt_headrooms: [400.0, 400.0, 230.0, 230.0, 50.0, 50.0, -100.0, -100.0]
+  bot_debt_headrooms: [400.0, 400.0, 230.0, 230.0, 50.0, 50.0, -100.0, -100.0]
   budget_ema_alpha: 0.3
   annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
@@ -501,7 +503,7 @@ logging:
 # ----------------------------------------------------------
 pretrain:
   enabled: true
-  episodes: 0   # auto: 4% of n_episodes, clamped to [40, 800]
+  episodes: 0   # auto: 4% of n_episodes, clamped to [40, 2000] (increased from 800 for better BC warm-start)
   epochs: 0     # auto: scales with n_episodes, clamped to [4, 12]
   lr: 0.001
 
@@ -543,6 +545,36 @@ exploration:
   # Action anchors in physical space (set initial policy mean via head bias).
   # Auction: [p1, q1, p2, q2, p3, q3, invest_frac, logit_onshore, logit_offshore, logit_solar]
   # 3-tranche ladder: tranche 1 slightly below, tranche 2 at, tranche 3 slightly above expected price
-  auction_anchors: [75.0, 0.33, 80.0, 0.33, 85.0, 0.33, 0.03, 0.3, -0.5, 0.5]
+  # qty_mult per tranche biased to 0.40 each → total 1.2 (qty_mult ≈ 1.2 for compliance)
+  auction_anchors: [75.0, 0.40, 80.0, 0.40, 85.0, 0.40, 0.03, 0.3, -0.5, 0.5]
   # Secondary: [sec_price (absolute €/t), sec_qty]
   secondary_anchors: [80.0, 0.0]
+
+# ----------------------------------------------------------
+# Held for next iteration — implemented but NOT enabled.
+# Flip enabled: true when ready for curriculum experiments.
+# ----------------------------------------------------------
+
+# Immediate-post-auction coverage shaping: bonus reward proportional to
+# coverage_ratio, decaying over training. Encourages compliance early on.
+coverage_shaping:
+  enabled: false
+  weight: 0.5                    # reward bonus weight
+  decay_start_frac: 0.0          # start decaying from episode 0
+  decay_end_frac: 0.30           # fully off by 30% of training
+
+# Cap curriculum: start with cap multiplied by cap_start, decay to 1.0
+# over the first 30% of training. Eases cold-start market dynamics.
+cap_curriculum:
+  enabled: false
+  cap_start: 1.3                 # initial cap multiplier (relaxed)
+  cap_end: 1.0                   # final cap multiplier (nominal)
+  decay_frac: 0.30               # fraction of n_episodes to decay over
+
+# Budget curriculum: start with budget multiplied by budget_start, decay to 1.0
+# over the first 30% of training. Prevents early-training budget starvation.
+budget_curriculum:
+  enabled: false
+  budget_start: 1.5              # initial budget multiplier (generous)
+  budget_end: 1.0                # final budget multiplier (nominal)
+  decay_frac: 0.30               # fraction of n_episodes to decay over

@@ -597,7 +597,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     eff_pretrain_cfg = dict(pretrain_cfg)
     pretrain_eps_eff, pretrain_eps_auto = _resolve_auto_episode_count(
         pretrain_cfg.get("episodes", 0), n_episodes,
-        frac=0.04, min_count=40, max_count=800,
+        frac=0.04, min_count=40, max_count=2000,
     )
     pretrain_epochs_eff, pretrain_epochs_auto = _resolve_auto_episode_count(
         pretrain_cfg.get("epochs", 0), n_episodes,
@@ -1508,6 +1508,41 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         price_std = float(np.std(prices_ep)) if len(prices_ep) > 1 else 0.0
 
+        # ── Per-episode summary diagnostics (validation sequence, Run 1/2) ──
+        # Coal bot indices: bots B1=n_agents, B2=n_agents+1 (coal-heavy mix)
+        coal_bot_indices = [n_agents, n_agents + 1] if n_bot_agents >= 2 else []
+        ep_mean_clearing = float(np.mean(prices_ep)) if prices_ep else 0.0
+
+        # Mean coverage ratio for coal bots (post-compliance, from per_agent_diag)
+        coal_coverages = []
+        for yl in env.episode_log:
+            pad = yl.get("per_agent_diag", {})
+            for ci in coal_bot_indices:
+                if ci in pad and "coverage_ratio_post_compliance" in pad[ci]:
+                    coal_coverages.append(float(pad[ci]["coverage_ratio_post_compliance"]))
+        ep_mean_coal_coverage = float(np.mean(coal_coverages)) if coal_coverages else float("nan")
+
+        # Default count for this episode
+        ep_default_count = sum(
+            yl.get("auction_stats", {}).get("defaults", 0) for yl in env.episode_log
+        )
+
+        # Mean bid qty_mult across all agents
+        all_bid_mults = []
+        for yl in env.episode_log:
+            bmults = yl.get("bid_qty_multipliers", [])
+            all_bid_mults.extend([float(v) for v in bmults if v > 0])
+        ep_mean_bid_qty_mult = float(np.mean(all_bid_mults)) if all_bid_mults else float("nan")
+
+        # Mean coal-bot budget headroom after compliance (available budget at end of year)
+        coal_headrooms = []
+        for i, company in enumerate(env.companies):
+            if i in coal_bot_indices:
+                coal_headrooms.append(
+                    max(0.0, float(company.annual_budget - company.budget_spent_this_year))
+                )
+        ep_mean_coal_budget_headroom = float(np.mean(coal_headrooms)) if coal_headrooms else float("nan")
+
         ep_row = {
             "episode": episode,
             "clearing_price_last": last_log.get("clearing_price", 0),
@@ -1523,6 +1558,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             "price_start": round(price_start, 2),
             "price_peak": round(price_peak, 2),
             "price_std": round(price_std, 2),
+            # Per-episode summary diagnostics
+            "ep_mean_clearing_price": round(ep_mean_clearing, 2),
+            "ep_mean_coal_coverage_ratio": round(ep_mean_coal_coverage, 4) if not np.isnan(ep_mean_coal_coverage) else None,
+            "ep_default_count": ep_default_count,
+            "ep_mean_bid_qty_mult": round(ep_mean_bid_qty_mult, 4) if not np.isnan(ep_mean_bid_qty_mult) else None,
+            "ep_mean_coal_budget_headroom": round(ep_mean_coal_budget_headroom, 2) if not np.isnan(ep_mean_coal_budget_headroom) else None,
         }
         for i in range(n_total_agents):
             # Post-warmstart initial bank for "Holdings by Year" plot

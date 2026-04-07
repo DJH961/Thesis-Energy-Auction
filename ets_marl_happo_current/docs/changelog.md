@@ -5,6 +5,67 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.8.0
+
+**Heuristic Refactor (WTP Bidding + Compliance-Priority Investment), Marginal EF Revenue, Softened Collateral Re-clip, BC Warm-Start Enhancement, Diagnostics, Held Curriculum Items**
+
+### M1 — Marginal EF for Revenue Computation (`ets_environment.py`, `company.py`)
+- **`_compute_marginal_ef()`**: New module-level function. Computes the emission factor of the
+  most carbon-intensive technology with ≥5% system-wide capacity share (soft blend 3–8%).
+  When coal has material system presence it becomes the marginal price setter.
+  Reference: Fabra & Reguant (2014) AER; Sijm et al. (2006) Energy Policy.
+- **Revenue computation fix**: `compute_dynamic_budget()` now receives `marginal_ef` instead of
+  `system_ef`. Coal-heavy portfolios earn higher revenue when coal is the marginal price setter,
+  substantially improving coal-bot compliance and budget headroom.
+- **`system_ef` preserved for observation space**: Agents still observe the system-wide average.
+- **Logging**: `self._last_system_ef` and `self._last_marginal_ef` stored each budget cycle.
+
+### Heuristic Refactor — `heuristic_policy.py`
+- **WTP bid price**: Replaced MAC→penalty gradient with budget-aware WTP formula:
+  `wtp = min(0.95 * penalty_rate, market_anchor + urgency * (penalty_rate - market_anchor))`
+  `bid_price = min(wtp, available / max(qty, 1e-6))`, floored at `reserve_price + 1.0`.
+- **Physical-need quantity**: Replaced target-bank formula with:
+  `qty_target = annual_need + carry_fwd + 0.1 * annual_need * urgency`.
+  Clips to `[qty_mult_low, qty_mult_high]` action-space bounds only; never budget-clipped.
+- **Removed collateral-double-counting blocks**: Deleted E3 `max_safe_qty` block and
+  `collateral_load_last > 0.25` qty fade block. Heuristic is now self-consistent with WTP.
+- **Compliance-priority investment**: After NPV gate, `invest_frac` is scaled by
+  post-compliance budget headroom: bots with tight budgets invest less; well-funded bots invest fully.
+  Stores `_last_invest_frac_pre_compliance_clip` and `_last_invest_frac_post_compliance_clip`
+  on company for diagnostics.
+- **Secondary market**: When `carry_forward > 0.01`, `spend_frac` raised to 0.9 (from 0.6/0.3)
+  for aggressive debt recovery.
+- **Diagnostic storage on company**: `_last_wtp`, `_last_bid_price_heuristic`, `_last_qty_target`.
+
+### E2 Softened — Collateral Re-clip (`ets_environment.py`)
+- Collateral affordability block changed from bid-quantity scalpel to solvency warning.
+  The fixed heuristic's WTP formula already ensures bids stay within available budget.
+  Now logs a `warnings.warn()` diagnostic when collateral would exceed budget threshold
+  (only when `budget_remaining > 1.0`), without reshaping bids.
+
+### Config Updates (`configs/default.yaml`)
+- **Debt headrooms**: +50 M€ for coal agents (0-1) and gas agents (2-3):
+  `[400, 400, 230, 230, 50, 50, -100, -100]` (was `[350, 350, 180, 180, ...]`).
+- **BC pretrain max raised** to 2000 episodes (was 800). `train.py` `max_count` updated.
+- **Auction qty anchor biased** to 1.2 (was 1.0) for initial policy qty_mult ≈ 1.2.
+
+### Diagnostics (`ets_environment.py`, `train.py`)
+- **Per-agent per-year** `log["per_agent_diag"]` dict added to `step_secondary` log:
+  `wtp`, `bid_price`, `bid_qty`, `qty_target`, `expected_clearing_ma3`, `actual_clearing`,
+  `actual_pay`, `coverage_ratio_post_compliance`, `marginal_ef`, `system_ef`, `revenue`,
+  `compliance_cost_share_of_budget`, `invest_frac_pre/post_compliance_clip`.
+  Stored as `env._last_per_agent_diag`.
+- **Per-episode summary** fields added to `ep_row` in `train.py`:
+  `ep_mean_clearing_price`, `ep_mean_coal_coverage_ratio`, `ep_default_count`,
+  `ep_mean_bid_qty_mult`, `ep_mean_coal_budget_headroom`.
+
+### Held for Next Iteration (not enabled) — `configs/default.yaml`
+- `coverage_shaping` block (disabled): post-auction coverage bonus decaying over 30% of training.
+- `cap_curriculum` block (disabled): cap multiplier 1.3→1.0 over 30% of training.
+- `budget_curriculum` block (disabled): budget multiplier 1.5→1.0 over 30% of training.
+
+---
+
 ## v7.7.0
 
 **Revenue-Based Budget, Emergency Loans, Observation Enrichment, Budget Hardening, Reward Channels, Heuristic Loan-Awareness**

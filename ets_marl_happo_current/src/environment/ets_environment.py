@@ -301,6 +301,9 @@ class ETSEnvironment(gym.Env):
         self._last_reward_channels: dict = {}
         self._last_auction_reward_channels: dict = {}
 
+        # Per-agent per-year diagnostics (M1, validation diagnostics)
+        self._last_per_agent_diag: dict = {}
+
         # Emission factor diagnostics (M1)
         self._last_system_ef = 0.0
         self._last_marginal_ef = 0.0
@@ -542,6 +545,7 @@ class ETSEnvironment(gym.Env):
         # Reward channel diagnostics
         self._last_reward_channels = {}
         self._last_auction_reward_channels = {}
+        self._last_per_agent_diag = {}
 
         initial_mixes = self.config["companies"]["initial_mix"]
         for i, company in enumerate(self.companies):
@@ -1966,6 +1970,38 @@ class ETSEnvironment(gym.Env):
             ],
             "investment_costs": invest_costs.tolist(),
         })
+
+        # ── Per-agent per-year diagnostics ───────────────────────────────────
+        # Diagnostic fields for validation (Run 1/2 from validation sequence).
+        price_ma3_now = self._compute_price_ma3()
+        per_agent_diag = {}
+        for i, company in enumerate(self.companies):
+            if not active_mask[i]:
+                continue
+            annual_need_i = max(company.compute_estimate_need() + company._carry_forward, 1e-6)
+            inf_i = company.inflation_factor(self.current_year)
+            revenue_i = company.compute_revenue(price_ma3_now, self._last_marginal_ef, inf_i)
+            compliance_cost_i = float(payments[i]) + float(trade_costs[i])
+            coverage_post = float(self.holdings[i]) / annual_need_i
+            per_agent_diag[i] = {
+                "wtp": float(getattr(company, "_last_wtp", float("nan"))),
+                "bid_price": float(getattr(company, "_last_bid_price_heuristic", float("nan"))),
+                "bid_qty": float(self._phase1_bid_quantities[i]) if self._phase1_bid_quantities is not None else float("nan"),
+                "qty_target": float(getattr(company, "_last_qty_target", float("nan"))),
+                "expected_clearing_ma3": float(price_ma3_now),
+                "actual_clearing": float(clearing_price),
+                "actual_pay": float(payments[i]),
+                "coverage_ratio_post_compliance": float(coverage_post),
+                "marginal_ef": float(self._last_marginal_ef),
+                "system_ef": float(self._last_system_ef),
+                "revenue": float(revenue_i),
+                "compliance_cost_share_of_budget": float(compliance_cost_i) / max(float(company.annual_budget), 1e-6),
+                "invest_frac_pre_compliance_clip": float(getattr(company, "_last_invest_frac_pre_compliance_clip", float("nan"))),
+                "invest_frac_post_compliance_clip": float(getattr(company, "_last_invest_frac_post_compliance_clip", float("nan"))),
+            }
+        self._last_per_agent_diag = per_agent_diag
+        log["per_agent_diag"] = per_agent_diag
+
         self.episode_log.append(log)
 
         # 9. Advance year + AR(1) price
