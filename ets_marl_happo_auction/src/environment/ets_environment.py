@@ -1466,7 +1466,6 @@ class ETSEnvironment(gym.Env):
                     max_collateral = max_coll_share * budget_remaining
                     if collateral > max_collateral and max_collateral > 0 and budget_remaining > 1.0:
                         # Log solvency warning; do not reshape bid (heuristic is self-consistent)
-                        import warnings
                         warnings.warn(
                             f"[E2] Agent {i} collateral {collateral:.1f} > "
                             f"max {max_collateral:.1f} (budget_remaining={budget_remaining:.1f}); "

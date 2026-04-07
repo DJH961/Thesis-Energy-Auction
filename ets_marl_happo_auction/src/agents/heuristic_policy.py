@@ -337,7 +337,6 @@ def auction_action(
     wtp = min(wtp_penalty_cap, wtp_urgency)
     carry_fwd = max(0.0, float(company._carry_forward))
     qty_target_for_price = annual_need + carry_fwd + 0.1 * annual_need * urgency
-    # carry_fwd is intentionally added again as an over-buying safety buffer when in debt
     qty_for_price = float(np.clip(qty_target_for_price,
         aq.get("qty_mult_low", 0.3) * annual_need,
         aq.get("qty_mult_high", 2.0) * annual_need))
