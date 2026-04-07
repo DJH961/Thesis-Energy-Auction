@@ -269,6 +269,7 @@ bots:
   # Per-bot urgency denominators: B1=1.3, B2=1.7, B3=1.3, B4=1.7, B5=1.3, B6=1.7, B7=1.3, B8=1.7
   # This differentiates bot pairs: even bots more urgent (1.3), odd bots less urgent (1.7)
   urgency_denominators: [1.3, 1.7, 1.3, 1.7, 1.3, 1.7, 1.3, 1.7]
+  max_compliance_share: 0.70  # max fraction of available budget committed to compliance
   # --- Enhanced noise (off by default, easily toggled) ---
   enhanced_noise:
     enabled: true
@@ -318,12 +319,12 @@ mac:
 
 # ----------------------------------------------------------
 # Electricity revenue — margin-based reward component.
-# Revenue_i = output_TWh x (base_price + passthrough x carbon_price x sys_avg_EF)
+# Revenue_i = output_TWh x (base_price + passthrough x carbon_price x marginal_ef)
 # ----------------------------------------------------------
 electricity:
   enabled: true
-  base_price: 50.0           # EUR/MWh base electricity price
-  carbon_passthrough: 0.80   # fraction of carbon cost passed into electricity price
+  base_price: 55.0           # EUR/MWh base electricity price
+  carbon_passthrough: 0.90   # fraction of carbon cost passed into electricity price
 
 # ----------------------------------------------------------
 # Reward (HAPPO-compliant)

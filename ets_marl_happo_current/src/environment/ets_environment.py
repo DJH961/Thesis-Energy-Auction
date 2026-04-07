@@ -231,6 +231,8 @@ class ETSEnvironment(gym.Env):
         self._last_collateral_load = np.zeros(self.n_total)
         # C2: Per-agent bid affordability from PREVIOUS year
         self._bid_affordability = np.zeros(self.n_total)
+        # E2: Collateral warning counter — cumulative per-agent count of collateral warnings
+        self._collateral_warning_count: np.ndarray = np.zeros(self.n_total, dtype=int)
 
         # Dynamic reserve tracking
         self._last_effective_reserve = config["ets"].get("reserve_price", 0.0)
@@ -307,6 +309,7 @@ class ETSEnvironment(gym.Env):
         # Emission factor diagnostics (M1)
         self._last_system_ef = 0.0
         self._last_marginal_ef = 0.0
+        self._current_marginal_ef = 0.0
 
     # ------------------------------------------------------------------
     # Training loop interface
@@ -477,6 +480,8 @@ class ETSEnvironment(gym.Env):
         self._collateral_locked = np.zeros(self.n_total)
         self._last_collateral_load = np.zeros(self.n_total)
         self._bid_affordability = np.zeros(self.n_total)
+        self._collateral_warning_count = np.zeros(self.n_total, dtype=int)
+        self._current_marginal_ef = 0.0
         self._build_episode_inflation_path()
 
         if self._fade_enabled:
@@ -1052,6 +1057,18 @@ class ETSEnvironment(gym.Env):
             )
         return actions
 
+    def _compute_marginal_ef(self) -> float:
+        """
+        Compute marginal emission factor for carbon cost pass-through.
+
+        Uses self.companies (active companies only) and self.config.
+        Stores result in self._current_marginal_ef before returning.
+        """
+        active_companies = [c for c in self.companies if self._is_agent_active(c.agent_id)]
+        marginal_ef = _compute_marginal_ef(active_companies, self.config)
+        self._current_marginal_ef = marginal_ef
+        return marginal_ef
+
     def step_auction(self, auction_actions: np.ndarray):
         """
         Phase 1: Execute auction and green investments.
@@ -1103,6 +1120,7 @@ class ETSEnvironment(gym.Env):
             while len(hist) < 3:
                 hist.insert(0, init_p)
             smoothed_price = float(np.mean(hist[-3:]))
+            carbon_price_for_budget = smoothed_price
             # System-wide average emission factor
             active_companies = [c for c in self.companies if self._is_agent_active(c.agent_id)]
             # System-wide average EF (kept for observation space)
@@ -1111,11 +1129,11 @@ class ETSEnvironment(gym.Env):
             # Carbon cost pass-through in electricity markets prices off the marginal setter (typically
             # coal when it has material system presence). Using system_ef understates coal revenue.
             # Reference: Fabra & Reguant (2014), Sijm et al. (2006).
-            marginal_ef = _compute_marginal_ef(active_companies, self.config)
+            marginal_ef = self._compute_marginal_ef()
             # Update budgets for all companies (agents + bots)
             for c in active_companies:
                 c.set_annual_budget(
-                    c.compute_dynamic_budget(smoothed_price, marginal_ef, self.current_year)
+                    c.compute_dynamic_budget(carbon_price_for_budget, marginal_ef, self.current_year)
                 )
                 c.apply_loan_repayment()  # B4: repay from fresh dynamic budget
                 c.reset_budget()
@@ -1312,6 +1330,7 @@ class ETSEnvironment(gym.Env):
                     max_collateral = max_coll_share * budget_remaining
                     if collateral > max_collateral and max_collateral > 0 and budget_remaining > 1.0:
                         # Log solvency warning; do not reshape bid (heuristic is self-consistent)
+                        self._collateral_warning_count[i] += 1
                         warnings.warn(
                             f"[E2] Agent {i} collateral {collateral:.1f} > "
                             f"max {max_collateral:.1f} (budget_remaining={budget_remaining:.1f}); "
@@ -1612,7 +1631,7 @@ class ETSEnvironment(gym.Env):
                 current_year=year,
             )
             for i in range(self.n_agents)
-        ])
+        ]) if self.n_agents > 0 else np.zeros((0,), dtype=np.float32)
 
         # Log P5/P6 values for year-level diagnostics
         log["emission_shocks"] = epsilons.tolist()
@@ -1979,11 +1998,14 @@ class ETSEnvironment(gym.Env):
                 continue
             annual_need_i = max(company.compute_estimate_need() + company._carry_forward, 1e-6)
             inf_i = company.inflation_factor(self.current_year)
-            revenue_i = company.compute_revenue(price_ma3_now, self._last_marginal_ef, inf_i)
+            revenue_i = company.compute_revenue(self._last_marginal_ef, price_ma3_now, inf_i)
             compliance_cost_i = float(payments[i]) + float(trade_costs[i])
             coverage_post = float(self.holdings[i]) / annual_need_i
             per_agent_diag[i] = {
                 "wtp": float(getattr(company, "_last_wtp", float("nan"))),
+                "wtp_economic": float(getattr(company, "_last_wtp_economic", float("nan"))),
+                "wtp_budget": float(getattr(company, "_last_wtp_budget", float("nan"))),
+                "wtp_binding": str(getattr(company, "_last_wtp_binding", "")),
                 "bid_price": float(getattr(company, "_last_bid_price_heuristic", float("nan"))),
                 "bid_qty": float(self._phase1_bid_quantities[i]) if self._phase1_bid_quantities is not None else float("nan"),
                 "qty_target": float(getattr(company, "_last_qty_target", float("nan"))),
@@ -1997,9 +2019,11 @@ class ETSEnvironment(gym.Env):
                 "compliance_cost_share_of_budget": float(compliance_cost_i) / max(float(company.annual_budget), 1e-6),
                 "invest_frac_pre_compliance_clip": float(getattr(company, "_last_invest_frac_pre_compliance_clip", float("nan"))),
                 "invest_frac_post_compliance_clip": float(getattr(company, "_last_invest_frac_post_compliance_clip", float("nan"))),
+                "available_budget": float(company.annual_budget - company.budget_spent_this_year),
             }
         self._last_per_agent_diag = per_agent_diag
         log["per_agent_diag"] = per_agent_diag
+        log["marginal_ef_used"] = float(self._last_marginal_ef)
 
         self.episode_log.append(log)
 
@@ -2625,4 +2649,6 @@ class ETSEnvironment(gym.Env):
             )
             obs_list.append(obs_i)
 
+        if not obs_list:
+            return np.zeros((0,), dtype=np.float32)
         return np.stack(obs_list)

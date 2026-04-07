@@ -331,29 +331,35 @@ def auction_action(
     urgency = min(1.0, (urgency + urgency_boost) * urgency_multiplier)
     market_anchor = max(mac_cost, price_ma3) + valuation_noise
 
-    # --- C1: Mid bid price (WTP-based: willingness-to-pay bounded by penalty cap) ---
-    wtp_penalty_cap = 0.95 * penalty_rate
-    wtp_urgency = market_anchor + urgency * (penalty_rate - market_anchor)
-    wtp = min(wtp_penalty_cap, wtp_urgency)
+    # --- C1: Target quantity (needed early for wtp_budget ceiling) ---
     carry_fwd = max(0.0, float(company._carry_forward))
-    qty_target_for_price = annual_need + carry_fwd + 0.1 * annual_need * urgency
-    qty_for_price = float(np.clip(qty_target_for_price,
-        aq.get("qty_mult_low", 0.3) * annual_need,
-        aq.get("qty_mult_high", 2.0) * annual_need))
-    bid_price = min(wtp, available / max(qty_for_price, 1e-6))
-    bid_price = max(bid_price, float(reserve_price) + 1.0)
+    qty_target_raw = annual_need + carry_fwd + 0.1 * annual_need * urgency
+    qty_mult_raw = qty_target_raw / max(annual_need, 1e-6)
+    qty_mult_clipped = float(np.clip(qty_mult_raw, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0)))
+    qty_clipped = qty_mult_clipped * annual_need  # EUR-denominator for wtp_budget
+
+    # --- C1: Mid bid price — dual-ceiling WTP ---
+    # Economic ceiling: penalty + expected future price incentivises buying before penalty
+    expected_future_price = price_ma3
+    wtp_economic = market_anchor + urgency * max(0.0, penalty_rate + expected_future_price - market_anchor)
+    wtp_economic = min(wtp_economic, penalty_rate + expected_future_price - 1.0)
+    # Budget ceiling: agent cannot commit more than max_compliance_share of available budget to compliance
+    max_compliance_share = config.get("bots", {}).get("max_compliance_share", 0.70)
+    wtp_budget = max_compliance_share * available / max(qty_clipped, 1e-6)
+    bid_price = max(min(wtp_economic, wtp_budget), float(reserve_price) + 1.0)
     bid_price = float(np.clip(bid_price, aq["price_min"], aq["price_max"]))
     # Store for diagnostics
-    company._last_wtp = float(wtp)
+    company._last_wtp_economic = float(wtp_economic)
+    company._last_wtp_budget = float(wtp_budget)
+    company._last_wtp_binding = "economic" if wtp_economic <= wtp_budget else "budget"
     company._last_bid_price_heuristic = bid_price
 
     # --- C1: Target quantity (total across all 3 tranches) ---
     remaining_years = max(1, n_years - current_year)
-    qty_target = annual_need + carry_fwd + 0.1 * annual_need * urgency
-    # carry_fwd is intentionally added again as an over-buying safety buffer when in debt
+    qty_target = qty_target_raw  # already computed above for wtp_budget ceiling
+    # carry_fwd is intentionally added as an over-buying safety buffer when in debt
     # Clip to action-space bounds (never below zero unless suspended)
-    qty_mult = qty_target / max(annual_need, 1e-6)
-    qty_mult = float(np.clip(qty_mult, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0)))
+    qty_mult = qty_mult_clipped
     # Store for diagnostics
     company._last_qty_target = float(qty_target)
 

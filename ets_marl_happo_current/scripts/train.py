@@ -769,7 +769,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     yr_fields = ["episode", "year", "cap", "auction_volume", "tnac",
                  "clearing_price", "secondary_price", "msr_reserve",
                  "msr_total_cancelled", "msr_withhold_this_year", "msr_release_this_year",
-                 "inflation_rate", "inflation_factor"]
+                 "inflation_rate", "inflation_factor", "marginal_ef_used"]
     for i in range(n_total_agents):
         yr_fields += [f"bank_start_A{i+1}", f"alloc_A{i+1}", f"emissions_A{i+1}",
                       f"trade_qty_A{i+1}", f"trade_cost_A{i+1}", f"green_frac_A{i+1}",
@@ -797,7 +797,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       # F: Diagnostic scores (F2)
                       f"diag_S_financial_A{i+1}",
                       f"diag_S_green_A{i+1}",
-                      f"diag_S_composite_A{i+1}"]
+                      f"diag_S_composite_A{i+1}",
+                      f"wtp_economic_A{i+1}",
+                      f"wtp_budget_A{i+1}",
+                      f"wtp_binding_A{i+1}",
+                      f"invest_frac_pre_clip_A{i+1}",
+                      f"invest_frac_post_clip_A{i+1}",
+                      f"available_budget_A{i+1}",
+                      f"compliance_share_of_available_A{i+1}"]
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -1051,6 +1058,16 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 yr_row[f"bid_coverage_A{i+1}"] = round(_get("bid_coverages", default=0.0), 4)
                 yr_row[f"bid_to_reserve_A{i+1}"] = round(_get("bid_to_reserve_ratio", default=0.0), 4)
                 yr_row[f"invest_tech_choice_A{i+1}"] = int(_get("invest_tech_choices", default=-1))
+                # Per-bot compliance diagnostics
+                pad = yl.get("per_agent_diag", {})
+                agent_diag = pad.get(i, {})
+                yr_row[f"wtp_economic_A{i+1}"] = round(float(agent_diag.get("wtp_economic", agent_diag.get("wtp", float("nan")))), 4) if not np.isnan(agent_diag.get("wtp_economic", agent_diag.get("wtp", float("nan")))) else None
+                yr_row[f"wtp_budget_A{i+1}"] = round(float(agent_diag.get("wtp_budget", float("nan"))), 4) if not np.isnan(float(agent_diag.get("wtp_budget", float("nan")))) else None
+                yr_row[f"wtp_binding_A{i+1}"] = str(agent_diag.get("wtp_binding", ""))
+                yr_row[f"invest_frac_pre_clip_A{i+1}"] = round(float(agent_diag.get("invest_frac_pre_compliance_clip", float("nan"))), 6) if not np.isnan(float(agent_diag.get("invest_frac_pre_compliance_clip", float("nan")))) else None
+                yr_row[f"invest_frac_post_clip_A{i+1}"] = round(float(agent_diag.get("invest_frac_post_compliance_clip", float("nan"))), 6) if not np.isnan(float(agent_diag.get("invest_frac_post_compliance_clip", float("nan")))) else None
+                yr_row[f"available_budget_A{i+1}"] = round(float(agent_diag.get("available_budget", float("nan"))), 2) if not np.isnan(float(agent_diag.get("available_budget", float("nan")))) else None
+                yr_row[f"compliance_share_of_available_A{i+1}"] = round(float(agent_diag.get("compliance_cost_share_of_budget", float("nan"))), 4) if not np.isnan(float(agent_diag.get("compliance_cost_share_of_budget", float("nan")))) else None
             # F3: Diagnostic scores (one set per learning agent)
             try:
                 diag_scores = env.compute_diagnostic_score()
@@ -1067,6 +1084,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                         ep_diag_accumulator[aid]["count"] += 1
             except Exception:
                 pass  # diagnostic scoring is non-critical
+            yr_row["marginal_ef_used"] = round(float(yl.get("marginal_ef_used", getattr(env, "_last_marginal_ef", 0.0))), 4)
             yr_writer.writerow(yr_row)
 
             obs1 = obs1_next
