@@ -41,9 +41,15 @@ import numpy as np
 def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0.0,
                         max_agent_share: float = 1.0, rng=None,
                         cancel_under_subscribed: bool = False,
-                        n_agents: int = None):
+                        n_agents: int = None,
+                        pricing_rule: str = "uniform"):
     """
-    Uniform-price sealed-bid buyer auction clearing (EU ETS style).
+    Sealed-bid buyer auction clearing for ETS markets.
+
+    Supports two pricing rules:
+      - "uniform" (EU ETS style): all winners pay the marginal (lowest
+        accepted) bid price.
+      - "pay_as_bid" (UK ETS style): each winner pays their own bid price.
 
     Parameters
     ----------
@@ -67,15 +73,20 @@ def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0
         (Article 7(6) of Reg. 1031/2010).  If False (default), the auction
         proceeds and sells whatever is demanded — better for RL training
         where early-stage agents may bid insufficient quantities.
+    pricing_rule : str
+        "uniform" — all winners pay the clearing price (EU ETS).
+        "pay_as_bid" — each winner pays their own bid price (UK ETS).
 
     Returns
     -------
     clearing_price : float
-        Uniform price paid by all winners (EUR/t).
+        Marginal accepted price (EUR/t). Under uniform pricing, this is
+        the price all winners pay. Under pay-as-bid, it is reported for
+        diagnostics but each agent pays their own bid.
     allocations : np.ndarray, shape (n_agents,)
         Allowances allocated to each agent (indexed by agent_id).
     payments : np.ndarray, shape (n_agents,)
-        Total payment by each agent = allocation * clearing_price.
+        Total payment by each agent.
     auction_stats : dict
         Diagnostic information (cover ratio, total demand, etc.).
     """
@@ -184,8 +195,16 @@ def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0
     if is_under_subscribed:
         clearing_price = lowest_submitted_price
 
-    # --- Compute payments (uniform price) ---
-    payments = allocations * clearing_price
+    # --- Compute payments ---
+    if pricing_rule == "pay_as_bid":
+        # Pay-as-bid (UK ETS style): each winner pays their own bid price
+        # for each unit allocated from that bid.
+        for i, (agent_id, qty, price) in enumerate(sorted_bids):
+            if alloc_per_bid[i] > 0:
+                payments[int(agent_id)] += alloc_per_bid[i] * price
+    else:
+        # Uniform price (EU ETS style): all winners pay the clearing price.
+        payments = allocations * clearing_price
 
     # --- Auction statistics ---
     total_allocated = allocations.sum()

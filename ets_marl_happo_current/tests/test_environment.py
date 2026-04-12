@@ -516,6 +516,8 @@ def test_static_reserve_no_silent_rejection():
 def test_unsold_volume_rolls_over_to_next_year():
     """When unsold_to_msr=false, unsold volume should appear in next year's auction supply."""
     env = load_env()
+    # Override: this test specifically tests rollover behavior with unsold_to_msr=false
+    env.config["ets"]["unsold_to_msr"] = False
     assert not env.config["ets"].get("unsold_to_msr", True), "Expected unsold_to_msr=false"
     # Temporarily disable bots for this test so that low bidding produces unsold volume
     saved_n_bots = env.n_bots
@@ -525,6 +527,7 @@ def test_unsold_volume_rolls_over_to_next_year():
     import copy
     config = copy.deepcopy(env.config)
     config["companies"]["n_bot_agents"] = 0
+    config["auction"]["qty_mult_low"] = 0.1  # allow very low bids for rollover test
     env = ETSEnvironment(config, seed=42)
     env.reset(seed=42)
 

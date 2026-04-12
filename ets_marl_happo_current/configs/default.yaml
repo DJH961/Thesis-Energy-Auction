@@ -1,16 +1,16 @@
 # ============================================================
-# ETS MARL — Configuration v7.8.0
-#   - 8 learning agents + 8 heuristic bot agents (16 total)
+# ETS MARL — Configuration v7.11.0
+#   - 8 learning agents, 0 bots (pure MARL)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
 #   - Episode-level inflation randomness window (small stochastic variation)
 #   - MAC fuel-switching (48 EUR/tCO2), electricity revenue
-#   - Carry-forward obligations (cap=2.0x)
+#   - Carry-forward obligations (cap=0.5x)
 #   - Terminal valuation: max(clearing, secondary, 80% eff_penalty)
-#   - Fundamentals-based heuristic bidding (MAC→penalty gradient)
 #   - Absolute-price secondary market (no multiplier)
 #   - ESG reward signal (saved-carbon-years formula)
 #   - Pre-auction collateral affordability clip + budget-headroom phase-1 signal
+#   - Structural over-subscription: cap=-10%, qty_low=0.85 (ratio≥1.05x)
 # ============================================================
 
 simulation:
@@ -22,14 +22,14 @@ tabula_rasa:
   enabled: true
   # When enabled, these OVERRIDE the corresponding values elsewhere.
   # All fractions are relative to n_episodes.
-  epsilon_start: 0.50
+  epsilon_start: 0.30
   epsilon_final: 0.05
-  epsilon_decay_frac: 0.50
+  epsilon_decay_frac: 0.80
   entropy_coef: 0.08
   entropy_decay_start_frac: 0.0     # no plateau — decay from ep 0
   entropy_decay_window_frac: 0.95
-  critic_warmup_frac: 0.10
-  shaping_decay_frac: 0.33
+  critic_warmup_frac: 0.03
+  shaping_decay_frac: 0.60
   hpp_warmup_frac: 0.25
   exploration_mode: "uniform"        # side-balanced uniform auction-price sampling around expected price
 
@@ -62,8 +62,8 @@ ets:
   #   total_system_emissions × (1 + cap_overhead_pct)
   # To override with a manual value, set cap_year_0_override to a number.
   cap_year_0_override: null     # null enables emission-weighted calibration
-  initial_bank_fraction: 0.10   # default episode-start bank seed fraction of annual need
-  cap_overhead_pct: 0.02        # 2% surplus over total initial emissions
+  initial_bank_fraction: 0.25   # realistic carry-over from prior compliance period (~25% of annual need)
+  cap_overhead_pct: -0.10       # -10% below total initial emissions — ensures over-subscription at min bid coverage
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044
@@ -84,9 +84,9 @@ ets:
     min_auction_frac: 0.10            # safety floor for minimum auction volume
 
   banking: true
-  reserve_price: 30.0              # auction bid floor (matches price_min)
+  reserve_price: 45.0              # auction bid floor — just below MAC (48 EUR/t), prevents degenerate floor equilibrium
   reserve_price_mode: "static"     # "static" or "dynamic" (= max(reserve_price, discount x MA3))
-  unsold_to_msr: false             # unsold volume rolls over to next year (not absorbed into MSR)
+  unsold_to_msr: true              # unsold volume absorbed into MSR (matches real EU ETS behavior)
   max_rollover_multiplier: 1.5     # caps rollover: auction_vol ≤ cap_t × multiplier per year
   # Price history anchor for MA3 calculation.
   # "auction": only successful auction clearing prices enter the MA3 (stable, prevents
@@ -125,7 +125,7 @@ companies:
   # Must keep bot_initial_mix, bot_reward_weights, bot_annual_budgets
   # arrays in sync with n_bot_agents.
   # bot_reward_weights are for eval logging only — bots use heuristic_policy, not rewards.
-  n_bot_agents: 8
+  n_bot_agents: 0
   bot_initial_mix:
     - [0.40, 0.40, 0.10, 0.05, 0.05]   # B1: coal-heavy (id=8)
     - [0.40, 0.40, 0.10, 0.05, 0.05]   # B2: coal-heavy (id=9)
@@ -159,15 +159,16 @@ risk:
 
 auction:
   price_max: 500.0
-  price_min: 30.0      # matches ets.reserve_price — no silent bid rejection
+  price_min: 45.0      # matches ets.reserve_price — no silent bid rejection
   quantity_max: 3.0
   # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
   # Centred around 1.0 (full coverage), range [0.3, 2.0] = 30%-200% of need.
-  qty_mult_low: 0.3
-  qty_mult_high: 2.0
+  qty_mult_low: 0.85
+  qty_mult_high: 1.5
   # Holding limit: max fraction of auctioned volume one agent can receive.
   # 1.0 = no limit (disabled). Set to 0.25 for California-style 25% cap.
   max_agent_share: 1.0
+  pricing_rule: "uniform"           # "uniform" (EU ETS) — uniform-price sealed-bid auction per Regulation 1031/2010
   cancel_under_subscribed: false   # disabled — under-subscription handled by unsold rollover
   lot_size: 0.0005                 # EU lot-size: 500 EUAs = 0.0005 Mt
   # E2: Bid collateral — realistic pre-auction margin requirement.
@@ -207,7 +208,7 @@ trading:
   enabled: true
   transaction_cost: 0.5
   spread_tolerance: 0.12      # +/-12% of clearing_price for bid-ask matching
-  sec_price_min: 30.0         # absolute secondary price floor (= reserve price)
+  sec_price_min: 45.0         # absolute secondary price floor (= reserve price)
   sec_price_max_mult: 2.0     # secondary price cap = 2.0 × effective_penalty_rate
 
 secondary:
@@ -294,7 +295,7 @@ penalty:
   inflation_rate: 0.020            # μ = 2.0% annual inflation (historical average)
   inflation_random_std: 0.015      # σ = 1.5%-pt annual inflation volatility (normal sampling)
   carry_forward: true
-  carry_forward_cap: 1.0           # max carry-forward as multiple of base annual emissions
+  carry_forward_cap: 0.5           # max carry-forward as multiple of base annual emissions (prevents infinite deferral)
 
 # ----------------------------------------------------------
 # AR(1) expected price model
@@ -335,14 +336,22 @@ reward:
   normalizer_alpha: 0.01
   opportunity_cost_rate: 0.0  # H4: disabled — agents learn holding decisions through terminal value
   clip_min: -10.0
-  clip_max: 10.0         # Increased from 5.0 — symmetric with clip_min to avoid asymmetric gradient compression
+  clip_max: 10.0         # symmetric with clip_min to avoid asymmetric gradient compression
   shaping_beta: 7.0              # green_delta bonus weight
   shaping_gamma: 1.0             # queue bonus weight
   shaping_decay_episode: 0       # auto: 12% of n_episodes, clamped to [300, 8000]
-  shaping_weight_floor: 0.0      # shaping decays fully to zero
+  shaping_weight_floor: 0.10     # 10% residual shaping keeps green/efficiency signals alive
   terminal_bank_value: true      # value banked allowances at terminal_price in final year
   terminal_queue_value: true     # value construction queue via NPV of carbon savings
   terminal_payoff_years: 5       # years of future savings for queue valuation
+
+  # Phase-decomposed credit assignment (Direction 2)
+  # Coverage credit: added to r_auction so agents see "I won X% of need" as a signal.
+  # Scaled by shaping_weight so it decays over training.
+  coverage_credit_weight: 0.3    # weight of coverage ratio in auction reward
+  # Gap closure credit: added to r_secondary when agent BUYS to close compliance deficit.
+  # Provides direct gradient for "buy on secondary = good when in deficit."
+  gap_closure_weight: 0.5        # weight of gap closure signal in secondary reward
 
 # ----------------------------------------------------------
 # ESG signal — saved-carbon-years formula
@@ -455,8 +464,8 @@ warm_start:
   burnin_price_seed_mean: 70.0
   burnin_price_seed_std: 10.0
   n_burnin_prices: 2
-  bank_seed_min: 0.05
-  bank_seed_max: 0.15
+  bank_seed_min: 0.15
+  bank_seed_max: 0.35
   queue_mu_onshore: 1.5
   queue_mu_offshore: 0.5
   queue_mu_solar: 2.0
@@ -468,6 +477,7 @@ logging:
   log_interval: 10
   save_interval: 500
   csv_flush_interval: 1000
+  snapshot_interval: 2500       # copy CSV logs every N episodes for mid-run analysis (0 = disabled)
   results_dir: "results/"
 
 # ----------------------------------------------------------

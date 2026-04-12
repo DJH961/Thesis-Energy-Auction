@@ -24,6 +24,8 @@ def _base_cfg():
     cfg["warm_start"]["enabled"] = False
     cfg["uncertainty"]["enabled"] = False
     cfg["construction_jitter"]["enabled"] = False
+    # Bot tests require bots — override the default (which may be 0)
+    cfg["companies"]["n_bot_agents"] = 8
     return cfg
 
 

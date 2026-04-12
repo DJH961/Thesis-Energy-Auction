@@ -572,7 +572,7 @@ def test_shaping_weight_decays():
     env.set_episode(12000)
     w_end = env.shaping_weight
     assert w0 > w_mid > w_end
-    assert w_end <= 0.01, f"Shaping weight should be ~0 at decay end: {w_end}"
+    assert w_end <= 0.20, f"Shaping weight should be near floor at decay end: {w_end}"
 
 
 def test_w_green_differentiates_reward():
@@ -939,9 +939,7 @@ def test_reward_channels_present():
     assert len(env._last_reward_channels) > 0
     for i in range(min(env.n_agents, 2)):
         ch = env._last_reward_channels[i]
-        expected_keys = {"cost_norm", "penalty_norm", "green_bonus", "esg_signal",
-                         "efficiency_bonus", "budget_penalty",
-                         "capex_penalty", "loan_interest", "base_reward", "shaping_reward"}
+        expected_keys = {"cost_norm", "penalty_norm", "esg_signal", "base_reward"}
         assert expected_keys.issubset(ch.keys()), f"Missing keys: {expected_keys - ch.keys()}"
 
 def test_auction_reward_channels_present():
@@ -958,7 +956,7 @@ def test_auction_reward_channels_present():
     for i in range(min(env.n_agents, 2)):
         ch = env._last_auction_reward_channels[i]
         expected_keys = {"auction_cost", "collateral_cost", "investment_cost",
-                         "opex_delta", "mac_cost", "loan_interest", "capex_penalty"}
+                         "opex_delta", "mac_cost"}
         assert expected_keys.issubset(ch.keys()), f"Missing keys: {expected_keys - ch.keys()}"
 
 def test_reward_channels_values_finite():

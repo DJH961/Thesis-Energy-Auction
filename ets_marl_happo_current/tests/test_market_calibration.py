@@ -43,6 +43,8 @@ def test_16_agents_matches_current_config():
 
 def test_12_agents_scales_down():
     cfg = _load_config()
+    # Start with 8 bots (16 total) as the full baseline
+    cfg["companies"]["n_bot_agents"] = 8
     full_cap = compute_market_params(cfg)["cap_year_0"]
     cfg["companies"]["n_bot_agents"] = 4
     params = compute_market_params(cfg)
@@ -52,6 +54,8 @@ def test_12_agents_scales_down():
 
 def test_8_agents_scales_down():
     cfg = _load_config()
+    # Explicit 16-agent baseline
+    cfg["companies"]["n_bot_agents"] = 8
     cap_16 = compute_market_params(cfg)["cap_year_0"]
     cfg_12 = copy.deepcopy(cfg)
     cfg_12["companies"]["n_bot_agents"] = 4
@@ -129,6 +133,8 @@ def test_fade_schedule_recalibrates():
     cfg["warm_start"]["enabled"] = False
     cfg["uncertainty"]["enabled"] = False
     cfg["construction_jitter"]["enabled"] = False
+    # This test requires bots to test fade schedule
+    cfg["companies"]["n_bot_agents"] = 8
 
     cfg["bots"]["fade_schedule"]["enabled"] = True
     cfg["bots"]["fade_schedule"]["schedule"] = [[0, 8], [1, 6]]

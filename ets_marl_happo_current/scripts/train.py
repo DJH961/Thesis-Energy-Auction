@@ -826,6 +826,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     log_interval = config["logging"]["log_interval"]
     save_interval = config["logging"]["save_interval"]
+    _snapshot_interval = int(config["logging"].get("snapshot_interval", 0))
     # Flush logs every N episodes to reduce data loss if training aborts early.
     csv_flush_interval = int(
         config["logging"].get("csv_flush_interval", 1000)
@@ -1913,6 +1914,18 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             for i, agent in enumerate(agents):
                 agent.save(os.path.join(ckpt_dir, f"agent_{i}_ep{episode}.pt"))
             _flush_csv_logs(episode, force=True)
+
+        # Periodic log snapshots: copy CSV logs at regular intervals for
+        # mid-run analysis without waiting for training to finish.
+        if _snapshot_interval > 0 and episode > 0 and episode % _snapshot_interval == 0:
+            import shutil
+            snap_dir = os.path.join(results_dir, "snapshots")
+            os.makedirs(snap_dir, exist_ok=True)
+            _flush_csv_logs(episode, force=True)
+            snap_ep = os.path.join(snap_dir, f"training_log_s{seed}_ep{episode}.csv")
+            snap_yr = os.path.join(snap_dir, f"year_log_s{seed}_ep{episode}.csv")
+            shutil.copy2(ep_path, snap_ep)
+            shutil.copy2(yr_path, snap_yr)
 
         ep_total = total_rewards.sum()
         if ep_total > best_total_reward:

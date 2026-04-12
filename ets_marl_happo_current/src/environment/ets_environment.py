@@ -817,6 +817,7 @@ class ETSEnvironment(gym.Env):
                 rng=self.rng,
                 cancel_under_subscribed=cancel_under_subscribed,
                 n_agents=self.n_total,
+                pricing_rule=self.config["auction"].get("pricing_rule", "uniform"),
             )
 
             unsold = max(0.0, float(auction_volume) - float(allocations.sum()))
@@ -1390,6 +1391,7 @@ class ETSEnvironment(gym.Env):
             cancel_under_subscribed=self.config["auction"].get(
                 "cancel_under_subscribed", False),
             n_agents=self.n_total,
+            pricing_rule=self.config["auction"].get("pricing_rule", "uniform"),
         )
 
         # E4: Post-clearing settlement — check each winner can pay; handle defaults.
@@ -1695,11 +1697,10 @@ class ETSEnvironment(gym.Env):
         """
         Compute per-agent intermediate reward for the auction phase.
 
-        This captures costs attributable to auction-phase decisions:
-        auction payment, collateral, investment, OPEX delta, MAC cost,
-        loan interest, and a prospective capex-throughput penalty estimate.
-        Budget penalty is intentionally excluded here because final annual
-        spending is only known after secondary market settlement.
+        Pure cost signal: negative sum of all phase-1 costs normalized by
+        a fixed scale (REWARD_SCALE = 1000 M€). No shaping terms — the
+        penalty in phase 2 provides the natural gradient for winning
+        sufficient allowances.
 
         Must be called after step_auction() and before step_secondary().
 
@@ -1708,10 +1709,10 @@ class ETSEnvironment(gym.Env):
         r_auction : np.ndarray, shape (n_agents,)
             Auction-phase reward per learning agent (negative = cost).
         """
+        REWARD_SCALE = 1000.0
         r_auction = np.zeros(self.n_agents)
         for i in range(self.n_agents):
             company = self.companies[i]
-            budget_divisor = max(company.annual_budget, 1.0)
 
             auction_cost = float(self._phase1_payments[i])
             investment_cost = float(self._phase1_invest_costs[i])
@@ -1719,32 +1720,18 @@ class ETSEnvironment(gym.Env):
             mac_cost_i = float(self._phase1_mac_costs[i])
             collateral_cost_i = float(self._collateral_locked[i]) * float(
                 self.config["auction"]["collateral"].get("collateral_rate", 0.05))
-            loan_interest_cost = float(company.compute_green_loan_cost())
-            # loan_interest_cost is recorded in _compute_rewards() via record_spending(); not double-counted here
-
-            projected_capex_spend = float(company.capex_spent_this_year + investment_cost)
-            capex_overshoot = max(0.0, projected_capex_spend - float(company.capex_throughput))
-            if capex_overshoot > 1e-6:
-                capex_ratio = capex_overshoot / max(float(company.capex_throughput), 1e-6)
-                capex_penalty = float(company.capex_overspend_coef) * (capex_ratio ** 2) * float(company.capex_throughput)
-            else:
-                capex_penalty = 0.0
 
             total_cost = (auction_cost + collateral_cost_i + investment_cost
-                          + opex_delta + mac_cost_i + loan_interest_cost
-                          + capex_penalty)
-            baseline_cost = company.compute_estimate_need() * self._phase1_clearing_price / budget_divisor
-            r_auction[i] = -(total_cost / budget_divisor) + baseline_cost
+                          + opex_delta + mac_cost_i)
+
+            r_auction[i] = -(total_cost / REWARD_SCALE)
 
             self._last_auction_reward_channels[i] = {
-                "auction_cost": float(auction_cost / budget_divisor),
-                "collateral_cost": float(collateral_cost_i / budget_divisor),
-                "investment_cost": float(investment_cost / budget_divisor),
-                "opex_delta": float(opex_delta / budget_divisor),
-                "mac_cost": float(mac_cost_i / budget_divisor),
-                "loan_interest": float(loan_interest_cost / budget_divisor),
-                "capex_penalty": float(capex_penalty / budget_divisor),
-                "baseline_cost": float(baseline_cost),
+                "auction_cost": float(auction_cost / REWARD_SCALE),
+                "collateral_cost": float(collateral_cost_i / REWARD_SCALE),
+                "investment_cost": float(investment_cost / REWARD_SCALE),
+                "opex_delta": float(opex_delta / REWARD_SCALE),
+                "mac_cost": float(mac_cost_i / REWARD_SCALE),
             }
         return r_auction
 
@@ -1906,6 +1893,7 @@ class ETSEnvironment(gym.Env):
             precompliance_holdings=pretrade_holdings,
             old_carry_forward=old_carry_forward,
             active_mask=active_mask,
+            trade_qtys=trade_qtys,
         )
 
         # Compute per-agent shortfall for diagnostics.
@@ -2261,39 +2249,37 @@ class ETSEnvironment(gym.Env):
                          invest_costs, emissions, clearing_price,
                          mac_costs=None, collateral_costs=None,
                          precompliance_holdings=None,
-                         old_carry_forward=None, active_mask=None):
+                         old_carry_forward=None, active_mask=None,
+                         trade_qtys=None):
         """
-        Reward (HAPPO-compliant, v7.6):
-            R_i = w_cost * (-cost_norm_ex_penalty) + w_green * (esg_scale_i * esg_raw)
-                  + green_bonus - penalty_norm - opportunity_cost
+        Simplified reward (v8.0) — 3 core terms + terminal values.
 
-        v7.6 changes:
-          - OPEX delta: only the change from baseline OPEX enters the cost signal.
-          - Per-agent normalization: /annual_budget instead of /1000 for cost, penalty,
-            opportunity cost, terminal bank value, and terminal debt penalty.
-          - Per-agent ESG scale: compensates for the divisor change to preserve the
-            50/50 ESG-to-cost balance for agents with w_green=0.5.
+        R_i = w_cost × (-cost_norm) + w_green × esg_signal - penalty_norm
+              + terminal_bank (final year) - terminal_debt (final year)
 
-        Core signals:
-          cost_norm_ex_penalty: total_cost_ex_penalty / annual_budget
-          penalty_norm:         penalty_cost / annual_budget
-          green_bonus:          diminishing-returns bonus for green investment progress
-          esg_raw:              saved-carbon-years formula before weighting
-
-        Penalty is separated from cost and applied at full strength regardless of w_cost.
-        Terminal bonuses: log-scaled bank value / annual_budget + ESG terminal queue.
+        Design principles:
+          - Fixed REWARD_SCALE (1000 M€) instead of per-agent EMA budget.
+            One stable denominator; the RewardNormalizer handles the rest.
+          - Penalty separated from cost, applied at full strength to ALL agents.
+            This is the natural gradient for compliance — no shaping needed.
+          - ESG signal (saved-carbon-years) is the only green incentive for
+            w_green > 0 agents. Financial agents rely purely on cost minimization.
+          - No shaping rewards (green_bonus, efficiency_bonus, gap_closure_credit
+            removed). These created contradictory gradients and washed out the
+            cost signal. Greening is already rational: lower emissions → lower
+            allowance need → lower cost. ESG agents get an explicit ESG signal.
+          - Budget/capex penalties removed from reward. Enforced mechanically
+            via investment_hard_gate and hard_cap_fraction action clipping.
+            Spending is still recorded for diagnostics.
         """
+        REWARD_SCALE = 1000.0
         rewards = np.zeros(self.n_total)
         base_rewards = np.zeros(self.n_total)
-        shaping_rewards = np.zeros(self.n_total)
         terminal_bank_values = np.zeros(self.n_total)
-        terminal_queue_values = np.zeros(self.n_total)
         reward_cfg = self.config.get("reward", {})
         esg_cfg = self.config.get("esg", {})
         esg_enabled = esg_cfg.get("enabled", False)
-        base_esg_scale = float(esg_cfg.get("scale", 2.0))
-
-        beta_shaping = reward_cfg.get("shaping_beta", 10.0)
+        esg_scale = float(esg_cfg.get("scale", 2.0))
 
         if mac_costs is None:
             mac_costs = np.zeros(self.n_total)
@@ -2310,151 +2296,54 @@ class ETSEnvironment(gym.Env):
             secondary_cost = float(trade_costs[i])
             penalty_cost = float(penalties[i])
             investment_cost = float(invest_costs[i])
-            # v7.6: OPEX delta — only the change from baseline enters the cost signal.
-            # Positive delta = costs rose, negative delta = OPEX savings from greening.
             opex_delta = company.compute_operational_cost(self.current_year) - company.baseline_opex
             mac_cost_i = float(mac_costs[i])
-            # NOTE: hold_fraction=0.02 (~7 days). Real EU ETS settles T+2 (~0.0055)
-            # but one annual step represents ~52 real auctions; 0.02 is the balance.
             collateral_cost_i = float(collateral_costs[i])
             loan_interest_cost = company.compute_green_loan_cost()
 
-            # Record spending: operational costs only (no non-compliance penalty).
-            # Non-compliance penalty is a regulatory fine, not operational spending —
-            # including it in budget tracking caused a death-spiral: penalty → budget
-            # overshoot → budget_penalty explosion → carry-forward amplification.
-            # Penalty already penalises the agent directly via penalty_norm in the reward.
+            # Record spending for budget tracking (diagnostics + hard gates).
+            # Non-compliance penalty excluded from budget (regulatory fine, not
+            # operational spending — see v7.6 rationale).
             company.record_spending(auction_cost + secondary_cost
                                     + investment_cost + mac_cost_i
                                     + collateral_cost_i
                                     + loan_interest_cost)
             company.record_capex_spending(investment_cost)
-            budget_penalty = company.compute_budget_penalty()
-            capex_penalty = company.compute_capex_penalty()
 
-            # v7.7: Per-agent financial-scale normalization using EMA budget
-            budget_divisor = max(company.annual_budget, 1.0)
-
-            # Separate penalty from other costs
-            # Penalty applies at full strength to ALL agents regardless of w_cost
-            total_cost_ex_penalty = (auction_cost + secondary_cost + investment_cost
-                                     + opex_delta + budget_penalty + capex_penalty
-                                     + mac_cost_i + collateral_cost_i + loan_interest_cost)
-
-            cost_norm_ex_penalty = total_cost_ex_penalty / budget_divisor
-            penalty_norm = penalty_cost / budget_divisor
-
-            # Baseline-relative normalization: subtract expected cost at market price
-            baseline_cost = company.compute_estimate_need() * clearing_price / budget_divisor
-            cost_norm_ex_penalty -= baseline_cost
-
-            # Green investment bonus with diminishing returns
-            # Scaled by (0.2 + w_green) so financial agents still get some signal
-            green_delta = max(0.0, company.green_frac - company.prev_green_frac)
-            fossil_scale = max(company.fossil_frac, 0.05)
-            green_bonus = beta_shaping * green_delta * fossil_scale * self.shaping_weight * (0.2 + company.w_green)
-
-            # v7.7: ESG scale is just base_esg_scale (no per-agent budget compensation)
-            esg_scale_i = base_esg_scale
+            # --- Core reward: 3 terms ---
+            total_cost = (auction_cost + secondary_cost + investment_cost
+                          + opex_delta + mac_cost_i + collateral_cost_i
+                          + loan_interest_cost)
+            cost_norm = total_cost / REWARD_SCALE
+            penalty_norm = penalty_cost / REWARD_SCALE
 
             # ESG signal: saved-carbon-years formula
             esg_signal = 0.0
             if esg_enabled and company.initial_ef > 1e-6:
                 ef_ratio = (company.initial_ef - company.weighted_emission_factor) / company.initial_ef
                 time_ratio = remaining_years / self.n_years
-                esg_raw = ef_ratio * time_ratio
-                esg_signal = esg_scale_i * esg_raw
-
-            # F1: Efficiency bonus as a shaping reward (decays with shaping_weight).
-            # Named 'efficiency_bonus' for consistency; acts as shaping (not permanent base reward).
-            efficiency_bonus = 0.0
-            if company.initial_ef > 0.01:
-                ef_improvement = max(0.0, company.initial_ef - company.weighted_emission_factor)
-                ef_improvement_ratio = ef_improvement / company.initial_ef
-                time_weight = remaining_years / self.n_years
-                price_weight = clearing_price / 100.0
-                efficiency_bonus = 1.5 * ef_improvement_ratio * time_weight * price_weight * self.shaping_weight
+                esg_signal = esg_scale * ef_ratio * time_ratio
 
             base_reward = float(
-                company.w_cost * (-cost_norm_ex_penalty)
+                company.w_cost * (-cost_norm)
                 + company.w_green * esg_signal
-                - penalty_norm  # penalty at full strength for all agents
+                - penalty_norm
             )
-            shaping_reward = float(green_bonus + efficiency_bonus)
 
             base_rewards[i] = base_reward
-            shaping_rewards[i] = shaping_reward
-            rewards[i] = base_reward + shaping_reward
+            rewards[i] = base_reward
 
             self._last_reward_channels[i] = {
-                "cost_norm": float(cost_norm_ex_penalty),
+                "cost_norm": float(cost_norm),
                 "penalty_norm": float(penalty_norm),
-                "green_bonus": float(green_bonus),
                 "esg_signal": float(esg_signal),
-                "efficiency_bonus": float(efficiency_bonus),
-                "budget_penalty": float(budget_penalty / budget_divisor),
-                "capex_penalty": float(capex_penalty / budget_divisor),
-                "loan_interest": float(loan_interest_cost / budget_divisor),
-                "baseline_cost": float(baseline_cost),
                 "base_reward": float(base_reward),
-                "shaping_reward": float(shaping_reward),
             }
 
-        # Terminal value bonuses (final year only)
+        # --- Terminal values (final year only) ---
         is_final_year = self.current_year >= self.n_years - 1
         terminal_bank = reward_cfg.get("terminal_bank_value", False)
-        terminal_queue = reward_cfg.get("terminal_queue_value", False)
 
-        if is_final_year and (terminal_bank or terminal_queue):
-            gamma_discount = self.config["ppo"].get("gamma", 0.99)
-            terminal_payoff_years = reward_cfg.get("terminal_payoff_years", 5)
-
-            # Shared terminal price: max(clearing, last_secondary, 80% of inflation-adjusted penalty)
-            pen_cfg = self.config["penalty"]
-            eff_penalty = pen_cfg["rate"] * self._inflation_factor(self.current_year)
-            terminal_price = max(clearing_price, self.last_secondary_price, eff_penalty * 0.8)
-
-            for i, company in enumerate(self.companies):
-                if active_mask is not None and not bool(active_mask[i]):
-                    continue
-                budget_divisor = max(company.annual_budget, 1.0)
-                # Terminal bank value with 2× annual_need cap:
-                # Bank beyond 2yr of reserves gets ZERO additional terminal credit,
-                # making secondary selling immediately rational. Diminishing-returns
-                # log1p formula maps prudent hedging (~1yr need) to ~69% of linear value.
-                if terminal_bank:
-                    annual_need = max(company.compute_estimate_need(), 0.1)
-                    # Cap effective bank at 2× annual need
-                    capped_holdings = min(self.holdings[i], 2.0 * annual_need)
-                    ratio = capped_holdings / annual_need
-                    bank_value = np.log1p(ratio) * annual_need * terminal_price / budget_divisor
-                    rewards[i] += bank_value
-                    terminal_bank_values[i] = bank_value
-
-                # Terminal queue value: ESG from queue items with γ^years_late discount
-                if terminal_queue:
-                    queue_value = 0.0
-                    for item in company._construction_queue:
-                        years_late = max(0, item["completion_year"] - self.current_year)
-                        effective_remaining = max(0, terminal_payoff_years - years_late)
-                        if effective_remaining <= 0 or company.initial_ef < 1e-6:
-                            continue
-                        delta_ef = company.weighted_emission_factor - company.emission_factors[item["tech_idx"]]
-                        if delta_ef <= 0:
-                            continue
-                        annual_saving = (delta_ef * item["frac_delta"]
-                                         * company.output_mwh / 1e6)
-                        discount = gamma_discount ** years_late
-                        # Normalize by initial_ef × output_twh × n_years
-                        normalizer = company.initial_ef * company.output_twh * self.n_years
-                        queue_value += (annual_saving * effective_remaining * discount
-                                        * terminal_price / max(normalizer, 1e-6))
-                    queue_term = queue_value
-                    rewards[i] += queue_term
-                    base_rewards[i] += queue_term
-                    terminal_queue_values[i] = queue_term
-
-        # Terminal debt liquidation: applied in final year regardless of terminal_bank/queue settings
         if is_final_year:
             pen_cfg = self.config["penalty"]
             eff_penalty = pen_cfg["rate"] * self._inflation_factor(self.current_year)
@@ -2463,18 +2352,27 @@ class ETSEnvironment(gym.Env):
             for i, company in enumerate(self.companies):
                 if active_mask is not None and not bool(active_mask[i]):
                     continue
-                budget_divisor = max(company.annual_budget, 1.0)
-                # Aggressively penalize outstanding carry_forward debt
+
+                # Terminal bank value: linear, capped at 2× annual need
+                if terminal_bank:
+                    annual_need = max(company.compute_estimate_need(), 0.1)
+                    capped_holdings = min(self.holdings[i], 2.0 * annual_need)
+                    bank_value = capped_holdings * terminal_price / REWARD_SCALE
+                    rewards[i] += bank_value
+                    base_rewards[i] += bank_value
+                    terminal_bank_values[i] = bank_value
+
+                # Terminal debt: penalize outstanding carry-forward
                 if company._carry_forward > 0:
-                    debt_penalty = (company._carry_forward * terminal_price * 1.5) / budget_divisor
+                    debt_penalty = (company._carry_forward * terminal_price * 1.5) / REWARD_SCALE
                     rewards[i] -= debt_penalty
                     base_rewards[i] -= debt_penalty
 
         self._last_terminal_bank_values = terminal_bank_values
-        self._last_terminal_queue_values = terminal_queue_values
-        self._last_terminal_liquidation_values = terminal_bank_values + terminal_queue_values
+        self._last_terminal_queue_values = np.zeros(self.n_total)
+        self._last_terminal_liquidation_values = terminal_bank_values
         self._last_reward_base_values = base_rewards
-        self._last_reward_shaping_values = shaping_rewards
+        self._last_reward_shaping_values = np.zeros(self.n_total)
 
         return rewards
 
@@ -2512,7 +2410,7 @@ class ETSEnvironment(gym.Env):
                 })
                 continue
 
-            s_financial = max(0.0, 1.0 - company.budget_spent_this_year / max(budget_ref, 1.0))
+            s_financial = min(1.0, max(0.0, 1.0 - company.budget_spent_this_year / max(budget_ref, 1.0)))
 
             if company.initial_ef > 1e-6:
                 ef_progress = max(0.0, company.initial_ef - company.weighted_emission_factor)

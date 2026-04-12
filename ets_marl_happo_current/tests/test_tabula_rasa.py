@@ -59,9 +59,9 @@ def test_tabula_rasa_schedule_overrides(monkeypatch):
     resolved = _capture_config_after_train_overrides(monkeypatch, cfg)
     n_ep = resolved["simulation"]["n_episodes"]
 
-    assert resolved["ppo"]["critic_warmup_episodes"] == int(0.10 * n_ep)
-    assert resolved["reward"]["shaping_decay_episode"] == int(0.33 * n_ep)
-    assert resolved["exploration"]["epsilon_decay_episodes"] == int(0.50 * n_ep)
+    assert resolved["ppo"]["critic_warmup_episodes"] == int(0.03 * n_ep)
+    assert resolved["reward"]["shaping_decay_episode"] == int(0.60 * n_ep)
+    assert resolved["exploration"]["epsilon_decay_episodes"] == int(0.80 * n_ep)
     assert resolved["exploration"]["mode"] == "uniform"
 
 
