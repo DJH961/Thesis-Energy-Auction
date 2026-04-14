@@ -1924,7 +1924,8 @@ class ETSEnvironment(gym.Env):
             total_cost = (auction_cost + collateral_cost_i + investment_cost
                           + opex_delta + mac_cost_i + loan_interest_cost
                           + capex_penalty)
-            baseline_cost = company.compute_estimate_need() * self._phase1_clearing_price / budget_divisor
+            baseline_need = max(company.compute_estimate_need() + company._carry_forward, 1e-6)
+            baseline_cost = baseline_need * self._phase1_clearing_price / budget_divisor
             r_auction[i] = -(total_cost / budget_divisor) + baseline_cost
 
             self._last_auction_reward_channels[i] = {
@@ -2515,7 +2516,8 @@ class ETSEnvironment(gym.Env):
             penalty_norm = penalty_cost / budget_divisor
 
             # Baseline-relative normalization: subtract expected cost at market price
-            baseline_cost = company.compute_estimate_need() * clearing_price / budget_divisor
+            baseline_need = max(company.compute_estimate_need() + company._carry_forward, 1e-6)
+            baseline_cost = baseline_need * clearing_price / budget_divisor
             cost_norm_ex_penalty -= baseline_cost
 
             # Green investment bonus with diminishing returns
@@ -2589,7 +2591,7 @@ class ETSEnvironment(gym.Env):
                 budget_divisor = max(company.annual_budget, 1.0)
                 # Terminal bank value with 2× annual_need cap:
                 if terminal_bank:
-                    annual_need = max(company.compute_estimate_need(), 0.1)
+                    annual_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
                     capped_holdings = min(self.holdings[i], 2.0 * annual_need)
                     ratio = capped_holdings / annual_need
                     bank_value = np.log1p(ratio) * annual_need * terminal_price / budget_divisor

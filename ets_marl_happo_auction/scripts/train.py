@@ -226,12 +226,14 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
                     loan_outstanding_norm=company.get_loan_outstanding_norm(),
                 )
                 p, q = h_auc[0], h_auc[1] / 3.0
-                auction_actions[i] = np.array([p, q, p, q, p, q,
-                                               h_auc[2], h_auc[3], h_auc[4], h_auc[5]],
-                                              dtype=np.float32)
+                h_auc_expanded = np.array([
+                    p, q, p, q, p, q,
+                    h_auc[2], h_auc[3], h_auc[4], h_auc[5]
+                ], dtype=np.float32)
+                auction_actions[i] = h_auc_expanded
 
-                auc_raw = _to_raw(h_auc, agents[i].auction_policy,
-                                      agents[i].device)
+                auc_raw = _to_raw(h_auc_expanded, agents[i].auction_policy,
+                                  agents[i].device)
                 auc_data[i].append((obs1[i].copy(), auc_raw))
 
             obs2, _ = env.step_auction(auction_actions)

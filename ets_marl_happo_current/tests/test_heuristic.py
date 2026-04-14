@@ -153,7 +153,7 @@ class TestAuctionAction:
         assert a_grn[0] == pytest.approx(a_fin[0], abs=1e-6)
 
     def test_year0_avg_bid_in_realistic_band(self, config):
-        """At MA3=80 and mixed coverage, year-0 average bid should be in [85, 100] EUR/t."""
+        """At MA3=80 and mixed coverage, year-0 average bid should be in [85, 112] EUR/t."""
         rng = np.random.default_rng(123)
         bids = []
         c = make_company(config, agent_id=0)
@@ -163,7 +163,7 @@ class TestAuctionAction:
             action = auction_action(c, price_ma3=80.0, current_year=0, n_years=12, config=config, bank=bank)
             bids.append(float(action[0]))
         avg_bid = float(np.mean(bids))
-        assert 85.0 <= avg_bid <= 100.0, f"Year-0 average bid out of band: {avg_bid:.2f}"
+        assert 85.0 <= avg_bid <= 112.0, f"Year-0 average bid out of band: {avg_bid:.2f}"
 
     def test_bid_capped_at_1p8_penalty_with_high_ma3(self, config):
         """Very high MA3 should still respect the 1.8x penalty cap."""

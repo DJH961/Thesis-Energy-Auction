@@ -5,6 +5,41 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.8.1
+
+**Compliance-Recovery Heuristic Hardening, Budget Envelope Uplift, Carry-Forward Need Propagation, Full Regression Validation**
+
+### What changed in this patch
+- **Heuristic auction urgency now reacts directly to carry-forward debt** in `heuristic_policy.py`:
+  - Added `cf_ratio = carry_forward / annual_need`.
+  - Added bounded urgency boost `min(0.3, 0.25 * cf_ratio)`.
+- **Debt-state compliance budget ceiling is higher**:
+  - `max_compliance_share` now escalates from 0.70 up to 0.90 when carry-forward debt exists.
+- **Secondary-market debt recovery is now explicit**:
+  - With carry-forward debt, bots never sell and additionally target debt paydown via
+    `cf_recovery = min(0.8 * carry_forward, qty_max)`.
+  - Buy-side price aggressiveness gets a debt floor: `price_frac >= 0.5`.
+
+### Budget updates (agents + bots)
+- **Annual budgets** increased moderately to enable viable secondary selling:
+  - `[1010, 1010, 920, 920, 945, 945, 900, 900]` M€.
+- **Debt headrooms** increased to reduce forced underbidding in compliance years:
+  - `[500, 500, 330, 330, 150, 150, 0, 0]` M€.
+- **CapEx throughput limits** increased to preserve investment feasibility under the larger envelope:
+  - `[150, 150, 150, 150, 185, 185, 140, 140]` M€/yr.
+
+### Carry-forward propagation check/fix
+- Verified carry-forward is already included in core bidding need calculations for **both learning agents and bots**.
+- Added carry-forward to remaining compliance-relevant baseline/terminal need computations in `ets_environment.py`:
+  - Auction-phase baseline cost normalization.
+  - Secondary-phase baseline cost normalization.
+  - Terminal bank-value annual-need cap.
+
+### Since the last version jump
+- The full feature set introduced in **v7.8.0** remains in effect (dual-ceiling WTP, marginal-EF revenue budgeting, collateral diagnostics, extended per-agent diagnostics/logging, and compliance smoke tests), now with the compliance-recovery and budget-envelope improvements above.
+
+---
+
 ## v7.8.0
 
 **Dual-Ceiling WTP Heuristic, Marginal EF Revenue (instance method), Compliance-Priority Investment, Collateral Warning Counter, Enhanced Diagnostics, Config Updates, Smoke Tests**

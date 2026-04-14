@@ -170,15 +170,17 @@ def auction_action(
     # --- Bid price (WTP-based: willingness-to-pay bounded by penalty cap) ---
     mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
     urgency = max(0.0, 1.0 - coverage_ratio / urgency_denom)
+    carry_fwd = max(0.0, float(company._carry_forward))
+    cf_ratio = carry_fwd / max(annual_need, 1e-6)
+    cf_urgency_boost = min(0.3, 0.25 * cf_ratio)
     urgency_boost = 0.0
     if auction_volume is not None and cap_t is not None and cap_t > 0:
         supply_ratio = float(auction_volume) / max(float(cap_t), 1e-6)
         if supply_ratio < 0.8:
             urgency_boost = max(0.0, 1.0 - supply_ratio) * 0.3
-    urgency = min(1.0, (urgency + urgency_boost) * urgency_multiplier)
+    urgency = min(1.0, (urgency + urgency_boost + cf_urgency_boost) * urgency_multiplier)
     market_anchor = max(mac_cost, price_ma3) + valuation_noise
     # --- C1: Target quantity (needed early for wtp_budget ceiling) ---
-    carry_fwd = max(0.0, float(company._carry_forward))
     qty_target_raw = annual_need + carry_fwd + 0.1 * annual_need * urgency
     qty_mult_raw = qty_target_raw / max(annual_need, 1e-6)
     qty_mult_clipped = float(np.clip(qty_mult_raw, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0)))
@@ -191,6 +193,8 @@ def auction_action(
     wtp_economic = min(wtp_economic, penalty_rate + expected_future_price - 1.0)
     # Budget ceiling: agent cannot commit more than max_compliance_share of available budget to compliance
     max_compliance_share = config.get("bots", {}).get("max_compliance_share", 0.70)
+    if carry_fwd > 0.01:
+        max_compliance_share = min(0.90, max_compliance_share + 0.20)
     wtp_budget = max_compliance_share * available / max(qty_clipped, 1e-6)
     bid_price = max(min(wtp_economic, wtp_budget), float(reserve_price) + 1.0)
     bid_price = float(np.clip(bid_price, aq["price_min"], aq["price_max"]))
@@ -361,6 +365,8 @@ def secondary_action(
     # C3: Never sell when carrying forward debt (compliance risk)
     if company._carry_forward > 0.01:
         trade_target = max(0.0, trade_target)
+        cf_recovery = min(company._carry_forward * 0.8, qty_max)
+        trade_target = max(trade_target, cf_recovery)
 
     # C2: Budget headroom check — cap buy qty by remaining budget.
     # When already short (compliance debt), allow 60% of remaining budget to
@@ -403,6 +409,8 @@ def secondary_action(
         buy_qty = min(abs(trade_target), qty_max)
         sec_qty = float(buy_qty)
         price_frac = urgency + 0.2 * min(severity, 1.0)
+        if company._carry_forward > 0.01:
+            price_frac = max(price_frac, 0.5)
         sec_price = market_anchor + price_frac * (penalty_rate - market_anchor)
     elif trade_target < -0.01:
         sell_qty = min(abs(trade_target), qty_max)
