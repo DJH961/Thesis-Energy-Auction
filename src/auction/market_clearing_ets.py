@@ -1,0 +1,352 @@
+"""
+market_clearing_ets.py
+======================
+Uniform-price sealed-bid multi-unit buyer auction clearing for EU ETS.
+
+Forked and adapted from:
+    ckrk/bidding_learning (MIT License, 2024)
+    https://github.com/ckrk/bidding_learning
+
+Key differences from the original (energy seller market):
+    - Bids are BUYER bids: agents bid the MAX price they are willing to pay.
+    - Sort order is DESCENDING by price (highest willingness-to-pay first).
+    - The clearing price is the LOWEST accepted bid (marginal buyer).
+    - Every winner pays the uniform clearing price (not their own bid).
+    - Supply side = fixed cap volume Q_cap offered by the auctioneer.
+
+EU ETS reference:
+    Single-round, sealed-bid, uniform-price auction.
+    EU Auctioning Regulation (Commission Regulation 1031/2010).
+
+Stylised simplifications vs real EU ETS:
+    - ``reserve_price`` acts as a stylised *price floor* to prevent
+      zero-price learning artefacts.  In the real EU ETS, the reserve
+      price is computed via a different formula (CREG).
+    - Under-subscription (total demand < supply) *optionally* cancels the
+      auction, mirroring Article 7(6) of Regulation 1031/2010.  Disabled
+      by default for training; enable via ``cancel_under_subscribed=True``.
+    - Tie-break at the marginal price uses random ranking (not pro-rata):
+      tied bids are shuffled randomly and filled sequentially; only the
+      last successful bid in the random order receives a partial fill.
+"""
+
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Main clearing function
+# ---------------------------------------------------------------------------
+
+def market_clearing_ets(bids: np.ndarray, q_cap: float, reserve_price: float = 0.0,
+                        max_agent_share: float = 1.0, rng=None,
+                        cancel_under_subscribed: bool = False,
+                        n_agents: int = None,
+                        pricing_rule: str = "uniform"):
+    """
+    Sealed-bid buyer auction clearing for ETS markets.
+
+    Supports two pricing rules:
+      - "uniform" (EU ETS style): all winners pay the marginal (lowest
+        accepted) bid price.
+      - "pay_as_bid" (UK ETS style): each winner pays their own bid price.
+
+    Parameters
+    ----------
+    bids : np.ndarray, shape (N, 3)
+        Each row: [agent_id (int), quantity_bid (Mt), price_bid (EUR/t)]
+    q_cap : float
+        Total allowances offered by the auctioneer (Mt).
+    reserve_price : float
+        Stylised minimum accepted price (EUR/t).  Bids below this are
+        discarded.  Not identical to the real EU ETS reserve price
+        (CREG formula), but serves an analogous role.
+    max_agent_share : float
+        Maximum fraction of q_cap any single agent can receive (California-
+        style holding limit).  Default 1.0 = no limit.  E.g. 0.25 means
+        each agent can receive at most 25 % of the total auctioned volume.
+    rng : np.random.Generator or None
+        Random number generator for reproducible tie-breaking.  If None,
+        a fresh default generator is created.
+    cancel_under_subscribed : bool
+        If True, the auction is cancelled when total valid demand < q_cap
+        (Article 7(6) of Reg. 1031/2010).  If False (default), the auction
+        proceeds and sells whatever is demanded — better for RL training
+        where early-stage agents may bid insufficient quantities.
+    pricing_rule : str
+        "uniform" — all winners pay the clearing price (EU ETS).
+        "pay_as_bid" — each winner pays their own bid price (UK ETS).
+
+    Returns
+    -------
+    clearing_price : float
+        Marginal accepted price (EUR/t). Under uniform pricing, this is
+        the price all winners pay. Under pay-as-bid, it is reported for
+        diagnostics but each agent pays their own bid.
+    allocations : np.ndarray, shape (n_agents,)
+        Allowances allocated to each agent (indexed by agent_id).
+    payments : np.ndarray, shape (n_agents,)
+        Total payment by each agent.
+    auction_stats : dict
+        Diagnostic information (cover ratio, total demand, etc.).
+    """
+    bids = np.array(bids, dtype=float)
+
+    # --- Safeguard: empty bids array ---
+    if bids.ndim != 2 or len(bids) == 0:
+        stats = {
+            "clearing_price": reserve_price,
+            "total_demand": 0.0,
+            "total_allocated": 0.0,
+            "cover_ratio": 0.0,
+            "auction_failed": True,
+            "fail_reason": "no_bids",
+            "unsold": q_cap,
+        }
+        return reserve_price, np.zeros(0, dtype=float), np.zeros(0, dtype=float), stats
+
+    if n_agents is None:
+        n_agents = int(bids[:, 0].max()) + 1
+    else:
+        n_agents = int(n_agents)
+        if n_agents <= 0:
+            raise ValueError("n_agents must be a positive integer")
+
+    # Validate IDs when an explicit participant count is provided.
+    if np.any(bids[:, 0] < 0) or np.any(bids[:, 0] >= n_agents):
+        raise ValueError("bids contain agent_id outside [0, n_agents)")
+
+    allocations = np.zeros(n_agents, dtype=float)
+    payments = np.zeros(n_agents, dtype=float)
+
+    # --- Filter: remove invalid bids ---
+    valid_mask = (bids[:, 1] > 0) & (bids[:, 2] >= reserve_price)
+    valid_bids = bids[valid_mask]
+
+    if len(valid_bids) == 0:
+        # No valid bids: auction fails, nothing sold
+        stats = {
+            "clearing_price": reserve_price,
+            "total_demand": 0.0,
+            "total_allocated": 0.0,
+            "cover_ratio": 0.0,
+            "auction_failed": True,
+            "fail_reason": "all_below_reserve",
+            "unsold": q_cap,
+        }
+        return reserve_price, allocations, payments, stats
+
+    total_demand = valid_bids[:, 1].sum()
+    is_under_subscribed = total_demand < q_cap - 1e-9
+    lowest_submitted_price = float(np.min(valid_bids[:, 2]))
+
+    # --- Under-subscription check (Article 7(6) of Reg. 1031/2010) ---
+    # If total valid demand does not reach the supply, the auction is
+    # cancelled and no allowances are sold.  Disabled by default for
+    # RL training (early agents bid too little → uninformative signal).
+    if cancel_under_subscribed and is_under_subscribed:
+        stats = {
+            "clearing_price": reserve_price,
+            "total_demand": total_demand,
+            "total_allocated": 0.0,
+            "cover_ratio": total_demand / q_cap if q_cap > 0 else 0.0,
+            "auction_failed": True,
+            "fail_reason": "under_subscribed",
+            "unsold": q_cap,
+        }
+        return reserve_price, allocations, payments, stats
+
+    # --- Sort DESCENDING by price; random tie-break at same price ---
+    if rng is None:
+        rng = np.random.default_rng()
+    tiebreakers = rng.random(len(valid_bids))
+    sort_idx = np.lexsort((tiebreakers, -valid_bids[:, 2]))
+    sorted_bids = valid_bids[sort_idx]
+
+    # --- Walk through sorted bids, fill up to q_cap ---
+    # California-style holding limit: each agent can receive at most
+    # max_agent_share * q_cap allowances across all their bids.
+    per_agent_cap = max_agent_share * q_cap
+    agent_cumul = np.zeros(n_agents, dtype=float)
+
+    cumulative = 0.0
+    clearing_price = reserve_price
+    alloc_per_bid = np.zeros(len(sorted_bids), dtype=float)
+
+    for i, (agent_id, qty, price) in enumerate(sorted_bids):
+        if cumulative >= q_cap - 1e-9:
+            break
+        aid = int(agent_id)
+        agent_room = per_agent_cap - agent_cumul[aid]
+        if agent_room <= 1e-9:
+            continue  # this agent already at holding limit
+        take = min(qty, q_cap - cumulative, agent_room)
+        alloc_per_bid[i] = take
+        cumulative += take
+        agent_cumul[aid] += take
+        clearing_price = price
+
+    # --- Aggregate allocations back to agents ---
+    for i, (agent_id, _, _) in enumerate(sorted_bids):
+        allocations[int(agent_id)] += alloc_per_bid[i]
+
+    # When auction proceeds while under-subscribed, clear at the lowest
+    # submitted valid bid rather than the reserve/minimum fallback.
+    if is_under_subscribed:
+        clearing_price = lowest_submitted_price
+
+    # --- Compute payments ---
+    if pricing_rule == "pay_as_bid":
+        # Pay-as-bid (UK ETS style): each winner pays their own bid price
+        # for each unit allocated from that bid.
+        for i, (agent_id, qty, price) in enumerate(sorted_bids):
+            if alloc_per_bid[i] > 0:
+                payments[int(agent_id)] += alloc_per_bid[i] * price
+    else:
+        # Uniform price (EU ETS style): all winners pay the clearing price.
+        payments = allocations * clearing_price
+
+    # --- Auction statistics ---
+    total_allocated = allocations.sum()
+    cover_ratio = total_demand / q_cap if q_cap > 0 else 0.0
+    unsold = max(0.0, q_cap - total_allocated)
+
+    # HHI: Herfindahl-Hirschman Index of allocation concentration
+    # HHI = sum of squared market shares (0 = perfectly spread, 10000 = monopoly)
+    if total_allocated > 1e-9:
+        shares = allocations / total_allocated
+        hhi = float(np.sum((shares * 100) ** 2))
+        max_agent_share_actual = float(np.max(shares))
+    else:
+        hhi = 0.0
+        max_agent_share_actual = 0.0
+
+    stats = {
+        "clearing_price": clearing_price,
+        "total_demand": total_demand,
+        "total_allocated": total_allocated,
+        "cover_ratio": cover_ratio,
+        "auction_failed": False,
+        "unsold": unsold,
+        "hhi": hhi,
+        "max_agent_share_actual": max_agent_share_actual,
+    }
+
+    return clearing_price, allocations, payments, stats
+
+
+# ---------------------------------------------------------------------------
+# Convenience: build bids array from per-agent (price, quantity) actions
+# ---------------------------------------------------------------------------
+
+def build_bids(actions: np.ndarray) -> np.ndarray:
+    """
+    Convert agent actions to bids array for market_clearing_ets.
+
+    Parameters
+    ----------
+    actions : np.ndarray, shape (N, 2)
+        Each row: [price_bid (EUR/t), quantity_bid (Mt)] for agent i.
+
+    Returns
+    -------
+    bids : np.ndarray, shape (N, 3)
+        Each row: [agent_id, quantity_bid, price_bid]
+    """
+    n = len(actions)
+    agent_ids = np.arange(n, dtype=float).reshape(-1, 1)
+    # reorder: [agent_id, quantity, price]
+    bids = np.hstack([agent_ids, actions[:, 1:2], actions[:, 0:1]])
+    return bids
+
+
+# ---------------------------------------------------------------------------
+# E4: Post-clearing settlement with default handling
+# ---------------------------------------------------------------------------
+
+def settle_auction(
+    allocations: np.ndarray,
+    payments: np.ndarray,
+    agent_cash: np.ndarray,
+    collateral_locked: np.ndarray,
+    suspension_length: int = 1,
+    max_loan_budgets: np.ndarray = None,
+):
+    """
+    E4: Post-clearing settlement — check each winner can pay; handle defaults.
+
+    For each winning agent, the cash available for payment is reduced by any
+    collateral already locked pre-bid (margin deposit).  If the remaining cash
+    is insufficient to cover the uniform-price payment the agent defaults
+    unless an emergency loan can cover the shortfall.
+
+    If ``max_loan_budgets`` is provided and the shortfall is within the loan
+    limit, the agent keeps its allocation and the shortfall is recorded as a
+    loan.  Otherwise the agent defaults: allocations are cancelled, collateral
+    is forfeited, and the agent is suspended.
+
+    Non-winners have their collateral returned automatically (no action needed
+    — they never paid anything).
+
+    Parameters
+    ----------
+    allocations : np.ndarray, shape (n_agents,)
+        Provisional allocations from ``market_clearing_ets``.
+    payments : np.ndarray, shape (n_agents,)
+        Provisional payments (allocation × clearing_price).
+    agent_cash : np.ndarray, shape (n_agents,)
+        Available cash per agent at settlement time
+        (typically annual_budget − budget_spent_this_year).
+    collateral_locked : np.ndarray, shape (n_agents,)
+        Collateral locked pre-bid per agent
+        (collateral_fraction × max(0, bid_price − reserve) × bid_qty).
+        Reduces effective cash available for the payment.
+    suspension_length : int
+        Number of auction rounds an agent is suspended after defaulting.
+    max_loan_budgets : np.ndarray or None, shape (n_agents,)
+        Maximum emergency loan each agent can take. If None, no loans.
+
+    Returns
+    -------
+    actual_allocations : np.ndarray
+        Final allocations after default resolution (defaulters get 0).
+    actual_payments : np.ndarray
+        Final payments after default resolution (defaulters pay 0).
+    defaults_mask : np.ndarray, dtype=bool
+        True for agents that defaulted.
+    defaulted_volume : float
+        Total allowance volume returned to the market from defaults.
+    suspension_steps : np.ndarray, dtype=int
+        Rounds to suspend per agent (``suspension_length`` for defaulters, 0
+        for all others).
+    loan_amounts : np.ndarray
+        Emergency loan taken per agent (0.0 if no loan or defaulted).
+    """
+    n = len(allocations)
+    actual_allocations = allocations.copy()
+    actual_payments = payments.copy()
+    defaults_mask = np.zeros(n, dtype=bool)
+    suspension_steps = np.zeros(n, dtype=int)
+    loan_amounts = np.zeros(n)
+    defaulted_volume = 0.0
+
+    for i in range(n):
+        if allocations[i] < 1e-9:
+            continue  # non-winner: collateral released automatically
+        # Cash available for payment after collateral is locked
+        cash_available = float(agent_cash[i]) - float(collateral_locked[i])
+        payment = float(payments[i])
+        if cash_available < payment:
+            shortfall = payment - cash_available
+            # Try emergency loan if available
+            if max_loan_budgets is not None and shortfall <= float(max_loan_budgets[i]):
+                loan_amounts[i] = shortfall
+            else:
+                # Default: insufficient funds → cancel allocation, forfeit collateral
+                defaults_mask[i] = True
+                defaulted_volume += float(allocations[i])
+                actual_allocations[i] = 0.0
+                actual_payments[i] = 0.0
+                suspension_steps[i] = suspension_length
+
+    return actual_allocations, actual_payments, defaults_mask, defaulted_volume, suspension_steps, loan_amounts
