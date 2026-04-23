@@ -86,7 +86,12 @@ class RewardNormalizer:
 # ---------------------------------------------------------------------------
 # Observation index constants
 # ---------------------------------------------------------------------------
-OBS1_EXPECTED_PRICE_IDX = 3  # Phase-1 obs dim 3: normalized expected price (×price_max)
+OBS1_EXPECTED_PRICE_IDX = 3   # Phase-1 obs dim 3: normalized expected price (×price_max)
+OBS1_NEED_IDX = 10             # Phase-1 obs dim 10: estimated_need / 10.0 (Mt)
+OBS1_BUDGET_HEADROOM_IDX = 27  # Phase-1 obs dim 27: budget headroom (1.0=fresh)
+OBS1_COVER_RATIO_IDX = 33      # Phase-1 obs dim 33: last auction cover_ratio / 3.0
+OBS1_OWN_SEC_BUY_PRICE_IDX = 34   # Phase-1 obs dim 34: own last secondary buy price / price_max
+OBS1_CUM_COVERAGE_RATIO_IDX = 35  # Phase-1 obs dim 35: cumulative alloc/emissions ratio / 2.0
 # Phase-2 appends 10 dims to phase1; clearing_price_norm is extra dim [base+1].
 # Relative index from end keeps this robust across opponent-modeling sizes.
 OBS2_CLEARING_PRICE_IDX_FROM_END = -9
@@ -206,6 +211,15 @@ class PPOAgent:
             self.expected_price_fallback = float(fallback_expected)
         except (TypeError, ValueError):
             self.expected_price_fallback = 80.0
+
+        # WTP-anchored exploration parameters (Approach C+D: escape floor-price trap)
+        penalty_cfg = config.get("penalty", {})
+        self._wtp_penalty_rate = float(penalty_cfg.get("rate", 138.75))
+        companies_cfg = config.get("companies", {})
+        budgets = companies_cfg.get("annual_budgets", [880.0])
+        idx = min(agent_id, len(budgets) - 1)
+        self._wtp_annual_budget = float(budgets[idx])
+        self._wtp_mac = float(config.get("mac", {}).get("coal_to_gas_cost", 48.0))
 
         # No explicit anchors: keep neutral defaults for non-price dimensions,
         # but initialize bid-price near the expected market level.
@@ -356,13 +370,19 @@ class PPOAgent:
     # ------------------------------------------------------------------
 
     def select_auction_action(self, obs1: np.ndarray, deterministic=False,
-                              epsilon: float = 0.0):
+                              epsilon: float = 0.0,
+                              last_secondary_buy_price: float = 0.0):
         """Phase 1: obs(18) → (action[6], raw[6], logp[1]).
 
         When ``epsilon > 0`` and not deterministic, with probability *epsilon*
         an epsilon-random action in physical space replaces the policy sample.
         The raw action and log_prob are still computed under the current policy
         so that the PPO importance ratio remains correct.
+
+        ``last_secondary_buy_price``: price this agent paid per Mt on the
+        secondary market last year. Used for Approach C+D — shifts the WTP
+        exploration anchor upward so agents learn to bid above floor when
+        the secondary market is expensive.
         """
         obs_t = torch.FloatTensor(obs1).unsqueeze(0).to(self.device)
         with torch.no_grad():
@@ -375,30 +395,46 @@ class PPOAgent:
                 if self.exploration_mode == "uniform":
                     rand_action = low + (high - low) * torch.rand_like(action)
 
-                    # Keep under/overbid directions balanced around expected price.
-                    # Uniform-in-range sampling overweights overbids because [expected, max]
-                    # is much wider than [min, expected] in ETS price bounds.
+                    # WTP-anchored exploration (Approach C+D): anchor exploration
+                    # on willingness-to-pay instead of expected price.
+                    # This breaks the floor-price self-reinforcement loop where
+                    # expected_price = floor → exploration samples near floor →
+                    # clearing price = floor → expected_price stays at floor.
                     price_min = float(low[0].item())
                     price_max = float(high[0].item())
-                    fallback_expected = float(np.clip(
-                        self.expected_price_fallback, price_min, price_max))
-                    expected_price = (
-                        float(obs1[OBS1_EXPECTED_PRICE_IDX]) * price_max
-                        if len(obs1) > OBS1_EXPECTED_PRICE_IDX
-                        else fallback_expected
-                    )
-                    if not np.isfinite(expected_price):
-                        expected_price = fallback_expected
-                    expected_price = float(np.clip(expected_price, price_min, price_max))
 
-                    if expected_price <= price_min + 1e-9:
-                        sampled_price = np.random.uniform(expected_price, price_max)
-                    elif expected_price >= price_max - 1e-9:
-                        sampled_price = np.random.uniform(price_min, expected_price)
+                    # Compute WTP anchor from agent's own state
+                    need_mt = float(obs1[OBS1_NEED_IDX]) * 10.0 if len(obs1) > OBS1_NEED_IDX else 1.0
+                    need_mt = max(need_mt, 0.01)
+                    budget_headroom = float(obs1[OBS1_BUDGET_HEADROOM_IDX]) if len(obs1) > OBS1_BUDGET_HEADROOM_IDX else 0.5
+                    available_budget = max(budget_headroom, 0.0) * self._wtp_annual_budget
+                    # WTP economic: MAC + half the gap to penalty (heuristic midpoint)
+                    wtp_economic = self._wtp_mac + 0.5 * max(0.0, self._wtp_penalty_rate - self._wtp_mac)
+                    # WTP budget: what can the agent afford per tonne
+                    wtp_budget = available_budget / need_mt if need_mt > 0.01 else price_max
+
+                    # Approach C: shift anchor to secondary buy price if higher
+                    # "Last year I paid 280 on secondary → I should bid at least
+                    # that much at auction to avoid overpaying again."
+                    wtp_base = min(wtp_economic, wtp_budget)
+                    if last_secondary_buy_price > 0.0:
+                        wtp_base = max(wtp_base, last_secondary_buy_price)
+
+                    # Approach D: blend — bid floor = 0.5 * sec_price + 0.5 * econ
+                    # This softens the shift so agents don't jump to full sec price
+                    if last_secondary_buy_price > wtp_economic and last_secondary_buy_price > 0.0:
+                        wtp_base = 0.5 * last_secondary_buy_price + 0.5 * wtp_economic
+
+                    wtp_anchor = float(np.clip(wtp_base, price_min, price_max))
+
+                    if wtp_anchor <= price_min + 1e-9:
+                        sampled_price = np.random.uniform(price_min, price_max * 0.5)
+                    elif wtp_anchor >= price_max - 1e-9:
+                        sampled_price = np.random.uniform(price_min, wtp_anchor)
                     elif np.random.random() < 0.5:
-                        sampled_price = np.random.uniform(price_min, expected_price)
+                        sampled_price = np.random.uniform(price_min, wtp_anchor)
                     else:
-                        sampled_price = np.random.uniform(expected_price, price_max)
+                        sampled_price = np.random.uniform(wtp_anchor, price_max)
                     rand_action[0, 0] = float(sampled_price)
                 else:
                     # Anchored exploration: sample each dim from Gaussian around
@@ -409,10 +445,23 @@ class PPOAgent:
                     price_max = high[0].item()
                     price_min = low[0].item()
 
-                    # [0] bid_price: Gaussian around expected_price (obs[OBS1_EXPECTED_PRICE_IDX] × price_max)
-                    expected_price = float(obs1[OBS1_EXPECTED_PRICE_IDX]) * price_max
+                    # [0] bid_price: Gaussian around WTP anchor (with C+D secondary feedback)
+                    need_mt = float(obs1[OBS1_NEED_IDX]) * 10.0 if len(obs1) > OBS1_NEED_IDX else 1.0
+                    need_mt = max(need_mt, 0.01)
+                    bh = float(obs1[OBS1_BUDGET_HEADROOM_IDX]) if len(obs1) > OBS1_BUDGET_HEADROOM_IDX else 0.5
+                    avail = max(bh, 0.0) * self._wtp_annual_budget
+                    wtp_e = self._wtp_mac + 0.5 * max(0.0, self._wtp_penalty_rate - self._wtp_mac)
+                    wtp_b = avail / need_mt if need_mt > 0.01 else price_max
+                    wtp_base = min(wtp_e, wtp_b)
+                    # Approach C: shift anchor to secondary buy price if higher
+                    if last_secondary_buy_price > 0.0:
+                        wtp_base = max(wtp_base, last_secondary_buy_price)
+                    # Approach D: blend when secondary > economic
+                    if last_secondary_buy_price > wtp_e and last_secondary_buy_price > 0.0:
+                        wtp_base = 0.5 * last_secondary_buy_price + 0.5 * wtp_e
+                    wtp_anc = float(np.clip(wtp_base, price_min, price_max))
                     rand_action[0, 0] = np.clip(
-                        np.random.normal(expected_price, max(expected_price * 0.3, 15.0)),
+                        np.random.normal(wtp_anc, max(wtp_anc * 0.3, 15.0)),
                         price_min, price_max)
 
                     # [1] qty_multiplier: Gaussian around 1.0 (cover full need)

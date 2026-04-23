@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v7.12.0
+# ETS MARL — Configuration v7.13.0
 #   - 8 learning agents, 0 bots (pure MARL)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -10,7 +10,7 @@
 #   - Absolute-price secondary market (no multiplier)
 #   - ESG reward signal (saved-carbon-years formula)
 #   - Pre-auction collateral affordability clip + budget-headroom phase-1 signal
-#   - Structural over-subscription: cap=-10%, qty_low=0.50 (allows broader auction/secondary strategies)
+#   - Structural over-subscription: cap=-20%, qty_low=0.50 (wide action space with aggressive cap)
 # ============================================================
 
 simulation:
@@ -23,15 +23,26 @@ tabula_rasa:
   # When enabled, these OVERRIDE the corresponding values elsewhere.
   # All fractions are relative to n_episodes.
   epsilon_start: 0.30
-  epsilon_final: 0.05
-  epsilon_decay_frac: 0.80
+  epsilon_final: 0.10
+  epsilon_decay_frac: 0.90
   entropy_coef: 0.08
   entropy_decay_start_frac: 0.0     # no plateau — decay from ep 0
   entropy_decay_window_frac: 0.95
   critic_warmup_frac: 0.03
   shaping_decay_frac: 0.60
   hpp_warmup_frac: 0.25
-  exploration_mode: "uniform"        # side-balanced uniform auction-price sampling around expected price
+  exploration_mode: "uniform"        # side-balanced WTP-anchored uniform auction-price sampling
+
+# ----------------------------------------------------------
+# Pricing curriculum: train with pay-as-bid first, then switch
+# to uniform pricing. PAB creates direct bid-price gradient
+# (you pay what you bid), teaching agents that bid_price matters
+# before the uniform-pricing zero-gradient phase.
+# ----------------------------------------------------------
+pricing_curriculum:
+  enabled: true
+  pab_frac: 0.20                     # first 20% of episodes use pay-as-bid
+  # After pab_frac × n_episodes, pricing_rule switches to "uniform"
 
 # ----------------------------------------------------------
 # Technology parameters (5 technologies)
@@ -62,8 +73,8 @@ ets:
   #   total_system_emissions × (1 + cap_overhead_pct)
   # To override with a manual value, set cap_year_0_override to a number.
   cap_year_0_override: null     # null enables emission-weighted calibration
-  initial_bank_fraction: 0.25   # realistic carry-over from prior compliance period (~25% of annual need)
-  cap_overhead_pct: -0.10       # -10% below total initial emissions — ensures over-subscription at min bid coverage
+  initial_bank_fraction: 0.10   # post-Phase-3 depleted bank (~10% of annual need)
+  cap_overhead_pct: -0.20       # -20% below total initial emissions — aggressive over-subscription
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044
@@ -86,7 +97,7 @@ ets:
   banking: true
   reserve_price: 45.0              # auction bid floor — just below MAC (48 EUR/t), prevents degenerate floor equilibrium
   reserve_price_mode: "static"     # "static" or "dynamic" (= max(reserve_price, discount x MA3))
-  unsold_to_msr: false             # unsold volume rolls over to next year (Article 10(6)-style rescheduling)
+  unsold_to_msr: false             # unsold volume rolls over to next year
   max_rollover_multiplier: 1.5     # caps rollover: auction_vol ≤ cap_t × multiplier per year
   # Price history anchor for MA3 calculation.
   # "auction": only successful auction clearing prices enter the MA3 (stable, prevents
@@ -103,14 +114,16 @@ companies:
   n_agents: 8
   output_twh: 10.0
   initial_mix:                     # [coal, gas, onshore, offshore, solar]
-    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A1: coal-heavy / financial
-    - [0.40, 0.40, 0.10, 0.05, 0.05]   # A2: coal-heavy / ESG
-    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A3: gas-dominant / financial
-    - [0.15, 0.45, 0.20, 0.10, 0.10]   # A4: gas-dominant / ESG
-    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A5: transitioner / financial
-    - [0.05, 0.25, 0.35, 0.20, 0.15]   # A6: transitioner / ESG
-    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A7: green-leader / financial
-    - [0.00, 0.10, 0.30, 0.35, 0.25]   # A8: green-leader / ESG
+    # Tighter 45-75% green spread — all agents face non-trivial compliance.
+    # EU ETS Phase IV participants are ~44% renewable on average (Eurostat 2023).
+    - [0.25, 0.30, 0.20, 0.15, 0.10]   # A1: 45% green, ef≈0.355 / financial
+    - [0.25, 0.30, 0.20, 0.15, 0.10]   # A2: 45% green, ef≈0.355 / ESG
+    - [0.15, 0.35, 0.25, 0.15, 0.10]   # A3: 50% green, ef≈0.299 / financial
+    - [0.15, 0.35, 0.25, 0.15, 0.10]   # A4: 50% green, ef≈0.299 / ESG
+    - [0.10, 0.25, 0.30, 0.20, 0.15]   # A5: 65% green, ef≈0.210 / financial
+    - [0.10, 0.25, 0.30, 0.20, 0.15]   # A6: 65% green, ef≈0.210 / ESG
+    - [0.05, 0.20, 0.30, 0.25, 0.20]   # A7: 75% green, ef≈0.143 / financial
+    - [0.05, 0.20, 0.30, 0.25, 0.20]   # A8: 75% green, ef≈0.143 / ESG
   reward_weights:                  # [w_cost, w_green]
     - [1.0, 0.0]   # A1: even → pure financial
     - [0.5, 0.5]   # A2: odd  → balanced ESG
@@ -162,7 +175,7 @@ auction:
   price_min: 45.0      # matches ets.reserve_price — no silent bid rejection
   quantity_max: 3.0
   # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
-  # Keep a wider strategic range so auction demand can differ from total procurement.
+  # Wide strategic range so auction demand can span from partial to speculative coverage.
   qty_mult_low: 0.5
   qty_mult_high: 2.0
   # Holding limit: max fraction of auctioned volume one agent can receive.
@@ -171,22 +184,24 @@ auction:
   pricing_rule: "uniform"           # "uniform" (EU ETS) — uniform-price sealed-bid auction per Regulation 1031/2010
   cancel_under_subscribed: false   # disabled — under-subscription handled by unsold rollover
   lot_size: 0.0005                 # EU lot-size: 500 EUAs = 0.0005 Mt
-  # E2: Bid collateral — realistic pre-auction margin requirement.
+  # E2: Bid collateral — pre-auction margin requirement.
   # Real EU ETS: bidders post initial margin with the clearing house (ECC/EEX) before
   # the auction closes. Real EUA initial margins are 5–15% of contract value depending
-  # on exchange volatility regime. We use 10% as a defensible mid-range value.
+  # on exchange volatility regime. We use 15% collateral_rate and 20% collateral_fraction
+  # to reflect tighter margin conditions and stress-test agent budget management.
   # Collateral = collateral_fraction × weighted_avg_price × total_bid_qty
   # If collateral > max_collateral_budget_share × available_budget → scale bids down.
   collateral:
     enabled: true
-    collateral_rate: 0.05
+    collateral_rate: 0.15
     # hold_fraction=0.02 (~7 days). Real EU ETS settles T+2 (~0.0055) but one
     # annual auction step represents ~52 real auctions; 0.02 balances real
     # settlement mechanics with yearly simulation granularity.
     hold_fraction: 0.02
     # E2: collateral_fraction: flat fraction of weighted-avg (price × qty).
-    # 0.10 = 10% — mid-point of real EUA exchange initial margin range (5–15%).
-    collateral_fraction: 0.10
+    # 0.20 = 20% — upper end of real EUA exchange initial margin range (5–15%);
+    # chosen to create meaningful budget-management pressure during training.
+    collateral_fraction: 0.20
     # E2: max_collateral_budget_share: cap collateral at this fraction of remaining
     # annual budget. 0.50 = collateral can consume at most 50% of remaining budget.
     max_collateral_budget_share: 0.50
@@ -342,7 +357,28 @@ reward:
   shaping_decay_episode: 0       # auto: 12% of n_episodes, clamped to [300, 8000]
   shaping_weight_floor: 0.0      # shaping decays fully to zero
   terminal_bank_value: true      # value banked allowances at terminal_price in final year
+  terminal_queue_value: true     # value construction queue via NPV of carbon savings
   terminal_payoff_years: 5       # years of future savings for queue valuation
+
+  # B1: Opportunity cost shaping — models the CFO's post-trade reflection:
+  # "each Mt bought on secondary cost me X more than the auction clearing price".
+  # This gives a direct gradient linking low bids → high secondary spending → negative reward.
+  # Decays with shaping_weight so the equilibrium reward is pure.
+  opportunity_cost_shaping:
+    enabled: true
+    scale: 1.0
+
+  # S1: Coverage gap shaping — immediate per-year signal when the agent buys
+  # less than its compliance need. Models the CFO's anticipatory concern:
+  # "we won X Mt but need Y Mt; the gap will cost penalty_rate per Mt later".
+  # Decays with shaping_weight so the equilibrium reward is pure.
+  coverage_gap_shaping:
+    enabled: true
+    scale: 0.5
+
+  # Phase-decomposed credit assignment weights
+  coverage_credit_weight: 0.3
+  gap_closure_weight: 0.5
 
 # ----------------------------------------------------------
 # ESG signal — saved-carbon-years formula
@@ -363,8 +399,10 @@ esg:
 
 # ----------------------------------------------------------
 # Opponent modeling — 6D public info per opponent.
-# obs_dim_phase1 = 33 + 6*(N_total-1) = 123 (for 16 agents)
-# obs_dim_phase2 = phase1 + 10 = 133
+# obs_dim_phase1 = 36 + 6*(N_total-1) = 126 (for 16 agents)
+# obs_dim_phase2 = phase1 + 10 = 136
+# (36 base dims: 33 + last_cover_ratio[33], own_last_secondary_buy_price[34],
+#  cumulative_coverage_ratio[35])
 # ----------------------------------------------------------
 opponent_modeling:
   enabled: true

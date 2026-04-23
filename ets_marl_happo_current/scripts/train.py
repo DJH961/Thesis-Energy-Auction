@@ -565,6 +565,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     )
     reward_cfg["shaping_decay_episode"] = shaping_decay_eps
 
+    # Pricing curriculum: PAB -> uniform transition
+    _pricing_curric_cfg = config.get("pricing_curriculum", {})
+    _pricing_curriculum_enabled = _pricing_curric_cfg.get("enabled", False)
+    _pab_frac = _pricing_curric_cfg.get("pab_frac", 0.20)
+    _pab_switch_ep = int(_pab_frac * n_episodes) if _pricing_curriculum_enabled else 0
+    if _pricing_curriculum_enabled:
+        config["auction"]["pricing_rule"] = "pay_as_bid"  # start with PAB
+
     happo_enabled = config["ppo"].get("happo", False)
     clip_eps = config["ppo"].get("clip_eps", 0.2)
 
@@ -602,6 +610,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     print(f"{'='*60}")
     _print_training_legend()
 
+    if _pricing_curriculum_enabled:
+        print(f"Pricing curriculum: PAB for episodes 0-{_pab_switch_ep}, "
+              f"then UNIFORM from episode {_pab_switch_ep}+")
     if shaping_decay_auto:
         print(f"Reward shaping decay: → 0 at episode {shaping_decay_eps} [auto] "
               f"(12% of {n_episodes}, clamp=[300, 8000]).")
@@ -913,6 +924,14 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         # P4: Communicate episode to environment for shaping weight + lock-in activation
         env.set_episode(episode)
 
+        # Pricing curriculum: PAB -> uniform switch
+        if _pricing_curriculum_enabled:
+            if episode < _pab_switch_ep:
+                config["auction"]["pricing_rule"] = "pay_as_bid"
+            elif episode == _pab_switch_ep:
+                config["auction"]["pricing_rule"] = "uniform"
+                print(f"  [Pricing curriculum] Switched to UNIFORM pricing at episode {episode}")
+
         # Epsilon-greedy schedule: linear decay
         if eps_start > 0.0:
             eps_frac = min(1.0, episode / max(eps_decay_episodes, 1))
@@ -954,7 +973,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
             for i in range(n_agents):
                 action, raw, logp = agents[i].select_auction_action(
-                    obs1[i], epsilon=current_epsilon)
+                    obs1[i], epsilon=current_epsilon,
+                    last_secondary_buy_price=float(env._last_secondary_buy_price[i]))
                 auction_actions[i] = action
                 auction_raws.append(raw)
                 auction_logps.append(logp)
