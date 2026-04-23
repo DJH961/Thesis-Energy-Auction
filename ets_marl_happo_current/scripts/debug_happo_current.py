@@ -19,6 +19,7 @@ from src.agents import heuristic_policy
 from src.environment.ets_environment import ETSEnvironment
 
 TECH_NAMES = ["coal", "gas", "onshore_wind", "offshore_wind", "solar"]
+BUILDABLE_TECH_NAMES = ["onshore_wind", "offshore_wind", "solar"]
 
 
 @dataclass
@@ -35,7 +36,8 @@ def load_config(path: Path) -> dict:
         return yaml.safe_load(f)
 
 
-def repeat_to_length(items, n):
+def repeat_items_to_length(items, n):
+    """Repeat template items with deep copies until length n is reached."""
     if n <= 0:
         return []
     if not items:
@@ -44,6 +46,7 @@ def repeat_to_length(items, n):
 
 
 def configure_simulation(cfg: dict, n_years: int, n_learning_agents: int, n_bots: int) -> dict:
+    """Apply run-time participant/year overrides while preserving config structure."""
     cfg = copy.deepcopy(cfg)
     cfg.setdefault("simulation", {})["n_years"] = int(n_years)
 
@@ -53,23 +56,23 @@ def configure_simulation(cfg: dict, n_years: int, n_learning_agents: int, n_bots
 
     base_learn_mixes = companies.get("initial_mix", [])
     base_learn_weights = companies.get("reward_weights", [])
-    companies["initial_mix"] = repeat_to_length(base_learn_mixes, n_learning_agents) if n_learning_agents > 0 else []
-    companies["reward_weights"] = repeat_to_length(base_learn_weights, n_learning_agents) if n_learning_agents > 0 else []
+    companies["initial_mix"] = repeat_items_to_length(base_learn_mixes, n_learning_agents) if n_learning_agents > 0 else []
+    companies["reward_weights"] = repeat_items_to_length(base_learn_weights, n_learning_agents) if n_learning_agents > 0 else []
 
     bot_mix_templates = companies.get("bot_initial_mix", []) or base_learn_mixes
     bot_weight_templates = companies.get("bot_reward_weights", []) or base_learn_weights
-    companies["bot_initial_mix"] = repeat_to_length(bot_mix_templates, n_bots)
-    companies["bot_reward_weights"] = repeat_to_length(bot_weight_templates, n_bots)
+    companies["bot_initial_mix"] = repeat_items_to_length(bot_mix_templates, n_bots)
+    companies["bot_reward_weights"] = repeat_items_to_length(bot_weight_templates, n_bots)
 
     annual_templates = budget.get("annual_budgets", []) or [800.0]
     capex_templates = budget.get("capex_throughputs", []) or [130.0]
-    budget["annual_budgets"] = repeat_to_length(annual_templates, n_learning_agents)
-    budget["capex_throughputs"] = repeat_to_length(capex_templates, n_learning_agents)
-    budget["bot_annual_budgets"] = repeat_to_length(annual_templates, n_bots)
-    budget["bot_capex_throughputs"] = repeat_to_length(capex_templates, n_bots)
+    budget["annual_budgets"] = repeat_items_to_length(annual_templates, n_learning_agents)
+    budget["capex_throughputs"] = repeat_items_to_length(capex_templates, n_learning_agents)
+    budget["bot_annual_budgets"] = repeat_items_to_length(annual_templates, n_bots)
+    budget["bot_capex_throughputs"] = repeat_items_to_length(capex_templates, n_bots)
 
     if "urgency_denominators" in bots and bots["urgency_denominators"]:
-        bots["urgency_denominators"] = repeat_to_length(bots["urgency_denominators"], n_bots)
+        bots["urgency_denominators"] = repeat_items_to_length(bots["urgency_denominators"], n_bots)
 
     companies["n_agents"] = int(n_learning_agents)
     companies["n_bot_agents"] = int(n_bots)
@@ -77,14 +80,17 @@ def configure_simulation(cfg: dict, n_years: int, n_learning_agents: int, n_bots
 
 
 def participant_name(env: ETSEnvironment, idx: int) -> str:
+    """Map participant index to display name (A1.. for learners, B1.. for bots)."""
     return f"A{idx + 1}" if idx < env.n_agents else f"B{idx - env.n_agents + 1}"
 
 
 def participant_type(env: ETSEnvironment, idx: int) -> str:
+    """Return participant class label used in debug tables."""
     return "learning" if idx < env.n_agents else "bot"
 
 
 def build_learning_auction_actions(env: ETSEnvironment, config: dict) -> np.ndarray:
+    """Build phase-1 heuristic actions for all learning agents."""
     actions = np.zeros((env.n_agents, 6), dtype=np.float32)
     for i in range(env.n_agents):
         company = env.companies[i]
@@ -125,6 +131,7 @@ def build_learning_auction_actions(env: ETSEnvironment, config: dict) -> np.ndar
 
 
 def build_learning_secondary_actions(env: ETSEnvironment, config: dict) -> np.ndarray:
+    """Build phase-2 heuristic actions for all learning agents."""
     actions = np.zeros((env.n_agents, 2), dtype=np.float32)
     for i in range(env.n_agents):
         company = env.companies[i]
@@ -148,6 +155,7 @@ def check_year_constraints(
     pre_suspension: np.ndarray,
     pre_cash: np.ndarray,
 ) -> list[dict]:
+    """Run year-level accounting/constraint checks and return structured diagnostics."""
     issues = []
     eps = 1e-6
     n = env.n_total
@@ -303,12 +311,13 @@ def check_year_constraints(
 
 
 def build_per_participant_df(env: ETSEnvironment, log: dict, carry_start: np.ndarray) -> pd.DataFrame:
+    """Create a per-agent debug table with bids, costs, compliance, and budget state."""
     rows = []
     n = env.n_total
     for i in range(n):
         c = env.companies[i]
         tech = int(log.get("invest_tech_choices", [0] * n)[i])
-        tech_name = TECH_NAMES[tech + 2] if 0 <= tech <= 2 else str(tech)
+        tech_name = BUILDABLE_TECH_NAMES[tech] if 0 <= tech < len(BUILDABLE_TECH_NAMES) else str(tech)
         start_bank = float(log["bank_start"][i])
         allocation = float(log["allocations"][i])
         sec_trade = float(log["trade_qtys"][i])
@@ -355,6 +364,7 @@ def build_per_participant_df(env: ETSEnvironment, log: dict, carry_start: np.nda
 
 
 def run_detailed_episode(config: dict, seed: int = 42, print_output: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Execute one episode with full tracing and return (year_summary_df, issues_df)."""
     env = ETSEnvironment(config, seed=seed)
     env.reset(seed=seed)
     issues_all = []
@@ -423,6 +433,7 @@ def run_detailed_episode(config: dict, seed: int = 42, print_output: bool = True
 
 
 def run_scale_diagnostics(config: dict, n_episodes: int = 30, seed_start: int = 100) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Run many episodes and return (episode_summary_df, issue_counts_df, conclusions_df)."""
     rows = []
     issue_counter = Counter()
     hard_issue_counter = Counter()
@@ -489,7 +500,7 @@ def run_scale_diagnostics(config: dict, n_episodes: int = 30, seed_start: int = 
         fails_sum = int(ep_df["auction_fail_years"].sum())
         issues_sum = int(ep_df["issues_total"].sum())
         issues_hard_sum = int(ep_df["issues_hard"].sum())
-        clip_sum = int(ep_df["collateral_clip_events_total"].sum())
+        total_collateral_clip_events = int(ep_df["collateral_clip_events_total"].sum())
         pmin = float(ep_df["price_min"].min())
         pmax = float(ep_df["price_max"].max())
         if defaults_sum == 0:
@@ -510,10 +521,10 @@ def run_scale_diagnostics(config: dict, n_episodes: int = 30, seed_start: int = 
             conclusions.append(("does_not_work", f"Detected {issues_hard_sum} hard-constraint violations."))
         if issues_sum - issues_hard_sum > 0:
             conclusions.append(("needs_review", f"Observed {issues_sum - issues_hard_sum} soft/warning constraint flags (inspect scale_issues table)."))
-        if clip_sum == 0:
+        if total_collateral_clip_events == 0:
             conclusions.append(("works", "No collateral clip events observed."))
         else:
-            conclusions.append(("needs_review", f"Collateral clip events observed ({clip_sum}); review heuristic/environment alignment."))
+            conclusions.append(("needs_review", f"Collateral clip events observed ({total_collateral_clip_events}); review heuristic/environment alignment."))
     conc_df = pd.DataFrame(conclusions, columns=["status", "conclusion"])
     return ep_df, issue_df, conc_df
 
@@ -528,6 +539,7 @@ def run_debug_session(
     scale_seed_start: int = 100,
     print_detailed: bool = True,
 ) -> DebugOutputs:
+    """Run detailed + scale diagnostics and package all outputs."""
     raw = load_config(config_path)
     cfg = configure_simulation(raw, n_years=n_years, n_learning_agents=n_learning_agents, n_bots=n_bots)
     detailed_year_summary, detailed_issues = run_detailed_episode(cfg, seed=seed, print_output=print_detailed)
