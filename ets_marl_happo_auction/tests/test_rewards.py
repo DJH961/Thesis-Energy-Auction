@@ -1181,11 +1181,12 @@ def test_full_coverage_gives_neutral_auction_reward():
 
     n = env.n_agents
     # Use invest_frac_action = -1.0 → invest_frac = 0 (no investment, no MAC/capex costs).
+    # Encoding: invest_frac = (action[6] + 1.0) / 2.0 * max_invest_frac; -1.0 → 0.0.
     auction_actions = np.zeros((n, 10), dtype=np.float32)
     auction_actions[:, 0] = 80.0
     auction_actions[:, 2] = 80.0
     auction_actions[:, 4] = 80.0
-    auction_actions[:, 6] = -1.0   # (action+1)/2 * max_invest = 0
+    auction_actions[:, 6] = -1.0   # invest_frac = (−1+1)/2 × max_invest = 0
     auction_actions[:, 9] = 1.0    # solar logit
     env.step_auction(auction_actions)
 
@@ -1201,7 +1202,9 @@ def test_full_coverage_gives_neutral_auction_reward():
 
     r_auction = env.compute_auction_rewards()
 
-    # coverage_gap=0 → gap_penalty=0; opex_delta=0 at year 0; invest/mac/loan/capex=0
+    # coverage_gap=0 → gap_penalty=0.
+    # opex_delta=0 because baseline_opex is snapshotted at year 0 and current_year=0.
+    # invest/mac/loan/capex costs all zeroed above.
     # → r_auction = -(need*clearing/budget) + need*clearing/budget = 0.
     for i in range(n):
         assert abs(r_auction[i]) < 0.01, (
