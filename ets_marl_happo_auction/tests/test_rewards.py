@@ -1133,3 +1133,81 @@ def test_reward_channels_reset():
     assert len(env._last_reward_channels) > 0
     env.reset()
     assert len(env._last_reward_channels) == 0
+
+
+# ---------------------------------------------------------------------------
+# Auction phase coverage-gap penalty (underbidding)
+# ---------------------------------------------------------------------------
+
+def test_underbid_gives_negative_auction_reward():
+    """Bidding zero quantity wins nothing; the coverage-gap penalty makes r_auction < 0."""
+    config = load_config()
+    config["companies"]["n_bot_agents"] = 0
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset(seed=42)
+
+    n = env.n_agents
+    # All tranches have qty = 0 → agents win nothing.
+    auction_actions = np.zeros((n, 10), dtype=np.float32)
+    auction_actions[:, 0] = 80.0   # p1 (price irrelevant with qty=0)
+    auction_actions[:, 2] = 80.0   # p2
+    auction_actions[:, 4] = 80.0   # p3
+    auction_actions[:, 9] = 1.0    # solar logit highest
+
+    env.step_auction(auction_actions)
+    r_auction = env.compute_auction_rewards()
+
+    for i in range(n):
+        assert r_auction[i] < 0, (
+            f"Agent {i}: underbidding (0 qty) should yield negative auction reward, "
+            f"got {r_auction[i]:.4f}"
+        )
+
+
+def test_full_coverage_gives_neutral_auction_reward():
+    """Winning exactly estimate_need gives near-zero r_auction (baseline cancels cost)."""
+    config = load_config()
+    config["companies"]["n_bot_agents"] = 0
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset(seed=42)
+
+    n = env.n_agents
+    # Use invest_frac_action = -1.0 → invest_frac = 0 (no investment, no MAC/capex costs).
+    # Encoding: invest_frac = (action[6] + 1.0) / 2.0 * max_invest_frac; -1.0 → 0.0.
+    auction_actions = np.zeros((n, 10), dtype=np.float32)
+    auction_actions[:, 0] = 80.0
+    auction_actions[:, 2] = 80.0
+    auction_actions[:, 4] = 80.0
+    auction_actions[:, 6] = -1.0   # invest_frac = (−1+1)/2 × max_invest = 0
+    auction_actions[:, 9] = 1.0    # solar logit
+    env.step_auction(auction_actions)
+
+    # Simulate exact coverage: override allocations and payments to match estimate_need.
+    clearing = env._phase1_clearing_price
+    for i, company in enumerate(env.companies[:n]):
+        need = company.compute_estimate_need()
+        env._phase1_allocations[i] = need
+        env._phase1_payments[i] = need * clearing
+    # Zero residual costs so baseline_cost exactly cancels auction_cost.
+    env._collateral_locked[:n] = 0.0
+    env._phase1_mac_costs[:n] = 0.0
+
+    r_auction = env.compute_auction_rewards()
+
+    # coverage_gap=0 → gap_penalty=0.
+    # opex_delta=0 because baseline_opex is snapshotted at year 0 and current_year=0.
+    # invest/mac/loan/capex costs all zeroed above.
+    # → r_auction = -(need*clearing/budget) + need*clearing/budget = 0.
+    for i in range(n):
+        assert abs(r_auction[i]) < 0.01, (
+            f"Agent {i}: full coverage should yield near-zero auction reward, "
+            f"got {r_auction[i]:.6f}"
+        )

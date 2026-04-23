@@ -1925,7 +1925,9 @@ class ETSEnvironment(gym.Env):
                           + opex_delta + mac_cost_i + loan_interest_cost
                           + capex_penalty)
             baseline_cost = company.compute_estimate_need() * self._phase1_clearing_price / budget_divisor
-            r_auction[i] = -(total_cost / budget_divisor) + baseline_cost
+            coverage_gap = max(0.0, company.compute_estimate_need() - float(self._phase1_allocations[i]))
+            gap_penalty = coverage_gap * company.effective_penalty_rate(self.current_year) / budget_divisor
+            r_auction[i] = -(total_cost / budget_divisor) + baseline_cost - gap_penalty
 
             self._last_auction_reward_channels[i] = {
                 "auction_cost": float(auction_cost / budget_divisor),
@@ -1936,6 +1938,7 @@ class ETSEnvironment(gym.Env):
                 "loan_interest": float(loan_interest_cost / budget_divisor),
                 "capex_penalty": float(capex_penalty / budget_divisor),
                 "baseline_cost": float(baseline_cost),
+                "coverage_gap_penalty": float(gap_penalty),
             }
         return r_auction
 
