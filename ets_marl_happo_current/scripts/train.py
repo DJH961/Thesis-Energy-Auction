@@ -363,8 +363,12 @@ def _print_training_legend():
     print("  │  Green      Green energy share: start→end %(Δpp)")
     print("  │  Emiss      Mean annual emissions (Mt)")
     print("  │  Alloc      Mean annual allowances received from auction (Mt)")
-    print("  │  Sf         Shortfall-years / total-years (compliance failures)")
-    print("  │  Bid€       Mean bid price (€/t) — single-price auction bid")
+    print("  │  Sf         Shortfall-years / total-years (compliance failures); e.g. ' 3/12'")
+    print("  │  yr1€       Bid price (€/t) in year 1 of the episode")
+    print("  │  yrN€       Bid price (€/t) in the final year of the episode")
+    print("  │  avg€       Quantity-weighted mean bid price across all episode years")
+    print("  │  lo€        Lowest bid price across all episode years")
+    print("  │  hi€        Highest bid price across all episode years")
     print("  │  BidMt      Mean annual bid quantity submitted to auction (Mt)")
     print("  │  Rew        Total reward summed over all years (raw RL signal)")
     print("  │  DiagPts    Sfin/Sgrn/Scomp shown as points on a 0–100 scale")
@@ -1330,6 +1334,28 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             else:
                 avg_bid_per_agent.append(float(np.mean(bids_this_ep)) if bids_this_ep else 0.0)
 
+        # Per-agent bid arc: yr1, yrN, hi, lo (avg is separately quantity-weighted above)
+        yr1_bid_per_agent = []
+        yrN_bid_per_agent = []
+        max_bid_per_agent = []
+        min_bid_per_agent = []
+        for i in range(n_total_agents):
+            _bids_arc = [
+                yl["bid_prices"][i]
+                for yl in env.episode_log
+                if "bid_prices" in yl and i < len(yl["bid_prices"])
+            ]
+            if _bids_arc:
+                yr1_bid_per_agent.append(float(_bids_arc[0]))
+                yrN_bid_per_agent.append(float(_bids_arc[-1]))
+                max_bid_per_agent.append(float(max(_bids_arc)))
+                min_bid_per_agent.append(float(min(_bids_arc)))
+            else:
+                yr1_bid_per_agent.append(0.0)
+                yrN_bid_per_agent.append(0.0)
+                max_bid_per_agent.append(0.0)
+                min_bid_per_agent.append(0.0)
+
         # Average bid quantity (Mt) per agent — Phase 1 action[1] after multiplier expansion
         avg_bid_qty_per_agent = []
         for i in range(n_total_agents):
@@ -1793,7 +1819,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             # ═══════════════════════════════════════════════════════════
             #  PRINT
             # ═══════════════════════════════════════════════════════════
-            W = 130
+            W = 155
             sep = "═" * W
             thin = "─" * W
             print(sep)
@@ -1828,7 +1854,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             # ── Per-agent table ─────────────────────────────────────────
             print(thin)
             print(f"  {'':4}  {'Green':>16}  {'Emiss':>5} {'Alloc':>5}"
-                f" {'Sf':>4}  {'Bid€':>6} {'BidMt':>6}"
+                f" {'Sf':>5}  {'yr1€':>5} {'yrN€':>5} {'avg€':>5} {'lo€':>5} {'hi€':>5} {'BidMt':>6}"
                 f"  {'Rew':>8}  {'DiagPts(F/G/C)':>16}"
                   f"  {'ALoss':>7} {'CLoss':>7}"
                   f"  Secondary")
@@ -1839,9 +1865,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 g1 = ep_green_end[i] * 100
                 dg = g1 - g0
                 grn_str = f"{g0:3.0f}→{g1:3.0f}%({dg:+3.0f}pp)"
-                sf_str = f"{ep_shortfall_years[i]}/{n_years_ep}"
-
-                # Diagnostic scores (inline)
+                sf_str = f"{ep_shortfall_years[i]:2d}/{n_years_ep}"
                 acc = ep_diag_accumulator[i]
                 nd = max(acc["count"], 1)
                 s_fin  = float(np.nan_to_num(acc["S_financial"] / nd, nan=0.0, posinf=1.0, neginf=0.0))
@@ -1868,7 +1892,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
                 print(f"  A{i+1}{act_mark}: {grn_str:>16}"
                                                 f"  {ep_mean_emiss[i]:5.2f} {ep_mean_alloc[i]:5.2f}"
-                                            f" {sf_str:>4}  {avg_bid_per_agent[i]:6.1f} {avg_bid_qty_per_agent[i]:6.2f}"
+                                            f" {sf_str:>5}  {yr1_bid_per_agent[i]:5.0f} {yrN_bid_per_agent[i]:5.0f} {avg_bid_per_agent[i]:5.0f} {min_bid_per_agent[i]:5.0f} {max_bid_per_agent[i]:5.0f} {avg_bid_qty_per_agent[i]:6.2f}"
                         f"  {ep_total_rewards_all[i]:8.1f}  {diag_str:>16}"
                       f"  {al_str:>7} {cl_str:>7}"
                       f"  {sec_str}")
@@ -1877,7 +1901,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             if n_bot_agents > 0:
                 print(thin)
                 print(f"  {'':4}  {'Green':>16}  {'Emiss':>5} {'Alloc':>5}"
-                    f" {'Sf':>4}  {'Bid€':>6} {'BidMt':>6}"
+                    f" {'Sf':>5}  {'yr1€':>5} {'yrN€':>5} {'avg€':>5} {'lo€':>5} {'hi€':>5} {'BidMt':>6}"
                     f"  {'Rew':>8}  Secondary")
                 for b in range(n_bot_agents):
                     j = n_agents + b
@@ -1885,7 +1909,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     g1 = ep_green_end[j] * 100
                     dg = g1 - g0
                     grn_str = f"{g0:3.0f}→{g1:3.0f}%({dg:+3.0f}pp)"
-                    sf_str = f"{ep_shortfall_years[j]}/{n_years_ep}"
+                    sf_str = f"{ep_shortfall_years[j]:2d}/{n_years_ep}"
 
                     # Secondary detail
                     ss_j = per_agent_sec_stats[j]
@@ -1898,7 +1922,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
                     print(f"  B{b+1} : {grn_str:>16}"
                           f"  {ep_mean_emiss[j]:5.2f} {ep_mean_alloc[j]:5.2f}"
-                          f" {sf_str:>4}  {avg_bid_per_agent[j]:6.1f} {avg_bid_qty_per_agent[j]:6.2f}"
+                          f" {sf_str:>5}  {yr1_bid_per_agent[j]:5.0f} {yrN_bid_per_agent[j]:5.0f} {avg_bid_per_agent[j]:5.0f} {min_bid_per_agent[j]:5.0f} {max_bid_per_agent[j]:5.0f} {avg_bid_qty_per_agent[j]:6.2f}"
                           f"  {ep_total_rewards_all[j]:8.1f}  {sec_str_b}")
 
             # ── Event board (separate visual block) ────────────────────
