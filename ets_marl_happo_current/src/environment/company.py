@@ -749,11 +749,14 @@ class Company:
                                suspension_remaining_norm: float = 0.0,
                                collateral_load_last: float = 0.0,
                                bid_affordability_last: float = 0.0,
-                               n_years: int = 12):
+                               n_years: int = 12,
+                               last_cover_ratio: float = 1.0,
+                               own_last_secondary_buy_price: float = 0.0,
+                               cumulative_coverage_ratio: float = 1.0):
         """
-        Phase 1 observation (pre-auction): 33D base + 5*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 36D base + 6*(N-1) opponent dims.
 
-        Base 33 dims:
+        Base 36 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
@@ -783,9 +786,15 @@ class Company:
         [30] bid_affordability_last: last year's bid_total / budget_remaining (clipped [0,1])
         [31] loan_outstanding_norm: emergency loan outstanding / annual_budget
         [32] years_under_loan_norm: remaining loan years / n_years
+        [33] last_cover_ratio: auction_supply / total_demand (clipped [0,3], /3)
+             WTP signal: low cover_ratio → high competition → should bid higher
+        [34] own_last_secondary_buy_price: (own last sec buy price / price_max)
+             WTP signal: high secondary cost → agent should bid more at auction
+        [35] cumulative_coverage_ratio: cumul_alloc / cumul_emissions (clipped [0,2], /2)
+             Long-run compliance signal: <1 means persistently under-buying
 
         Opponent dims (if opponent_modeling enabled, 6D per opponent):
-        [33..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total, is_active) per opponent
+        [36..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total, is_active) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
@@ -841,7 +850,10 @@ class Company:
             float(np.clip(collateral_load_last, 0.0, 1.0)),       # [29] collateral load last year
             float(np.clip(bid_affordability_last, 0.0, 1.0)),     # [30] bid affordability
             self.get_loan_outstanding_norm(),                      # [31] loan outstanding norm
-            float(self._years_under_loan / max(n_years, 1)),             # [32] years under loan norm
+            float(self._years_under_loan / max(n_years, 1)),      # [32] years under loan norm
+            float(np.clip(last_cover_ratio, 0.0, 3.0)) / 3.0,    # [33] WTP: auction cover ratio
+            float(np.clip(own_last_secondary_buy_price, 0.0, pn)) / pn,  # [34] WTP: own sec buy price
+            float(np.clip(cumulative_coverage_ratio, 0.0, 2.0)) / 2.0,  # [35] cumulative coverage
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -918,7 +930,7 @@ class Company:
 
     @property
     def obs_dim_phase1(self) -> int:
-        """33 base dims + 6*(N_total-1) opponent dims when opponent modeling is enabled.
+        """36 base dims + 6*(N_total-1) opponent dims when opponent modeling is enabled.
         N_total = learning agents + bot agents (all market participants).
         Base dims include carry-forward at [20], TNAC proxy at [21],
         effective reserve at [22], THIS YEAR's auction volume ratio at [23],
@@ -926,11 +938,12 @@ class Company:
         MSR withholding at [26], budget headroom at [27],
         suspension_remaining_norm at [28], collateral_load_last at [29],
         bid_affordability_last at [30], loan_outstanding_norm at [31],
-        years_under_loan_norm at [32].
+        years_under_loan_norm at [32], last_cover_ratio at [33],
+        own_last_secondary_buy_price at [34], cumulative_coverage_ratio at [35].
         Opponent dims: emissions, carry_forward, green_frac, fossil_frac, queue_total, is_active."""
         if self._opponent_modeling and self._n_total > 1:
-            return 33 + 6 * (self._n_total - 1)
-        return 33
+            return 36 + 6 * (self._n_total - 1)
+        return 36
 
     @property
     def obs_dim_phase2(self) -> int:

@@ -459,23 +459,25 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
 # ---------------------------------------------------------------------------
 
 def test_obs_phase1_shape(config):
-    """Phase 1 obs should be 33D base (no opponent modeling)."""
+    """Phase 1 obs should be 36D base (no opponent modeling).
+    36 dims = 33 original + 3 WTP dims (last_cover_ratio, own_last_secondary_buy_price,
+    cumulative_coverage_ratio)."""
     c = make_company(config, agent_id=0)
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, auction_gap=1.0)
-    assert obs.shape == (33,), f"Expected 33D, got {obs.shape}"
+    assert obs.shape == (36,), f"Expected 36D, got {obs.shape}"
     assert obs.dtype == np.float32
 
 def test_obs_phase1_with_opponents(config):
-    """With opponent modeling, obs should have 33 + 6*(N-1) dims."""
+    """With opponent modeling, obs should have 36 + 6*(N-1) dims."""
     config_opp = {**config, "opponent_modeling": {"enabled": True}}
     c = make_company(config_opp, agent_id=0)
     opponent_obs = np.zeros(6 * 3, dtype=np.float32)  # 3 opponents, 6D each
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, opponent_obs=opponent_obs)
-    assert obs.shape == (33 + 18,)
+    assert obs.shape == (36 + 18,)
 
 def test_obs_phase2_extends_phase1(config):
     """Phase 2 obs = phase1 + 10 extra dims."""
@@ -485,9 +487,9 @@ def test_obs_phase2_extends_phase1(config):
     obs2 = c.get_observation_phase2(
         obs_phase1=obs1, allocation=2.0, clearing_price=80.0,
         emissions=3.0, banked=1.0, emission_shock=0.05, payment=160.0)
-    assert obs2.shape == (33 + 10,)
-    # First 33 dims should match phase1
-    np.testing.assert_array_equal(obs2[:33], obs1)
+    assert obs2.shape == (36 + 10,)
+    # First 36 dims should match phase1
+    np.testing.assert_array_equal(obs2[:36], obs1)
 
 def test_obs_values_finite(config):
     """All observation values should be finite."""

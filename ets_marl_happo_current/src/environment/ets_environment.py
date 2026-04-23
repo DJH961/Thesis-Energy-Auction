@@ -192,6 +192,11 @@ class ETSEnvironment(gym.Env):
         self._secondary_profit_ema = np.zeros(self.n_total)
         self._ema_alpha = 0.1
 
+        # Per-agent last secondary buy price (for WTP anchor feedback, Approach C+D)
+        self._last_secondary_buy_price = np.zeros(self.n_total)
+        self._cumulative_alloc = np.zeros(self.n_total)
+        self._cumulative_emissions = np.zeros(self.n_total)
+
         # Auction results (stored between phase 1 and phase 2)
         self._phase1_allocations = None
         self._phase1_payments = None
@@ -471,6 +476,10 @@ class ETSEnvironment(gym.Env):
         self._last_reward_base_values = np.zeros(self.n_total)
         self._last_reward_shaping_values = np.zeros(self.n_total)
         self._secondary_profit_ema = np.zeros(self.n_total)
+        self._last_secondary_buy_price = np.zeros(self.n_total)
+        self._cumulative_alloc = np.zeros(self.n_total)
+        self._cumulative_emissions = np.zeros(self.n_total)
+        self._last_cover_ratio = 1.0  # neutral default before first auction
         self._consecutive_years_without_valid_auction_clear = 0
         self._liquidity_ref_ema = float(self.config["price"]["initial_expected"])
 
@@ -1462,6 +1471,7 @@ class ETSEnvironment(gym.Env):
         log["clearing_price"] = clearing_price
         log["effective_reserve"] = effective_reserve
         log["auction_stats"] = auction_stats
+        self._last_cover_ratio = float(auction_stats.get("cover_ratio", 1.0))
 
         auction_succeeded = not bool(auction_stats.get("auction_failed", False))
         if auction_succeeded:
@@ -1830,6 +1840,8 @@ class ETSEnvironment(gym.Env):
                     self._ema_alpha * margin +
                     (1 - self._ema_alpha) * self._secondary_profit_ema[i]
                 )
+                # Approach C+D: record what this agent actually paid on secondary
+                self._last_secondary_buy_price[i] = cost_per_mt
 
         # Holdings after secondary market
         holdings = self.holdings + allocations + trade_qtys
@@ -1882,6 +1894,11 @@ class ETSEnvironment(gym.Env):
             if len(self._fossil_frac_history[i]) > 3:
                 self._fossil_frac_history[i].pop(0)
 
+        # S3: Update cumulative allocation and emission trackers for obs.
+        for i in range(self.n_total):
+            self._cumulative_alloc[i] += float(allocations[i])
+            self._cumulative_emissions[i] += float(realized_emissions[i])
+
         # 7. Rewards (raw — normalisation happens in PPOAgent)
         rewards = self._compute_rewards(
             payments,
@@ -1896,6 +1913,7 @@ class ETSEnvironment(gym.Env):
             old_carry_forward=old_carry_forward,
             active_mask=active_mask,
             trade_qtys=trade_qtys,
+            allocations=allocations,
         )
 
         # Compute per-agent shortfall for diagnostics.
@@ -2252,18 +2270,20 @@ class ETSEnvironment(gym.Env):
                          mac_costs=None, collateral_costs=None,
                          precompliance_holdings=None,
                          old_carry_forward=None, active_mask=None,
-                         trade_qtys=None):
+                         trade_qtys=None, allocations=None):
         """
-        Simplified reward (v8.0) with v7.12 rollback updates.
+        Simplified reward (v8.0) with v7.13 HAPPO-best shaping restore.
 
         R_i = w_cost * (-cost_norm) + w_green * esg_signal - penalty_norm
+              + B1_opp_cost_shaping + S1_coverage_gap_shaping (decaying)
               + terminal_bank + terminal_queue (final year)
               - terminal_debt (final year)
 
         Key points:
           - Fixed REWARD_SCALE (1000 M EUR) for shared critic stability.
           - Penalties stay separated from costs and always apply at full strength.
-          - No shaping rewards; only economic cost and ESG signal drive learning.
+          - B1/S1 shaping decays with shaping_weight (floor=0); pure economic reward
+            at equilibrium.
           - Soft budget/capex penalties remain in cost_norm until hard-gate
             coverage is fully audited.
         """
@@ -2338,11 +2358,53 @@ class ETSEnvironment(gym.Env):
             base_rewards[i] = base_reward
             rewards[i] = base_reward
 
+            # B1: Opportunity cost shaping — models the CFO's post-trade
+            # reflection: "each Mt bought on secondary cost me X more than
+            # the auction clearing price". This gives a direct gradient
+            # linking low bids → high secondary spending → negative reward.
+            # Decays with shaping_weight so the equilibrium reward is pure.
+            opp_cost_shaping = 0.0
+            opp_cost_cfg = reward_cfg.get("opportunity_cost_shaping", {})
+            if (opp_cost_cfg.get("enabled", False)
+                    and self.shaping_weight > 0
+                    and trade_qtys is not None
+                    and float(trade_qtys[i]) > 1e-6):
+                sec_buy_qty = float(trade_qtys[i])
+                sec_buy_cost_per_mt = float(trade_costs[i]) / sec_buy_qty
+                opp_cost_per_mt = max(0.0, sec_buy_cost_per_mt - clearing_price)
+                opp_cost_scale = float(opp_cost_cfg.get("scale", 1.0))
+                opp_cost_shaping = -(opp_cost_scale * opp_cost_per_mt * sec_buy_qty
+                                     * self.shaping_weight / REWARD_SCALE)
+                rewards[i] += opp_cost_shaping
+
+            # S1: Coverage gap shaping — immediate per-year signal when the
+            # agent buys less than its compliance need. Models the CFO's
+            # anticipatory concern: "we won X Mt but need Y Mt; the gap will
+            # cost us penalty_rate per Mt later". Decays with shaping_weight.
+            coverage_gap_shaping = 0.0
+            cov_gap_cfg = reward_cfg.get("coverage_gap_shaping", {})
+            if (cov_gap_cfg.get("enabled", False)
+                    and self.shaping_weight > 0
+                    and allocations is not None):
+                alloc_i = float(allocations[i])
+                need_i = max(float(emissions[i]) + float(old_carry_forward[i])
+                             if old_carry_forward is not None
+                             else float(emissions[i]), 0.1)
+                gap = max(0.0, need_i - alloc_i)
+                if gap > 0.01:
+                    pen_rate = float(self.config["penalty"]["rate"])
+                    cov_scale = float(cov_gap_cfg.get("scale", 0.5))
+                    coverage_gap_shaping = -(cov_scale * gap * pen_rate
+                                             * self.shaping_weight / REWARD_SCALE)
+                    rewards[i] += coverage_gap_shaping
+
             self._last_reward_channels[i] = {
                 "cost_norm": float(cost_norm),
                 "penalty_norm": float(penalty_norm),
                 "esg_signal": float(esg_signal),
                 "base_reward": float(base_reward),
+                "opp_cost_shaping": float(opp_cost_shaping),
+                "coverage_gap_shaping": float(coverage_gap_shaping),
             }
 
         is_final_year = self.current_year >= self.n_years - 1
@@ -2424,7 +2486,7 @@ class ETSEnvironment(gym.Env):
         self._last_terminal_queue_values = terminal_queue_values
         self._last_terminal_liquidation_values = terminal_bank_values + terminal_queue_values
         self._last_reward_base_values = base_rewards
-        self._last_reward_shaping_values = np.zeros(self.n_total)
+        self._last_reward_shaping_values = rewards - base_rewards
 
         return rewards
 
@@ -2603,6 +2665,11 @@ class ETSEnvironment(gym.Env):
                 collateral_load_last=float(self._last_collateral_load[i]),
                 bid_affordability_last=float(self._bid_affordability[i]),
                 n_years=self.n_years,
+                last_cover_ratio=self._last_cover_ratio,
+                own_last_secondary_buy_price=float(self._last_secondary_buy_price[i]),
+                cumulative_coverage_ratio=float(
+                    self._cumulative_alloc[i] / max(self._cumulative_emissions[i], 0.1)
+                ) if self._cumulative_emissions[i] > 0.01 else 1.0,
             )
             obs_list.append(obs_i)
 
