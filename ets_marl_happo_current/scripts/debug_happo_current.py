@@ -17,9 +17,19 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.agents import heuristic_policy
 from src.environment.ets_environment import ETSEnvironment
+from scripts.train import build_agents
 
 TECH_NAMES = ["coal", "gas", "onshore_wind", "offshore_wind", "solar"]
 BUILDABLE_TECH_NAMES = ["onshore_wind", "offshore_wind", "solar"]
+
+# Diagnostic thresholds for price realism checks.
+MIN_PRICE_SLOPE_FOR_UPTREND = 0.1
+MIN_POSITIVE_SLOPE_EP_SHARE = 0.5
+MIN_YOY_UP_SHARE = 0.45
+MAX_FLAT_FLOOR_EP_SHARE = 0.5
+
+# Budget guardrails used in diagnostics.
+MIN_BUDGET_FOR_HARD_CAP = 1.0
 
 
 @dataclass
@@ -41,12 +51,15 @@ def repeat_items_to_length(items, n):
     if n <= 0:
         return []
     if not items:
-        raise ValueError("Cannot repeat an empty template list.")
+        raise ValueError(
+            "Cannot repeat an empty template list. Ensure your config "
+            "contains valid template entries for the requested agents."
+        )
     return [copy.deepcopy(items[i % len(items)]) for i in range(n)]
 
 
 def configure_simulation(cfg: dict, n_years: int, n_learning_agents: int, n_bots: int) -> dict:
-    """Apply run-time participant/year overrides while preserving config structure."""
+    """Apply runtime participant/year overrides while preserving config structure."""
     cfg = copy.deepcopy(cfg)
     cfg.setdefault("simulation", {})["n_years"] = int(n_years)
 
@@ -89,9 +102,55 @@ def participant_type(env: ETSEnvironment, idx: int) -> str:
     return "learning" if idx < env.n_agents else "bot"
 
 
-def build_learning_auction_actions(env: ETSEnvironment, config: dict) -> np.ndarray:
-    """Build phase-1 heuristic actions for all learning agents."""
+def compute_remaining_budgets(env: ETSEnvironment) -> np.ndarray:
+    """Compute per-participant remaining annual budget (non-negative)."""
+    return np.array(
+        [max(0.0, float(c.annual_budget - c.budget_spent_this_year)) for c in env.companies],
+        dtype=float,
+    )
+
+
+def load_checkpoint_agents(config: dict, seed: int, checkpoint_dir: Path):
+    """Build learning agents and load per-agent checkpoints."""
+    env = ETSEnvironment(config, seed=seed)
+    env.reset(seed=seed)
+    agents = build_agents(env, config, seed)
+    missing = []
+    for i, agent in enumerate(agents):
+        ckpt = checkpoint_dir / f"agent_{i}_best.pt"
+        if ckpt.exists():
+            agent.load(str(ckpt))
+        else:
+            missing.append(i)
+    if missing:
+        raise FileNotFoundError(
+            f"Missing checkpoint(s) in '{checkpoint_dir}': "
+            f"{', '.join(f'agent_{m}_best.pt' for m in missing)}. "
+            "Ensure all learning-agent checkpoints are trained and saved there."
+        )
+    return agents
+
+
+def build_learning_auction_actions(
+    env: ETSEnvironment,
+    config: dict,
+    policy_agents=None,
+    deterministic: bool = True,
+) -> tuple[np.ndarray, str]:
+    """Build phase-1 actions for learning agents (heuristic or loaded actor policy)."""
     actions = np.zeros((env.n_agents, 6), dtype=np.float32)
+    if env.n_agents == 0:
+        return actions, "none"
+
+    if policy_agents is not None:
+        obs_phase1 = env._get_obs_phase1()
+        for i in range(env.n_agents):
+            act, _, _ = policy_agents[i].select_auction_action(
+                obs_phase1[i], deterministic=deterministic
+            )
+            actions[i] = act
+        return actions, "checkpoint_actor"
+
     for i in range(env.n_agents):
         company = env.companies[i]
         current_year = env.current_year
@@ -127,12 +186,34 @@ def build_learning_auction_actions(env: ETSEnvironment, config: dict) -> np.ndar
             suspension_length=int(config["auction"].get("suspension_length", 2)),
             collateral_load_last=float(env._last_collateral_load[i]),
         )
-    return actions
+    return actions, "heuristic"
 
 
-def build_learning_secondary_actions(env: ETSEnvironment, config: dict) -> np.ndarray:
-    """Build phase-2 heuristic actions for all learning agents."""
+def build_learning_secondary_actions(
+    env: ETSEnvironment,
+    config: dict,
+    obs_phase2: np.ndarray | None = None,
+    policy_agents=None,
+    deterministic: bool = True,
+) -> tuple[np.ndarray, str]:
+    """Build phase-2 actions for learning agents (heuristic or loaded actor policy)."""
     actions = np.zeros((env.n_agents, 2), dtype=np.float32)
+    if env.n_agents == 0:
+        return actions, "none"
+
+    if policy_agents is not None:
+        if obs_phase2 is None:
+            raise ValueError(
+                "obs_phase2 is required when policy_agents are provided. "
+                "Call step_auction() first and pass its phase-2 observations."
+            )
+        for i in range(env.n_agents):
+            act, _, _ = policy_agents[i].select_secondary_action(
+                obs_phase2[i], deterministic=deterministic
+            )
+            actions[i] = act
+        return actions, "checkpoint_actor"
+
     for i in range(env.n_agents):
         company = env.companies[i]
         actions[i] = heuristic_policy.secondary_action(
@@ -144,7 +225,7 @@ def build_learning_secondary_actions(env: ETSEnvironment, config: dict) -> np.nd
             current_year=env.current_year,
             n_years=config["simulation"]["n_years"],
         )
-    return actions
+    return actions, "heuristic"
 
 
 def check_year_constraints(
@@ -178,15 +259,19 @@ def check_year_constraints(
     collateral_costs = np.array(log.get("collateral_costs", [0.0] * n), dtype=float)
 
     auction_volume = float(log.get("auction_volume", 0.0))
-    defaulted = float(log.get("auction_stats", {}).get("defaulted_volume", 0.0))
+    defaulted_volume = float(log.get("auction_stats", {}).get("defaulted_volume", 0.0))
     unsold_out = float(log.get("unsold_rollover_out", 0.0))
     alloc_sum = float(np.sum(alloc))
-    if abs((alloc_sum + defaulted + unsold_out) - auction_volume) > 1e-3:
+    if abs((alloc_sum + defaulted_volume + unsold_out) - auction_volume) > 1e-3:
         issues.append(
             {
                 "type": "market_mass_balance",
                 "severity": "hard",
-                "detail": f"alloc+default+unsold={alloc_sum + defaulted + unsold_out:.4f} vs auction_volume={auction_volume:.4f}",
+                "detail": (
+                    f"alloc+default+unsold="
+                    f"{alloc_sum + defaulted_volume + unsold_out:.4f} "
+                    f"vs auction_volume={auction_volume:.4f}"
+                ),
             }
         )
 
@@ -275,11 +360,45 @@ def check_year_constraints(
             )
         if end_bank[i] < -1e-6:
             issues.append(
-                {"type": "negative_holdings", "severity": "hard", "participant": name, "detail": f"end_bank={end_bank[i]:.6f}"}
+                {
+                    "type": "negative_holdings",
+                    "severity": "hard",
+                    "participant": name,
+                    "detail": f"end_bank={end_bank[i]:.6f}",
+                }
             )
         c = env.companies[i]
         hard_cap_frac = float(config.get("budget", {}).get("hard_cap_fraction", 1.15))
-        hard_cap_abs = hard_cap_frac * max(float(c.annual_budget), 1.0)
+        hard_cap_abs = hard_cap_frac * max(float(c.annual_budget), MIN_BUDGET_FOR_HARD_CAP)
+        loan_interest_cost = float(c.compute_green_loan_cost())
+        tracked_budget_spend = (
+            float(payments[i])
+            + float(log["trade_costs"][i])
+            + float(log["invest_costs"][i])
+            + float(log.get("mac_costs", [0.0] * n)[i])
+            + float(log.get("collateral_costs", [0.0] * n)[i])
+            + loan_interest_cost
+        )
+        budget_gap = float(c.budget_spent_this_year) - tracked_budget_spend
+        if abs(budget_gap) > 1e-3:
+            issues.append(
+                {
+                    "type": "budget_accounting_gap",
+                    "severity": "hard",
+                    "participant": name,
+                    "detail": f"budget_spent={c.budget_spent_this_year:.4f} vs tracked={tracked_budget_spend:.4f} (gap={budget_gap:.4f})",
+                }
+            )
+        annual_overspend = float(c.budget_spent_this_year - c.annual_budget)
+        if annual_overspend > 1e-3:
+            issues.append(
+                {
+                    "type": "annual_budget_overspend",
+                    "severity": "soft",
+                    "participant": name,
+                    "detail": f"spend={c.budget_spent_this_year:.4f} > annual_budget={c.annual_budget:.4f} by {annual_overspend:.4f}",
+                }
+            )
         if c.budget_spent_this_year > hard_cap_abs + 1e-3:
             issues.append(
                 {
@@ -310,7 +429,7 @@ def check_year_constraints(
     return issues
 
 
-def build_per_participant_df(env: ETSEnvironment, log: dict, carry_start: np.ndarray) -> pd.DataFrame:
+def build_per_participant_df(env: ETSEnvironment, log: dict, carry_start: np.ndarray, learning_action_source: str) -> pd.DataFrame:
     """Create a per-agent debug table with bids, costs, compliance, and budget state."""
     rows = []
     n = env.n_total
@@ -327,6 +446,7 @@ def build_per_participant_df(env: ETSEnvironment, log: dict, carry_start: np.nda
             {
                 "participant": participant_name(env, i),
                 "type": participant_type(env, i),
+                "learning_action_source": learning_action_source if i < env.n_agents else "bot_heuristic",
                 "start_bank_mt": start_bank,
                 "carry_in_mt": float(carry_start[i]),
                 "est_need_mt": float(log.get("estimate_needs", [0] * n)[i]),
@@ -355,6 +475,7 @@ def build_per_participant_df(env: ETSEnvironment, log: dict, carry_start: np.nda
                 "reward": float(log["rewards"][i]),
                 "budget_spent": float(c.budget_spent_this_year),
                 "annual_budget": float(c.annual_budget),
+                "annual_budget_overspend": float(max(0.0, c.budget_spent_this_year - c.annual_budget)),
                 "capex_spent": float(c.capex_spent_this_year),
                 "capex_limit": float(c.capex_throughput),
                 "green_frac_pct": 100.0 * float(c.green_frac),
@@ -363,7 +484,13 @@ def build_per_participant_df(env: ETSEnvironment, log: dict, carry_start: np.nda
     return pd.DataFrame(rows)
 
 
-def run_detailed_episode(config: dict, seed: int = 42, print_output: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+def run_detailed_episode(
+    config: dict,
+    seed: int = 42,
+    print_output: bool = True,
+    policy_agents=None,
+    deterministic_policy: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Execute one episode with full tracing and return (year_summary_df, issues_df)."""
     env = ETSEnvironment(config, seed=seed)
     env.reset(seed=seed)
@@ -371,12 +498,23 @@ def run_detailed_episode(config: dict, seed: int = 42, print_output: bool = True
     summary_rows = []
     for year in range(config["simulation"]["n_years"]):
         pre_suspension = env._suspension_remaining.copy()
-        pre_cash = np.array([max(0.0, float(c.annual_budget - c.budget_spent_this_year)) for c in env.companies], dtype=float)
+        pre_cash = compute_remaining_budgets(env)
         carry_start = np.array([float(c._carry_forward) for c in env.companies], dtype=float)
 
-        auc_actions = build_learning_auction_actions(env, config)
-        env.step_auction(auc_actions)
-        sec_actions = build_learning_secondary_actions(env, config)
+        auc_actions, learning_action_source = build_learning_auction_actions(
+            env,
+            config,
+            policy_agents=policy_agents,
+            deterministic=deterministic_policy,
+        )
+        obs_phase2, _ = env.step_auction(auc_actions)
+        sec_actions, _ = build_learning_secondary_actions(
+            env,
+            config,
+            obs_phase2=obs_phase2,
+            policy_agents=policy_agents,
+            deterministic=deterministic_policy,
+        )
         _, _, terminated, truncated, info = env.step_secondary(sec_actions)
         log = info["year_log"]
         year_issues = check_year_constraints(env, config, log, carry_start, pre_suspension, pre_cash)
@@ -391,20 +529,35 @@ def run_detailed_episode(config: dict, seed: int = 42, print_output: bool = True
                 "defaults": int(log.get("auction_stats", {}).get("defaults", 0)),
                 "defaulted_volume": float(log.get("auction_stats", {}).get("defaulted_volume", 0.0)),
                 "unsold_out": float(log.get("unsold_rollover_out", 0.0)),
+                "learning_action_source": learning_action_source,
+                "learning_bid_mean": float(np.mean(log.get("bid_prices", [])[:env.n_agents])) if env.n_agents > 0 else np.nan,
+                "learning_bid_std": float(np.std(log.get("bid_prices", [])[:env.n_agents])) if env.n_agents > 0 else np.nan,
+                "learning_invest_mean": float(np.mean(log.get("invest_fracs", [])[:env.n_agents])) if env.n_agents > 0 else np.nan,
+                "learning_annual_budget_overspend_total": float(
+                    np.sum([
+                        max(0.0, env.companies[i].budget_spent_this_year - env.companies[i].annual_budget)
+                        for i in range(env.n_agents)
+                    ])
+                ),
                 "issues_this_year": int(len(year_issues)),
                 "collateral_clip_events_total": int(sum(env._collateral_clip_events.values())),
             }
         )
         if print_output:
-            print(f"[Year {year+1:02d}] clearing={summary_rows[-1]['clearing_price']:.3f} secondary={summary_rows[-1]['secondary_clearing']:.3f} "
-                  f"defaults={summary_rows[-1]['defaults']} issues={len(year_issues)}")
+            year_summary = summary_rows[-1]
+            print(
+                f"[Year {year + 1:02d}] "
+                f"clearing={year_summary['clearing_price']:.3f} "
+                f"secondary={year_summary['secondary_clearing']:.3f} "
+                f"defaults={year_summary['defaults']} issues={len(year_issues)}"
+            )
             if year_issues:
                 for i in year_issues:
                     who = i.get("participant", "GLOBAL")
                     print(f"  - [{i['type']}] {who}: {i['detail']}")
             else:
                 print("  - no constraint issues")
-            _df = build_per_participant_df(env, log, carry_start)
+            _df = build_per_participant_df(env, log, carry_start, learning_action_source=learning_action_source)
             print(_df.to_string(index=False))
             if env.n_agents > 0:
                 reward_rows = []
@@ -432,7 +585,14 @@ def run_detailed_episode(config: dict, seed: int = 42, print_output: bool = True
     return pd.DataFrame(summary_rows), pd.DataFrame(issues_all)
 
 
-def run_scale_diagnostics(config: dict, n_episodes: int = 30, seed_start: int = 100) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def run_scale_diagnostics(
+    config: dict,
+    n_episodes: int = 30,
+    seed_start: int = 100,
+    policy_agents=None,
+    deterministic_policy: bool = True,
+    learning_policy_mode: str = "heuristic",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Run many episodes and return (episode_summary_df, issue_counts_df, conclusions_df)."""
     rows = []
     issue_counter = Counter()
@@ -446,13 +606,25 @@ def run_scale_diagnostics(config: dict, n_episodes: int = 30, seed_start: int = 
         ep_sec = []
         ep_issues_total = 0
         ep_issues_hard = 0
+        learning_overspend_count = 0
+        bot_overspend_count = 0
+        learning_overspend_total = 0.0
+        bot_overspend_total = 0.0
         for _ in range(config["simulation"]["n_years"]):
             pre_suspension = env._suspension_remaining.copy()
-            pre_cash = np.array([max(0.0, float(c.annual_budget - c.budget_spent_this_year)) for c in env.companies], dtype=float)
+            pre_cash = compute_remaining_budgets(env)
             carry_start = np.array([float(c._carry_forward) for c in env.companies], dtype=float)
-            auc_actions = build_learning_auction_actions(env, config)
-            env.step_auction(auc_actions)
-            sec_actions = build_learning_secondary_actions(env, config)
+            auc_actions, _ = build_learning_auction_actions(
+                env, config, policy_agents=policy_agents, deterministic=deterministic_policy
+            )
+            obs_phase2, _ = env.step_auction(auc_actions)
+            sec_actions, _ = build_learning_secondary_actions(
+                env,
+                config,
+                obs_phase2=obs_phase2,
+                policy_agents=policy_agents,
+                deterministic=deterministic_policy,
+            )
             _, _, terminated, truncated, info = env.step_secondary(sec_actions)
             log = info["year_log"]
             issues = check_year_constraints(env, config, log, carry_start, pre_suspension, pre_cash)
@@ -467,14 +639,36 @@ def run_scale_diagnostics(config: dict, n_episodes: int = 30, seed_start: int = 
             ep_fails += int(bool(stats.get("auction_failed", False)))
             ep_prices.append(float(log.get("clearing_price", np.nan)))
             ep_sec.append(float(log.get("secondary_clearing", np.nan)))
+            for i, c in enumerate(env.companies):
+                overs = max(0.0, float(c.budget_spent_this_year - c.annual_budget))
+                if i < env.n_agents:
+                    learning_overspend_total += overs
+                    if overs > 1e-6:
+                        learning_overspend_count += 1
+                else:
+                    bot_overspend_total += overs
+                    if overs > 1e-6:
+                        bot_overspend_count += 1
             if terminated or truncated:
                 break
         prices = np.array(ep_prices, dtype=float)
         sec = np.array(ep_sec, dtype=float)
+        years = len(ep_prices)
+        if years > 1:
+            x = np.arange(years, dtype=float)
+            price_slope = float(np.polyfit(x, prices, 1)[0])
+            yoy = np.diff(prices)
+            yoy_abs_max = float(np.max(np.abs(yoy))) if len(yoy) > 0 else 0.0
+            yoy_up_share = float(np.mean(yoy > 0.0)) if len(yoy) > 0 else 0.0
+        else:
+            price_slope = 0.0
+            yoy_abs_max = 0.0
+            yoy_up_share = 0.0
         rows.append(
             {
                 "episode": ep + 1,
                 "seed": seed_start + ep,
+                "learning_policy_mode": learning_policy_mode,
                 "years": len(ep_prices),
                 "defaults_total": ep_defaults,
                 "auction_fail_years": ep_fails,
@@ -482,8 +676,15 @@ def run_scale_diagnostics(config: dict, n_episodes: int = 30, seed_start: int = 
                 "price_min": float(np.nanmin(prices)) if len(prices) else np.nan,
                 "price_max": float(np.nanmax(prices)) if len(prices) else np.nan,
                 "secondary_price_mean": float(np.nanmean(sec)) if len(sec) else np.nan,
+                "price_slope_per_year": price_slope,
+                "price_yoy_abs_max": yoy_abs_max,
+                "price_yoy_up_share": yoy_up_share,
                 "issues_total": ep_issues_total,
                 "issues_hard": ep_issues_hard,
+                "learning_annual_overspend_total": learning_overspend_total,
+                "learning_annual_overspend_count": learning_overspend_count,
+                "bot_annual_overspend_total": bot_overspend_total,
+                "bot_annual_overspend_count": bot_overspend_count,
                 "collateral_clip_events_total": int(sum(env._collateral_clip_events.values())),
             }
         )
@@ -501,6 +702,11 @@ def run_scale_diagnostics(config: dict, n_episodes: int = 30, seed_start: int = 
         issues_sum = int(ep_df["issues_total"].sum())
         issues_hard_sum = int(ep_df["issues_hard"].sum())
         total_collateral_clip_events = int(ep_df["collateral_clip_events_total"].sum())
+        learning_overspend_total = float(ep_df["learning_annual_overspend_total"].sum())
+        bot_overspend_total = float(ep_df["bot_annual_overspend_total"].sum())
+        mean_price_slope = float(ep_df["price_slope_per_year"].mean())
+        positive_slope_share = float(np.mean(ep_df["price_slope_per_year"] > 0.0))
+        mean_yoy_up_share = float(ep_df["price_yoy_up_share"].mean())
         pmin = float(ep_df["price_min"].min())
         pmax = float(ep_df["price_max"].max())
         if defaults_sum == 0:
@@ -515,6 +721,37 @@ def run_scale_diagnostics(config: dict, n_episodes: int = 30, seed_start: int = 
             conclusions.append(("works", f"Clearing prices stayed within configured bounds [{config['auction']['price_min']}, {config['auction']['price_max']}]."))
         else:
             conclusions.append(("does_not_work", f"Price out-of-bounds observed (min={pmin:.3f}, max={pmax:.3f})."))
+        flat_floor_mask = (
+            (ep_df["price_max"] - ep_df["price_min"] <= 1e-6)
+            & (ep_df["price_min"] <= float(config["auction"]["price_min"]) + 1e-6)
+        )
+        flat_floor_share = float(np.mean(flat_floor_mask))
+        if (
+            mean_price_slope > MIN_PRICE_SLOPE_FOR_UPTREND
+            and positive_slope_share >= MIN_POSITIVE_SLOPE_EP_SHARE
+        ):
+            conclusions.append(("works", f"Price trend is generally upward (mean slope={mean_price_slope:.3f}, positive-slope episodes={positive_slope_share:.1%})."))
+        else:
+            conclusions.append(("needs_review", f"Price rise is not consistently upward (mean slope={mean_price_slope:.3f}, positive-slope episodes={positive_slope_share:.1%})."))
+        if mean_yoy_up_share >= MIN_YOY_UP_SHARE:
+            conclusions.append(("works", f"Year-to-year price increases appear active (mean up-share={mean_yoy_up_share:.1%})."))
+        else:
+            conclusions.append(("needs_review", f"Year-to-year price increases are sparse (mean up-share={mean_yoy_up_share:.1%})."))
+        if flat_floor_share > MAX_FLAT_FLOOR_EP_SHARE:
+            conclusions.append(
+                (
+                    "does_not_work",
+                    (
+                        "Price is stuck at the auction floor in "
+                        f"{flat_floor_share:.1%} of episodes; this is likely "
+                        "not realistic market price formation."
+                    ),
+                )
+            )
+        if learning_overspend_total <= 1e-6 and bot_overspend_total <= 1e-6:
+            conclusions.append(("works", "No annual-budget overspend observed for either learning agents or bots."))
+        else:
+            conclusions.append(("needs_review", f"Annual-budget overspend observed: learning={learning_overspend_total:.3f}, bots={bot_overspend_total:.3f}."))
         if issues_hard_sum == 0:
             conclusions.append(("works", "No hard-constraint violations were detected."))
         else:
@@ -525,6 +762,10 @@ def run_scale_diagnostics(config: dict, n_episodes: int = 30, seed_start: int = 
             conclusions.append(("works", "No collateral clip events observed."))
         else:
             conclusions.append(("needs_review", f"Collateral clip events observed ({total_collateral_clip_events}); review heuristic/environment alignment."))
+        if learning_policy_mode == "checkpoint_actor":
+            conclusions.append(("works", "Learning-agent decisions came from loaded actor checkpoints (not heuristic fallback)."))
+        else:
+            conclusions.append(("needs_review", "Learning-agent decisions used heuristics; load checkpoints to directly evaluate learned actor behavior."))
     conc_df = pd.DataFrame(conclusions, columns=["status", "conclusion"])
     return ep_df, issue_df, conc_df
 
@@ -538,13 +779,39 @@ def run_debug_session(
     scale_episodes: int = 30,
     scale_seed_start: int = 100,
     print_detailed: bool = True,
+    checkpoint_dir: Path | None = None,
+    deterministic_policy: bool = True,
+    require_learning_agents: bool = True,
 ) -> DebugOutputs:
     """Run detailed + scale diagnostics and package all outputs."""
     raw = load_config(config_path)
     cfg = configure_simulation(raw, n_years=n_years, n_learning_agents=n_learning_agents, n_bots=n_bots)
-    detailed_year_summary, detailed_issues = run_detailed_episode(cfg, seed=seed, print_output=print_detailed)
+    if require_learning_agents and cfg["companies"].get("n_agents", 0) <= 0:
+        raise ValueError(
+            "This debug session requires learning agents; set n_learning_agents > 0 "
+            "or pass --allow-no-learning-agents."
+        )
+
+    policy_agents = None
+    learning_policy_mode = "heuristic"
+    if checkpoint_dir is not None:
+        policy_agents = load_checkpoint_agents(cfg, seed=seed, checkpoint_dir=checkpoint_dir)
+        learning_policy_mode = "checkpoint_actor"
+
+    detailed_year_summary, detailed_issues = run_detailed_episode(
+        cfg,
+        seed=seed,
+        print_output=print_detailed,
+        policy_agents=policy_agents,
+        deterministic_policy=deterministic_policy,
+    )
     scale_episode_summary, scale_issues, scale_conclusions = run_scale_diagnostics(
-        cfg, n_episodes=scale_episodes, seed_start=scale_seed_start
+        cfg,
+        n_episodes=scale_episodes,
+        seed_start=scale_seed_start,
+        policy_agents=policy_agents,
+        deterministic_policy=deterministic_policy,
+        learning_policy_mode=learning_policy_mode,
     )
     return DebugOutputs(
         detailed_year_summary=detailed_year_summary,
@@ -564,6 +831,9 @@ def main():
     parser.add_argument("--bots", type=int, default=8)
     parser.add_argument("--scale-episodes", type=int, default=30)
     parser.add_argument("--scale-seed-start", type=int, default=100)
+    parser.add_argument("--checkpoint-dir", type=Path, default=None, help="Path containing agent_<i>_best.pt checkpoints for learning agents.")
+    parser.add_argument("--stochastic-policy", action="store_true", help="Use stochastic actor actions (default is deterministic).")
+    parser.add_argument("--allow-no-learning-agents", action="store_true", help="Allow runs with n_learning_agents=0.")
     parser.add_argument("--quiet-detailed", action="store_true", help="Disable detailed per-year prints.")
     parser.add_argument("--export-dir", type=Path, default=None)
     args = parser.parse_args()
@@ -577,6 +847,9 @@ def main():
         scale_episodes=args.scale_episodes,
         scale_seed_start=args.scale_seed_start,
         print_detailed=not args.quiet_detailed,
+        checkpoint_dir=args.checkpoint_dir,
+        deterministic_policy=not args.stochastic_policy,
+        require_learning_agents=not args.allow_no_learning_agents,
     )
 
     print("\n===== SCALE EPISODE SUMMARY =====")
