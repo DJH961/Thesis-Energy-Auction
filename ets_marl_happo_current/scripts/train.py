@@ -378,6 +378,13 @@ def _print_training_legend():
     print("  │  Same core columns as learning agents (single-price bids in current mode)")
     print("  │  Event board is printed as a separate section below the bot rows")
     print()
+    print("  ┌─ BID ARC  (separate block below agent/bot rows, one column per agent)")
+    print("  │  yr1     Bid price (€/t) in year 1 of the episode")
+    print("  │  yrN     Bid price (€/t) in the final year of the episode")
+    print("  │  hi      Highest bid price across all episode years")
+    print("  │  lo      Lowest bid price across all episode years")
+    print("  │  avg     Quantity-weighted mean bid price across all episode years")
+    print()
     print("  ┌─ EVENT BOARD  (separate visual block)")
     print("  │  Defaults/Suspensions by agent: A#/B#:<count> (how many year-events)")
     print("  │  Stuck states (learning agents): one line only if any condition occurs")
@@ -1330,6 +1337,28 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             else:
                 avg_bid_per_agent.append(float(np.mean(bids_this_ep)) if bids_this_ep else 0.0)
 
+        # Per-agent bid arc: yr1, yrN, hi, lo (avg is separately quantity-weighted above)
+        yr1_bid_per_agent = []
+        yrN_bid_per_agent = []
+        max_bid_per_agent = []
+        min_bid_per_agent = []
+        for i in range(n_total_agents):
+            _bids_arc = [
+                yl["bid_prices"][i]
+                for yl in env.episode_log
+                if "bid_prices" in yl and i < len(yl["bid_prices"])
+            ]
+            if _bids_arc:
+                yr1_bid_per_agent.append(float(_bids_arc[0]))
+                yrN_bid_per_agent.append(float(_bids_arc[-1]))
+                max_bid_per_agent.append(float(max(_bids_arc)))
+                min_bid_per_agent.append(float(min(_bids_arc)))
+            else:
+                yr1_bid_per_agent.append(0.0)
+                yrN_bid_per_agent.append(0.0)
+                max_bid_per_agent.append(0.0)
+                min_bid_per_agent.append(0.0)
+
         # Average bid quantity (Mt) per agent — Phase 1 action[1] after multiplier expansion
         avg_bid_qty_per_agent = []
         for i in range(n_total_agents):
@@ -1900,6 +1929,34 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                           f"  {ep_mean_emiss[j]:5.2f} {ep_mean_alloc[j]:5.2f}"
                           f" {sf_str:>4}  {avg_bid_per_agent[j]:6.1f} {avg_bid_qty_per_agent[j]:6.2f}"
                           f"  {ep_total_rewards_all[j]:8.1f}  {sec_str_b}")
+
+            # ── Bid arc (per-agent: yr1 / yrN / hi / lo / avg) ────────
+            print(thin)
+            _arc_labels = (
+                [f"A{i+1}" for i in range(n_agents)] +
+                [f"B{b+1}" for b in range(n_bot_agents)]
+            )
+            _col_w = 7    # chars per agent column
+            _lbl_w = 16   # chars for row-label prefix (after leading "  ")
+            _arc_hdr = (f"  {'Bid arc (€/t)':<{_lbl_w}}" +
+                        "".join(f"{lbl:>{_col_w}}" for lbl in _arc_labels))
+            _yrN_lbl = f"yr{n_years_ep}:"
+            _arc_yr1 = (f"  {'yr1:':<{_lbl_w}}" +
+                        "".join(f"{yr1_bid_per_agent[i]:>{_col_w}.0f}" for i in range(n_total_agents)))
+            _arc_yrN = (f"  {_yrN_lbl:<{_lbl_w}}" +
+                        "".join(f"{yrN_bid_per_agent[i]:>{_col_w}.0f}" for i in range(n_total_agents)))
+            _arc_hi  = (f"  {'hi:':<{_lbl_w}}" +
+                        "".join(f"{max_bid_per_agent[i]:>{_col_w}.0f}" for i in range(n_total_agents)))
+            _arc_lo  = (f"  {'lo:':<{_lbl_w}}" +
+                        "".join(f"{min_bid_per_agent[i]:>{_col_w}.0f}" for i in range(n_total_agents)))
+            _arc_avg = (f"  {'avg:':<{_lbl_w}}" +
+                        "".join(f"{avg_bid_per_agent[i]:>{_col_w}.0f}" for i in range(n_total_agents)))
+            print(_arc_hdr)
+            print(_arc_yr1)
+            print(_arc_yrN)
+            print(_arc_hi)
+            print(_arc_lo)
+            print(_arc_avg)
 
             # ── Event board (separate visual block) ────────────────────
             print(thin)
