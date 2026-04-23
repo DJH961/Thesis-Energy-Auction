@@ -50,6 +50,70 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.11.0
+
+**Pure MARL Default + Scarcity-First Market Calibration + Reward Simplification**
+
+### Market structure and policy defaults (`configs/default.yaml`)
+- **Participant mix switched to pure MARL by default**:
+  - `companies.n_bot_agents`: `8 -> 0`
+- **Structural scarcity introduced from year 0**:
+  - `ets.cap_overhead_pct`: `+0.02 -> -0.10`
+- **Price floor raised near MAC anchor**:
+  - `auction.reserve_price`: `30.0 -> 45.0`
+  - `auction.price_min`: `30.0 -> 45.0`
+  - `secondary.sec_price_min`: `30.0 -> 45.0`
+- **Auction quantity range tightened**:
+  - `auction.qty_mult_low`: `0.3 -> 0.85`
+  - `auction.qty_mult_high`: `2.0 -> 1.5`
+- **Unsold volume moved to MSR path**:
+  - `ets.unsold_to_msr`: `false -> true`
+- **Carry-forward tolerance tightened**:
+  - `penalty.carry_forward_cap`: `1.0 -> 0.5`
+- **Initial bank seed increased**:
+  - `stochastic.bank_seed_min/max`: `0.05/0.15 -> 0.15/0.35`
+  - `ets.initial_bank_fraction`: `0.10 -> 0.25`
+
+### Reward and training behavior changes (`src/environment/ets_environment.py`)
+- **Reward normalization moved to fixed global scale** (`REWARD_SCALE=1000`) instead of per-agent budget divisors.
+- **Removed baseline-cost subtraction** from reward.
+- **Removed shaping channels from active reward path**:
+  - green bonus
+  - efficiency bonus
+- **Removed soft budget/capex penalties from reward path** (constraints shifted to hard mechanical gating/clipping).
+- **Terminal valuation changes**:
+  - bank value switched from diminishing `log1p` form to linear value
+  - terminal queue value removed from reward path
+- **Reward channel diagnostics reduced** to active core channels (`cost_norm`, `penalty_norm`, `esg_signal`, `base_reward`).
+- **Diagnostic score clamp fix**: `S_financial` bounded in `[0, 1]`.
+
+### Exploration schedule updates (`configs/default.yaml`)
+- `tabular.epsilon_start`: `0.50 -> 0.30`
+- `tabular.epsilon_decay_frac`: `0.50 -> 0.80`
+- `tabular.critic_warmup_frac`: `0.10 -> 0.03`
+- `tabular.shaping_decay_frac`: `0.33 -> 0.60`
+- `reward.shaping_weight_floor`: `0.00 -> 0.10`
+
+### Auction mechanism extension (`src/auction/market_clearing_ets.py`)
+- Added configurable pricing mode support:
+  - `auction.pricing_rule: uniform | pay_as_bid`
+- Default remained `uniform`; `pay_as_bid` added for comparative market-design experiments.
+
+### Tooling and tests
+- Added periodic training CSV snapshots (`logging.snapshot_interval: 2500`) in `scripts/train.py`.
+- Adapted tests to the new default profile and reward channel set (bot-count overrides, schedule expectations, reward-channel keys).
+
+### Known config-only declarations in v7.11
+- Declared but unused at runtime in that release:
+  - `reward.coverage_credit_weight`
+  - `reward.gap_closure_weight`
+  - `reward.terminal_queue_value`
+
+Historical note:
+- Several v7.11 defaults above were intentionally rolled back in `v7.12.0` based on approval scope.
+
+---
+
 ## v7.8.0
 
 **Dual-Ceiling WTP Heuristic, Marginal EF Revenue (instance method), Compliance-Priority Investment, Collateral Warning Counter, Enhanced Diagnostics, Config Updates, Smoke Tests**
