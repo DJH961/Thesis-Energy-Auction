@@ -61,7 +61,7 @@ def test_tabula_rasa_schedule_overrides(monkeypatch):
 
     assert resolved["ppo"]["critic_warmup_episodes"] == int(0.03 * n_ep)
     assert resolved["reward"]["shaping_decay_episode"] == int(0.60 * n_ep)
-    assert resolved["exploration"]["epsilon_decay_episodes"] == int(0.80 * n_ep)
+    assert resolved["exploration"]["epsilon_decay_episodes"] == int(0.90 * n_ep)
     assert resolved["exploration"]["mode"] == "uniform"
 
 
@@ -145,7 +145,7 @@ def test_tabula_rasa_uniform_exploration():
     )
 
     obs1 = np.zeros(22, dtype=np.float32)
-    obs1[3] = 0.156  # anchored path would target ~78 if used
+    obs1[3] = 0.156  # expected_price = 78 EUR/t (used in fallback/anchored mode)
     np.random.seed(42)
 
     prices = []
@@ -153,19 +153,38 @@ def test_tabula_rasa_uniform_exploration():
         action, _, _ = agent.select_auction_action(obs1, deterministic=False, epsilon=1.0)
         prices.append(float(action[0]))
 
-    reference_price = float(obs1[3]) * config["auction"]["price_max"]
-    under = sum(p < reference_price for p in prices)
-    over = sum(p > reference_price for p in prices)
-    non_equal = under + over
+    # WTP anchor: with small obs (22D < OBS1_BUDGET_HEADROOM_IDX=27), headroom defaults to 0.5.
+    # WTP economic = MAC(48) + 0.5*(penalty(138.75)-MAC(48)) = ~93.4 EUR/t.
+    # WTP budget = large (0.5*880 / 0.01). WTP anchor ≈ wtp_economic ≈ 93.4.
+    # Compute actual WTP anchor so balance check is around the right reference.
+    wtp_mac = 48.0
+    wtp_penalty = 138.75
+    wtp_budget_default = 880.0
+    need_mt = max(0.01, float(obs1[10]) * 10.0)
+    headroom_default = 0.5  # fallback (obs dim < 27)
+    available = headroom_default * wtp_budget_default
+    wtp_economic = wtp_mac + 0.5 * max(0.0, wtp_penalty - wtp_mac)
+    wtp_base = min(wtp_economic, available / need_mt)
+    price_min = config["auction"]["price_min"]
+    price_max = config["auction"]["price_max"]
+    wtp_anchor = float(np.clip(wtp_base, price_min, price_max))
 
-    assert min(prices) >= 30.0
-    assert max(prices) <= 500.0
+    assert min(prices) >= price_min
+    assert max(prices) <= price_max
+    assert len(prices) > 0
+
+    # WTP-uniform mode: bids are side-balanced around the WTP anchor.
+    # Each epsilon sample draws with prob 0.5 from [price_min, wtp_anchor]
+    # and prob 0.5 from [wtp_anchor, price_max].
+    under_wtp = sum(p < wtp_anchor for p in prices)
+    over_wtp = sum(p > wtp_anchor for p in prices)
+    non_equal = under_wtp + over_wtp
     assert non_equal > 0
-
-    # Uniform mode keeps side-balanced bid-price sampling around the expected price,
-    # so overbids and underbids are equally likely even with asymmetric price ranges.
-    under_share = under / non_equal
-    assert 0.40 <= under_share <= 0.60
+    under_share = under_wtp / non_equal
+    assert 0.40 <= under_share <= 0.60, (
+        f"Expected side-balanced sampling around WTP anchor {wtp_anchor:.1f}, "
+        f"got under_share={under_share:.3f}"
+    )
 
 
 def test_tabula_rasa_uniform_exploration_fallback_expected_price():

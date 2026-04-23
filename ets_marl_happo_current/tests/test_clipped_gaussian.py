@@ -183,12 +183,13 @@ def test_to_raw_invertibility(auction_policy):
 # ---------------------------------------------------------------------------
 
 def test_epsilon_greedy_auction(sample_config):
-    """With epsilon=1.0, select_auction_action produces anchored-Gaussian actions.
+    """With epsilon=1.0, select_auction_action produces WTP-anchored actions.
 
-    Epsilon exploration now samples from Gaussians centered on realistic anchors
-    (e.g. bid_price around expected_price from obs[3]) rather than uniform.
-    The test verifies: (a) actions stay within bounds, (b) there is meaningful
-    variance, and (c) the mean is near the anchor rather than the midpoint.
+    Epsilon exploration now samples from distributions centered on the WTP anchor
+    (economic: MAC + 0.5*(penalty - MAC), capped by available budget per tonne)
+    rather than the expected price. The test verifies: (a) actions stay within
+    bounds, (b) there is meaningful variance, and (c) the mean is near the WTP
+    anchor rather than the midpoint.
     """
     from src.agents.ppo_agent import PPOAgent
 
@@ -201,26 +202,41 @@ def test_epsilon_greedy_auction(sample_config):
         config=sample_config, seed=42,
     )
 
-    # Use a controlled obs where obs[3] (expected_price / price_max) = 0.65
-    # → expected_price = 0.65 × 120 = 78 €/t
-    obs = np.random.randn(21).astype(np.float32)
-    obs[3] = 0.65
+    # Controlled obs: obs[10] = 0.3 → need_mt = 3.0 Mt (typical)
+    # budget_headroom defaults to 0.5 (obs dim=21 < OBS1_BUDGET_HEADROOM_IDX=27)
+    # WTP anchor: wtp_economic = 48 + 0.5*(138.75-48) = 93.4; wtp_budget = 440/3 = 146.7
+    # → wtp_anchor ≈ 93.4 EUR/t
+    obs = np.zeros(21, dtype=np.float32)
+    obs[3] = 0.65      # expected_price norm = 78 EUR/t (for reference, not used as anchor)
+    obs[10] = 0.30     # need_mt = 3.0 Mt → wtp_budget = 146.7 > wtp_economic
+
+    # Compute expected WTP anchor for the assertion
+    wtp_mac = 48.0
+    wtp_penalty = 138.75
+    wtp_annual_budget = 880.0
+    need_mt = max(obs[10] * 10.0, 0.01)
+    budget_headroom = 0.5  # default (obs dim < 27)
+    avail = budget_headroom * wtp_annual_budget
+    wtp_economic = wtp_mac + 0.5 * max(0.0, wtp_penalty - wtp_mac)
+    wtp_budget = avail / need_mt
+    wtp_base = min(wtp_economic, wtp_budget)
+    price_min, price_max = 40.0, 120.0
+    wtp_anchor = float(np.clip(wtp_base, price_min, price_max))
+
     bid_prices = []
     for _ in range(200):
         action, raw, lp = agent.select_auction_action(obs, epsilon=1.0)
         bid_prices.append(action[0])
 
     bid_prices = np.array(bid_prices)
-    price_max = 120.0
-    expected_price = obs[3] * price_max  # 78.0
     # (a) All within bounds
     assert bid_prices.min() >= 40.0 - 0.01, f"Bid below floor: {bid_prices.min():.1f}"
     assert bid_prices.max() <= 120.0 + 0.01, f"Bid above ceiling: {bid_prices.max():.1f}"
     # (b) Meaningful variance (not collapsed)
     assert bid_prices.std() > 5.0, f"Bid std too low: {bid_prices.std():.1f}"
-    # (c) Mean is near expected_price anchor, not the midpoint (80)
-    assert abs(bid_prices.mean() - expected_price) < 25.0, (
-        f"Mean bid {bid_prices.mean():.1f} too far from anchor {expected_price:.1f}")
+    # (c) Mean is near WTP anchor, not expected_price (78) or midpoint (80)
+    assert abs(bid_prices.mean() - wtp_anchor) < 25.0, (
+        f"Mean bid {bid_prices.mean():.1f} too far from WTP anchor {wtp_anchor:.1f}")
 
 
 # ---------------------------------------------------------------------------
