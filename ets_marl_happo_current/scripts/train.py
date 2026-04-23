@@ -444,6 +444,25 @@ def _resolve_auto_episode_count(raw_value, n_episodes: int,
     return int(raw_value), False
 
 
+def _phase1_batch_to_phase2_value_input(obs1_batch: np.ndarray, phase2_dim: int) -> np.ndarray:
+    """
+    Build phase-2-sized critic inputs from phase-1 observations by zero-padding.
+
+    This keeps value targets time-aligned for auction transitions (state before
+    auction action) while preserving critic input dimensionality. If phase-1
+    observations have fewer dimensions than phase2_dim, the tail is zero-padded;
+    these padded dims represent post-auction phase-2 features that are not yet
+    available at auction decision time. If phase-1 observations have more
+    dimensions than phase2_dim (future config/schema drift), extra dimensions
+    are truncated defensively.
+    """
+    obs1_arr = np.asarray(obs1_batch, dtype=np.float32)
+    out = np.zeros((obs1_arr.shape[0], phase2_dim), dtype=np.float32)
+    copy_dim = min(obs1_arr.shape[1], phase2_dim)
+    out[:, :copy_dim] = obs1_arr[:, :copy_dim]
+    return out
+
+
 def _apply_ppo_run_profile(config: dict, n_episodes: int) -> dict:
     """
     Resolve PPO settings by run length.
@@ -945,20 +964,23 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             # v7.6: Split rewards — compute auction-phase intermediate reward
             r_auction = env.compute_auction_rewards()
 
-            # MAPPO: construct global state from all agents' phase2 obs
+            # MAPPO: construct global states for each transition phase
             _centralized = config["ppo"].get("centralized_critic", False)
-            global_state = obs2.flatten() if _centralized else None
+            obs2_dim = obs2.shape[1] if obs2.ndim == 2 else env.companies[0].obs_dim_phase2
+            critic_obs_auc = _phase1_batch_to_phase2_value_input(obs1, obs2_dim)
+            global_state_auc = critic_obs_auc.flatten() if _centralized else None
+            global_state_sec = obs2.flatten() if _centralized else None
 
             # Store auction-phase transition (done=False: episode continues)
             for i in range(n_agents):
                 value_auc = agents[i].estimate_value(
-                    global_state if _centralized else obs2[i])
+                    global_state_auc if _centralized else critic_obs_auc[i])
                 agents[i].store_transition(
                     obs1=obs1[i], obs2=obs2[i],
                     auc_raw=auction_raws[i], sec_raw=np.zeros(2, dtype=np.float32),
                     auc_lp=auction_logps[i], sec_lp=np.zeros(1, dtype=np.float32),
                     reward=float(r_auction[i]), done=False, value=value_auc,
-                    global_state=global_state,
+                    global_state=global_state_auc,
                     phase='auction',
                 )
 
@@ -989,13 +1011,13 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             # Store secondary-phase transition
             for i in range(n_agents):
                 value_sec = agents[i].estimate_value(
-                    global_state if _centralized else obs2[i])
+                    global_state_sec if _centralized else obs2[i])
                 agents[i].store_transition(
                     obs1=obs1[i], obs2=obs2[i],
                     auc_raw=auction_raws[i], sec_raw=secondary_raws[i],
                     auc_lp=auction_logps[i], sec_lp=secondary_logps[i],
                     reward=float(r_secondary[i]), done=terminated, value=value_sec,
-                    global_state=global_state,
+                    global_state=global_state_sec,
                     phase='secondary',
                 )
 
