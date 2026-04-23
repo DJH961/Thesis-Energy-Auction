@@ -419,3 +419,104 @@ def test_agent_id_out_of_range_raises_with_explicit_n_agents():
 
     with pytest.raises(ValueError, match=r"outside \[0, n_agents\)"):
         market_clearing_ets(bids, q_cap=1.0, n_agents=3)
+
+
+# ---------------------------------------------------------------------------
+# Phantom Bidder Tests
+# ---------------------------------------------------------------------------
+
+def test_phantom_above_reserve_squeezes_floor_bidders():
+    """
+    Phantom bid above reserve consumes supply before floor bidders.
+
+    Setup: 2 real agents bid at reserve (50.0), phantom bids above reserve at 90.0.
+    Supply = 2.0 Mt.  Phantom takes its full quantity first (bids are sorted descending).
+    If phantom bids 1.5 Mt at 90.0, only 0.5 Mt remains for floor bidders.
+    """
+    rng = np.random.default_rng(42)
+    # Real agents: agent 0 bids 50 × 1.0 Mt; agent 1 bids 50 × 1.0 Mt.
+    # Phantom: agent 2 bids 90 × 1.5 Mt (above reserve).
+    reserve = 50.0
+    q_cap = 2.0
+    bids = np.array([
+        [0, 1.0, reserve],   # floor bidder
+        [1, 1.0, reserve],   # floor bidder
+        [2, 1.5, 90.0],      # phantom (agent_id = n_agents = 2, passed n_agents=3)
+    ], dtype=float)
+
+    price, alloc, pay, stats = market_clearing_ets(
+        bids, q_cap=q_cap, reserve_price=reserve, n_agents=3, rng=rng
+    )
+
+    # Phantom consumed 1.5 Mt; only 0.5 Mt remains for the two floor bidders.
+    phantom_alloc = alloc[2]
+    real_alloc_total = alloc[0] + alloc[1]
+
+    assert phantom_alloc == pytest.approx(1.5, abs=1e-6), (
+        f"Phantom should get 1.5 Mt, got {phantom_alloc}"
+    )
+    assert real_alloc_total == pytest.approx(0.5, abs=1e-6), (
+        f"Floor bidders combined should get only 0.5 Mt remaining, got {real_alloc_total}"
+    )
+    assert alloc.sum() == pytest.approx(q_cap, abs=1e-6)
+
+
+def test_phantom_below_reserve_rejected_floor_bidders_unaffected():
+    """
+    Phantom bid below reserve is silently rejected; real floor bids are unaffected.
+
+    Setup: 2 real agents bid above reserve; phantom bids below reserve.
+    All real demand should be filled as if phantom doesn't exist.
+    """
+    rng = np.random.default_rng(7)
+    reserve = 50.0
+    q_cap = 3.0
+    bids = np.array([
+        [0, 1.5, 70.0],     # real agent — above reserve
+        [1, 1.0, 60.0],     # real agent — above reserve
+        [2, 1.0, 30.0],     # phantom — below reserve → rejected
+    ], dtype=float)
+
+    price, alloc, pay, stats = market_clearing_ets(
+        bids, q_cap=q_cap, reserve_price=reserve, n_agents=3, rng=rng
+    )
+
+    # Phantom bid below reserve: alloc[2] = 0
+    assert alloc[2] == pytest.approx(0.0, abs=1e-6), (
+        f"Below-reserve phantom should get 0 allocation, got {alloc[2]}"
+    )
+    # Real agents should get their full quantities (total 2.5 Mt < q_cap 3.0)
+    assert alloc[0] == pytest.approx(1.5, abs=1e-6)
+    assert alloc[1] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_phantom_fills_entire_supply_floor_bidders_zero():
+    """
+    Phantom consuming 100% of supply leaves all floor bidders with zero allocation.
+
+    Setup: phantom bids above reserve for the full q_cap quantity.
+    All real agents bid at reserve. Phantom wins everything.
+    """
+    rng = np.random.default_rng(99)
+    reserve = 50.0
+    q_cap = 5.0
+    # Phantom (agent 3) bids 5.0 Mt at 100 EUR/t — takes full supply.
+    bids = np.array([
+        [0, 2.0, reserve],   # floor bidder
+        [1, 2.0, reserve],   # floor bidder
+        [2, 2.0, reserve],   # floor bidder
+        [3, 5.0, 100.0],     # phantom — high price, full supply quantity
+    ], dtype=float)
+
+    price, alloc, pay, stats = market_clearing_ets(
+        bids, q_cap=q_cap, reserve_price=reserve, n_agents=4, rng=rng
+    )
+
+    # Phantom gets all 5 Mt; real agents get nothing.
+    assert alloc[3] == pytest.approx(q_cap, abs=1e-6), (
+        f"Phantom should absorb full supply, got {alloc[3]}"
+    )
+    for i in range(3):
+        assert alloc[i] == pytest.approx(0.0, abs=1e-6), (
+            f"Floor bidder A{i} should get zero allocation, got {alloc[i]}"
+        )

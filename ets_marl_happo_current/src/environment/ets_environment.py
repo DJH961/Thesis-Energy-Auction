@@ -47,6 +47,7 @@ from src.auction.market_clearing_ets import market_clearing_ets, build_bids, set
 from src.environment.cap_schedule import CapSchedule
 from src.environment.company import Company
 from src.environment.market_calibration import compute_market_params
+from src.environment.phantom_bidder import PhantomBidder
 from src.agents import heuristic_policy
 
 
@@ -188,6 +189,9 @@ class ETSEnvironment(gym.Env):
         # P4: shaping weight — decays from 1.0 to 0.0 over training (set by train.py)
         self.shaping_weight = 1.0
 
+        # Private per-episode urgency scalars — initialised to 1.0; sampled each reset()
+        self._urgency_scalars = np.ones(self.n_agents, dtype=float)
+
         # Secondary market profit tracking (EMA per agent)
         self._secondary_profit_ema = np.zeros(self.n_total)
         self._ema_alpha = 0.1
@@ -304,6 +308,9 @@ class ETSEnvironment(gym.Env):
 
         # Logging
         self.episode_log: List[dict] = []
+
+        # Phantom bidder (financial intermediary demand)
+        self._phantom_bidder = PhantomBidder(config, self.rng)
 
         # Reward channel diagnostics
         self._last_reward_channels: dict = {}
@@ -562,6 +569,18 @@ class ETSEnvironment(gym.Env):
         self._last_reward_channels = {}
         self._last_auction_reward_channels = {}
         self._last_per_agent_diag = {}
+
+        # Private per-episode urgency scalars (not shared across agents).
+        # Sampled from LogNormal so E[scalar]=1.0; creates private heterogeneity
+        # in effective penalty sensitivity — agents face slightly different urgency.
+        urgency_cfg = self.config.get("urgency_scalars", {})
+        if urgency_cfg.get("enabled", False):
+            sigma_u = float(urgency_cfg.get("lognormal_sigma", 0.30))
+            self._urgency_scalars = self.rng.lognormal(
+                mean=0.0, sigma=sigma_u, size=self.n_agents
+            ).astype(float)
+        else:
+            self._urgency_scalars = np.ones(self.n_agents, dtype=float)
 
         initial_mixes = self.config["companies"]["initial_mix"]
         for i, company in enumerate(self.companies):
@@ -1392,17 +1411,48 @@ class ETSEnvironment(gym.Env):
             ))
 
         bids = build_bids(bid_actions)
-        clearing_price, allocations, payments, auction_stats = market_clearing_ets(
-            bids=bids,
+
+        # Phantom bidder: inject financial intermediary demand before clearing.
+        # The phantom uses agent_id = n_total (one beyond all real participants).
+        # market_clearing_ets is called with n_agents = n_total + 1 so it
+        # pre-allocates the extra slot; the slot is stripped immediately after.
+        effective_penalty_rate_for_phantom = (
+            float(self.config["penalty"]["rate"]) * self._inflation_factor(self.current_year)
+        )
+        if self._phantom_bidder.enabled:
+            ph_price, ph_qty = self._phantom_bidder.sample_bid(
+                price_ma3=price_ma3,
+                reserve_price=effective_reserve,
+                penalty_rate=effective_penalty_rate_for_phantom,
+                auction_supply=auction_volume,
+            )
+            phantom_row = np.array([[self.n_total, ph_qty, ph_price]], dtype=float)
+            bids_for_clearing = np.vstack([bids, phantom_row])
+            n_agents_clearing = self.n_total + 1
+        else:
+            bids_for_clearing = bids
+            n_agents_clearing = self.n_total
+
+        clearing_price, all_allocs, all_pays, auction_stats = market_clearing_ets(
+            bids=bids_for_clearing,
             q_cap=auction_volume,
             reserve_price=effective_reserve,
             max_agent_share=self.config["auction"].get("max_agent_share", 1.0),
             rng=self.rng,
             cancel_under_subscribed=self.config["auction"].get(
                 "cancel_under_subscribed", False),
-            n_agents=self.n_total,
+            n_agents=n_agents_clearing,
             pricing_rule=self.config["auction"].get("pricing_rule", "uniform"),
         )
+        # Strip phantom slot — its allocation represents supply consumed by
+        # financial traders; it is NOT credited to any holdings array.
+        allocations = all_allocs[:self.n_total]
+        payments = all_pays[:self.n_total]
+
+        # Log phantom state for year-level diagnostics
+        log["phantom_bid_price"] = self._phantom_bidder.last_price
+        log["phantom_bid_qty"] = self._phantom_bidder.last_qty
+        log["phantom_active"] = self._phantom_bidder.last_active
 
         # E4: Post-clearing settlement — check each winner can pay; handle defaults.
         auction_susp_len = self.config.get("auction", {}).get("suspension_length", None)
@@ -2037,6 +2087,8 @@ class ETSEnvironment(gym.Env):
         self._last_per_agent_diag = per_agent_diag
         log["per_agent_diag"] = per_agent_diag
         log["marginal_ef_used"] = float(self._last_marginal_ef)
+        # Store reward channels in year log for diagnostics (esg_vs_penalty_ratio, etc.)
+        log["reward_channels"] = {i: dict(ch) for i, ch in self._last_reward_channels.items()}
 
         self.episode_log.append(log)
 
@@ -2221,6 +2273,18 @@ class ETSEnvironment(gym.Env):
                 ema_alpha * float(clearing_price) +
                 (1.0 - ema_alpha) * self._liquidity_ref_ema
             )
+            # Liquidity pool floor: prevent pool from pricing at the auction
+            # reserve price floor — ensures secondary market remains active even
+            # when the primary auction collapses to reserve price.
+            # floor_fraction_of_penalty = 0.25 means pool never prices below
+            # 25% of the non-compliance penalty (≈34€ at current calibration).
+            _eff_penalty_for_pool = (
+                float(self.config["penalty"]["rate"])
+                * self._inflation_factor(self.current_year)
+            )
+            _floor_frac = float(pool_cfg.get("floor_fraction_of_penalty", 0.25))
+            _pool_price_floor = _floor_frac * _eff_penalty_for_pool
+            self._liquidity_ref_ema = max(self._liquidity_ref_ema, _pool_price_floor)
             # Keep pool pricing anchored to market reference by default.
             # Optional override allows explicit anchor experiments.
             penalty_anchor_price = float(pool_cfg.get("penalty_anchor_price", clearing_price))
@@ -2347,13 +2411,36 @@ class ETSEnvironment(gym.Env):
                 + loan_interest_cost
             )
             cost_norm = total_cost / REWARD_SCALE
-            penalty_norm = penalty_cost / REWARD_SCALE
+            # Apply private urgency scalar to penalty (only for learning agents).
+            # This creates private heterogeneity in effective compliance urgency,
+            # destroying symmetric equilibria where all agents free-ride at floor.
+            if i < self.n_agents:
+                urgency_scalar = float(self._urgency_scalars[i])
+            else:
+                urgency_scalar = 1.0
+            penalty_norm = (penalty_cost * urgency_scalar) / REWARD_SCALE
 
             esg_signal = 0.0
             if esg_enabled and company.initial_ef > 1e-6:
                 ef_ratio = (company.initial_ef - company.weighted_emission_factor) / company.initial_ef
                 time_ratio = remaining_years / self.n_years
-                esg_signal = esg_scale * ef_ratio * time_ratio
+                esg_raw = esg_scale * ef_ratio * time_ratio
+
+                # Compliance gate: ESG bonus scales quadratically with coverage.
+                # Non-compliant agents lose ESG credit, mirroring real corporate
+                # ESG accreditation loss when sustainability commitments are unmet.
+                annual_need_i = max(
+                    company.compute_estimate_need() + company._carry_forward, 1e-6
+                )
+                if precompliance_holdings is not None:
+                    coverage_frac = min(1.0, float(precompliance_holdings[i]) / annual_need_i)
+                else:
+                    coverage_frac = 1.0
+                compliance_gate = coverage_frac ** 2  # quadratic: 80% → 64% ESG, 50% → 25%
+                esg_signal = esg_raw * compliance_gate
+            else:
+                compliance_gate = 1.0
+                esg_signal = 0.0
 
             base_reward = float(
                 company.w_cost * (-cost_norm)
@@ -2410,6 +2497,10 @@ class ETSEnvironment(gym.Env):
                 "base_reward": float(base_reward),
                 "opp_cost_shaping": float(opp_cost_shaping),
                 "coverage_gap_shaping": float(coverage_gap_shaping),
+                "compliance_gate": float(compliance_gate),
+                "esg_vs_penalty_ratio": (
+                    float(company.w_green * esg_signal) / max(float(penalty_norm), 1e-9)
+                ),
             }
 
         is_final_year = self.current_year >= self.n_years - 1

@@ -63,7 +63,10 @@ ets:
   # To override with a manual value, set cap_year_0_override to a number.
   cap_year_0_override: null     # null enables emission-weighted calibration
   initial_bank_fraction: 0.10   # default episode-start bank seed fraction of annual need
-  cap_overhead_pct: 0.11        # 11% surplus over total initial emissions
+  # Phantom-bidder-aware scarcity calibration (mirrors default.yaml v7.13):
+  # With phantom consuming ~11% of auction supply in expectation, cap_overhead_pct=+0.08
+  # yields a net ~4% compliance supply shortfall in year 0 (just minor scarcity).
+  cap_overhead_pct: 0.08        # +8% above total initial emissions (phantom-aware baseline)
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044
@@ -213,6 +216,7 @@ trading:
 secondary:
   liquidity_pool:
     enabled: false             # disabled — no financial intermediaries
+    floor_fraction_of_penalty: 0.25
 
 # ----------------------------------------------------------
 # Unified financial envelope: total annual capacity for ALL spending
@@ -352,9 +356,10 @@ reward:
 esg:
   enabled: true
   scale: 2.0
-  # Reward = w_cost × (-cost_norm) + w_green × (esg_scale × esg_raw) + shaping
+  # Lowered from 3.5 → 2.0: compliance gate now multiplies into ESG signal.
+  # Reward = w_cost × (-cost_norm) + w_green × (esg_scale × esg_raw × compliance_gate) + shaping
   # Financial agents (w_green=0): reward = -cost_norm
-  # ESG agents (w_green=0.5): reward = 0.5×(-cost_norm) + 0.5×(esg_scaled)
+  # ESG agents (w_green=0.5): reward = 0.5×(-cost_norm) + 0.5×(esg_scaled×gated)
   # This structurally guarantees 50/50 financial/environmental weighting.
 
 # ----------------------------------------------------------
@@ -487,6 +492,7 @@ diagnostics:
   zero_qty_threshold: 0.01            # avg bid qty <= this x qty_max -> zero-qty warning
   stuck_boost_window: 250             # episodes stuck before entropy boost triggers
   stuck_boost_coef: 0.04              # boosted entropy coef
+  esg_over_penalty_warn_window: 50    # consecutive episodes ESG>penalty for non-compliant agent before warning
 
 # ----------------------------------------------------------
 # Historical Policy Pool (HPP)
@@ -499,6 +505,8 @@ hpp:
   save_interval: 0      # auto: 3% of n_episodes, clamped to [50, 1000]
   swap_prob: 0.20
   warmup_episodes: 0    # auto: 20% of n_episodes, clamped to [200, 6000]
+  seed_heuristic: true
+  seed_count: 2
 
 # ----------------------------------------------------------
 # Epsilon-greedy exploration (physical-space)
@@ -515,4 +523,17 @@ exploration:
   auction_anchors: [80.0, 1.0, 0.03, 0.3, -0.5, 0.5]
   # Secondary: [sec_price (absolute €/t), sec_qty]
   secondary_anchors: [80.0, 0.0]
+
+phantom_bidder:
+  enabled: true
+  qty_frac_lo: 0.05
+  qty_frac_hi: 0.20
+  price_lognormal_sigma: 0.45
+  price_min_above_reserve: 2.0
+  price_max_frac_penalty: 0.65
+  price_min_below_reserve_buffer: 5.0
+
+urgency_scalars:
+  enabled: true
+  lognormal_sigma: 0.30
 

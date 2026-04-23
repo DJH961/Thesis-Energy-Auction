@@ -5,6 +5,74 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.13.0
+
+**Equilibrium-Breaking Mechanisms + Phantom-Bidder-Aware Scarcity Calibration**
+
+### Phantom Bidder (new file `src/environment/phantom_bidder.py`)
+- **`PhantomBidder` class**: Models financial intermediary demand (~40% of real EU ETS
+  auction volume; Regulation 1031/2010). Bids with `LogNormal(log(anchor), σ=0.45)` price
+  anchored to MA3 and `Uniform[5%,20%]` quantity fraction of auction supply.
+- **Integration (`ets_environment.py` `step_auction()`)**: Phantom injected as `agent_id=n_total`
+  row; `market_clearing_ets` called with `n_agents=n_total+1`; phantom slot stripped from
+  returned allocations/payments. Phantom allocation discarded (not credited to any agent).
+- **Logging**: `phantom_bid_price`, `phantom_bid_qty`, `phantom_active` written to year log.
+  `phantom_active_pct` written to episode CSV. Console `Bid/yr` line shows `(+Ph X%)` suffix.
+- **Config block** (`default.yaml`, `smoke_100.yaml`): `phantom_bidder.enabled`,
+  `qty_frac_lo/hi`, `price_lognormal_sigma`, `price_min_above_reserve`,
+  `price_max_frac_penalty`, `price_min_below_reserve_buffer`.
+
+### Scarcity recalibration (`configs/default.yaml`, `configs/smoke_100.yaml`)
+- **`ets.cap_overhead_pct`**: `-0.20 → +0.08` in default; `+0.11 → +0.08` in smoke.
+  Rationale: the prior -20% overhead yielded extreme scarcity even before the phantom.
+  With phantom expected to consume ~11% of auction supply, `+0.08` gives compliance agents
+  a net ~4% supply shortfall in year 0 — "just minorly scarcer than what they need".
+  The LRF compounds scarcity naturally over the 12-year episode.
+
+### ESG Compliance Gate (`ets_environment.py` `_compute_rewards()`)
+- `compliance_gate = (coverage_frac)²` multiplies into `esg_signal`.
+  Non-compliant agents lose ESG credit proportionally (80% coverage → 64% ESG signal).
+- `compliance_gate` and `esg_vs_penalty_ratio` added to `_last_reward_channels[i]`
+  and stored in the year-level log (`log["reward_channels"]`).
+- `esg.scale` lowered `3.5 → 2.0` to compensate for gate interaction.
+- Episode CSV: `esg_vs_penalty_ratio_A{i}` and `compliance_gate_A{i}` per agent.
+- Console warning fires when `esg_vs_penalty_ratio > 1.0` for a non-compliant agent
+  for `diagnostics.esg_over_penalty_warn_window` (default 50) consecutive episodes.
+
+### Liquidity Pool Floor (`ets_environment.py` `_settle_double_auction()`)
+- After EMA update: `_liquidity_ref_ema = max(_liquidity_ref_ema, floor_frac × penalty_rate)`.
+  Default `floor_frac = 0.25` prevents secondary market from collapsing to reserve when
+  primary auctions fail repeatedly.
+- Config key: `secondary.liquidity_pool.floor_fraction_of_penalty: 0.25`.
+
+### HPP Heuristic Seeding (`scripts/train.py`)
+- After BC pretraining, `seed_count` copies of BC snapshot are seeded into each agent's
+  HPP pool. These BC-trained WTP-bidding opponents remain present as diversity anchors
+  for the entire training run.
+- `hpp_min_pool_sizes` protects BC seeds from immediate eviction.
+- Config: `hpp.seed_heuristic: true`, `hpp.seed_count: 2`.
+
+### Private Urgency Scalars (`ets_environment.py` `reset()`, `_compute_rewards()`)
+- Per-episode `LogNormal(0, σ=0.30)` scalar per learning agent multiplied into effective
+  penalty in reward. `E[scalar]=1.0`, range ≈ 0.5–2.0. Breaks symmetric cost structure
+  that supports the floor-bidding equilibrium.
+- Config: `urgency_scalars.enabled: true`, `urgency_scalars.lognormal_sigma: 0.30`.
+
+### Diagnostics (`scripts/train.py`)
+- Episode CSV additions: `esg_vs_penalty_ratio_A{i}`, `compliance_gate_A{i}`,
+  `phantom_active_pct`.
+- `_esg_over_penalty_streak` per-agent counter triggers console warnings.
+- Year-level log now stores `log["reward_channels"]` dict for CSV/diagnostic access.
+
+### Tests (`tests/test_market_clearing.py`)
+- Three new phantom bidder tests:
+  - `test_phantom_above_reserve_squeezes_floor_bidders`: phantom consumes supply, floor bidders get less.
+  - `test_phantom_below_reserve_rejected_floor_bidders_unaffected`: below-reserve phantom is harmless.
+  - `test_phantom_fills_entire_supply_floor_bidders_zero`: 100% consumption case.
+- All 272 tests pass.
+
+---
+
 ## v7.12.0
 
 **Rollback of Non-Approved v7.11 Defaults + Reward Corrections**

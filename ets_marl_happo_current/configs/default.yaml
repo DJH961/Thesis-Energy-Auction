@@ -8,9 +8,12 @@
 #   - Carry-forward obligations (cap=1.0x)
 #   - Terminal valuation: max(clearing, secondary, 80% eff_penalty)
 #   - Absolute-price secondary market (no multiplier)
-#   - ESG reward signal (saved-carbon-years formula)
+#   - ESG reward signal (saved-carbon-years formula) with compliance gate (coverage²)
+#   - Phantom bidder: financial intermediary demand, 5-20% of supply, breaks floor equilibrium
+#   - Phantom-aware scarcity: cap_overhead_pct=+0.08, net ~4% shortfall after phantom demand
+#   - Private urgency scalars: LogNormal(0, 0.30) per-agent penalty multiplier each episode
+#   - HPP heuristic seeding: BC snapshots pre-seeded into HPP pool for diversity anchoring
 #   - Pre-auction collateral affordability clip + budget-headroom phase-1 signal
-#   - Structural over-subscription: cap=-20%, qty_low=0.50 (wide action space with aggressive cap)
 # ============================================================
 
 simulation:
@@ -74,7 +77,15 @@ ets:
   # To override with a manual value, set cap_year_0_override to a number.
   cap_year_0_override: null     # null enables emission-weighted calibration
   initial_bank_fraction: 0.10   # post-Phase-3 depleted bank (~10% of annual need)
-  cap_overhead_pct: -0.20       # -20% below total initial emissions — aggressive over-subscription
+  # Phantom-bidder-aware scarcity calibration (v7.13):
+  # The phantom bidder (financial intermediary) consumes an expected ~11% of
+  # auction supply each year (uniform[5%,20%] × P(bid≥reserve)≈0.90).
+  # Setting cap_overhead_pct=+0.08 means cap_0 = 1.08 × total_emissions.
+  # After phantom: compliance agents face ~0.8875 × 1.08 × E ≈ 0.958 × E,
+  # giving a ~4% net supply shortfall in year 0 — "just minorly scarcer
+  # than what agents need".  The LRF then compounds scarcity at ~4.3-4.4%
+  # per year, creating meaningful compliance pressure by mid-episode.
+  cap_overhead_pct: 0.08        # +8% above total initial emissions (phantom-aware baseline)
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044
@@ -229,6 +240,7 @@ trading:
 secondary:
   liquidity_pool:
     enabled: false             # disabled — no financial intermediaries
+    floor_fraction_of_penalty: 0.25  # pool EMA never falls below this fraction of effective penalty rate
 
 # ----------------------------------------------------------
 # Unified financial envelope: total annual capacity for ALL spending
@@ -391,10 +403,13 @@ reward:
 # ----------------------------------------------------------
 esg:
   enabled: true
-  scale: 3.5
-  # Reward = w_cost × (-cost_norm) + w_green × (esg_scale × esg_raw) + shaping
+  scale: 2.0
+  # Lowered from 3.5 → 2.0 because the compliance gate (coverage_frac²) now
+  # multiplies into the ESG signal. At values above 2.5, ESG can dominate the
+  # compliance penalty for partially-covered agents, reducing incentive to buy.
+  # Reward = w_cost × (-cost_norm) + w_green × (esg_scale × esg_raw × compliance_gate) + shaping
   # Financial agents (w_green=0): reward = -cost_norm
-  # ESG agents (w_green=0.5): reward = 0.5×(-cost_norm) + 0.5×(esg_scaled)
+  # ESG agents (w_green=0.5): reward = 0.5×(-cost_norm) + 0.5×(esg_scaled×gated)
   # This structurally guarantees 50/50 financial/environmental weighting.
 
 # ----------------------------------------------------------
@@ -530,6 +545,7 @@ diagnostics:
   zero_qty_threshold: 0.01            # avg bid qty <= this x qty_max -> zero-qty warning
   stuck_boost_window: 250             # episodes stuck before entropy boost triggers
   stuck_boost_coef: 0.04              # boosted entropy coef
+  esg_over_penalty_warn_window: 50    # consecutive episodes ESG>penalty for non-compliant agent before warning
 
 # ----------------------------------------------------------
 # Historical Policy Pool (HPP)
@@ -542,6 +558,8 @@ hpp:
   save_interval: 0      # auto: 3% of n_episodes, clamped to [50, 1000]
   swap_prob: 0.20
   warmup_episodes: 0    # auto: 20% of n_episodes, clamped to [200, 6000]
+  seed_heuristic: true  # seed pool with BC snapshot at training start for diversity anchoring
+  seed_count: 2         # number of BC snapshots to seed per agent pool (eviction-protected)
 
 # ----------------------------------------------------------
 # Epsilon-greedy exploration (physical-space)
@@ -587,3 +605,32 @@ budget_curriculum:
   budget_start: 1.5              # initial budget multiplier (generous)
   budget_end: 1.0                # final budget multiplier (nominal)
   decay_frac: 0.30               # fraction of n_episodes to decay over
+
+# ----------------------------------------------------------
+# Phantom Bidder: financial intermediary demand at primary auction.
+# Represents ~40% of EU ETS demand from banks/hedge funds who buy
+# allowances speculatively (Regulation 1031/2010 allows this).
+# Creates stochastic supply squeeze: floor bidders sometimes get
+# zero allocation even at full auction demand, destroying the
+# "floor is always safe" equilibrium belief.
+# ----------------------------------------------------------
+phantom_bidder:
+  enabled: true
+  qty_frac_lo: 0.05          # minimum quantity: 5% of auction supply
+  qty_frac_hi: 0.20          # maximum quantity: 20% of auction supply
+  price_lognormal_sigma: 0.45  # high variance; lognormal median=anchor, mean≈1.11×anchor (right-skewed)
+  price_min_above_reserve: 2.0  # lower bound anchor above reserve (EUR/t)
+  price_max_frac_penalty: 0.65  # upper bound: 65% of penalty rate (~90€ at current calibration)
+  price_min_below_reserve_buffer: 5.0  # max below-reserve draw allowed (EUR/t); bid rejected by clearing
+
+# ----------------------------------------------------------
+# Private per-episode urgency scalars.
+# Each learning agent receives a LogNormal scalar at episode start
+# (E[scalar]=1.0) that multiplies into their effective penalty.
+# Creates private heterogeneity in compliance urgency — destroys
+# symmetric floor-bidding equilibria by making each agent face
+# a slightly different effective penalty environment.
+# ----------------------------------------------------------
+urgency_scalars:
+  enabled: true
+  lognormal_sigma: 0.30   # E[scalar]=1.0, std≈0.31, range roughly 0.5–2.0
