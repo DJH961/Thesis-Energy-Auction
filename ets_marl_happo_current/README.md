@@ -1,6 +1,6 @@
 # ETS MARL — Current (HAPPO/PPO)
 
-This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System, now with **8 heuristic bot agents** that mirror all learning agent archetypes and add realistic market demand.
+This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System. The default profile (`v7.13`) runs **8 pure learning agents** with no heuristic bots and includes a **phantom bidder** representing financial intermediary demand.
 
 Recent changes and release-specific details are tracked in `docs/changelog.md`.
 
@@ -19,7 +19,7 @@ At a high level, this project:
 
 Each "episode" simulates **12 years** of a carbon market. Every year:
 
-1. The government sets a **cap** — the total CO2 allowed. This cap **shrinks each year** (by about 4.3-4.4%) to push companies toward cleaner energy. Over 12 years, the cap drops from 50.0 Mt (~11% surplus over ~45 Mt initial emissions for 16 participants).
+1. The government sets a **cap** — the total CO2 allowed. This cap **shrinks each year** (by about 4.3-4.4%) to push companies toward cleaner energy. The cap starts at ~8% above total initial emissions (`cap_overhead_pct: 0.08`); after financial intermediary (phantom) demand takes its share (~11%), compliance agents face only a minor supply shortfall (~4%) in year 0. Scarcity increases over 12 years as the cap declines.
 2. Companies participate in an **auction** where they bid for emission allowances (each allowance = right to emit 1 tonne of CO2).
 3. The auction uses a **uniform price** — everyone pays the same price, which is the lowest winning bid. This is how the real EU ETS works.
 4. Companies that don't have enough allowances to cover their emissions face a **penalty** (base **€138.75/t in 2026**, indexed from €132.06 in 2024; plus carry-forward obligations).
@@ -42,7 +42,7 @@ Both can be independently enabled/disabled via config flags (`reward.terminal_ba
 
 ### The Companies (Agents)
 
-There are **16 total market participants**: 8 learning agents (PPO/HAPPO) and 8 heuristic bot agents.
+The default `v7.13` profile uses **8 learning agents** (PPO/HAPPO) and **no heuristic bots** (`n_bot_agents: 0`). The smoke/ablation config (`smoke_100.yaml`) includes 8 additional heuristic bot agents for validation.
 
 **Learning Agents (A1-A8)** — organized into 4 archetypes (2 of each — one financially-motivated, one ESG-balanced):
 
@@ -110,7 +110,10 @@ The reward signal balances:
 - **Electricity revenue**: Companies earn revenue from electricity sales, with carbon costs partially passed through to electricity prices (80%). Green generators benefit from the same revenue with lower carbon costs.
 - **Unified financial envelope**: Each company has a single annual budget covering all spending (compliance + capex + MAC), calibrated to realistic revenue retention (~€724M for 10 TWh). Coal-heavy companies have the tightest budgets due to higher fuel OPEX.
 - **Capex throughput cap**: Organizational constraint on annual construction spend (M€), modelling permitting pipeline capacity, EPC contractor access, and management bandwidth. Independent of the financial budget — a company can afford more investment than it can physically deliver.
-- **Static reserve price**: Auction floor price at €30/t (matching price_min)
+- **Static reserve price**: Auction floor price at €45/t (just below MAC cost, prevents degenerate floor equilibrium)
+- **Phantom bidder** (v7.13): A synthetic financial intermediary participant bids at each primary auction with LogNormal price (anchored to MA3) and 5–20% of supply as quantity. When its bid clears, it consumes supply that would otherwise be available to compliance agents, creating stochastic scarcity. Its allocation is discarded (no compliance obligation). This breaks the "floor-bidding equilibrium" where all agents converge on bidding at the reserve price. See `docs/design.md §11`.
+- **ESG compliance gate** (v7.13): ESG bonus is multiplied by `coverage_frac²`, so non-compliant agents receive proportionally reduced ESG credit. Prevents ESG from masking compliance failures.
+- **Private urgency scalars** (v7.13): Per-episode LogNormal scalar multiplied into each agent's effective penalty, creating heterogeneous compliance pressure and breaking symmetric equilibria.
 - **Auction bid collateral**: overbids above clearing incur a real capital lock-up cost on awarded quantity (`auction.collateral.enabled`)
 - **Collateral affordability guardrail**: if collateral lock-up is unaffordable, bids are clipped in two steps (quantity first, then price if needed) to preserve feasible participation
 - **Budget headroom observation**: Phase-1 dim `[27]` reports current annual budget headroom (`1.0` fresh, `0.0` at limit, negative overspend)
@@ -118,11 +121,11 @@ The reward signal balances:
 - **Emergency loan system**: When a company faces auction default, an emergency loan covers the shortfall (up to `max_loan_fraction × annual_budget`) instead of immediate suspension. Loans carry interest (default 8%) with annual repayment deducted at year start.
 - **Budget hardening**: Tiered penalty regime — free spending up to 100% of budget, quadratic penalty in [100%, 115%], steep growth above. Investment hard gate scales down `invest_frac` if total projected spending would exceed the hard cap.
 - **Heuristic loan-awareness**: Bots with emergency loans reduce auction quantity (−30%), investment (−50%), and secondary buy volume (−40%) proportional to loan pressure.
-- **Carry-forward**: Non-compliance shortfall is added to next year's obligation (capped at 2.0x, allowing larger debt accumulation)
+- **Carry-forward**: Non-compliance shortfall is added to next year's obligation (capped at 1.0×, modelling standard carry-forward)
 - **Hidden burn-in warm-start**: A configurable pre-period (`warm_start.burnin_enabled`) seeds realistic bank holdings, MSR reserve, and MA3 history before year 0
 - **Fundamentals-based heuristic**: Bot bidding uses MAC→penalty gradient (`mac_cost + urgency × (penalty - mac_cost)`), removing dependence on price moving average
 - **Absolute-price secondary market**: Secondary prices are expressed in €/t (not as multipliers), clipped to [sec_price_min, 2× effective penalty rate]
-- **ESG signal**: Saved-carbon-years formula rewards emission factor improvements proportional to remaining time, gated by w_green
+- **ESG signal**: Saved-carbon-years formula rewards emission factor improvements proportional to remaining time, gated by w_green and the compliance gate
 - **Tabula-rasa balanced price-side exploration**: epsilon-random auction prices in `uniform` mode are sampled 50/50 under vs over expected price (uniform within each side), preventing bias from asymmetric price bounds
 
 ## Project Structure
@@ -134,7 +137,9 @@ ets_marl_happo_current/
 │   ├── environment/
 │   │   ├── ets_environment.py    # The main simulation loop (auction → trade → invest → repeat)
 │   │   ├── company.py            # Each company's state: portfolio, allowances, budget, etc.
-│   │   └── cap_schedule.py       # How the emission cap shrinks + MSR logic
+│   │   ├── cap_schedule.py       # How the emission cap shrinks + MSR logic
+│   │   ├── phantom_bidder.py     # Financial intermediary demand (breaks floor-bidding equilibrium)
+│   │   └── market_calibration.py # Cap/MSR calibration from active participant emissions
 │   │
 │   ├── agents/
 │   │   ├── ppo_agent.py          # The PPO/HAPPO learning algorithm

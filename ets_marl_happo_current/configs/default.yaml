@@ -8,9 +8,12 @@
 #   - Carry-forward obligations (cap=1.0x)
 #   - Terminal valuation: max(clearing, secondary, 80% eff_penalty)
 #   - Absolute-price secondary market (no multiplier)
-#   - ESG reward signal (saved-carbon-years formula)
+#   - ESG reward signal (saved-carbon-years formula) with compliance gate (coverage²)
+#   - Phantom bidder: financial intermediary demand, 5-20% of supply, breaks floor equilibrium
+#   - Phantom-aware scarcity: cap_overhead_pct=+0.08, net ~4% shortfall after phantom demand
+#   - Private urgency scalars: LogNormal(0, 0.30) per-agent penalty multiplier each episode
+#   - HPP heuristic seeding: BC snapshots pre-seeded into HPP pool for diversity anchoring
 #   - Pre-auction collateral affordability clip + budget-headroom phase-1 signal
-#   - Structural over-subscription: cap=-20%, qty_low=0.50 (wide action space with aggressive cap)
 # ============================================================
 
 simulation:
@@ -74,7 +77,15 @@ ets:
   # To override with a manual value, set cap_year_0_override to a number.
   cap_year_0_override: null     # null enables emission-weighted calibration
   initial_bank_fraction: 0.10   # post-Phase-3 depleted bank (~10% of annual need)
-  cap_overhead_pct: -0.20       # -20% below total initial emissions — aggressive over-subscription
+  # Phantom-bidder-aware scarcity calibration (v7.13):
+  # The phantom bidder (financial intermediary) consumes an expected ~11% of
+  # auction supply each year (uniform[5%,20%] × P(bid≥reserve)≈0.90).
+  # Setting cap_overhead_pct=+0.08 means cap_0 = 1.08 × total_emissions.
+  # After phantom: compliance agents face ~0.8875 × 1.08 × E ≈ 0.958 × E,
+  # giving a ~4% net supply shortfall in year 0 — "just minorly scarcer
+  # than what agents need".  The LRF then compounds scarcity at ~4.3-4.4%
+  # per year, creating meaningful compliance pressure by mid-episode.
+  cap_overhead_pct: 0.08        # +8% above total initial emissions (phantom-aware baseline)
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044

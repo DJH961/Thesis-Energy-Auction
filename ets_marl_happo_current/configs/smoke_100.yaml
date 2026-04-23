@@ -63,7 +63,10 @@ ets:
   # To override with a manual value, set cap_year_0_override to a number.
   cap_year_0_override: null     # null enables emission-weighted calibration
   initial_bank_fraction: 0.10   # default episode-start bank seed fraction of annual need
-  cap_overhead_pct: 0.11        # 11% surplus over total initial emissions
+  # Phantom-bidder-aware scarcity calibration (mirrors default.yaml v7.13):
+  # With phantom consuming ~11% of auction supply in expectation, cap_overhead_pct=+0.08
+  # yields a net ~4% compliance supply shortfall in year 0 (just minor scarcity).
+  cap_overhead_pct: 0.08        # +8% above total initial emissions (phantom-aware baseline)
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044

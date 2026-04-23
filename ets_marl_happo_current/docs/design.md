@@ -89,6 +89,31 @@ Each year's cap declines by a fixed absolute amount (`lrf_k × cap_0`), not by a
 compounding fraction. This matches the EU ETS Linear Reduction Factor mechanics
 (EU Directive 2003/87/EC Art. 9).
 
+**Phantom-bidder-aware scarcity calibration (v7.13):**
+
+When the phantom bidder is enabled, the cap overhead must be calibrated jointly
+with expected phantom demand so that compliance agents face *minor* supply
+scarcity in year 0, not excess scarcity. The phantom takes a fraction
+$f_{\text{ph}}$ of auction supply each year:
+
+$$
+f_{\text{ph}} = \frac{qty\_frac\_lo + qty\_frac\_hi}{2} \times P(\text{bid} \geq \text{reserve}) \approx 0.125 \times 0.90 \approx 0.113
+$$
+
+The effective compliance supply in year 0 is therefore:
+
+$$
+S_{\text{eff},0} = cap_0 \times (1 - f_{\text{ph}}) = E_{system} \times (1 + overhead) \times 0.887
+$$
+
+For a target net shortfall $\delta$ (e.g., 4%):
+
+$$
+overhead = \frac{1 - \delta}{1 - f_{\text{ph}}} - 1 = \frac{0.96}{0.887} - 1 \approx +0.08
+$$
+
+The default `cap_overhead_pct: 0.08` (+8%) yields $S_{\text{eff},0} \approx 0.958 \times E_{system}$, a ~4% compliance supply shortfall in year 0. The LRF then compounds scarcity at ~4.3-4.4% per year, creating meaningful compliance pressure by mid-episode while keeping year-0 incentives moderate.
+
 ### 3.2 MSR logic
 
 MSR operates on auction volume (not cap) using TNAC proxy (sum of all banks):
@@ -465,3 +490,131 @@ The model remains stylized despite expanded realism:
 - AR(1)-style expected price signal instead of full forward curve equilibrium.
 
 These are deliberate to keep MARL tractable while preserving key strategic channels.
+
+## 11. Phantom Bidder (v7.13)
+
+### 11.1 Motivation
+
+In a uniform-price auction, a symmetric Nash equilibrium exists where all
+compliance agents bid exactly at the reserve price: the lowest possible price
+that still guarantees inclusion. This "floor-bidding equilibrium" is stable but
+economically pathological — the clearing price never rises above the reserve
+and there is no incentive to bid truthfully.
+
+The phantom bidder breaks this equilibrium by introducing **stochastic supply
+scarcity**: because a random fraction of supply is consumed before compliance
+agents' bids are processed, a floor bid sometimes wins full allocation,
+sometimes partial, and sometimes nothing. This destroys the certainty that
+a floor bid is "always safe".
+
+### 11.2 Economic basis
+
+In the real EU ETS, approximately 40% of primary auction demand comes from
+financial intermediaries — banks, hedge funds, and proprietary traders — who
+are permitted under EU Regulation 1031/2010 to bid at primary auctions
+without a compliance obligation. These participants hold allowances
+speculatively and do not surrender them for compliance. The phantom bidder
+models this demand pool.
+
+### 11.3 Mechanism
+
+**Implementation** (`src/environment/phantom_bidder.py`):
+
+The `PhantomBidder` is injected as a synthetic participant with reserved
+`agent_id = n_total` (one beyond all real agents). Each year's auction
+proceeds in three steps:
+
+1. Phantom samples `(bid_price, bid_qty)` from its distributions.
+2. The phantom's bid row is prepended to the bids array before clearing.
+3. `market_clearing_ets` is called with `n_agents = n_total + 1`. After
+   clearing, index `n_total` is stripped from the allocations/payments array.
+   The phantom's allocation represents supply consumed by financial traders and
+   is intentionally discarded (not credited to any agent's holdings).
+
+**Price distribution:**
+
+$$
+\log(p_{\text{phantom}}) \sim \mathcal{N}(\log(\text{anchor}),\; \sigma^2)
+$$
+
+where $\text{anchor} = \max(MA3,\; \text{reserve} + \delta_{\min})$ and
+$\sigma = 0.45$ (high variance, EU ETS calibrated). The median price equals the
+anchor; the arithmetic mean is $\approx 1.11 \times \text{anchor}$ due to the
+right skew of the lognormal. The price is clipped to
+$[\text{reserve} - 5,\; 0.65 \times \text{effective penalty rate}]$.
+
+Because the anchor tracks MA3, when agents bid above floor and the MA3 rises,
+the phantom also rises — the distribution self-stabilises.
+
+**Quantity distribution:**
+
+$$
+q_{\text{phantom}} \sim \mathcal{U}(qty\_frac\_lo,\; qty\_frac\_hi) \times q_{\text{auction}}
+$$
+
+Default range [5%, 20%] of auction supply. Expected fraction consumed
+(accounting for below-reserve rejection probability) ≈ 11%.
+
+**Below-reserve draws:** When the sampled price falls below the reserve, the
+bid is submitted but rejected by the normal reserve-price filter in
+`market_clearing_ets`. Compliance agents observe full auction supply that year.
+This teaches agents that even without phantom squeezing, it is not guaranteed
+to always be the clearing price setter.
+
+### 11.4 What the phantom does NOT do
+
+- Does **not** participate in compliance, secondary market, or MSR.
+- Does **not** appear in any reward computation.
+- Does **not** affect TNAC accounting (phantom allocation is discarded).
+- Does **not** have special information or see other bids.
+
+### 11.5 Supply-scarcity interaction
+
+The phantom is calibrated jointly with `cap_overhead_pct` (§3.1). The intended
+operating point: compliance agents face **minor net scarcity** in year 0, not
+excess. With `cap_overhead_pct: 0.08` and phantom's expected 11% consumption:
+
+| Year | cap / E  | After phantom / E | Net shortage |
+|------|----------|-------------------|--------------|
+| 0    | 1.08     | 0.958             | ~4%          |
+| 3    | 0.94     | 0.834             | ~17%         |
+| 6    | 0.80     | 0.710             | ~29%         |
+| 12   | 0.52     | 0.461             | ~54%         |
+
+(Before green investment, which reduces agents' effective emission needs.)
+
+### 11.6 Configuration
+
+```yaml
+phantom_bidder:
+  enabled: true
+  qty_frac_lo: 0.05                 # 5% of auction supply minimum
+  qty_frac_hi: 0.20                 # 20% of auction supply maximum
+  price_lognormal_sigma: 0.45       # lognormal sigma; median=anchor, mean≈1.11×anchor
+  price_min_above_reserve: 2.0      # lower bound of anchor above reserve (EUR/t)
+  price_max_frac_penalty: 0.65      # upper bound: 65% of effective penalty rate
+  price_min_below_reserve_buffer: 5.0  # max below-reserve draw allowed (EUR/t)
+```
+
+### 11.7 Diagnostics
+
+- `phantom_bid_price`, `phantom_bid_qty`, `phantom_active` are logged to the
+  year-level episode log (`env.episode_log[-1]`).
+- `phantom_active_pct` is written to the episode CSV: percentage of years
+  the phantom was active (bid ≥ reserve) in that episode.
+- The training console `Bid/yr` line shows `(+Ph X%)` suffix when the
+  phantom was active for at least one year in the current episode.
+
+## 12. Equilibrium-Breaking Mechanisms (v7.13)
+
+Several mechanisms work together to prevent degenerate floor-bidding equilibria:
+
+| Mechanism | What it does |
+|---|---|
+| **Phantom Bidder** (§11) | Stochastic supply squeeze; floor bids sometimes fail to acquire any permits |
+| **ESG Compliance Gate** | `esg_signal × coverage_frac²` — non-compliant agents lose ESG bonus |
+| **Private Urgency Scalars** | Per-episode LogNormal penalty multiplier; destroys symmetric cost structure |
+| **HPP Heuristic Seeding** | BC-trained WTP-bidding opponents always present in HPP pool |
+| **Liquidity Pool Floor** | Secondary market price ≥ 25% of penalty rate; always a meaningful sell side |
+
+These are configurable and independently enable/disableable in `default.yaml`.
