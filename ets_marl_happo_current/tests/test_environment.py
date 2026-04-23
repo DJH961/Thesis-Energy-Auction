@@ -56,14 +56,77 @@ def test_two_phase_step_runs():
     obs2_dim = env.companies[0].obs_dim_phase2
     assert obs2.shape == (n_agents, obs2_dim), f"Expected ({n_agents}, {obs2_dim}), got {obs2.shape}"
 
-    # Phase 2: [sec_price_mult, sec_qty]
+    # Phase 2: [sec_price_abs, sec_qty]
     secondary_actions = np.random.uniform(
-        [0.8, -3.0], [1.3, 3.0], size=(n_agents, 2)
+        [45.0, -3.0], [200.0, 3.0], size=(n_agents, 2)
     ).astype(np.float32)
 
     obs1_next, rewards, terminated, truncated, info = env.step_secondary(secondary_actions)
     assert obs1_next.shape == (n_agents, env.companies[0].obs_dim_phase1)
     assert len(rewards) == n_agents
+
+
+# ---------------------------------------------------------------------------
+# Test 2b: Phase-1 invest action is direct physical invest_frac
+# ---------------------------------------------------------------------------
+
+def test_phase1_invest_action_direct_mapping():
+    """Higher invest action values should execute higher invest_frac (no hidden remap)."""
+    env = load_env(seed=77)
+    env.reset(seed=77)
+    n_agents = env.n_agents
+
+    def _run_with_invest(invest_action: float, seed: int) -> float:
+        env.reset(seed=seed)
+        auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+        auction_actions[:, 0] = 100.0
+        auction_actions[:, 1] = 1.0
+        auction_actions[:, 2] = invest_action
+        auction_actions[:, 3:] = [0.0, 0.0, 1.0]
+        _, log = env.step_auction(auction_actions)
+        sec_actions = np.zeros((n_agents, 2), dtype=np.float32)
+        sec_actions[:, 0] = env._phase1_clearing_price
+        env.step_secondary(sec_actions)
+        return float(log["invest_fracs"][0])
+
+    invest_low = _run_with_invest(0.00, seed=78)
+    invest_mid = _run_with_invest(0.03, seed=78)
+
+    assert invest_low <= 1e-6, f"Expected near-zero executed investment, got {invest_low:.6f}"
+    assert invest_mid > invest_low, (
+        f"Expected monotonic increase in executed investment, got low={invest_low:.6f}, mid={invest_mid:.6f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 2c: Settlement suspension length uses auction.suspension_length
+# ---------------------------------------------------------------------------
+
+def test_default_suspension_uses_auction_config_length():
+    """Defaulted agents should receive suspension from auction.suspension_length (not budget.*)."""
+    with open(CONFIG_PATH) as f:
+        config = yaml.safe_load(f)
+    config["companies"]["n_bot_agents"] = 0
+    config["auction"]["suspension_length"] = 3
+    config.setdefault("budget", {})["suspension_length"] = 1  # conflicting value on purpose
+    config["budget"]["emergency_loan"]["enabled"] = False
+    config["auction"]["leverage_multiplier"] = 100.0
+
+    env = ETSEnvironment(config, seed=91)
+    env.reset(seed=91)
+    n_agents = env.n_agents
+
+    auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
+    auction_actions[:, 0] = 500.0
+    auction_actions[:, 1] = 2.0
+    _, log = env.step_auction(auction_actions)
+
+    defaulted_agents = log["auction_stats"].get("defaults_agents", [])
+    assert defaulted_agents, "Expected at least one default to validate suspension length."
+    for idx in defaulted_agents:
+        assert env._suspension_remaining[int(idx)] == 3, (
+            f"Agent {idx} suspension={env._suspension_remaining[int(idx)]}, expected 3 from auction.suspension_length"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +149,7 @@ def test_episode_length():
         obs2, _ = env.step_auction(auction_actions)
 
         secondary_actions = np.random.uniform(
-            [0.8, -3.0], [1.3, 3.0], size=(n_agents, 2)
+            [45.0, -3.0], [200.0, 3.0], size=(n_agents, 2)
         ).astype(np.float32)
         obs1, _, terminated, _, _ = env.step_secondary(secondary_actions)
         steps += 1
@@ -113,7 +176,7 @@ def test_cap_decreases():
         obs2, _ = env.step_auction(auction_actions)
 
         secondary_actions = np.zeros((n_agents, 2), dtype=np.float32)
-        secondary_actions[:, 0] = 1.0
+        secondary_actions[:, 0] = env._phase1_clearing_price
         _, _, terminated, _, info = env.step_secondary(secondary_actions)
         caps.append(info["year_log"]["cap"])
         if terminated:
@@ -141,7 +204,7 @@ def test_rewards_finite():
         obs2, _ = env.step_auction(auction_actions)
 
         secondary_actions = np.random.uniform(
-            [0.8, -3.0], [1.3, 3.0], size=(n_agents, 2)
+            [45.0, -3.0], [200.0, 3.0], size=(n_agents, 2)
         ).astype(np.float32)
         _, rewards, terminated, _, _ = env.step_secondary(secondary_actions)
         assert np.all(np.isfinite(rewards)), f"Non-finite rewards: {rewards}"
@@ -167,7 +230,7 @@ def test_tech_mix_sums_to_one():
         obs2, _ = env.step_auction(auction_actions)
 
         secondary_actions = np.zeros((n_agents, 2), dtype=np.float32)
-        secondary_actions[:, 0] = 1.0
+        secondary_actions[:, 0] = env._phase1_clearing_price
         _, _, terminated, _, _ = env.step_secondary(secondary_actions)
 
         for c in env.companies:
@@ -200,7 +263,7 @@ def test_green_fraction_non_decreasing():
         obs2, _ = env.step_auction(auction_actions)
 
         secondary_actions = np.zeros((n_agents, 2), dtype=np.float32)
-        secondary_actions[:, 0] = 1.0
+        secondary_actions[:, 0] = env._phase1_clearing_price
         _, _, terminated, _, _ = env.step_secondary(secondary_actions)
         if terminated:
             break
@@ -235,7 +298,7 @@ def _collect_episode_rewards(seed):
         obs2, _ = env.step_auction(auction_actions)
 
         secondary_actions = rng.uniform(
-            [0.8, -3.0], [1.3, 3.0], size=(n_agents, 2)
+            [45.0, -3.0], [200.0, 3.0], size=(n_agents, 2)
         ).astype(np.float32)
         obs1, rewards, terminated, _, _ = env.step_secondary(secondary_actions)
         total += rewards
@@ -272,7 +335,7 @@ def test_year_log_keys():
     obs2, _ = env.step_auction(auction_actions)
 
     secondary_actions = np.zeros((n_agents, 2), dtype=np.float32)
-    secondary_actions[:, 0] = 1.0
+    secondary_actions[:, 0] = env._phase1_clearing_price
     _, _, _, _, info = env.step_secondary(secondary_actions)
     log = info["year_log"]
 
@@ -547,7 +610,7 @@ def test_unsold_volume_rolls_over_to_next_year():
 
     # Complete year 0
     sec_actions = np.zeros((n_agents, 2), dtype=np.float32)
-    sec_actions[:, 0] = 1.0
+    sec_actions[:, 0] = env._phase1_clearing_price
     env.step_secondary(sec_actions)
 
     # Year 1: get auction volume — should include rollover
@@ -810,7 +873,7 @@ def test_successful_auction_updates_price_history():
     )
 
     sec_actions = np.zeros((n_agents, 2), dtype=np.float32)
-    sec_actions[:, 0] = 1.0
+    sec_actions[:, 0] = env._phase1_clearing_price
     env.step_secondary(sec_actions)
 
     assert len(env._price_history) > history_len_before, (

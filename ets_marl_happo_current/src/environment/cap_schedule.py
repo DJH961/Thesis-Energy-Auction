@@ -284,6 +284,10 @@ class CapSchedule:
 
         # Read-only snapshot: apply cancellation cap to reserve without mutation
         prev_auction_vol = self.volume_history[-1] if self.volume_history else cap_t
+        # Mirror live _apply_msr cancellation-floor logic so previewed supply
+        # matches actual auction-year behavior under identical lagged state.
+        prev_cap = self.get_cap(year - 1) if year > 0 else self.cap_year_0
+        prev_auction_vol = max(prev_auction_vol, prev_cap)
         msr_snap = max(0.0, self._msr_reserve - max(0.0, self._msr_reserve - prev_auction_vol))
 
         # Inflation-adjusted penalty rate
@@ -296,7 +300,10 @@ class CapSchedule:
 
         # A4: Emergency release check (same logic as _apply_msr, read-only)
         if clearing_price >= release_threshold:
-            no_prior_ma3 = (self._prev_ma3 is None or year < 2)
+            # Keep preview parity with live _apply_msr: no special year<2 bypass.
+            # Early-year behavior is driven by whether _prev_ma3 exists (seeded in
+            # burn-in when enabled), not by absolute year index.
+            no_prior_ma3 = self._prev_ma3 is None
             smoothed_spike = (
                 no_prior_ma3 or
                 (price_ma3 is not None and self._prev_ma3 is not None

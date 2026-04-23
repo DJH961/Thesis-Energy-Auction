@@ -36,8 +36,8 @@ def auction_bounds():
 
 @pytest.fixture
 def secondary_bounds():
-    low = torch.FloatTensor([0.8, -3.0])
-    high = torch.FloatTensor([1.3, 3.0])
+    low = torch.FloatTensor([30.0, -3.0])
+    high = torch.FloatTensor([300.0, 3.0])
     return low, high
 
 
@@ -128,10 +128,10 @@ class TestAuctionAnchors:
 
 class TestSecondaryAnchors:
 
-    def test_anchored_price_mult(self, secondary_bounds):
-        """With anchor=1.05, initial output near 1.05 (not midpoint 1.05)."""
+    def test_anchored_price_abs(self, secondary_bounds):
+        """With anchor=80, initial output near 80 EUR/t."""
         low, high = secondary_bounds
-        anchors = [1.05, 0.0]
+        anchors = [80.0, 0.0]
         policy = SecondaryPolicy(
             obs_dim=29, action_dim=2, hidden_size=64,
             action_low=low, action_high=high, action_anchors=anchors)
@@ -139,13 +139,13 @@ class TestSecondaryAnchors:
         obs = torch.zeros(1, 29)
         with torch.no_grad():
             action, _, _ = policy.act(obs, deterministic=True)
-        mult = action[0, 0].item()
-        assert abs(mult - 1.05) < 0.1, f"Price mult {mult:.2f} should be near 1.05"
+        sec_price = action[0, 0].item()
+        assert abs(sec_price - 80.0) < 25.0, f"Price {sec_price:.2f} should be near 80"
 
     def test_anchored_qty_neutral(self, secondary_bounds):
         """With anchor=0.0, initial qty output near 0.0."""
         low, high = secondary_bounds
-        anchors = [1.05, 0.0]
+        anchors = [80.0, 0.0]
         policy = SecondaryPolicy(
             obs_dim=29, action_dim=2, hidden_size=64,
             action_low=low, action_high=high, action_anchors=anchors)
@@ -166,8 +166,7 @@ class TestSecondaryAnchors:
         obs = torch.zeros(1, 29)
         with torch.no_grad():
             action, _, _ = policy.act(obs, deterministic=True)
-        # Midpoint: [(0.8+1.3)/2, (-3+3)/2] = [1.05, 0.0]
-        # Both happen to be at the midpoint, which is the same as the anchor
+        # Midpoint: [(30+300)/2, (-3+3)/2] = [165.0, 0.0]
         assert action.shape == (1, 2)
 
 
@@ -190,12 +189,12 @@ def test_secondary_epsilon_anchored():
         "auction": {"price_min": 5.0, "price_max": 500.0, "quantity_max": 3.0,
                      "qty_mult_low": 0.3, "qty_mult_high": 1.3},
         "investment": {"max_invest_frac": 0.10},
-        "trading": {"sec_mult_low": 0.8, "sec_mult_high": 1.3},
+        "trading": {"sec_price_min": 30.0, "sec_price_max_mult": 2.0},
         "reward": {"normalizer_alpha": 0.01, "clip_min": -10.0, "clip_max": 2.0},
         "companies": {"n_agents": 2},
         "exploration": {
             "auction_anchors": [80.0, 1.0, 0.03, 0.3, -0.5, 0.5],
-            "secondary_anchors": [1.05, 0.0],
+            "secondary_anchors": [80.0, 0.0],
         },
     }
 
@@ -203,25 +202,26 @@ def test_secondary_epsilon_anchored():
         agent_id=0, obs_dim_phase1=22, obs_dim_phase2=29,
         auction_action_low=np.array([5.0, 0.3, 0.0, -1, -1, -1], dtype=np.float32),
         auction_action_high=np.array([500.0, 1.3, 0.10, 1, 1, 1], dtype=np.float32),
-        secondary_action_low=np.array([0.8, -3.0], dtype=np.float32),
-        secondary_action_high=np.array([1.3, 3.0], dtype=np.float32),
+        secondary_action_low=np.array([30.0, -3.0], dtype=np.float32),
+        secondary_action_high=np.array([300.0, 3.0], dtype=np.float32),
         config=config, seed=42,
     )
 
-    obs2 = np.random.randn(29).astype(np.float32)
-    price_mults = []
+    obs2 = np.zeros(29, dtype=np.float32)
+    obs2[-9] = 80.0 / 500.0  # normalized clearing-price feature in phase2 extras
+    prices = []
     qtys = []
     for _ in range(200):
         action, _, _ = agent.select_secondary_action(obs2, epsilon=1.0)
-        price_mults.append(action[0])
+        prices.append(action[0])
         qtys.append(action[1])
 
-    price_mults = np.array(price_mults)
+    prices = np.array(prices)
     qtys = np.array(qtys)
 
-    # Price mult should be centered around 1.05
-    assert abs(price_mults.mean() - 1.05) < 0.1, (
-        f"Mean price mult {price_mults.mean():.2f} too far from anchor 1.05")
+    # Secondary price should be centered around observed clearing (~80 EUR/t)
+    assert abs(prices.mean() - 80.0) < 20.0, (
+        f"Mean secondary price {prices.mean():.2f} too far from 80")
 
     # Qty should be centered around 0 (not the edges)
     assert abs(qtys.mean()) < 1.5, f"Mean qty {qtys.mean():.2f} should be near 0"
@@ -249,12 +249,12 @@ def test_anchor_config_passed_to_policy():
         "auction": {"price_min": 5.0, "price_max": 500.0, "quantity_max": 3.0,
                      "qty_mult_low": 0.3, "qty_mult_high": 1.3},
         "investment": {"max_invest_frac": 0.10},
-        "trading": {"sec_mult_low": 0.8, "sec_mult_high": 1.3},
+        "trading": {"sec_price_min": 30.0, "sec_price_max_mult": 2.0},
         "reward": {"normalizer_alpha": 0.01, "clip_min": -10.0, "clip_max": 2.0},
         "companies": {"n_agents": 2},
         "exploration": {
             "auction_anchors": [80.0, 1.0, 0.03, 0.3, -0.5, 0.5],
-            "secondary_anchors": [1.05, 0.0],
+            "secondary_anchors": [80.0, 0.0],
         },
     }
 
@@ -262,8 +262,8 @@ def test_anchor_config_passed_to_policy():
         agent_id=0, obs_dim_phase1=22, obs_dim_phase2=29,
         auction_action_low=np.array([5.0, 0.3, 0.0, -1, -1, -1], dtype=np.float32),
         auction_action_high=np.array([500.0, 1.3, 0.10, 1, 1, 1], dtype=np.float32),
-        secondary_action_low=np.array([0.8, -3.0], dtype=np.float32),
-        secondary_action_high=np.array([1.3, 3.0], dtype=np.float32),
+        secondary_action_low=np.array([30.0, -3.0], dtype=np.float32),
+        secondary_action_high=np.array([300.0, 3.0], dtype=np.float32),
         config=config, seed=42,
     )
 

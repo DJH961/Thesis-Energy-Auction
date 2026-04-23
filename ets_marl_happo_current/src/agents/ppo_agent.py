@@ -3,7 +3,7 @@ ppo_agent.py
 ============
 PPO agent with two-phase decision making for EU ETS:
   Phase 1 (Auction):   obs(18) → [bid_price, qty, invest_frac, tech_logits×3]
-  Phase 2 (Secondary): obs(21) → [sec_price_mult, sec_qty]
+  Phase 2 (Secondary): obs(21) → [sec_price_abs, sec_qty]
 
 On-policy: collects full episode rollout, then updates via
 clipped surrogate objective with GAE advantage estimation.
@@ -87,6 +87,9 @@ class RewardNormalizer:
 # Observation index constants
 # ---------------------------------------------------------------------------
 OBS1_EXPECTED_PRICE_IDX = 3  # Phase-1 obs dim 3: normalized expected price (×price_max)
+# Phase-2 appends 10 dims to phase1; clearing_price_norm is extra dim [base+1].
+# Relative index from end keeps this robust across opponent-modeling sizes.
+OBS2_CLEARING_PRICE_IDX_FROM_END = -9
 
 # ---------------------------------------------------------------------------
 # Rollout buffer
@@ -177,6 +180,7 @@ class PPOAgent:
         a_high = torch.FloatTensor(auction_action_high).to(self.device)
         s_low = torch.FloatTensor(secondary_action_low).to(self.device)
         s_high = torch.FloatTensor(secondary_action_high).to(self.device)
+        self.auction_price_max = float(auction_action_high[0])
 
         # Action anchors: realistic initial targets in physical space.
         # These shift the policy's initial mean output toward historically
@@ -461,10 +465,21 @@ class PPOAgent:
                 else:
                     rand_action = torch.zeros_like(action)
 
-                    # [0] sec_price_mult: Gaussian around 1.05 (trade near clearing price)
+                    # [0] sec_price (absolute EUR/t): sample around observed auction
+                    # clearing price from obs2 (normalized by auction price_max).
+                    sec_price_low = low[0].item()
+                    sec_price_high = high[0].item()
+                    clearing_ref = self.expected_price_fallback
+                    if len(obs2) >= 10:
+                        clearing_norm = float(obs2[OBS2_CLEARING_PRICE_IDX_FROM_END])
+                        if np.isfinite(clearing_norm):
+                            clearing_ref = clearing_norm * self.auction_price_max
+                    if not np.isfinite(clearing_ref):
+                        clearing_ref = self.expected_price_fallback
+                    clearing_ref = float(np.clip(clearing_ref, sec_price_low, sec_price_high))
                     rand_action[0, 0] = np.clip(
-                        np.random.normal(1.05, 0.10),
-                        low[0].item(), high[0].item())
+                        np.random.normal(clearing_ref, max(10.0, 0.15 * clearing_ref)),
+                        sec_price_low, sec_price_high)
 
                     # [1] sec_qty: Gaussian around 0 with moderate spread.
                     # Positive = buy, negative = sell; neutral center lets both be explored.

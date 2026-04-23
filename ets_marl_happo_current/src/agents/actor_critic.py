@@ -3,7 +3,7 @@ actor_critic.py
 ===============
 PPO networks for two-phase ETS decisions:
   - AuctionPolicy:    obs_phase1 → 6 actions [bid_price, qty, invest_frac, tech_logits×3]
-  - SecondaryPolicy:  obs_phase2 → 2 actions [sec_price_mult, sec_qty]
+  - SecondaryPolicy:  obs_phase2 → 2 actions [sec_price_abs, sec_qty]
   - ValueNetwork:     obs_phase2 → scalar V(s)
 
 All policies output Gaussian distributions (mean + learnable log_std).
@@ -142,7 +142,7 @@ class SecondaryPolicy(nn.Module):
         self.register_buffer("action_scale", (action_high - action_low) / 2.0)
         self.register_buffer("action_bias", (action_high + action_low) / 2.0)
         # action_anchors: physical-space targets for initial policy mean.
-        # [sec_price_multiplier, sec_qty]
+        # [sec_price_abs, sec_qty]
         self._action_anchors = action_anchors
         self._init_weights()
 

@@ -325,6 +325,48 @@ def test_force_msr_bypasses_prev_tnac_gate():
     assert s.msr_reserve() == pytest.approx(expected_withheld, rel=1e-6)
 
 
+def test_preview_matches_live_msr_logic():
+    """preview_auction_volume should match live get_auction_volume for the same lagged state."""
+    s_preview = make_schedule(msr_enabled=True)
+    s_live = make_schedule(msr_enabled=True)
+
+    for s in (s_preview, s_live):
+        s._prev_tnac = 10.0
+        s._prev_ma3 = 70.0
+        s._msr_reserve = 12.0
+        s.volume_history = [9.0]
+        s._unsold_rollover_pending = 0.0
+
+    year = 1
+    clearing_price = 420.0
+    price_max = 500.0
+    penalty_rate = 138.75
+    inflation_rate = 0.02
+    price_ma3 = 220.0
+
+    preview_vol = s_preview.preview_auction_volume(
+        year=year,
+        clearing_price=clearing_price,
+        price_max=price_max,
+        penalty_rate=penalty_rate,
+        inflation_rate=inflation_rate,
+        price_ma3=price_ma3,
+    )
+    live_vol = s_live.get_auction_volume(
+        year=year,
+        tnac=8.0,  # ignored for lagged decision branch; _prev_tnac is used
+        clearing_price=clearing_price,
+        price_max=price_max,
+        penalty_rate=penalty_rate,
+        inflation_rate=inflation_rate,
+        price_ma3=price_ma3,
+    )
+
+    assert preview_vol == pytest.approx(live_vol, rel=1e-9), (
+        f"Preview/live mismatch: preview={preview_vol}, live={live_vol}"
+    )
+
+
 def test_msr_smoothed_price_trigger_a4():
     """A4: Emergency release fires when both absolute threshold and MA3 spike are met."""
     s = make_schedule(msr_enabled=True, seed_prev_tnac=4.0)
@@ -371,4 +413,3 @@ def test_msr_tnac_lag_prev_tnac_update():
     assert s._prev_tnac == pytest.approx(7.5, rel=1e-9)
     s.get_auction_volume(year=1, tnac=4.2)
     assert s._prev_tnac == pytest.approx(4.2, rel=1e-9)
-

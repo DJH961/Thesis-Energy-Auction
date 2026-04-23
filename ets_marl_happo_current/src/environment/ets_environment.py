@@ -1395,10 +1395,12 @@ class ETSEnvironment(gym.Env):
         )
 
         # E4: Post-clearing settlement — check each winner can pay; handle defaults.
-        suspension_length = int(self.config.get("budget", {}).get(
-            "suspension_length",
-            self.config["auction"].get("suspension_length", 1),
-        ))
+        auction_susp_len = self.config.get("auction", {}).get("suspension_length", None)
+        budget_susp_len = self.config.get("budget", {}).get("suspension_length", None)
+        suspension_length = int(
+            auction_susp_len if auction_susp_len is not None
+            else (budget_susp_len if budget_susp_len is not None else 1)
+        )
         agent_cash = np.array([
             max(0.0, float(c.annual_budget - c.budget_spent_this_year))
             for c in self.companies
@@ -1525,9 +1527,9 @@ class ETSEnvironment(gym.Env):
                 company.prev_invest_frac = 0.0
                 continue
 
-            # Continuous linear mapping: [-1, 1] → [0, max_invest_frac]
-            # Eliminates the dead zone where negative actions all map to 0.
-            invest_frac = float((auction_actions[i, 2] + 1.0) / 2.0) * company.max_invest_frac
+            # Direct physical-space action: action[2] is invest_frac in
+            # [0, max_invest_frac] (already scaled by policy/action bounds).
+            invest_frac = float(auction_actions[i, 2])
             invest_frac = float(np.clip(invest_frac, 0.0, company.max_invest_frac))
             requested_invest_frac = invest_frac
             tech_logits = auction_actions[i, 3:6]
