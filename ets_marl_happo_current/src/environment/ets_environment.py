@@ -1136,7 +1136,8 @@ class ETSEnvironment(gym.Env):
             # System-wide average emission factor
             active_companies = [c for c in self.companies if self._is_agent_active(c.agent_id)]
             # System-wide average EF (kept for observation space)
-            system_ef = float(np.mean([c.weighted_emission_factor for c in active_companies]))
+            ef_values = [c.weighted_emission_factor for c in active_companies]
+            system_ef = float(np.mean(ef_values)) if ef_values else 0.0
             # M1: Marginal EF — EF of most carbon-intensive technology with significant system share.
             # Carbon cost pass-through in electricity markets prices off the marginal setter (typically
             # coal when it has material system presence). Using system_ef understates coal revenue.
