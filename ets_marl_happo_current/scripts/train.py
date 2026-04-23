@@ -712,12 +712,29 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     )
     # Per-agent FIFO pool of actor state_dicts (auction + secondary only)
     hpp_pools = [collections.deque(maxlen=hpp_pool_size) for _ in range(n_agents)]
+    # Track minimum pool size below which HPP eviction is blocked (heuristic seed protection)
+    hpp_min_pool_sizes = [0] * n_agents
     if hpp_enabled:
         auto_note = " [auto]" if (hpp_save_auto or hpp_warmup_auto) else ""
         print(
             f"HPP: pool={hpp_pool_size}, save every {hpp_save_interval} eps, "
             f"swap_prob={hpp_swap_prob:.0%}, warmup={hpp_warmup} eps{auto_note}."
         )
+
+    # HPP heuristic seeding: after BC pretraining, seed each pool with copies
+    # of the BC-trained snapshot so the pool always contains at least seed_count
+    # WTP-bidding heuristic policies as diversity anchors.
+    if hpp_enabled and bc_ran and hpp_cfg.get("seed_heuristic", True):
+        seed_count = int(hpp_cfg.get("seed_count", 2))
+        for i in range(n_agents):
+            for _ in range(seed_count):
+                hpp_pools[i].append((
+                    copy.deepcopy(agents[i].auction_policy.state_dict()),
+                    copy.deepcopy(agents[i].secondary_policy.state_dict()),
+                ))
+            hpp_min_pool_sizes[i] = seed_count
+        print(f"HPP heuristic seed: {seed_count} BC snapshots seeded into each of "
+              f"{n_agents} agent pools (eviction-protected).")
 
     # Batch accumulation: collect N episodes before triggering PPO update
     episodes_per_update = ppo_cfg.get("episodes_per_update", 1)
@@ -801,6 +818,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     for i in range(n_agents):
         ep_fields += [f"diag_S_financial_A{i+1}", f"diag_S_green_A{i+1}",
                       f"diag_S_composite_A{i+1}"]
+    # ESG compliance diagnostics per learning agent
+    for i in range(n_agents):
+        ep_fields += [f"esg_vs_penalty_ratio_A{i+1}", f"compliance_gate_A{i+1}"]
+    ep_fields += ["phantom_active_pct"]  # % of years phantom was active this episode
     ep_csv = open(ep_path, "w", newline="")
     ep_writer = csv.DictWriter(ep_csv, fieldnames=ep_fields)
     ep_writer.writeheader()
@@ -900,6 +921,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     _streak_ceil  = np.zeros(n_agents, dtype=int)  # avg bid >= ceil_thresh * price_max
     _streak_floor = np.zeros(n_agents, dtype=int)  # avg bid <= floor_thresh * price_min
     _streak_qty   = np.zeros(n_agents, dtype=int)  # avg bid qty <= zero_qty_thresh * qty_max
+    # ESG vs penalty ratio warning: consecutive episodes where esg > penalty for non-compliant agent
+    _esg_over_penalty_streak = np.zeros(n_agents, dtype=int)
 
     # Per-agent entropy boost: when an agent's bid is stuck at floor/ceiling
     # for _stuck_boost_window consecutive episodes, temporarily set its
@@ -1402,6 +1425,26 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     print(f"⚠ STUCK ZERO-QTY: A{_i+1} ({_streak_qty[_i]}ep)  "
                           f"avg qty ≤{_zero_qty_thresh*100:.0f}% of {_qty_max:.1f}Mt  (ep {episode})")
 
+            # ESG vs penalty warning: fire when non-compliant agent's ESG bonus
+            # exceeds its compliance penalty for 50+ consecutive episodes.
+            _esg_warn_window = 50
+            for _i in range(n_agents):
+                # Check last year's reward channels for this agent
+                _last_yl = env.episode_log[-1] if env.episode_log else {}
+                _rc_i = _last_yl.get("reward_channels", {}).get(_i, {})
+                _esg_ratio = float(_rc_i.get("esg_vs_penalty_ratio", 0.0))
+                _c_gate = float(_rc_i.get("compliance_gate", 1.0))
+                # Non-compliant = compliance_gate < 1.0 (agent had coverage < 100%)
+                if _esg_ratio > 1.0 and _c_gate < 1.0:
+                    _esg_over_penalty_streak[_i] += 1
+                else:
+                    _esg_over_penalty_streak[_i] = 0
+                if (_esg_over_penalty_streak[_i] >= _esg_warn_window and
+                        _esg_over_penalty_streak[_i] % _esg_warn_window == 0):
+                    print(f"⚠ ESG>PENALTY (non-compliant): A{_i+1} "
+                          f"({_esg_over_penalty_streak[_i]}ep)  "
+                          f"esg_ratio={_esg_ratio:.2f}  gate={_c_gate:.2f}  (ep {episode})")
+
         # Average invest_frac action per agent — Phase 1 action[2]
         avg_invest_frac_per_agent = []
         for i in range(n_total_agents):
@@ -1710,6 +1753,27 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             ep_row[f"diag_S_green_A{i+1}"] = round(acc["S_green"] / n_years_diag, 4)
             ep_row[f"diag_S_composite_A{i+1}"] = round(acc["S_composite"] / n_years_diag, 4)
 
+        # ESG compliance gate diagnostics: episode-mean per learning agent
+        for i in range(n_agents):
+            _esg_ratios = []
+            _comp_gates = []
+            for yl in env.episode_log:
+                rc = yl.get("reward_channels", {}).get(i, {})
+                if "esg_vs_penalty_ratio" in rc:
+                    _esg_ratios.append(float(rc["esg_vs_penalty_ratio"]))
+                if "compliance_gate" in rc:
+                    _comp_gates.append(float(rc["compliance_gate"]))
+            ep_row[f"esg_vs_penalty_ratio_A{i+1}"] = (
+                round(float(np.mean(_esg_ratios)), 4) if _esg_ratios else 0.0
+            )
+            ep_row[f"compliance_gate_A{i+1}"] = (
+                round(float(np.mean(_comp_gates)), 4) if _comp_gates else 1.0
+            )
+        # Phantom activity: % of years phantom bid was accepted (>= reserve)
+        _ph_active_ep = sum(1 for yl in env.episode_log if yl.get("phantom_active", False))
+        _n_ep_years = max(len(env.episode_log), 1)
+        ep_row["phantom_active_pct"] = round(100.0 * _ph_active_ep / _n_ep_years, 1)
+
         ep_row["warn_lowAlloc"] = int(env._warnings.get("low_alloc", 0))
         ep_row["warn_priceFloor"] = int(env._warnings.get("price_floor", 0))
         ep_row["warn_priceCeil"] = int(env._warnings.get("price_ceil", 0))
@@ -1836,20 +1900,26 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             emiss_traj = " ".join(f"{e:5.1f}" for e in yr_emiss)
             bid_traj = " ".join(f"{b:5.1f}" for b in yr_bid_total)
             auct_traj  = " ".join(f"{c:5.1f}" for c in yr_auct_vol)
+            # Phantom bidder activity summary (% of years phantom was active)
+            _ph_active_years = sum(1 for yl in env.episode_log if yl.get("phantom_active", False))
+            _n_years_logged = max(len(env.episode_log), 1)
+            _ph_pct = int(round(100.0 * _ph_active_years / _n_years_logged))
+            _ph_str = f"  (+Ph {_ph_pct}%)" if env._phantom_bidder.enabled else ""
             print(f"  {'Price/yr':<8}: {price_traj}   (σ={price_std:.0f}){_trend_arrow(prices_ep)}")
             print(f"  {'Emiss/yr':<8}: {emiss_traj}   (avg {avg_annual_emiss:.1f} Mt/yr){_trend_arrow(yr_emiss)}")
-            print(f"  {'Bid/yr':<8}: {bid_traj}   (agents' total auction demand, Mt){_trend_arrow(yr_bid_total)}")
+            print(f"  {'Bid/yr':<8}: {bid_traj}   (agents' total auction demand, Mt){_ph_str}{_trend_arrow(yr_bid_total)}")
             print(f"  {'Auct/yr':<8}: {auct_traj}   (auction supply after cap+rollover+MSR, TNAC={tnac:.1f} Mt){msr_str}{_trend_arrow(yr_auct_vol)}")
 
             # ── Health snapshot ─────────────────────────────────────────
             _gs = avg_green_start_all * 100
             _ge = avg_green_end_all * 100
             _dg = _ge - _gs
+            _phntm_str = f"  phntm={_ph_pct}%" if env._phantom_bidder.enabled else ""
             print(f"  Health: comply={compliance_rate*100:.0f}%"
                   f"  green={_gs:3.0f}→{_ge:3.0f}%({_dg:+.0f}pp)"
                   f" │ Sec: {total_sec_vol:.1f}Mt  match={sec_match_rate*100:.0f}%"
                   f"  avg={avg_sec_price:.0f}€  clear={sec_p:.0f}€"
-                f"  (↓{sec_avg_sellers:.0f}sell/↑{sec_avg_buyers:.0f}buy)")
+                f"  (↓{sec_avg_sellers:.0f}sell/↑{sec_avg_buyers:.0f}buy){_phntm_str}")
 
             # ── Per-agent table ─────────────────────────────────────────
             print(thin)

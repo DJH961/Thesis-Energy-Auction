@@ -391,10 +391,13 @@ reward:
 # ----------------------------------------------------------
 esg:
   enabled: true
-  scale: 3.5
-  # Reward = w_cost × (-cost_norm) + w_green × (esg_scale × esg_raw) + shaping
+  scale: 2.0
+  # Lowered from 3.5 → 2.0 because the compliance gate (coverage_frac²) now
+  # multiplies into the ESG signal. At values above 2.5, ESG can dominate the
+  # compliance penalty for partially-covered agents, reducing incentive to buy.
+  # Reward = w_cost × (-cost_norm) + w_green × (esg_scale × esg_raw × compliance_gate) + shaping
   # Financial agents (w_green=0): reward = -cost_norm
-  # ESG agents (w_green=0.5): reward = 0.5×(-cost_norm) + 0.5×(esg_scaled)
+  # ESG agents (w_green=0.5): reward = 0.5×(-cost_norm) + 0.5×(esg_scaled×gated)
   # This structurally guarantees 50/50 financial/environmental weighting.
 
 # ----------------------------------------------------------
@@ -542,6 +545,8 @@ hpp:
   save_interval: 0      # auto: 3% of n_episodes, clamped to [50, 1000]
   swap_prob: 0.20
   warmup_episodes: 0    # auto: 20% of n_episodes, clamped to [200, 6000]
+  seed_heuristic: true  # seed pool with BC snapshot at training start for diversity anchoring
+  seed_count: 2         # number of BC snapshots to seed per agent pool (eviction-protected)
 
 # ----------------------------------------------------------
 # Epsilon-greedy exploration (physical-space)
@@ -587,3 +592,31 @@ budget_curriculum:
   budget_start: 1.5              # initial budget multiplier (generous)
   budget_end: 1.0                # final budget multiplier (nominal)
   decay_frac: 0.30               # fraction of n_episodes to decay over
+
+# ----------------------------------------------------------
+# Phantom Bidder: financial intermediary demand at primary auction.
+# Represents ~40% of EU ETS demand from banks/hedge funds who buy
+# allowances speculatively (Regulation 1031/2010 allows this).
+# Creates stochastic supply squeeze: floor bidders sometimes get
+# zero allocation even at full auction demand, destroying the
+# "floor is always safe" equilibrium belief.
+# ----------------------------------------------------------
+phantom_bidder:
+  enabled: true
+  qty_frac_lo: 0.05          # minimum quantity: 5% of auction supply
+  qty_frac_hi: 0.20          # maximum quantity: 20% of auction supply
+  price_lognormal_sigma: 0.45  # high variance: sometimes below reserve, sometimes 2× MA3
+  price_min_above_reserve: 2.0  # lower bound anchor above reserve (EUR/t)
+  price_max_frac_penalty: 0.65  # upper bound: 65% of penalty rate (~90€ at current calibration)
+
+# ----------------------------------------------------------
+# Private per-episode urgency scalars.
+# Each learning agent receives a LogNormal scalar at episode start
+# (E[scalar]=1.0) that multiplies into their effective penalty.
+# Creates private heterogeneity in compliance urgency — destroys
+# symmetric floor-bidding equilibria by making each agent face
+# a slightly different effective penalty environment.
+# ----------------------------------------------------------
+urgency_scalars:
+  enabled: true
+  lognormal_sigma: 0.30   # E[scalar]=1.0, std≈0.31, range roughly 0.5–2.0

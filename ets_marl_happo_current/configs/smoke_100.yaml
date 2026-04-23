@@ -352,9 +352,10 @@ reward:
 esg:
   enabled: true
   scale: 2.0
-  # Reward = w_cost × (-cost_norm) + w_green × (esg_scale × esg_raw) + shaping
+  # Lowered from 3.5 → 2.0: compliance gate now multiplies into ESG signal.
+  # Reward = w_cost × (-cost_norm) + w_green × (esg_scale × esg_raw × compliance_gate) + shaping
   # Financial agents (w_green=0): reward = -cost_norm
-  # ESG agents (w_green=0.5): reward = 0.5×(-cost_norm) + 0.5×(esg_scaled)
+  # ESG agents (w_green=0.5): reward = 0.5×(-cost_norm) + 0.5×(esg_scaled×gated)
   # This structurally guarantees 50/50 financial/environmental weighting.
 
 # ----------------------------------------------------------
@@ -499,6 +500,8 @@ hpp:
   save_interval: 0      # auto: 3% of n_episodes, clamped to [50, 1000]
   swap_prob: 0.20
   warmup_episodes: 0    # auto: 20% of n_episodes, clamped to [200, 6000]
+  seed_heuristic: true
+  seed_count: 2
 
 # ----------------------------------------------------------
 # Epsilon-greedy exploration (physical-space)
@@ -515,4 +518,16 @@ exploration:
   auction_anchors: [80.0, 1.0, 0.03, 0.3, -0.5, 0.5]
   # Secondary: [sec_price (absolute €/t), sec_qty]
   secondary_anchors: [80.0, 0.0]
+
+phantom_bidder:
+  enabled: true
+  qty_frac_lo: 0.05
+  qty_frac_hi: 0.20
+  price_lognormal_sigma: 0.45
+  price_min_above_reserve: 2.0
+  price_max_frac_penalty: 0.65
+
+urgency_scalars:
+  enabled: true
+  lognormal_sigma: 0.30
 
