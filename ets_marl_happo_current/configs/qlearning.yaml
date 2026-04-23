@@ -25,7 +25,6 @@ reward:
   clip_min: -10.0
   clip_max: 5.0
   terminal_bank_value: true
-  terminal_queue_value: true
   terminal_payoff_years: 5
 
 # --- Evaluation ---

@@ -338,7 +338,6 @@ reward:
   shaping_decay_episode: 0       # auto: 12% of n_episodes, clamped to [300, 8000]
   shaping_weight_floor: 0.0      # shaping decays fully to zero
   terminal_bank_value: true      # value banked allowances at terminal_price in final year
-  terminal_queue_value: true     # value construction queue via NPV of carbon savings
   terminal_payoff_years: 5       # years of future savings for queue valuation
 
 # ----------------------------------------------------------

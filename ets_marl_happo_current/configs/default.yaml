@@ -1,16 +1,16 @@
 # ============================================================
-# ETS MARL — Configuration v7.11.0
+# ETS MARL — Configuration v7.12.0
 #   - 8 learning agents, 0 bots (pure MARL)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
 #   - Episode-level inflation randomness window (small stochastic variation)
 #   - MAC fuel-switching (48 EUR/tCO2), electricity revenue
-#   - Carry-forward obligations (cap=0.5x)
+#   - Carry-forward obligations (cap=1.0x)
 #   - Terminal valuation: max(clearing, secondary, 80% eff_penalty)
 #   - Absolute-price secondary market (no multiplier)
 #   - ESG reward signal (saved-carbon-years formula)
 #   - Pre-auction collateral affordability clip + budget-headroom phase-1 signal
-#   - Structural over-subscription: cap=-10%, qty_low=0.85 (ratio≥1.05x)
+#   - Structural over-subscription: cap=-10%, qty_low=0.50 (allows broader auction/secondary strategies)
 # ============================================================
 
 simulation:
@@ -86,7 +86,7 @@ ets:
   banking: true
   reserve_price: 45.0              # auction bid floor — just below MAC (48 EUR/t), prevents degenerate floor equilibrium
   reserve_price_mode: "static"     # "static" or "dynamic" (= max(reserve_price, discount x MA3))
-  unsold_to_msr: true              # unsold volume absorbed into MSR (matches real EU ETS behavior)
+  unsold_to_msr: false             # unsold volume rolls over to next year (Article 10(6)-style rescheduling)
   max_rollover_multiplier: 1.5     # caps rollover: auction_vol ≤ cap_t × multiplier per year
   # Price history anchor for MA3 calculation.
   # "auction": only successful auction clearing prices enter the MA3 (stable, prevents
@@ -162,9 +162,9 @@ auction:
   price_min: 45.0      # matches ets.reserve_price — no silent bid rejection
   quantity_max: 3.0
   # Coverage multiplier bounds: action[1] = fraction of estimated annual need to bid.
-  # Centred around 1.0 (full coverage), range [0.3, 2.0] = 30%-200% of need.
-  qty_mult_low: 0.85
-  qty_mult_high: 1.5
+  # Keep a wider strategic range so auction demand can differ from total procurement.
+  qty_mult_low: 0.5
+  qty_mult_high: 2.0
   # Holding limit: max fraction of auctioned volume one agent can receive.
   # 1.0 = no limit (disabled). Set to 0.25 for California-style 25% cap.
   max_agent_share: 1.0
@@ -295,7 +295,7 @@ penalty:
   inflation_rate: 0.020            # μ = 2.0% annual inflation (historical average)
   inflation_random_std: 0.015      # σ = 1.5%-pt annual inflation volatility (normal sampling)
   carry_forward: true
-  carry_forward_cap: 0.5           # max carry-forward as multiple of base annual emissions (prevents infinite deferral)
+  carry_forward_cap: 1.0           # max carry-forward as multiple of base annual emissions
 
 # ----------------------------------------------------------
 # AR(1) expected price model
@@ -340,18 +340,9 @@ reward:
   shaping_beta: 7.0              # green_delta bonus weight
   shaping_gamma: 1.0             # queue bonus weight
   shaping_decay_episode: 0       # auto: 12% of n_episodes, clamped to [300, 8000]
-  shaping_weight_floor: 0.10     # 10% residual shaping keeps green/efficiency signals alive
+  shaping_weight_floor: 0.0      # shaping decays fully to zero
   terminal_bank_value: true      # value banked allowances at terminal_price in final year
-  terminal_queue_value: true     # value construction queue via NPV of carbon savings
   terminal_payoff_years: 5       # years of future savings for queue valuation
-
-  # Phase-decomposed credit assignment (Direction 2)
-  # Coverage credit: added to r_auction so agents see "I won X% of need" as a signal.
-  # Scaled by shaping_weight so it decays over training.
-  coverage_credit_weight: 0.3    # weight of coverage ratio in auction reward
-  # Gap closure credit: added to r_secondary when agent BUYS to close compliance deficit.
-  # Provides direct gradient for "buy on secondary = good when in deficit."
-  gap_closure_weight: 0.5        # weight of gap closure signal in secondary reward
 
 # ----------------------------------------------------------
 # ESG signal — saved-carbon-years formula

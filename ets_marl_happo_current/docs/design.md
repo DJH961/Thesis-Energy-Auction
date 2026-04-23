@@ -8,7 +8,7 @@ This document describes the **ETS MARL** simulation: a stylised multi-agent rein
 
 **Why it exists:** To study emergent market behaviour (pricing dynamics, banking incentives, green-investment timing) under regulatory mechanisms (cap trajectory, Market Stability Reserve) using modern multi-agent RL.
 
-**Who participates:** 16 market participants — 8 learning agents trained with PPO/HAPPO and 8 heuristic rule-based bots. Agents span four archetypes (coal-heavy, gas-dominant, transitioner, green-leader), each paired into one financially-motivated and one ESG-balanced company.
+**Who participates:** The current default profile (`v7.12`) is pure MARL with 8 learning agents trained with PPO/HAPPO and 0 bots. The environment still supports optional heuristic bot participants for ablation/calibration runs.
 
 **How an episode works:** Each episode simulates 12 years. Every year, participants bid in a sealed-bid uniform-price auction for CO2 allowances, then trade in a bilateral secondary market, and choose how much to invest in renewable capacity. Penalties fall on those without enough allowances to cover emissions. The government cap shrinks by ~4.3–4.4 % annually, creating increasing scarcity that forces decarbonisation.
 
@@ -23,9 +23,13 @@ It supersedes earlier DDPG-era notes and reflects the current HAPPO/PPO setup,
 two-phase decision process, technology-resolved companies, bot participants,
 and reward/economic mechanisms used in training and evaluation.
 
-The model is a stylized EU ETS micro-market with 16 participants:
+The model is a stylized EU ETS micro-market with configurable participants:
 - 8 learning agents (PPO with HAPPO-style sequential updates)
-- 8 heuristic bot agents (rule-based, not trained)
+- 0-8 heuristic bot agents (rule-based, not trained)
+
+Default configuration in `v7.12` is:
+- 8 learning agents
+- 0 bot agents (`n_bot_agents: 0`)
 
 Each episode simulates 12 years.
 
@@ -53,9 +57,9 @@ All winners pay the same clearing price (the marginal accepted bid).
   bot-only runs should have near-zero clip events, and non-zero events indicate
   heuristic/environment mismatch.
 - If enabled, under-subscription can cancel the auction; default behavior is to clear partial demand.
-- Unsold volume is either:
-  - rolled into next year's auction supply, or
-  - absorbed into MSR reserve (configurable).
+- Unsold volume is configurable:
+  - rolled into next year's auction supply (default in `v7.12`), or
+  - absorbed into MSR reserve.
 
 ## 3. Cap and Supply Dynamics
 
@@ -124,7 +128,9 @@ Auction reserve can be:
 ### 4.1 Agent population
 
 - Learning agents A1-A8: PPO/HAPPO-trained.
-- Bot agents B1-B8: heuristic policy for both auction and secondary market.
+- Bot agents B1-B8 (optional): heuristic policy for both auction and secondary market.
+
+Current default (`v7.12`) uses no bots (`n_bot_agents=0`).
 
 From v7.0, bot behavior also supports:
 - `enhanced_noise` (higher valuation/urgency variance plus optional budget-stress quantity cuts),
@@ -285,8 +291,11 @@ Each opponent contributes public 5D tuple:
 - fossil fraction
 - total queue size
 
-With 16 total participants:
-- phase 1 dimension = 33 + 5×15 = **108**
+With `N_total` total participants:
+- phase 1 dimension = `33 + 5 x (N_total - 1)`
+
+Default `v7.12` profile (`N_total=8`):
+- phase 1 dimension = `33 + 5 x 7 = 68`
 
 ### 6.2 Phase 2 observation
 
@@ -306,64 +315,52 @@ $$
 obsDimPhase2 = obsDimPhase1 + 10
 $$
 
-With 16 total participants:
-- phase 2 dimension = **118**
+With `N_total` total participants:
+- phase 2 dimension = `obsDimPhase1 + 10`
 
-## 7. Reward Design (v7.4)
+Default `v7.12` profile (`N_total=8`):
+- phase 2 dimension = `68 + 10 = 78`
+
+## 7. Reward Design (v7.12)
 
 **Reward channel logging:** After each year, `_last_reward_channels` and
-`_last_auction_reward_channels` dicts are populated with named components (cost_norm,
-penalty_norm, green_bonus, esg_signal, efficiency_bonus, opp_cost, budget_penalty,
-capex_penalty, loan_interest, base_reward, shaping_reward). These are for
+`_last_auction_reward_channels` dicts are populated with named components. These are for
 debugging/analysis only and do not affect reward computation.
 
-Per-agent reward is split into a **base reward** and a **shaping reward** that decays
-over training:
+Per-agent reward uses a fixed-scale base formulation (no shaping channels):
 
 $$
-R_i = \underbrace{w_{cost,i}(-\text{costNorm}_i) + w_{green,i}(\text{esgScale}_i\cdot \text{esgRaw}_i)
-  - \text{penalty\_norm}_i - \text{oppCost}_i}_{\text{base reward}}
-  + \underbrace{(\text{greenBonus}_i + \text{efficiencyBonus}_i) \cdot \text{shapingWeight}}_{\text{shaping reward}}
+R_i = w_{cost,i}(-\text{costNorm}_i) + w_{green,i}(\text{esgSignal}_i)
+  - \text{penaltyNorm}_i
   + \text{terminalValues}_i
 $$
 
 Where:
-- `costNorm` is total non-penalty cost, scaled by `annual_budget` (v7.6: changed from /1000).
-- Costs include auction, secondary, investment, OPEX delta (v7.6), budget penalties, capex throughput, and MAC cost.
-- **OPEX delta** (v7.6): Only the change from baseline OPEX enters the cost signal: `opex_delta = current_opex - baseline_opex`. Positive delta = costs rose; negative = OPEX savings from greening.
-- `penalty_norm` is the compliance penalty at full strength, normalized by `annual_budget`.
-- `greenBonus` rewards positive green share change with shaping decay over training.
-- `efficiencyBonus` (v7.4) rewards emission-factor improvement vs initial EF, scaled by
-  remaining time and carbon price. Decays with `shaping_weight`.
-- `esgRaw` uses saved-carbon-years style term before weighting.
-- `esgScale_i` (v7.6) is per-agent: `base_esg_scale × (1000 / annual_budget)`, compensating
-  for the divisor change to preserve the ESG-to-cost balance.
-- `oppCost` is a cost-of-capital term on post-compliance banked allowances:
-  $\text{oppCost}_i = holdings_i \cdot price_t \cdot r_{opp} / \text{annual\_budget}$.
+- `costNorm` is total non-penalty cost scaled by `REWARD_SCALE = 1000`.
+- Costs include auction, secondary, investment, OPEX delta, restored soft budget penalty,
+  restored soft capex penalty, MAC cost, collateral cost, and green-loan interest.
+- `penaltyNorm` is compliance penalty at full strength, scaled by `REWARD_SCALE`.
+- `esgSignal` is saved-carbon-years style improvement signal (global ESG scale).
+- No shaping reward terms are active in the reward path.
 
-This structure makes objective weights explicit:
+This keeps objective weights explicit:
 - Financial agents (`w_cost=1.0`, `w_green=0.0`) optimize pure cost.
-- ESG agents (`w_cost=0.5`, `w_green=0.5`) are guaranteed an exact 50/50 split
-  between financial and environmental reward channels (excluding transient shaping terms).
+- ESG-balanced agents (`w_cost=0.5`, `w_green=0.5`) trade off cost and ESG signal.
 
 Terminal values in final year (configurable):
 - bank terminal value with diminishing returns:
 
 $$
 V^{bank}_i = \log\left(1 + \frac{B_i}{\max(\hat{E}_i, 0.1)}\right)
-\cdot \hat{E}_i \cdot \frac{P_T}{\text{annual\_budget}}
+\cdot \hat{E}_i \cdot \frac{P_T}{\text{REWARD\_SCALE}}
 $$
 
 where $B_i$ is banked allowances, $\hat{E}_i$ is annual estimated need,
 and $P_T$ is the terminal price anchor.
 
-Thesis justification: this specification preserves monotonicity (more prudent
-banking still increases value) while imposing economically meaningful
-diminishing marginal value on very large stocks. A one-year hedge remains
-valuable, but speculative multi-year hoarding is discounted relative to a
-linear payoff, improving market realism by encouraging secondary-market release
-instead of end-horizon stockpile accumulation.
 - queue terminal value (discounted future emissions savings from queued projects)
+  with a completion-fraction discount to prevent end-of-episode gaming of
+  long-lead projects.
 
 Policy-timing note for reward interpretation: the MSR 1-year TNAC lag (v7.4) means
 year-0 rewards are not affected by MSR. Year 1+ rewards reflect prior-year TNAC decisions,

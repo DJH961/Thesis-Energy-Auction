@@ -5,6 +5,51 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.12.0
+
+**Rollback of Non-Approved v7.11 Defaults + Reward Corrections**
+
+### Market/config rollbacks (`configs/default.yaml`)
+- **Auction quantity multiplier range widened** to preserve auction/secondary strategy space:
+  - `auction.qty_mult_low`: `0.85 -> 0.5`
+  - `auction.qty_mult_high`: `1.5 -> 2.0`
+- **Unsold handling reverted to rollover**:
+  - `ets.unsold_to_msr`: `true -> false`
+  - Unsold allowances are now rescheduled into next-year supply by default.
+- **Carry-forward cap reverted**:
+  - `penalty.carry_forward_cap`: `0.5 -> 1.0`
+- **Shaping floor reset**:
+  - `reward.shaping_weight_floor`: `0.10 -> 0.0`
+- **Dead reward config declarations removed** from default profile:
+  - `reward.terminal_queue_value`
+  - `reward.coverage_credit_weight`
+  - `reward.gap_closure_weight`
+
+### Reward-function rollbacks (`src/environment/ets_environment.py`)
+- **Soft budget/capex penalties restored** inside `cost_norm`:
+  - `budget_penalty = company.compute_budget_penalty()`
+  - `capex_penalty = company.compute_capex_penalty()`
+  - Both terms are added to total cost before normalization.
+- **Terminal bank valuation reverted to diminishing returns**:
+  - Restored `log1p` form (with existing 2x annual-need cap) instead of linear valuation.
+- **Terminal queue valuation restored** with anti-gaming control:
+  - Queue value is back in final-year reward.
+  - Added **completion-fraction discount** so long-lead projects started too late receive little/no terminal credit.
+
+### Documentation/overlay cleanup
+- Removed redundant `terminal_queue_value` overrides from:
+  - `configs/qlearning.yaml`
+  - `configs/smoke_100.yaml`
+
+### Tests
+- Added regression test for completion-discount queue valuation:
+  - `tests/test_rewards.py::TestTerminalQueueValue::test_terminal_queue_completion_fraction_discount`
+- Updated shaping-floor expectation test to match zero floor.
+- Full suite validation:
+  - `265 passed, 12 warnings` (`python -m pytest`)
+
+---
+
 ## v7.8.0
 
 **Dual-Ceiling WTP Heuristic, Marginal EF Revenue (instance method), Compliance-Priority Investment, Collateral Warning Counter, Enhanced Diagnostics, Config Updates, Smoke Tests**

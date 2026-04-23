@@ -561,6 +561,67 @@ class TestTerminalQueueValue:
         # No investment, no queue → terminal queue value should be zero → same rewards
         np.testing.assert_allclose(rewards_with, rewards_without, atol=1e-4)
 
+    def test_terminal_queue_completion_fraction_discount(self):
+        """Near-completion projects should get more terminal queue value than late projects."""
+        config = load_config()
+        config["reward"]["terminal_bank_value"] = False
+        config["reward"]["terminal_queue_value"] = True
+        config["reward"]["terminal_payoff_years"] = 5
+        config["simulation"]["n_years"] = 12
+        config["warm_start"]["enabled"] = False
+        config["uncertainty"]["enabled"] = False
+        config["construction_jitter"]["enabled"] = False
+
+        env = ETSEnvironment(config, seed=42)
+        env.reset()
+        env.current_year = env.n_years - 1
+        env.last_secondary_price = 100.0
+
+        company = env.companies[0]
+        company._construction_queue = [{
+            "tech_idx": 3,
+            "frac_delta": 0.05,
+            "completion_year": env.current_year + 7,
+            "success": True,
+            "capex_spent": 0.0,
+        }]
+
+        zeros = np.zeros(env.n_total)
+        env._compute_rewards(
+            payments=zeros,
+            trade_costs=zeros,
+            penalties=zeros,
+            invest_costs=zeros,
+            emissions=zeros,
+            clearing_price=100.0,
+            mac_costs=zeros,
+            precompliance_holdings=zeros,
+            old_carry_forward=zeros,
+        )
+        late_value = float(env._last_terminal_queue_values[0])
+
+        company._construction_queue = [{
+            "tech_idx": 3,
+            "frac_delta": 0.05,
+            "completion_year": env.current_year + 1,
+            "success": True,
+            "capex_spent": 0.0,
+        }]
+        env._compute_rewards(
+            payments=zeros,
+            trade_costs=zeros,
+            penalties=zeros,
+            invest_costs=zeros,
+            emissions=zeros,
+            clearing_price=100.0,
+            mac_costs=zeros,
+            precompliance_holdings=zeros,
+            old_carry_forward=zeros,
+        )
+        near_value = float(env._last_terminal_queue_values[0])
+
+        assert near_value > late_value
+
 
 def test_shaping_weight_decays():
     """Shaping weight should decrease toward 0 over episodes."""
@@ -572,7 +633,7 @@ def test_shaping_weight_decays():
     env.set_episode(12000)
     w_end = env.shaping_weight
     assert w0 > w_mid > w_end
-    assert w_end <= 0.20, f"Shaping weight should be near floor at decay end: {w_end}"
+    assert w_end <= 0.01, f"Shaping weight should decay to ~0 with zero floor: {w_end}"
 
 
 def test_w_green_differentiates_reward():
