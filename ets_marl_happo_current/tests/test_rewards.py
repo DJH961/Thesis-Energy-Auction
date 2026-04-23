@@ -1032,3 +1032,34 @@ def test_reward_channels_reset():
     assert len(env._last_reward_channels) > 0
     env.reset()
     assert len(env._last_reward_channels) == 0
+
+
+# ---------------------------------------------------------------------------
+# Auction phase coverage-gap penalty (underbidding)
+# ---------------------------------------------------------------------------
+
+def test_underbid_gives_negative_auction_reward():
+    """Bidding zero quantity wins nothing; the coverage-gap penalty makes r_auction < 0."""
+    config = load_config()
+    config["companies"]["n_bot_agents"] = 0
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset(seed=42)
+
+    n = env.n_agents
+    # All tranches have qty = 0 → agents win nothing.
+    auction_actions = np.zeros((n, 6), dtype=np.float32)
+    auction_actions[:, 0] = 80.0          # price (irrelevant with qty=0)
+    auction_actions[:, 3:] = [0.0, 0.0, 1.0]  # solar logit highest
+
+    env.step_auction(auction_actions)
+    r_auction = env.compute_auction_rewards()
+
+    for i in range(n):
+        assert r_auction[i] < 0, (
+            f"Agent {i}: underbidding (0 qty) should yield negative auction reward, "
+            f"got {r_auction[i]:.4f}"
+        )

@@ -1726,7 +1726,10 @@ class ETSEnvironment(gym.Env):
             total_cost = (auction_cost + collateral_cost_i + investment_cost
                           + opex_delta + mac_cost_i)
 
-            r_auction[i] = -(total_cost / REWARD_SCALE)
+            coverage_gap = max(0.0, company.compute_estimate_need() - float(self._phase1_allocations[i]))
+            gap_penalty = coverage_gap * company.effective_penalty_rate(self.current_year) / REWARD_SCALE
+
+            r_auction[i] = -(total_cost / REWARD_SCALE) - gap_penalty
 
             self._last_auction_reward_channels[i] = {
                 "auction_cost": float(auction_cost / REWARD_SCALE),
@@ -1734,6 +1737,7 @@ class ETSEnvironment(gym.Env):
                 "investment_cost": float(investment_cost / REWARD_SCALE),
                 "opex_delta": float(opex_delta / REWARD_SCALE),
                 "mac_cost": float(mac_cost_i / REWARD_SCALE),
+                "coverage_gap_penalty": float(gap_penalty),
             }
         return r_auction
 
