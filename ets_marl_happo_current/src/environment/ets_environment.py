@@ -2276,11 +2276,14 @@ class ETSEnvironment(gym.Env):
             # Liquidity pool floor: prevent pool from pricing at the auction
             # reserve price floor — ensures secondary market remains active even
             # when the primary auction collapses to reserve price.
+            # floor_fraction_of_penalty = 0.25 means pool never prices below
+            # 25% of the non-compliance penalty (≈34€ at current calibration).
             _eff_penalty_for_pool = (
                 float(self.config["penalty"]["rate"])
                 * self._inflation_factor(self.current_year)
             )
-            _pool_price_floor = 0.25 * _eff_penalty_for_pool
+            _floor_frac = float(pool_cfg.get("floor_fraction_of_penalty", 0.25))
+            _pool_price_floor = _floor_frac * _eff_penalty_for_pool
             self._liquidity_ref_ema = max(self._liquidity_ref_ema, _pool_price_floor)
             # Keep pool pricing anchored to market reference by default.
             # Optional override allows explicit anchor experiments.

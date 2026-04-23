@@ -49,6 +49,7 @@ class PhantomBidder:
         self.sigma: float = float(cfg.get("price_lognormal_sigma", 0.45))
         self.min_above_reserve: float = float(cfg.get("price_min_above_reserve", 2.0))
         self.max_frac_penalty: float = float(cfg.get("price_max_frac_penalty", 0.65))
+        self.min_below_reserve_buffer: float = float(cfg.get("price_min_below_reserve_buffer", 5.0))
         self.rng = rng
 
         # Logging attributes — updated by sample_bid(), read by ets_environment.py
@@ -88,16 +89,19 @@ class PhantomBidder:
         bid_qty : float
             Drawn bid quantity (Mt).
         """
-        # Anchor: at least reserve + min_above_reserve so the lognormal mean
+        # Anchor: at least reserve + min_above_reserve so the lognormal median
         # is realistically above the floor, producing occasional below-reserve
         # draws (teaching agents the floor can fail) while centering near MA3.
+        # Note: np.lognormal(mean=log(anchor), sigma) gives median=anchor.
+        # With sigma=0.45 the arithmetic mean is ~1.11×anchor (right-skewed).
         anchor = max(price_ma3, reserve_price + self.min_above_reserve)
         price = float(self.rng.lognormal(mean=np.log(anchor), sigma=self.sigma))
-        # Clip: allow draws below reserve (bid rejected by clearing) but cap
-        # at max_frac_penalty to prevent unrealistic blow-ups.
+        # Clip: allow draws up to min_below_reserve_buffer below reserve
+        # (bid rejected by clearing) but cap at max_frac_penalty to prevent
+        # unrealistic blow-ups.
         price = float(np.clip(
             price,
-            reserve_price - 5.0,                         # allow some below-reserve draws
+            reserve_price - self.min_below_reserve_buffer,
             self.max_frac_penalty * max(penalty_rate, 1.0),
         ))
         qty = (

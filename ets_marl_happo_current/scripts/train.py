@@ -1426,8 +1426,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                           f"avg qty ≤{_zero_qty_thresh*100:.0f}% of {_qty_max:.1f}Mt  (ep {episode})")
 
             # ESG vs penalty warning: fire when non-compliant agent's ESG bonus
-            # exceeds its compliance penalty for 50+ consecutive episodes.
-            _esg_warn_window = 50
+            # exceeds its compliance penalty for esg_warn_window consecutive episodes.
+            _esg_warn_window = int(_diag.get("esg_over_penalty_warn_window", 50))
             for _i in range(n_agents):
                 # Check last year's reward channels for this agent
                 _last_yl = env.episode_log[-1] if env.episode_log else {}
