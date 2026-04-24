@@ -537,14 +537,11 @@ $$
 \log(p_{\text{phantom}}) \sim \mathcal{N}(\log(\text{anchor}),\; \sigma^2)
 $$
 
-where $\text{anchor} = \max(MA3,\; \text{reserve} + \delta_{\min})$ and
-$\sigma = 0.45$ (high variance, EU ETS calibrated). The median price equals the
+where $\text{anchor} = \max(f_{\text{fund}} \cdot \text{effective penalty},\; \text{reserve} + \delta_{\min})$,
+$f_{\text{fund}}=0.60$, and $\sigma = 0.35$. The median price equals the
 anchor; the arithmetic mean is $\approx 1.11 \times \text{anchor}$ due to the
 right skew of the lognormal. The price is clipped to
 $[\text{reserve} - 5,\; 0.65 \times \text{effective penalty rate}]$.
-
-Because the anchor tracks MA3, when agents bid above floor and the MA3 rises,
-the phantom also rises — the distribution self-stabilises.
 
 **Quantity distribution:**
 
@@ -588,9 +585,10 @@ excess. With `cap_overhead_pct: 0.08` and phantom's expected 11% consumption:
 ```yaml
 phantom_bidder:
   enabled: true
-  qty_frac_lo: 0.05                 # 5% of auction supply minimum
-  qty_frac_hi: 0.20                 # 20% of auction supply maximum
-  price_lognormal_sigma: 0.45       # lognormal sigma; median=anchor, mean≈1.11×anchor
+  qty_frac_lo: 0.15                 # 15% of auction supply minimum
+  qty_frac_hi: 0.35                 # 35% of auction supply maximum
+  price_lognormal_sigma: 0.35       # lognormal sigma; median=anchor, mean≈1.11×anchor
+  price_fundamental_frac: 0.60      # anchor baseline fraction of effective penalty rate
   price_min_above_reserve: 2.0      # lower bound of anchor above reserve (EUR/t)
   price_max_frac_penalty: 0.65      # upper bound: 65% of effective penalty rate
   price_min_below_reserve_buffer: 5.0  # max below-reserve draw allowed (EUR/t)
@@ -602,8 +600,9 @@ phantom_bidder:
   year-level episode log (`env.episode_log[-1]`).
 - `phantom_active_pct` is written to the episode CSV: percentage of years
   the phantom was active (bid ≥ reserve) in that episode.
-- The training console `Bid/yr` line shows `(+Ph X%)` suffix when the
-  phantom was active for at least one year in the current episode.
+- `phantom_avg_bid_price` and `phantom_avg_bid_qty` are written to episode CSV.
+- The training console `Bid/yr` line shows phantom activity plus average
+  phantom bid price/quantity for the current episode.
 
 ## 12. Equilibrium-Breaking Mechanisms (v7.13)
 

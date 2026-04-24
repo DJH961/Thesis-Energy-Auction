@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v7.13.0
+# ETS MARL — Configuration v7.13.1
 #   - 8 learning agents, 0 bots (pure MARL)
 #   - HAPPO sequential policy update
 #   - 2026-indexed non-compliance penalty with annual inflation path
@@ -9,7 +9,7 @@
 #   - Terminal valuation: max(clearing, secondary, 80% eff_penalty)
 #   - Absolute-price secondary market (no multiplier)
 #   - ESG reward signal (saved-carbon-years formula) with compliance gate (coverage²)
-#   - Phantom bidder: financial intermediary demand, 5-20% of supply, breaks floor equilibrium
+#   - Phantom bidder: financial intermediary demand, 15-35% of supply, breaks floor equilibrium
 #   - Phantom-aware scarcity: cap_overhead_pct=+0.08, net ~4% shortfall after phantom demand
 #   - Private urgency scalars: LogNormal(0, 0.30) per-agent penalty multiplier each episode
 #   - HPP heuristic seeding: BC snapshots pre-seeded into HPP pool for diversity anchoring
@@ -361,6 +361,7 @@ electricity:
 # ----------------------------------------------------------
 reward:
   normalizer_alpha: 0.01
+  gae_min_std: 0.1        # minimum std floor for phase-wise reward normalization in compute_gae()
   opportunity_cost_rate: 0.0  # H4: disabled — agents learn holding decisions through terminal value
   clip_min: -10.0
   clip_max: 10.0         # symmetric with clip_min to avoid asymmetric gradient compression
@@ -616,9 +617,10 @@ budget_curriculum:
 # ----------------------------------------------------------
 phantom_bidder:
   enabled: true
-  qty_frac_lo: 0.05          # minimum quantity: 5% of auction supply
-  qty_frac_hi: 0.20          # maximum quantity: 20% of auction supply
-  price_lognormal_sigma: 0.45  # high variance; lognormal median=anchor, mean≈1.11×anchor (right-skewed)
+  qty_frac_lo: 0.15          # minimum quantity: 15% of auction supply
+  qty_frac_hi: 0.35          # maximum quantity: 35% of auction supply
+  price_lognormal_sigma: 0.35  # lognormal sigma; median=anchor
+  price_fundamental_frac: 0.60  # anchor baseline = 60% of effective penalty rate
   price_min_above_reserve: 2.0  # lower bound anchor above reserve (EUR/t)
   price_max_frac_penalty: 0.65  # upper bound: 65% of penalty rate (~90€ at current calibration)
   price_min_below_reserve_buffer: 5.0  # max below-reserve draw allowed (EUR/t); bid rejected by clearing
