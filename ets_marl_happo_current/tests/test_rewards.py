@@ -943,6 +943,70 @@ def test_batch_normalization_replaces_ema():
     )
 
 
+def test_gae_produces_nonzero_advantages_constant_reward():
+    """Constant rewards should still yield non-collapsed normalized advantages."""
+    import torch
+    from src.agents.ppo_agent import PPOAgent
+
+    config = load_config()
+    config["companies"]["n_agents"] = 2
+    config["companies"]["n_bot_agents"] = 0
+    config["ppo"]["hidden_size"] = 32
+    config["reward"]["gae_min_std"] = 0.1
+
+    env = ETSEnvironment(config, seed=7)
+    env.reset()
+
+    obs1_dim = env.companies[0].obs_dim_phase1
+    obs2_dim = env.companies[0].obs_dim_phase2
+    aq = config["auction"]
+    inv = config["investment"]
+    auction_low = np.array(
+        [aq["price_min"], aq.get("qty_mult_low", 0.3), 0.0, -1.0, -1.0, -1.0],
+        dtype=np.float32,
+    )
+    auction_high = np.array(
+        [aq["price_max"], aq.get("qty_mult_high", 2.0), inv["max_invest_frac"], 1.0, 1.0, 1.0],
+        dtype=np.float32,
+    )
+    secondary_low = np.array([30.0, -10.0], dtype=np.float32)
+    secondary_high = np.array([500.0, 10.0], dtype=np.float32)
+
+    agent = PPOAgent(
+        agent_id=0,
+        obs_dim_phase1=obs1_dim,
+        obs_dim_phase2=obs2_dim,
+        auction_action_low=auction_low,
+        auction_action_high=auction_high,
+        secondary_action_low=secondary_low,
+        secondary_action_high=secondary_high,
+        config=config,
+        seed=7,
+    )
+
+    n_steps = 24
+    for t in range(n_steps):
+        phase = "auction" if (t % 2 == 0) else "secondary"
+        agent.store_transition(
+            obs1=np.random.randn(obs1_dim).astype(np.float32),
+            obs2=np.random.randn(obs2_dim).astype(np.float32),
+            auc_raw=np.random.randn(len(auction_low)).astype(np.float32),
+            sec_raw=np.random.randn(len(secondary_low)).astype(np.float32),
+            auc_lp=-1.0,
+            sec_lp=-1.0,
+            reward=1.0,               # constant reward sequence
+            done=False,               # keep trajectory continuous for bootstrap signal
+            value=0.05 * float(t),    # non-flat critic baseline
+            phase=phase,
+        )
+
+    adv_t, _, _ = agent.compute_gae(last_value=1.0)
+    assert adv_t is not None
+    assert torch.all(torch.isfinite(adv_t))
+    assert float(adv_t.abs().mean().item()) > 0.05
+    assert float(adv_t.abs().max().item()) < 10.0
+
+
 def test_split_rewards_sum_to_total():
     """r_auction + r_secondary ≈ old_single_reward for the same environment state."""
     config = load_config()

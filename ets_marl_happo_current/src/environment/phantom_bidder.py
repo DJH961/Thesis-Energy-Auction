@@ -11,7 +11,7 @@ Reference: European Commission Auction Report 2024; EEX/ICE data 2019-2023.
 
 Mechanism:
     The phantom bids above the reserve price with a LogNormal-distributed
-    price anchored to the 3-year moving average (MA3) and a Uniform-
+    price anchored to a fraction of the effective penalty rate and a Uniform-
     distributed quantity fraction of the total auction supply.  Because
     bids are ranked descending, the phantom is consumed first when it wins,
     shrinking the effective supply available to floor-bidding compliance
@@ -47,6 +47,7 @@ class PhantomBidder:
         self.qty_frac_lo: float = float(cfg.get("qty_frac_lo", 0.05))
         self.qty_frac_hi: float = float(cfg.get("qty_frac_hi", 0.20))
         self.sigma: float = float(cfg.get("price_lognormal_sigma", 0.45))
+        self.price_fundamental_frac: float = float(cfg.get("price_fundamental_frac", 0.60))
         self.min_above_reserve: float = float(cfg.get("price_min_above_reserve", 2.0))
         self.max_frac_penalty: float = float(cfg.get("price_max_frac_penalty", 0.65))
         self.min_below_reserve_buffer: float = float(cfg.get("price_min_below_reserve_buffer", 5.0))
@@ -75,6 +76,9 @@ class PhantomBidder:
         ----------
         price_ma3 : float
             3-year moving average of auction clearing prices (EUR/t).
+            Deprecated and ignored for anchor computation (kept only for
+            backward-compatible call sites/logging; planned for removal in
+            a future release.
         reserve_price : float
             Effective reserve price for this year (EUR/t).
         penalty_rate : float
@@ -89,12 +93,17 @@ class PhantomBidder:
         bid_qty : float
             Drawn bid quantity (Mt).
         """
-        # Anchor: at least reserve + min_above_reserve so the lognormal median
-        # is realistically above the floor, producing occasional below-reserve
-        # draws (teaching agents the floor can fail) while centering near MA3.
+        # Explicitly ignore MA3 in anchor construction (deprecated arg retained).
+        _ = price_ma3
+
+        # Anchor: max(fundamental_fraction * penalty_rate, reserve + min_above).
+        # This decouples phantom pricing from MA3 so floor stickiness in the
+        # learning population does not suppress phantom demand pressure.
         # Note: np.lognormal(mean=log(anchor), sigma) gives median=anchor.
-        # With sigma=0.45 the arithmetic mean is ~1.11×anchor (right-skewed).
-        anchor = max(price_ma3, reserve_price + self.min_above_reserve)
+        anchor = max(
+            self.price_fundamental_frac * max(penalty_rate, 1.0),
+            reserve_price + self.min_above_reserve,
+        )
         price = float(self.rng.lognormal(mean=np.log(anchor), sigma=self.sigma))
         # Clip: allow draws up to min_below_reserve_buffer below reserve
         # (bid rejected by clearing) but cap at max_frac_penalty to prevent

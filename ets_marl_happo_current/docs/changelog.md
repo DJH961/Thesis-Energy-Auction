@@ -5,6 +5,40 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v7.13.1
+
+**Phantom anchor decoupling + GAE std-floor hardening + delayed ESG gate activation**
+
+### Phantom bidder (`src/environment/phantom_bidder.py`, configs)
+- Phantom price anchor now uses `max(price_fundamental_frac × effective_penalty_rate, reserve + min_above_reserve)`,
+  decoupling phantom demand from MA3 drift.
+- Added config key `phantom_bidder.price_fundamental_frac: 0.60`.
+- Updated default phantom parameters:
+  - `qty_frac_lo: 0.15`
+  - `qty_frac_hi: 0.35`
+  - `price_lognormal_sigma: 0.35`
+- Added regression test `tests/test_phantom_bidder.py::test_phantom_anchor_independent_of_ma3`.
+
+### PPO / GAE normalization (`src/agents/ppo_agent.py`, configs)
+- Added config key `reward.gae_min_std` (default `0.1`).
+- `compute_gae()` now uses this std floor in both auction/secondary phase reward normalization blocks
+  (replacing the previous near-zero floor).
+- Added regression test `tests/test_rewards.py::test_gae_produces_nonzero_advantages_constant_reward`.
+
+### Reward function gate scheduling (`src/environment/ets_environment.py`)
+- ESG compliance gate now ramps in with shaping decay:
+  - `gate_activation = clamp(1 - shaping_weight / 0.5, 0, 1)`
+  - `compliance_gate = coverage_frac ** (2 * gate_activation)`
+- Added `gate_activation` to `reward_channels` diagnostics.
+
+### Training diagnostics (`scripts/train.py`)
+- Added phantom bidder fields to logs:
+  - Episode CSV: `phantom_avg_bid_price`, `phantom_avg_bid_qty` (alongside `phantom_active_pct`)
+  - Year CSV: `phantom_bid_price`, `phantom_bid_qty`, `phantom_active`
+- Console `Bid/yr` line now prints phantom active rate plus average phantom price/qty.
+
+---
+
 ## v7.13.0
 
 **Equilibrium-Breaking Mechanisms + Phantom-Bidder-Aware Scarcity Calibration**

@@ -170,6 +170,8 @@ class PPOAgent:
         self.n_epochs = ppo["n_epochs"]
         self.mini_batch_size = ppo["mini_batch_size"]
         self.normalize_advantages = ppo.get("normalize_advantages", True)
+        reward_cfg = config.get("reward", {})
+        self.gae_min_std = float(max(1e-8, reward_cfg.get("gae_min_std", 0.1)))
         # P11: KL-based early stopping — abort PPO epochs if policy drifts too far
         self.target_kl = ppo.get("target_kl", 0.0)  # 0 = disabled
 
@@ -889,7 +891,7 @@ class PPOAgent:
         # each phase separately preserves learning signal in both heads.
         phase_is_auction = np.array([p == 'auction' for p in self.buffer.phases], dtype=bool)
         phase_is_secondary = ~phase_is_auction
-        _EPS_STD = 1e-8
+        _EPS_STD = self.gae_min_std
 
         if phase_is_auction.any():
             auc_rewards = rewards[phase_is_auction]

@@ -821,7 +821,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # ESG compliance diagnostics per learning agent
     for i in range(n_agents):
         ep_fields += [f"esg_vs_penalty_ratio_A{i+1}", f"compliance_gate_A{i+1}"]
-    ep_fields += ["phantom_active_pct"]  # % of years phantom was active this episode
+    ep_fields += [
+        "phantom_active_pct",       # % of years phantom was active this episode
+        "phantom_avg_bid_price",    # mean phantom bid price across years in episode
+        "phantom_avg_bid_qty",      # mean phantom bid qty across years in episode
+    ]
     ep_csv = open(ep_path, "w", newline="")
     ep_writer = csv.DictWriter(ep_csv, fieldnames=ep_fields)
     ep_writer.writeheader()
@@ -831,7 +835,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     yr_fields = ["episode", "year", "cap", "auction_volume", "tnac",
                  "clearing_price", "secondary_price", "msr_reserve",
                  "msr_total_cancelled", "msr_withhold_this_year", "msr_release_this_year",
-                 "inflation_rate", "inflation_factor", "marginal_ef_used"]
+                 "inflation_rate", "inflation_factor",
+                 "phantom_bid_price", "phantom_bid_qty", "phantom_active",
+                 "marginal_ef_used"]
     for i in range(n_total_agents):
         yr_fields += [f"bank_start_A{i+1}", f"alloc_A{i+1}", f"emissions_A{i+1}",
                       f"trade_qty_A{i+1}", f"trade_cost_A{i+1}", f"green_frac_A{i+1}",
@@ -1083,6 +1089,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 "msr_release_this_year": yl.get("msr_release_this_year", 0),
                 "inflation_rate": yl.get("inflation_rate", 0),
                 "inflation_factor": yl.get("inflation_factor", 1.0),
+                "phantom_bid_price": yl.get("phantom_bid_price", 0.0),
+                "phantom_bid_qty": yl.get("phantom_bid_qty", 0.0),
+                "phantom_active": int(bool(yl.get("phantom_active", False))),
             }
             for i in range(n_total_agents):
                 def _get(log_key, default=0):
@@ -1773,6 +1782,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         _ph_active_ep = sum(1 for yl in env.episode_log if yl.get("phantom_active", False))
         _n_ep_years = max(len(env.episode_log), 1)
         ep_row["phantom_active_pct"] = round(100.0 * _ph_active_ep / _n_ep_years, 1)
+        _ph_prices = [float(yl.get("phantom_bid_price", 0.0)) for yl in env.episode_log]
+        _ph_qtys = [float(yl.get("phantom_bid_qty", 0.0)) for yl in env.episode_log]
+        ep_row["phantom_avg_bid_price"] = round(float(np.mean(_ph_prices)), 2) if _ph_prices else 0.0
+        ep_row["phantom_avg_bid_qty"] = round(float(np.mean(_ph_qtys)), 4) if _ph_qtys else 0.0
 
         ep_row["warn_lowAlloc"] = int(env._warnings.get("low_alloc", 0))
         ep_row["warn_priceFloor"] = int(env._warnings.get("price_floor", 0))
@@ -1904,7 +1917,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             _ph_active_years = sum(1 for yl in env.episode_log if yl.get("phantom_active", False))
             _n_years_logged = max(len(env.episode_log), 1)
             _ph_pct = int(round(100.0 * _ph_active_years / _n_years_logged))
-            _ph_str = f"  (+Ph {_ph_pct}%)" if env._phantom_bidder.enabled else ""
+            _ph_avg_px = float(np.mean([yl.get("phantom_bid_price", 0.0) for yl in env.episode_log])) if env.episode_log else 0.0
+            _ph_avg_qty = float(np.mean([yl.get("phantom_bid_qty", 0.0) for yl in env.episode_log])) if env.episode_log else 0.0
+            _ph_str = f"  (+Ph {_ph_pct}% avg={_ph_avg_px:.0f}€/qty={_ph_avg_qty:.2f}Mt)" if env._phantom_bidder.enabled else ""
             print(f"  {'Price/yr':<8}: {price_traj}   (σ={price_std:.0f}){_trend_arrow(prices_ep)}")
             print(f"  {'Emiss/yr':<8}: {emiss_traj}   (avg {avg_annual_emiss:.1f} Mt/yr){_trend_arrow(yr_emiss)}")
             print(f"  {'Bid/yr':<8}: {bid_traj}   (agents' total auction demand, Mt){_ph_str}{_trend_arrow(yr_bid_total)}")

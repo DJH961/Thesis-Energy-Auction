@@ -2353,6 +2353,8 @@ class ETSEnvironment(gym.Env):
           - Penalties stay separated from costs and always apply at full strength.
           - B1/S1 shaping decays with shaping_weight (floor=0); pure economic reward
             at equilibrium.
+          - ESG compliance gate is delayed early in training and ramps in as
+            shaping decays, avoiding premature over-penalisation of exploration.
           - Soft budget/capex penalties remain in cost_norm until hard-gate
             coverage is fully audited.
         """
@@ -2436,9 +2438,11 @@ class ETSEnvironment(gym.Env):
                     coverage_frac = min(1.0, float(precompliance_holdings[i]) / annual_need_i)
                 else:
                     coverage_frac = 1.0
-                compliance_gate = coverage_frac ** 2  # quadratic: 80% → 64% ESG, 50% → 25%
+                gate_activation = min(1.0, max(0.0, 1.0 - self.shaping_weight / 0.5))
+                compliance_gate = coverage_frac ** (2.0 * gate_activation)
                 esg_signal = esg_raw * compliance_gate
             else:
+                gate_activation = 1.0
                 compliance_gate = 1.0
                 esg_signal = 0.0
 
@@ -2497,6 +2501,7 @@ class ETSEnvironment(gym.Env):
                 "base_reward": float(base_reward),
                 "opp_cost_shaping": float(opp_cost_shaping),
                 "coverage_gap_shaping": float(coverage_gap_shaping),
+                "gate_activation": float(gate_activation),
                 "compliance_gate": float(compliance_gate),
                 "esg_vs_penalty_ratio": (
                     float(company.w_green * esg_signal) / max(float(penalty_norm), 1e-9)
