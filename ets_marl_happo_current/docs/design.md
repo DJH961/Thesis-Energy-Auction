@@ -539,7 +539,7 @@ $$
 
 where $\text{anchor} = \max(f_{\text{fund}} \cdot \text{effective penalty},\; \text{reserve} + \delta_{\min})$,
 $f_{\text{fund}}=0.60$, and $\sigma = 0.35$. The median price equals the
-anchor; the arithmetic mean is $\approx 1.11 \times \text{anchor}$ due to the
+anchor; the arithmetic mean is $\approx 1.06 \times \text{anchor}$ due to the
 right skew of the lognormal. The price is clipped to
 $[\text{reserve} - 5,\; 0.65 \times \text{effective penalty rate}]$.
 

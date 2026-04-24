@@ -619,7 +619,7 @@ phantom_bidder:
   enabled: true
   qty_frac_lo: 0.15          # minimum quantity: 15% of auction supply
   qty_frac_hi: 0.35          # maximum quantity: 35% of auction supply
-  price_lognormal_sigma: 0.35  # lognormal sigma; median=anchor
+  price_lognormal_sigma: 0.35  # lognormal sigma; median=anchor, mean≈1.06×anchor
   price_fundamental_frac: 0.60  # anchor baseline = 60% of effective penalty rate
   price_min_above_reserve: 2.0  # lower bound anchor above reserve (EUR/t)
   price_max_frac_penalty: 0.65  # upper bound: 65% of penalty rate (~90€ at current calibration)

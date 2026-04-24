@@ -76,7 +76,9 @@ class PhantomBidder:
         ----------
         price_ma3 : float
             3-year moving average of auction clearing prices (EUR/t).
-            Kept for backward compatibility/logging; not used in anchor.
+            Deprecated and ignored for anchor computation (kept only for
+            backward-compatible call sites/logging; planned for removal in
+            a future release.
         reserve_price : float
             Effective reserve price for this year (EUR/t).
         penalty_rate : float
@@ -91,6 +93,9 @@ class PhantomBidder:
         bid_qty : float
             Drawn bid quantity (Mt).
         """
+        # Explicitly ignore MA3 in anchor construction (deprecated arg retained).
+        _ = price_ma3
+
         # Anchor: max(fundamental_fraction * penalty_rate, reserve + min_above).
         # This decouples phantom pricing from MA3 so floor stickiness in the
         # learning population does not suppress phantom demand pressure.
