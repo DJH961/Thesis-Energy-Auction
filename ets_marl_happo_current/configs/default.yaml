@@ -43,7 +43,7 @@ tabula_rasa:
 # before the uniform-pricing zero-gradient phase.
 # ----------------------------------------------------------
 pricing_curriculum:
-  enabled: true
+  enabled: false
   pab_frac: 0.20                     # first 20% of episodes use pay-as-bid
   # After pab_frac × n_episodes, pricing_rule switches to "uniform"
 
@@ -322,7 +322,7 @@ penalty:
   inflation_rate: 0.020            # μ = 2.0% annual inflation (historical average)
   inflation_random_std: 0.015      # σ = 1.5%-pt annual inflation volatility (normal sampling)
   carry_forward: true
-  carry_forward_cap: 1.0           # max carry-forward as multiple of base annual emissions
+  carry_forward_cap: 0.0           # 0.0 = no cap (unlimited carry-forward); set >0 to reactivate cap
 
 # ----------------------------------------------------------
 # AR(1) expected price model

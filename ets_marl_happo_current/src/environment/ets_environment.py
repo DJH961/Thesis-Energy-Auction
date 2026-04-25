@@ -828,7 +828,7 @@ class ETSEnvironment(gym.Env):
 
                 bid_price = float(np.clip(action[0], price_min, price_max))
                 qty_mult = float(np.clip(action[1], qty_mult_low, qty_mult_high))
-                annual_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
+                annual_need = max(company.compute_estimate_need(), 0.1)
                 bid_qty = qty_mult * annual_need
                 if lot_size > 0:
                     bid_qty = max(lot_size, round(bid_qty / lot_size) * lot_size)
@@ -1291,7 +1291,7 @@ class ETSEnvironment(gym.Env):
         # Direct bid price: agent action[0] is the bid price in [price_min, price_max]
         bid_actions[:, 0] = np.clip(bid_actions[:, 0], price_min, price_max)
         # Quantity reparameterization: action[1] is a coverage MULTIPLIER on estimated need.
-        # actual_qty = multiplier × (compute_estimate_need + carry_forward)
+        # actual_qty = multiplier × compute_estimate_need()
         # This keeps the strategic decision centred on compliance coverage ratio rather
         # than an absolute volume, avoiding the zero-quantity collapse.
         qty_mult_low = self.config["auction"].get("qty_mult_low", 0.3)
@@ -1311,7 +1311,7 @@ class ETSEnvironment(gym.Env):
             multiplier = float(np.clip(auction_actions[i, 1], qty_mult_low, qty_mult_high))
             # Base need is intentionally unbuffered (expected emissions + debt);
             # agents learn safety buffers through the bid multiplier itself.
-            base_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
+            base_need = max(company.compute_estimate_need(), 0.1)
             bid_actions[i, 1] = multiplier * base_need
             bid_qty_multipliers[i] = multiplier
             estimate_needs[i] = base_need
@@ -2059,7 +2059,7 @@ class ETSEnvironment(gym.Env):
         for i, company in enumerate(self.companies):
             if not active_mask[i]:
                 continue
-            annual_need_i = max(company.compute_estimate_need() + company._carry_forward, 1e-6)
+            annual_need_i = max(company.compute_estimate_need(), 1e-6)
             inf_i = company.inflation_factor(self.current_year)
             revenue_i = company.compute_revenue(self._last_marginal_ef, price_ma3_now, inf_i)
             compliance_cost_i = float(payments[i]) + float(trade_costs[i])
@@ -2432,7 +2432,7 @@ class ETSEnvironment(gym.Env):
                 # Non-compliant agents lose ESG credit, mirroring real corporate
                 # ESG accreditation loss when sustainability commitments are unmet.
                 annual_need_i = max(
-                    company.compute_estimate_need() + company._carry_forward, 1e-6
+                    company.compute_estimate_need(), 1e-6
                 )
                 if precompliance_holdings is not None:
                     coverage_frac = min(1.0, float(precompliance_holdings[i]) / annual_need_i)

@@ -248,7 +248,7 @@ class ActionProfileMapper:
         sec_high = trading.get("sec_mult_high", 1.3)
 
         # Estimate surplus/deficit
-        need = company.compute_estimate_need() + company._carry_forward
+        need = company.compute_estimate_need()
 
         profiles = {
             0: {  # Hold

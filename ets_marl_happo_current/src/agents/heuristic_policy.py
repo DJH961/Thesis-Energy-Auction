@@ -37,9 +37,8 @@ auction_action (WTP-based):
         boosted by max(0, 1 - supply_ratio) * 0.3.
         Budget-aware: bid price degrades gracefully when funds are tight.
     - qty_mult: physical compliance need + urgency safety buffer.
-        annual_need = compute_estimate_need() + _carry_forward  (minimum compliance need)
-        qty_target = annual_need + carry_fwd + 0.1 * annual_need * urgency
-        (carry_fwd added again as an intentional over-buying buffer when in debt)
+        annual_need = compute_estimate_need()  (includes carry-forward debt)
+        qty_target = annual_need + 0.1 * annual_need * urgency
         qty_mult = clip(qty_target / annual_need, low, high)
     - invest_frac: NPV-gated (properly discounted) with compliance-priority clip.
         annuity_factor = (1 - (1 + r)^-horizon) / r  where r = discount_rate
@@ -163,7 +162,7 @@ def auction_action(
         penalty_rate = base_penalty * float(inflation_factor)
 
     # --- Coverage ratio ---
-    annual_need = max(company.compute_estimate_need() + company._carry_forward, 0.1)
+    annual_need = max(company.compute_estimate_need(), 0.1)
     coverage_ratio = max(bank / annual_need, 0.0)
     available = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
 
@@ -178,8 +177,7 @@ def auction_action(
     urgency = min(1.0, (urgency + urgency_boost) * urgency_multiplier)
     market_anchor = max(mac_cost, price_ma3) + valuation_noise
     # --- C1: Target quantity (needed early for wtp_budget ceiling) ---
-    carry_fwd = max(0.0, float(company._carry_forward))
-    qty_target_raw = annual_need + carry_fwd + 0.1 * annual_need * urgency
+    qty_target_raw = annual_need + 0.1 * annual_need * urgency
     qty_mult_raw = qty_target_raw / max(annual_need, 1e-6)
     qty_mult_clipped = float(np.clip(qty_mult_raw, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0)))
     qty_clipped = qty_mult_clipped * annual_need  # EUR-denominator for wtp_budget
@@ -345,7 +343,7 @@ def secondary_action(
     aq = config["auction"]
     qty_max = aq["quantity_max"]
 
-    need = max(company.compute_estimate_need() + company._carry_forward, 1e-6)
+    need = max(company.compute_estimate_need(), 1e-6)
     remaining_years = max(1, n_years - current_year)
 
     # Target-bank trajectory: hold buffer for future years

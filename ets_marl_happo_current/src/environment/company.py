@@ -262,8 +262,9 @@ class Company:
         return self._compute_p_fail()
 
     def compute_estimate_need(self) -> float:
-        # Intentionally unbuffered: agents can learn their own coverage buffer.
-        return self.compute_emissions()
+        # Intentionally unbuffered: expected emissions + compliance debt.
+        # Coverage buffers are still learned through bid multipliers.
+        return self.compute_emissions() + self._carry_forward
 
     # ------------------------------------------------------------------
     # Operational costs
@@ -719,7 +720,8 @@ class Company:
         if self._carry_forward_enabled:
             cap_mult = self._carry_forward_cap
             if cap_mult > 0:
-                base_emiss = max(self.compute_estimate_need(), 0.1)
+                # Cap is defined against base annual emissions, not debt-inclusive need.
+                base_emiss = max(self.compute_emissions(), 0.1)
                 self._carry_forward = min(shortfall, cap_mult * base_emiss)
             else:
                 self._carry_forward = shortfall
@@ -907,7 +909,7 @@ class Company:
         ))
 
         # Compliance liability: unfunded shortfall × penalty rate / budget (E2-E3)
-        shortfall = max(0.0, estimated_need + self._carry_forward - current_holdings)
+        shortfall = max(0.0, estimated_need - current_holdings)
         eff_penalty = self.effective_penalty_rate(current_year)
         compliance_liability_norm = float(np.clip(
             shortfall * eff_penalty / max(self.annual_budget, 1e-6),
