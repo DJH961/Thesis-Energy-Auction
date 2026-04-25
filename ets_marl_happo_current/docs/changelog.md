@@ -5,6 +5,61 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v8.0.0
+
+**Tabula-Rasa Retirement, Fundamental Price Anchor, WTP-Uniform Exploration, Coverage Shaping Unification**
+
+### Tabula-rasa retirement (`scripts/train.py`, `configs/default.yaml`)
+- `tabula_rasa.enabled=true` now raises `ValueError` in `train_one_seed()` — it is no longer a valid runtime override.
+- The `tabula_rasa` block is kept in `default.yaml` with `enabled: false` as an ablation reference only.
+- Rationale: tabula-rasa accumulated too many conflicting overrides over v5-v7. The intended "start from scratch" behavior is now the default (no BC pretraining, no KL anchor, uniform exploration), making the override redundant.
+
+### Behavioral cloning and KL anchor disabled by default (`configs/default.yaml`, `src/agents/ppo_agent.py`)
+- `pretrain.enabled: false` — BC warm-start is off in the default profile.
+- `ppo.kl_anchor_beta: 0.0` — KL regularization toward frozen BC policy is off.
+- Both remain configurable for controlled ablation studies.
+
+### Fundamental price anchor (new file `src/utils/price_anchor.py`)
+- **`compute_fundamental_anchor(year, config)`**: Economically grounded expected clearing price derived from MAC cost (~48 EUR/t), banking premium multiplier (1.4×), cap scarcity (linear LRF approximation), and inflation-adjusted effective penalty rate.
+  - Formula: `mac_anchored + scarcity × (eff_penalty − mac_anchored)` where `scarcity = 1 − cap_t / cap_0`.
+  - Default output: ~67 EUR/t at yr0, ~101 EUR/t at yr11.
+  - No dependency on `CapSchedule` — resolves `cap_year_0` via three-priority fallback: (1) `ets["cap_year_0"]` runtime-calibrated value, (2) `ets["cap_year_0_override"]` YAML override, (3) estimate from `initial_mix × output_twh × emission_factors × (1 + cap_overhead_pct)`.
+- **`PPOAgent.inject_fundamental_anchor(year)`**: Seeds `price_head.bias` so the initial policy mean ≈ fundamental anchor for year `year`. Called once per episode at episode start.
+- **AR(1) mean-reversion floor** (`src/environment/ets_environment.py`): Static `ar1_floor` replaced with `compute_fundamental_anchor(year, config)` at the three AR(1) model update sites, so the expected price signal tracks economically grounded values as the cap tightens.
+- **`price.initial_expected` removed** from `default.yaml`: This static scalar is no longer needed; `ets_environment.py` falls back to `70.0` via `.get("initial_expected", 70.0)` for backward compatibility with any existing checkpoints.
+
+### WTP-uniform exploration (`src/agents/ppo_agent.py`)
+- Epsilon-random auction bids now sample 50/50 below/above the agent's **willingness-to-pay (WTP) anchor** rather than uniformly across the full price range.
+- WTP anchor: `wtp_economic = mac + 0.5 × (penalty − mac) ≈ 93 EUR/t`. Incorporates budget headroom from observation dim 27 when available.
+- Prevents systematic over-exploration above economic ceiling; keeps random bids interpretable as feasible market prices.
+- `exploration.mode: "uniform"` is the only supported mode (tabula-rasa override removed).
+- `exploration.auction_anchors` retained as optional per-head anchor override for ablation.
+
+### Coverage shaping unification (`configs/default.yaml`, `src/environment/ets_environment.py`)
+- Removed root `coverage_shaping` block (was a duplicate, never properly wired to the reward path).
+- Removed `reward.coverage_credit_weight` and `reward.gap_closure_weight` keys (dead config fields).
+- Single unified block: `reward.coverage_gap_shaping` with sub-keys `enabled`, `weight`, `target_coverage`.
+- Code reads exclusively from `reward.coverage_gap_shaping`; no fallback to old keys.
+
+### Price range reduction (`configs/default.yaml`, `configs/smoke_100.yaml`)
+- `auction.price_max`: 500 → **250 EUR/t**.
+- Rationale: 500 EUR/t is nearly 4× the penalty rate (138.75 EUR/t) — no rational compliance agent bids there. The tighter range reduces exploration waste and aligns the action space with economically plausible prices.
+- `secondary.sec_price_max_mult` adjusted accordingly in both configs.
+
+### Config cleanup (`configs/default.yaml`)
+- Stale comments and deprecated `price.initial_expected` key removed.
+- `tabula_rasa` block retained with `enabled: false` and a clear ablation-reference comment.
+- All `coverage_shaping`, `coverage_credit_weight`, `gap_closure_weight` references purged.
+
+### Tests added / updated
+- **`tests/test_price_anchor.py`** (new, 5 tests): `compute_fundamental_anchor()` calibration — year-0 value, monotonic increase, clipping to price bounds, config parameter sensitivity, `banking_premium_mult` kwarg override.
+- **`tests/test_anchors.py`**: Added `test_inject_fundamental_anchor_sets_price_near_anchor` — verifies `inject_fundamental_anchor(0)` sets policy mean within ±5 EUR/t of the year-0 anchor.
+- **`tests/test_tabula_rasa.py`** (rewritten): Tests now verify (1) `tabula_rasa.enabled=true` raises `ValueError`, (2) `enabled=false` is a no-op, (3) WTP-uniform exploration is side-balanced around WTP anchor (not midpoint), (4) null anchors fall back to WTP anchor not midpoint.
+- **`tests/test_environment.py`**: Fixed `test_defaulted_volume_not_double_counted_with_unsold_rollover` for v8 price_max change (budget override now triggers defaults under 250 EUR/t price cap).
+- All **279 tests pass**.
+
+---
+
 ## v7.13.1
 
 **Phantom anchor decoupling + GAE std-floor hardening + delayed ESG gate activation**

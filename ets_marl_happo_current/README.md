@@ -1,6 +1,6 @@
 # ETS MARL — Current (HAPPO/PPO)
 
-This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System. The default profile (`v7.13`) runs **8 pure learning agents** with no heuristic bots and includes a **phantom bidder** representing financial intermediary demand.
+This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System. The default profile (`v8.0`) runs **8 pure learning agents** with no heuristic bots and includes a **phantom bidder** representing financial intermediary demand.
 
 Recent changes and release-specific details are tracked in `docs/changelog.md`.
 
@@ -42,7 +42,7 @@ Both can be independently enabled/disabled via config flags (`reward.terminal_ba
 
 ### The Companies (Agents)
 
-The default `v7.13` profile uses **8 learning agents** (PPO/HAPPO) and **no heuristic bots** (`n_bot_agents: 0`). The smoke/ablation config (`smoke_100.yaml`) includes 8 additional heuristic bot agents for validation.
+The default `v8.0` profile uses **8 learning agents** (PPO/HAPPO) and **no heuristic bots** (`n_bot_agents: 0`). The smoke/ablation config (`smoke_100.yaml`) includes 8 additional heuristic bot agents for validation.
 
 **Learning Agents (A1-A8)** — organized into 4 archetypes (2 of each — one financially-motivated, one ESG-balanced):
 
@@ -73,7 +73,7 @@ All companies produce **10 TWh/year** of electricity — the same output, but ve
 Every year, each AI agent makes **6 decisions** (Phase 1) plus **2 more** (Phase 2):
 
 **Phase 1 — Auction & Investment:**
-- **Bid price**: How much to offer per allowance (€/tonne, range: 5-500)
+- **Bid price**: How much to offer per allowance (€/tonne, range: 5-250)
 - **Bid quantity**: Coverage multiplier on estimated annual need (0.3-2.0x)
 - **Investment fraction**: What share of capacity to convert to green (0-20%, subject to capex throughput cap)
 - **Technology choice**: Where to invest — onshore wind (4yr delay), offshore wind (7yr delay), or solar (2yr delay)
@@ -86,12 +86,14 @@ Every year, each AI agent makes **6 decisions** (Phase 1) plus **2 more** (Phase
 
 The agents use **HAPPO (Heterogeneous-Agent PPO)**, a multi-agent reinforcement learning algorithm with centralized critics.
 
-- Agents are pre-trained with **behavioral cloning** from a heuristic policy to seed sensible initial strategies
 - Each agent has a centralized critic that sees the global state, enabling coordinated learning
+- **Fundamental price anchor** (`src/utils/price_anchor.py`): Each episode, the auction policy price head is seeded to an economically grounded anchor (~67 EUR/t at yr0, rising to ~101 EUR/t by yr11) derived from MAC cost, cap scarcity, and penalty rate. This replaces behavioral cloning as the initialization mechanism.
+- **WTP-uniform exploration**: Epsilon-random auction prices sample 50/50 below/above the agent's willingness-to-pay anchor (~93 EUR/t), keeping exploration economically grounded rather than flat-uniform across the full price range.
 - **Epsilon-greedy exploration** decays from 25% to 5% over training, preventing policy collapse
 - **Historical Policy Pool** maintains past policy snapshots for opponent diversity
-- **Auto-scaled schedules**: warmup, pretraining, exploration decay, and HPP timing can scale automatically with `n_episodes`
+- **Auto-scaled schedules**: warmup, exploration decay, and HPP timing scale automatically with `n_episodes`
 - Hidden burn-in warm-start initializes banks, MSR reserve, and price history before visible year 0
+- Behavioral cloning pretraining and KL-anchor regularization are **disabled by default** in v8 (config: `pretrain.enabled: false`, `ppo.kl_anchor_beta: 0.0`)
 - Over 100,000 episodes, agents converge on sophisticated market strategies
 
 The reward signal balances:
@@ -126,7 +128,8 @@ The reward signal balances:
 - **Fundamentals-based heuristic**: Bot bidding uses MAC→penalty gradient (`mac_cost + urgency × (penalty - mac_cost)`), removing dependence on price moving average
 - **Absolute-price secondary market**: Secondary prices are expressed in €/t (not as multipliers), clipped to [sec_price_min, 2× effective penalty rate]
 - **ESG signal**: Saved-carbon-years formula rewards emission factor improvements proportional to remaining time, gated by w_green and the compliance gate
-- **Tabula-rasa balanced price-side exploration**: epsilon-random auction prices in `uniform` mode are sampled 50/50 under vs over expected price (uniform within each side), preventing bias from asymmetric price bounds
+- **WTP-uniform exploration** (v8): epsilon-random auction prices are sampled 50/50 under vs over the agent's willingness-to-pay anchor (~93 EUR/t = MAC + 0.5×(penalty-MAC)), preventing bias from asymmetric price bounds. The tabula-rasa override is retired; `tabula_rasa.enabled=true` raises an error.
+- **Coverage gap shaping** (`reward.coverage_gap_shaping`): optional per-agent reward bonus for closing the gap between allowance coverage and emissions; single unified block (root `coverage_shaping` and `coverage_credit_weight`/`gap_closure_weight` fields removed in v8)
 
 ## Project Structure
 
@@ -152,7 +155,8 @@ ets_marl_happo_current/
 │   │
 │   └── utils/
 │       ├── logger.py             # Logs training metrics
-│       └── replay_buffer.py      # Stores past experiences for learning
+│       ├── replay_buffer.py      # Stores past experiences for learning
+│       └── price_anchor.py       # Fundamental price anchor (MAC + scarcity + penalty)
 │
 ├── configs/
 │   └── default.yaml              # All simulation parameters
@@ -170,7 +174,9 @@ ets_marl_happo_current/
 │   ├── test_heuristic.py         # Tests heuristic policy
 │   ├── test_mappo.py             # Tests MAPPO/HAPPO integration
 │   ├── test_clipped_gaussian.py  # Tests clipped Gaussian policy
-│   └── test_anchors.py           # Tests action anchor initialization
+│   ├── test_anchors.py           # Tests action anchor initialization and fundamental anchor injection
+│   ├── test_price_anchor.py      # Tests compute_fundamental_anchor() calibration
+│   └── test_tabula_rasa.py       # Tests tabula-rasa retirement and WTP-uniform exploration
 │
 ├── notebooks/
 │   └── ets_marl_colab.ipynb      # Google Colab notebook for training in the cloud
@@ -262,12 +268,13 @@ The most important settings you might want to change:
 | `simulation.n_episodes` | 100,000 | How many episodes to train for (more = better but slower) |
 | `simulation.n_years` | 12 | How many years each episode simulates |
 | `companies.n_agents` | 8 | Number of learning agents (PPO) |
-| `companies.n_bot_agents` | 8 | Number of heuristic bot agents |
+| `companies.n_bot_agents` | 0 | Number of heuristic bot agents (0 = pure MARL; smoke_100.yaml uses 8) |
 | `ets.cap_overhead_pct` | 0.11 | Year-0 cap overhead over total initial emissions (dynamic calibration) |
 | `ets.cap_year_0_override` | `null` | Optional hard override for year-0 cap |
-| `auction.price_max` | 500 | Maximum bid price (€/tonne) |
+| `auction.price_max` | 250 | Maximum bid price (€/tonne) |
 | `penalty.rate` | 138.75 | Fine per excess tonne of CO2 (€), base level at simulation year-0 (2026) |
-| `tabula_rasa.enabled` | false | Enables no-anchor tabula-rasa overrides with side-balanced under/over expected-price exploration |
+| `pretrain.enabled` | false | Behavioral cloning warm-start from heuristic policy (disabled by default in v8) |
+| `ppo.kl_anchor_beta` | 0.0 | KL-anchor regularization toward BC policy (disabled by default in v8) |
 | `auction.collateral.enabled` | true | Enables EU ETS-style bid collateral opportunity-cost term on overbids |
 | `auction.collateral.collateral_rate` | 0.05 | Annualized cost-of-capital rate applied to locked collateral |
 | `auction.collateral.hold_fraction` | 0.02 | Fraction of year collateral lock-up used in annualized model (~7 days) |

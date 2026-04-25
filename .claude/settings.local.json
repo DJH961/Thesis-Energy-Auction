@@ -1,15 +1,19 @@
 {
-  "permissions": {
-    "allow": [
-      "Bash(python3 -c \":*)",
-      "Bash(python3 -c \"import json; json.load\\(open\\(''ets_marl_happo_current/notebooks/ets_marl_colab.ipynb'', encoding=''utf-8''\\)\\); print\\(''Valid JSON''\\)\")",
-      "Bash(python -c \":*)"
-    ]
-  },
-    "model": "sonnet",
   "env": {
     "MAX_THINKING_TOKENS": "10000",
     "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
     "CLAUDE_CODE_SUBAGENT_MODEL": "haiku"
-  }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \":*)",
+      "Bash(python3 -c \"import json; json.load\\(open\\(''ets_marl_happo_current/notebooks/ets_marl_colab.ipynb'', encoding=''utf-8''\\)\\); print\\(''Valid JSON''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python -m pytest tests/test_environment.py::test_defaulted_volume_not_double_counted_with_unsold_rollover -v --tb=long)",
+      "Bash(python -c \"import yaml; c=yaml.safe_load\\(open\\('configs/default.yaml'\\)\\); print\\('price_max:', c['auction']['price_max']\\)\")",
+      "Bash(python -c \"import yaml,sys; c=yaml.safe_load\\(sys.stdin\\); print\\('old price_max:', c['auction']['price_max']\\)\")",
+      "Bash(python -m pytest tests/test_environment.py::test_defaulted_volume_not_double_counted_with_unsold_rollover -v --tb=short)"
+    ]
+  },
+  "model": "sonnet"
 }

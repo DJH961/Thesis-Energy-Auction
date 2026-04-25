@@ -47,6 +47,7 @@ from src.auction.market_clearing_ets import market_clearing_ets, build_bids, set
 from src.environment.cap_schedule import CapSchedule
 from src.environment.company import Company
 from src.environment.market_calibration import compute_market_params
+from src.utils.price_anchor import compute_fundamental_anchor
 from src.environment.phantom_bidder import PhantomBidder
 from src.agents import heuristic_policy
 
@@ -176,10 +177,11 @@ class ETSEnvironment(gym.Env):
         # Episode state — all arrays are n_total sized (learning + bots)
         self.current_year = 0
         self.current_episode = 0          # updated by training loop via set_episode()
-        self.last_clearing_price = config["price"]["initial_expected"]
-        self.expected_price = config["price"]["initial_expected"]
+        self._price_initial = float(config.get("price", {}).get("initial_expected", 70.0))
+        self.last_clearing_price = self._price_initial
+        self.expected_price = self._price_initial
         self._price_history: List[float] = []
-        self.last_secondary_price = config["price"]["initial_expected"]
+        self.last_secondary_price = self._price_initial
         self.last_secondary_volume = 0.0  # P8: track volume for phase1 obs
         self._last_auction_volume = self.cap_schedule.get_cap(0)
         self._last_gaps = np.zeros(self.n_total)
@@ -254,7 +256,7 @@ class ETSEnvironment(gym.Env):
         self._consecutive_years_without_valid_auction_clear = 0
 
         # Secondary liquidity pool EMA anchor state (only used when pool enabled)
-        self._liquidity_ref_ema = float(config["price"]["initial_expected"])
+        self._liquidity_ref_ema = self._price_initial
 
         # Episode-level inflation path (shared by all participants)
         self._inflation_rates: List[float] = []
@@ -463,9 +465,9 @@ class ETSEnvironment(gym.Env):
 
         self.current_year = 0
         self.episode_done = False
-        self.last_clearing_price = self.config["price"]["initial_expected"]
-        self.expected_price = self.config["price"]["initial_expected"]
-        self.last_secondary_price = self.config["price"]["initial_expected"]
+        self.last_clearing_price = self._price_initial
+        self.expected_price = self._price_initial
+        self.last_secondary_price = self._price_initial
         self.last_secondary_volume = 0.0
         self._last_auction_volume = self.cap_schedule.get_cap(0)
         self._price_history = []
@@ -488,7 +490,7 @@ class ETSEnvironment(gym.Env):
         self._cumulative_emissions = np.zeros(self.n_total)
         self._last_cover_ratio = 1.0  # neutral default before first auction
         self._consecutive_years_without_valid_auction_clear = 0
-        self._liquidity_ref_ema = float(self.config["price"]["initial_expected"])
+        self._liquidity_ref_ema = self._price_initial
 
         self.cap_schedule.reset()
         self._unsold_rollover = 0.0
@@ -899,10 +901,7 @@ class ETSEnvironment(gym.Env):
             self.last_clearing_price = float(self._price_history[-1])
 
         rho = self.config["price"].get("ar1_persistence", 0.85)
-        price_floor = self.config["price"].get(
-            "ar1_floor",
-            self.config["price"].get("price_floor", 50.0),
-        )
+        price_floor = compute_fundamental_anchor(0, self.config)
         vol_std = self.config["price"].get("volatility_std", 0.15)
         base_price = self.last_clearing_price if self._price_history else price_mean
         shock = self.rng.normal(0, vol_std) * base_price
@@ -1003,8 +1002,7 @@ class ETSEnvironment(gym.Env):
             self._price_history.append(synthetic_price)
             self.last_clearing_price = synthetic_price
             rho = self.config["price"].get("ar1_persistence", 0.85)
-            price_floor = self.config["price"].get("ar1_floor",
-                            self.config["price"].get("price_floor", 50.0))
+            price_floor = compute_fundamental_anchor(0, self.config)
             vol_std = self.config["price"].get("volatility_std", 0.15)
             shock = self.rng.normal(0, vol_std) * synthetic_price
             self.expected_price = max(
@@ -1146,7 +1144,7 @@ class ETSEnvironment(gym.Env):
         budget_mode = self.config.get("budget", {}).get("mode", "fixed")
         if budget_mode == "revenue_based":
             # Smoothed price: MA3 from price history, padded with initial_expected
-            init_p = self.config["price"]["initial_expected"]
+            init_p = self._price_initial
             hist = list(self._price_history)
             while len(hist) < 3:
                 hist.insert(0, init_p)
@@ -2096,8 +2094,8 @@ class ETSEnvironment(gym.Env):
         if self._reserve_anchor == "secondary":
             self._price_history.append(secondary_clearing)
         rho = self.config["price"].get("ar1_persistence", 0.85)
-        price_floor = self.config["price"].get("ar1_floor",
-                        self.config["price"].get("price_floor", 50.0))
+        next_year = min(self.current_year + 1, self.n_years - 1)
+        price_floor = compute_fundamental_anchor(next_year, self.config)
         vol_std = self.config["price"].get("volatility_std", 0.15)
 
         # Only update the AR(1) expected-price forecast from a meaningful (successful)

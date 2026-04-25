@@ -309,12 +309,12 @@ class EntropyConditionTracker:
         self.coef_init = ppo_cfg.get("entropy_coef", 0.02)
         self.coef_final = ppo_cfg.get("entropy_coef_final", 0.005)
 
-        raw_window = ppo_cfg.get("entropy_decay_window", 0)
-        raw_start = ppo_cfg.get("entropy_decay_start", 0)
+        raw_window = ppo_cfg.get("entropy_decay_window", -1)
+        raw_start = ppo_cfg.get("entropy_decay_start", -1)
 
-        # Auto-scale: 0 means "compute from n_episodes"
-        self.decay_start = raw_start if raw_start > 0 else int(0.05 * n_episodes)
-        self.decay_window = raw_window if raw_window > 0 else int(0.80 * n_episodes)
+        # Auto-scale: -1 means "compute from n_episodes"; 0 means "start immediately"
+        self.decay_start = raw_start if raw_start >= 0 else int(0.05 * n_episodes)
+        self.decay_window = raw_window if raw_window >= 0 else int(0.90 * n_episodes)
 
     def update(self, episode: int) -> float:
         """Return current entropy coefficient based on episode number."""
@@ -506,6 +506,105 @@ def _apply_ppo_run_profile(config: dict, n_episodes: int) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint pruning
+# ---------------------------------------------------------------------------
+
+def prune_checkpoints(
+    ckpt_dir: str,
+    n_agents: int,
+    n_keep_recent: int = 5,
+    n_keep_milestones: int = 20,
+) -> None:
+    """Delete redundant periodic episode checkpoints after a completed training run.
+
+    Keeps (never deletes):
+      * ``agent_*_best.pt``          — best-reward snapshot (written at any point)
+      * ep0 checkpoint               — start-of-training baseline
+      * ``n_keep_milestones`` checkpoints  — log-spaced across the full episode range
+        so the learning curve is sampled at every order of magnitude
+      * The ``n_keep_recent`` most-recent episode checkpoints  — handy resume point
+
+    Everything else is removed.  The function is called at the **end** of
+    ``train_one_seed`` so that an interrupted run always retains all
+    checkpoints written so far.
+
+    Parameters
+    ----------
+    ckpt_dir : str
+        Directory containing ``agent_*_ep*.pt`` files.
+    n_agents : int
+        Number of learning agents (0 … n_agents-1).
+    n_keep_recent : int
+        How many of the most recent periodic checkpoints to keep.
+    n_keep_milestones : int
+        How many log-spaced milestones to keep across the whole run.
+    """
+    import re
+
+    if not os.path.isdir(ckpt_dir):
+        return
+
+    # Use agent_0 as the sentinel to discover which episode numbers exist.
+    ep_pat = re.compile(r"^agent_0_ep(\d+)\.pt$")
+    all_eps = sorted(
+        int(m.group(1))
+        for f in os.listdir(ckpt_dir)
+        for m in [ep_pat.match(f)]
+        if m is not None
+    )
+
+    if not all_eps:
+        return
+
+    keep_eps = set()
+
+    # Always keep the very first checkpoint (ep0 / cold-start baseline)
+    keep_eps.add(all_eps[0])
+
+    # Keep the N most recent
+    keep_eps.update(all_eps[-n_keep_recent:])
+
+    # Keep log-spaced milestones across the full range
+    lo, hi = all_eps[0], all_eps[-1]
+    if n_keep_milestones >= 2 and hi > lo:
+        import math
+        # Use log scale when lo > 0; fall back to linear from zero otherwise.
+        for k in range(n_keep_milestones):
+            frac = k / float(n_keep_milestones - 1)
+            if lo > 0:
+                target = int(round(math.exp(
+                    math.log(lo) + frac * (math.log(hi) - math.log(lo))
+                )))
+            else:
+                target = int(round(frac * hi))
+            nearest = min(all_eps, key=lambda e: abs(e - target))
+            keep_eps.add(nearest)
+    else:
+        # Fewer than 2 milestones or single-point range: keep everything
+        keep_eps.update(all_eps)
+
+    deleted = 0
+    for ep in all_eps:
+        if ep not in keep_eps:
+            for i in range(n_agents):
+                path = os.path.join(ckpt_dir, f"agent_{i}_ep{ep}.pt")
+                try:
+                    os.remove(path)
+                    deleted += 1
+                except OSError:
+                    pass
+
+    kept_files = len(keep_eps) * n_agents + len([
+        f for f in os.listdir(ckpt_dir) if f.endswith("_best.pt")
+    ])
+    print(
+        f"Checkpoint pruning: kept {len(keep_eps)} episode snapshots"
+        f" ({kept_files} files total, {n_agents} agents × milestone/recent),"
+        f" deleted {deleted} files."
+    )
+
+
 def train_one_seed(config: dict, seed: int, on_log=None):
     # Isolate per-run auto-resolved schedule values (e.g. shaping decay)
     # so earlier short runs do not mutate config used by later long runs.
@@ -519,41 +618,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     tr_cfg = config.get("tabula_rasa", {})
     if tr_cfg.get("enabled", False):
-        n_ep = config["simulation"]["n_episodes"]
-        # Disable BC and KL anchor
-        config.setdefault("pretrain", {})["enabled"] = False
-        config.setdefault("ppo", {})["kl_anchor_beta"] = 0.0
-
-        # Override exploration
-        explore_cfg = config.setdefault("exploration", {})
-        explore_cfg["epsilon_start"] = tr_cfg["epsilon_start"]
-        explore_cfg["epsilon_final"] = tr_cfg["epsilon_final"]
-        explore_cfg["epsilon_decay_episodes"] = int(tr_cfg["epsilon_decay_frac"] * n_ep)
-        explore_cfg["mode"] = tr_cfg.get("exploration_mode", "uniform")
-
-        # Override entropy + critic warmup
-        ppo_cfg = config.setdefault("ppo", {})
-        ppo_cfg["entropy_coef"] = tr_cfg["entropy_coef"]
-        ppo_cfg["entropy_decay_start"] = int(tr_cfg["entropy_decay_start_frac"] * n_ep)
-        ppo_cfg["entropy_decay_window"] = int(tr_cfg["entropy_decay_window_frac"] * n_ep)
-        ppo_cfg["critic_warmup_episodes"] = int(tr_cfg["critic_warmup_frac"] * n_ep)
-
-        # Override shaping and HPP
-        config.setdefault("reward", {})["shaping_decay_episode"] = int(
-            tr_cfg["shaping_decay_frac"] * n_ep
-        )
-        config.setdefault("hpp", {})["warmup_episodes"] = int(
-            tr_cfg["hpp_warmup_frac"] * n_ep
-        )
-
-        # Remove explicit action anchors (auction price still initializes
-        # near expected market price via PPOAgent fallback).
-        explore_cfg["auction_anchors"] = None
-        explore_cfg["secondary_anchors"] = None
-        print(
-            "TABULA RASA: BC off, KL off, anchors off, side-balanced price exploration, "
-            f"ε={tr_cfg['epsilon_start']}→{tr_cfg['epsilon_final']}, "
-            f"entropy={tr_cfg['entropy_coef']}"
+        raise ValueError(
+            "tabula_rasa.enabled=true is no longer supported as a runtime override. "
+            "Configure each schedule parameter directly in the relevant config section "
+            "(exploration, ppo, reward, hpp, pretrain). "
+            "See the tabula_rasa block in default.yaml for ablation reference values."
         )
 
     n_agents = config["companies"]["n_agents"]
@@ -564,8 +633,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # Reward shaping decay schedule: allow auto-scaling from n_episodes.
     reward_cfg = config.setdefault("reward", {})
     shaping_decay_eps, shaping_decay_auto = _resolve_auto_episode_count(
-        reward_cfg.get("shaping_decay_episode", 3000), n_episodes,
-        frac=0.12, min_count=300, max_count=8000,
+        reward_cfg.get("shaping_decay_episode", 0), n_episodes,
+        frac=0.40, min_count=500, max_count=80000,
     )
     reward_cfg["shaping_decay_episode"] = shaping_decay_eps
 
@@ -602,7 +671,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     print(f"\n{'='*60}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
-    print(f"v7.6.1: OPEX delta + /annual_budget norm + phase-aware GAE + calibration tune | Carry-forward{cf_str}")
+    print(f"v8.0: Fundamental price anchor + coverage shaping unified + tabula-rasa retired | Carry-forward{cf_str}")
     print(f"Clipped Gaussian (no tanh) + P1-P8 active{curric_str}{eps_str}")
     print(
         f"PPO profile: {run_profile['profile']} "
@@ -619,11 +688,16 @@ def train_one_seed(config: dict, seed: int, on_log=None):
               f"then UNIFORM from episode {_pab_switch_ep}+")
     if shaping_decay_auto:
         print(f"Reward shaping decay: → 0 at episode {shaping_decay_eps} [auto] "
-              f"(12% of {n_episodes}, clamp=[300, 8000]).")
+              f"(40% of {n_episodes}, clamp=[500, 80000]).")
 
     env = ETSEnvironment(config, seed=seed)
     agents = build_agents(env, config, seed)
     n_total_agents = env.n_total
+
+    # Calibrate each agent's price_head bias to the fundamental anchor.
+    # Called before BC (if enabled) so BC can refine from there, not from scratch.
+    for agent in agents:
+        agent.inject_fundamental_anchor(year=0)
 
     ppo_cfg = config["ppo"]
 
@@ -664,7 +738,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     critic_warmup_eps, critic_warmup_auto = _resolve_auto_episode_count(
         ppo_cfg.get("critic_warmup_episodes", 0), n_episodes,
-        frac=0.06, min_count=60, max_count=1200,
+        frac=0.03, min_count=100, max_count=5000,
     )
     if critic_warmup_eps > 0:
         auto_note = " [auto]" if critic_warmup_auto else ""
@@ -690,7 +764,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     eps_final = explore_cfg.get("epsilon_final", 0.0)
     eps_decay_episodes, eps_decay_auto = _resolve_auto_episode_count(
         explore_cfg.get("epsilon_decay_episodes", 0), n_episodes,
-        frac=0.35, min_count=300, max_count=12000,
+        frac=0.75, min_count=1000, max_count=100000,
     )
     if eps_start > 0.0:
         auto_note = " [auto]" if eps_decay_auto else ""
@@ -708,7 +782,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     hpp_swap_prob = hpp_cfg.get("swap_prob", 0.20)
     hpp_warmup, hpp_warmup_auto = _resolve_auto_episode_count(
         hpp_cfg.get("warmup_episodes", 0), n_episodes,
-        frac=0.20, min_count=200, max_count=6000,
+        frac=0.20, min_count=200, max_count=30000,
     )
     # Per-agent FIFO pool of actor state_dicts (auction + secondary only)
     hpp_pools = [collections.deque(maxlen=hpp_pool_size) for _ in range(n_agents)]
@@ -2092,6 +2166,18 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         f"containment_release={msr_event_totals['containment_release']}  "
         f"withdrawal_suppressed={msr_event_totals['withdrawal_suppressed']}"
     )
+
+    # Checkpoint pruning — runs only on clean completion so interrupted runs
+    # always retain every checkpoint written up to the point of failure.
+    prune_cfg = config.get("logging", {}).get("checkpoint_pruning", {})
+    if prune_cfg.get("enabled", True):
+        ckpt_dir = os.path.join(results_dir, f"checkpoints_s{seed}")
+        prune_checkpoints(
+            ckpt_dir=ckpt_dir,
+            n_agents=n_agents,
+            n_keep_recent=int(prune_cfg.get("n_keep_recent", 5)),
+            n_keep_milestones=int(prune_cfg.get("n_keep_milestones", 20)),
+        )
 
     ep_csv.close()
     yr_csv.close()

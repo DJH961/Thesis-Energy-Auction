@@ -642,9 +642,11 @@ def test_defaulted_volume_not_double_counted_with_unsold_rollover():
         config = yaml.safe_load(f)
 
     # Disable bots for deterministic demand and relax leverage so defaults can occur.
+    # Low budgets ensure payment (price_max × allocation) exceeds agent cash even with loans.
     config = copy.deepcopy(config)
     config["companies"]["n_bot_agents"] = 0
     config["auction"]["leverage_multiplier"] = 100.0
+    config["budget"]["annual_budgets"] = [200.0] * 8  # well below price_max × per-agent alloc
 
     env = ETSEnvironment(config, seed=42)
     env.reset(seed=42)

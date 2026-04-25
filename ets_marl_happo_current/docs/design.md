@@ -8,7 +8,7 @@ This document describes the **ETS MARL** simulation: a stylised multi-agent rein
 
 **Why it exists:** To study emergent market behaviour (pricing dynamics, banking incentives, green-investment timing) under regulatory mechanisms (cap trajectory, Market Stability Reserve) using modern multi-agent RL.
 
-**Who participates:** The current default profile (`v7.12`) is pure MARL with 8 learning agents trained with PPO/HAPPO and 0 bots. The environment still supports optional heuristic bot participants for ablation/calibration runs.
+**Who participates:** The current default profile (`v8.0`) is pure MARL with 8 learning agents trained with PPO/HAPPO and 0 bots. The environment still supports optional heuristic bot participants for ablation/calibration runs.
 
 **How an episode works:** Each episode simulates 12 years. Every year, participants bid in a sealed-bid uniform-price auction for CO2 allowances, then trade in a bilateral secondary market, and choose how much to invest in renewable capacity. Penalties fall on those without enough allowances to cover emissions. The government cap shrinks by ~4.3–4.4 % annually, creating increasing scarcity that forces decarbonisation.
 
@@ -27,7 +27,7 @@ The model is a stylized EU ETS micro-market with configurable participants:
 - 8 learning agents (PPO with HAPPO-style sequential updates)
 - 0-8 heuristic bot agents (rule-based, not trained)
 
-Default configuration in `v7.12` is:
+Default configuration in `v8.0` is:
 - 8 learning agents
 - 0 bot agents (`n_bot_agents: 0`)
 
@@ -155,7 +155,7 @@ Auction reserve can be:
 - Learning agents A1-A8: PPO/HAPPO-trained.
 - Bot agents B1-B8 (optional): heuristic policy for both auction and secondary market.
 
-Current default (`v7.12`) uses no bots (`n_bot_agents=0`).
+Current default (`v8.0`) uses no bots (`n_bot_agents=0`).
 
 From v7.0, bot behavior also supports:
 - `enhanced_noise` (higher valuation/urgency variance plus optional budget-stress quantity cuts),
@@ -319,7 +319,7 @@ Each opponent contributes public 5D tuple:
 With `N_total` total participants:
 - phase 1 dimension = `33 + 5 x (N_total - 1)`
 
-Default `v7.12` profile (`N_total=8`):
+Default `v8.0` profile (`N_total=8`):
 - phase 1 dimension = `33 + 5 x 7 = 68`
 
 ### 6.2 Phase 2 observation
@@ -343,10 +343,10 @@ $$
 With `N_total` total participants:
 - phase 2 dimension = `obsDimPhase1 + 10`
 
-Default `v7.12` profile (`N_total=8`):
+Default `v8.0` profile (`N_total=8`):
 - phase 2 dimension = `68 + 10 = 78`
 
-## 7. Reward Design (v7.12)
+## 7. Reward Design (v8.0)
 
 **Reward channel logging:** After each year, `_last_reward_channels` and
 `_last_auction_reward_channels` dicts are populated with named components. These are for
@@ -437,11 +437,15 @@ Actors are decentralized; critic can be centralized (MAPPO mode) over concatenat
 - Historical Policy Pool (periodic snapshots and random swaps for opponent diversity).
 - Diagnostics for stuck-market or degenerate-policy regimes.
 
-v7.0 adds a configurable **tabula-rasa mode** for ablation:
-- disables BC pretraining and KL anchor,
-- removes action anchors,
-- switches epsilon exploration to uniform,
-- overrides warmup/decay schedules from `n_episodes` fractions.
+**v8.0 tabula-rasa retirement:** `tabula_rasa.enabled=true` raises `ValueError` in `train_one_seed()`. The config block is kept in `default.yaml` as an ablation reference (always `enabled: false`). Behavioral cloning pretraining and KL-anchor regularization are disabled by default (`pretrain.enabled: false`, `ppo.kl_anchor_beta: 0.0`). Exploration defaults to `uniform` mode with WTP-uniform sampling — no tabula-rasa override needed.
+
+**v8.0 fundamental price anchor** (`src/utils/price_anchor.py`): `compute_fundamental_anchor(year, config)` returns the economically grounded expected clearing price derived from MAC cost, cap scarcity (LRF-based linear approximation), and effective penalty rate:
+
+$$
+\text{anchor}_t = \underbrace{MAC \times \text{mult}}_{\text{banking premium}} + \text{scarcity}_t \times (\text{eff\_penalty}_t - MAC \times \text{mult})
+$$
+
+where $\text{scarcity}_t = 1 - cap_t / cap_0$, compounding from 0 at yr0 to ~0.4 at yr11. Default output: ~67 EUR/t at yr0, ~101 EUR/t at yr11. Used as: (1) initial `price_head.bias` in `PPOAgent.inject_fundamental_anchor(year)`, and (2) AR(1) mean-reversion floor in `ETSEnvironment`.
 
 ## 9. Economic and Financial Layers
 

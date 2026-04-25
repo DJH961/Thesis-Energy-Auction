@@ -123,6 +123,11 @@ class AuctionPolicy(nn.Module):
                 self.price_head.bias.fill_(raw_anchors[0].item())
                 self.qty_head.bias.fill_(raw_anchors[1].item())
                 self.rest_head.bias.copy_(raw_anchors[2:])
+        # Tighten initial std on the price dimension only.
+        # log_std=-1.5 → std≈0.22 raw → ≈22 EUR/t physical spread (1σ) at price_max=250.
+        # Qty, invest_frac, and tech logits keep their default (wide exploration is fine).
+        with torch.no_grad():
+            self.log_std.data[0] = -1.5  # dim 0 = bid_price
 
 
 class SecondaryPolicy(nn.Module):

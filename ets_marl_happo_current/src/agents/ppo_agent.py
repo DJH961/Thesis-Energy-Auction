@@ -198,21 +198,15 @@ class PPOAgent:
         auction_anchors = explore_cfg.get("auction_anchors", None)
         secondary_anchors = explore_cfg.get("secondary_anchors", None)
 
-        # Market-based fallback for expected-price anchors in exploration.
-        # If the expected-price feature is unavailable or invalid, use a
-        # calibrated default (EU ETS recent auction level ~80 EUR/t) instead
-        # of midpoint-of-range behavior.
-        price_cfg = config.get("price", {})
-        fallback_expected = price_cfg.get("initial_expected", None)
-        if fallback_expected is None:
-            if isinstance(auction_anchors, (list, tuple)) and len(auction_anchors) > 0:
-                fallback_expected = auction_anchors[0]
-            else:
-                fallback_expected = 80.0
+        # Fundamental price anchor: MAC-based economically derived initial price.
+        # Falls back to config price.initial_expected or 80.0 if anchor fails.
         try:
-            self.expected_price_fallback = float(fallback_expected)
-        except (TypeError, ValueError):
-            self.expected_price_fallback = 80.0
+            from src.utils.price_anchor import compute_fundamental_anchor
+            self.expected_price_fallback = compute_fundamental_anchor(0, config)
+        except Exception:
+            self.expected_price_fallback = float(
+                config.get("price", {}).get("initial_expected", 80.0)
+            )
 
         # WTP-anchored exploration parameters (Approach C+D: escape floor-price trap)
         penalty_cfg = config.get("penalty", {})
@@ -309,6 +303,21 @@ class PPOAgent:
     def set_kl_beta(self, beta: float):
         """Update KL anchor penalty weight (decayed by train.py)."""
         self.kl_beta = float(beta)
+
+    def inject_fundamental_anchor(self, year: int = 0) -> None:
+        """Overwrite price_head.bias so the initial policy mean ≈ fundamental anchor.
+
+        Called once from train.py after build_agents() (and after BC if enabled,
+        so BC doesn't undo the calibration).  Safe to call multiple times.
+        """
+        import numpy as np
+        from src.utils.price_anchor import compute_fundamental_anchor
+        anchor = compute_fundamental_anchor(year, self.config)
+        scale  = float(self.auction_policy.action_scale[0].item())
+        bias   = float(self.auction_policy.action_bias[0].item())
+        raw    = float(np.clip((anchor - bias) / (scale + 1e-8), -0.95, 0.95))
+        with torch.no_grad():
+            self.auction_policy.price_head.bias.fill_(raw)
 
     def set_bc_anchor(self):
         """

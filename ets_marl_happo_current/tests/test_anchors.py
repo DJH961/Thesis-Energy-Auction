@@ -275,3 +275,103 @@ def test_anchor_config_passed_to_policy():
         action, _, _ = agent.auction_policy.act(obs, deterministic=True)
     price = action[0, 0].item()
     assert abs(price - 80.0) < 50.0, f"Anchor not applied: price {price:.1f}"
+
+
+# ---------------------------------------------------------------------------
+# inject_fundamental_anchor test
+# ---------------------------------------------------------------------------
+
+def test_inject_fundamental_anchor_sets_price_near_anchor():
+    """inject_fundamental_anchor() should calibrate price_head.bias so that
+    the deterministic initial action is near the fundamental anchor (~67 EUR/t
+    at year 0 for default params: MAC=48, mult=1.4, price_max=250).
+    """
+    from src.agents.ppo_agent import PPOAgent
+
+    config = {
+        "ppo": {
+            "hidden_size": 64, "lr": 0.0003, "gamma": 0.99,
+            "gae_lambda": 0.95, "clip_eps": 0.2, "entropy_coef": 0.02,
+            "value_coef": 0.5, "max_grad_norm": 0.5, "n_epochs": 2,
+            "mini_batch_size": 4, "log_std_min": -2.5, "log_std_max": 0.0,
+            "centralized_critic": False, "critic_hidden_size": 64,
+        },
+        "auction": {"price_min": 45.0, "price_max": 250.0, "quantity_max": 3.0,
+                     "qty_mult_low": 0.5, "qty_mult_high": 2.0},
+        "investment": {"max_invest_frac": 0.20},
+        "trading": {"sec_price_min": 45.0, "sec_price_max_mult": 2.0},
+        "penalty": {"rate": 138.75, "inflation_rate": 0.02,
+                    "carry_forward": True, "carry_forward_cap": 0.0},
+        "reward": {"normalizer_alpha": 0.01, "clip_min": -10.0, "clip_max": 10.0},
+        "companies": {"n_agents": 8, "output_twh": 10.0,
+                      "initial_mix": [[0.25, 0.30, 0.20, 0.15, 0.10]] * 8},
+        "mac": {"enabled": True, "coal_to_gas_cost": 48.0, "max_switch_frac": 0.20},
+        "price": {"banking_premium_mult": 1.4, "ar1_persistence": 0.85,
+                  "volatility_std": 0.15, "burnin_std": 10.0},
+        "ets": {
+            "cap_year_0_override": None, "initial_bank_fraction": 0.10,
+            "cap_overhead_pct": 0.02, "lrf_phase1": 0.043, "lrf_phase2": 0.044,
+            "lrf_phase_switch": 2,
+            "msr": {
+                "enabled": True, "tnac_upper_ratio": 0.36, "tnac_mid_ratio": None,
+                "tnac_lower_ratio": None, "withhold_rate": 0.24,
+                "release_frac": 0.0638297872, "activation_year": 1,
+                "price_containment_absolute": 350, "price_release_absolute": 450,
+                "emergency_release_frac": 0.064, "min_auction_frac": 0.10,
+            },
+            "banking": True, "reserve_price": 45.0, "reserve_price_mode": "static",
+            "unsold_to_msr": False, "max_rollover_multiplier": 1.5,
+            "price_history_anchor": "auction",
+        },
+        "technologies": {
+            "names": ["coal", "gas", "onshore_wind", "offshore_wind", "solar"],
+            "emission_factors": [0.820, 0.490, 0.011, 0.012, 0.048],
+            "capacity_factors": [0.65, 0.60, 0.35, 0.47, 0.17],
+            "capex": [3000, 1150, 1350, 3250, 750],
+            "deploy_delays": [0, 0, 4, 7, 2],
+            "operational_costs": [72.0, 55.0, 17.0, 47.0, 10.0],
+            "decommission_costs": [200, 100, 0, 0, 0],
+            "is_green": [False, False, True, True, True],
+            "is_buildable": [False, False, True, True, True],
+        },
+        "simulation": {"n_years": 12, "n_episodes": 100},
+        "exploration": {"auction_anchors": None, "secondary_anchors": None},
+    }
+
+    agent = PPOAgent(
+        agent_id=0, obs_dim_phase1=22, obs_dim_phase2=29,
+        auction_action_low=np.array([45.0, 0.5, 0.0, -1, -1, -1], dtype=np.float32),
+        auction_action_high=np.array([250.0, 2.0, 0.20, 1, 1, 1], dtype=np.float32),
+        secondary_action_low=np.array([45.0, -3.0], dtype=np.float32),
+        secondary_action_high=np.array([350.0, 3.0], dtype=np.float32),
+        config=config, seed=0,
+    )
+
+    # Before injection: no explicit anchor, bias starts at midpoint
+    device = next(agent.auction_policy.parameters()).device
+    obs = torch.zeros(1, 22, device=device)
+
+    with torch.no_grad():
+        action_before, _, _ = agent.auction_policy.act(obs, deterministic=True)
+    price_before = float(action_before[0, 0].item())
+
+    # Inject the fundamental anchor (MAC=48, mult=1.4 → ~67 EUR/t at year 0)
+    agent.inject_fundamental_anchor(year=0)
+
+    with torch.no_grad():
+        action_after, _, _ = agent.auction_policy.act(obs, deterministic=True)
+    price_after = float(action_after[0, 0].item())
+
+    # Without injection the price defaults near midpoint (147.5 EUR/t);
+    # after injection it should be near the anchor (~67 EUR/t).
+    expected_anchor = 48.0 * 1.4  # 67.2 EUR/t
+    midpoint = (45.0 + 250.0) / 2.0  # 147.5 EUR/t
+
+    assert abs(price_after - expected_anchor) < 20.0, (
+        f"After inject_fundamental_anchor, price {price_after:.1f} too far from "
+        f"expected anchor {expected_anchor:.1f} EUR/t"
+    )
+    assert abs(price_after - midpoint) > 30.0, (
+        f"After inject_fundamental_anchor, price {price_after:.1f} still near midpoint "
+        f"{midpoint:.1f} — injection had no effect"
+    )
