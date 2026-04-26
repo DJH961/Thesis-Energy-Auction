@@ -2119,6 +2119,9 @@ class ETSEnvironment(gym.Env):
 
         self.episode_log.append(log)
 
+        for company in self.companies:
+            company.prev_green_frac = company.green_frac
+
         # 9. Advance year + AR(1) price
         if self._reserve_anchor == "secondary":
             self._price_history.append(secondary_clearing)
@@ -2409,202 +2412,199 @@ class ETSEnvironment(gym.Env):
                          old_carry_forward=None, active_mask=None,
                          trade_qtys=None, allocations=None):
         """
-        Simplified reward (v8.0) with v7.13 HAPPO-best shaping restore.
-
-        R_i = w_cost * (-cost_norm) + w_green * esg_signal - penalty_norm
-              + B1_opp_cost_shaping + S1_coverage_gap_shaping (decaying)
-              + terminal_bank + terminal_queue (final year)
-              - terminal_debt (final year)
-
-        Key points:
-          - Fixed REWARD_SCALE (1000 M EUR) for shared critic stability.
-          - Penalties stay separated from costs and always apply at full strength.
-          - B1/S1 shaping decays with shaping_weight (floor=0); pure economic reward
-            at equilibrium.
-          - ESG compliance gate is delayed early in training and ramps in as
-            shaping decays, avoiding premature over-penalisation of exploration.
-          - Soft budget/capex penalties remain in cost_norm until hard-gate
-            coverage is fully audited.
+        v8.1.1 reward: inflation-deflated cost buckets, budget_real anchor for
+        penalty/ESG, scarcity-amplified prospective penalty, ESG speed bonus,
+        no time-decay on ESG, fragility-capped esg_anchor_ratio.
         """
-        REWARD_SCALE = 1000.0
-        rewards = np.zeros(self.n_total)
+        rewards      = np.zeros(self.n_total)
         base_rewards = np.zeros(self.n_total)
-        terminal_bank_values = np.zeros(self.n_total)
+        terminal_bank_values  = np.zeros(self.n_total)
         terminal_queue_values = np.zeros(self.n_total)
-        reward_cfg = self.config.get("reward", {})
-        esg_cfg = self.config.get("esg", {})
+
+        reward_cfg  = self.config.get("reward", {})
+        esg_cfg     = self.config.get("esg", {})
         esg_enabled = esg_cfg.get("enabled", False)
-        esg_scale = float(esg_cfg.get("scale", 2.0))
+        esg_scale   = float(esg_cfg.get("scale", 2.0))
+        esg_speed_coef = float(esg_cfg.get("speed_coef", 0.5))
 
         if mac_costs is None:
             mac_costs = np.zeros(self.n_total)
         if collateral_costs is None:
             collateral_costs = np.zeros(self.n_total)
 
-        remaining_years = max(1, self.n_years - self.current_year)
+        budget_norm_mode = reward_cfg.get("budget_norm_anchor", "dynamic")
+        budget_0_fixed   = float(reward_cfg.get("budget_norm_budget_0", 1000.0))
+
+        # Scarcity factor (pre-loop)
+        cap_0      = float(self.cap_schedule.get_cap(0))
+        cap_t      = float(self.cap_schedule.get_cap(self.current_year))
+        scarcity_t = max(0.0, 1.0 - cap_t / max(cap_0, 1e-9))
+
+        # Cache anchor once — avoid redundant calls per agent
+        anchor_t = compute_fundamental_anchor(self.current_year, self.config)
 
         for i, company in enumerate(self.companies):
             if active_mask is not None and not bool(active_mask[i]):
                 continue
 
-            auction_cost = float(payments[i])
-            secondary_cost = float(trade_costs[i])
-            penalty_cost = float(penalties[i])
-            investment_cost = float(invest_costs[i])
-            opex_delta = company.compute_operational_cost(self.current_year) - company.baseline_opex
-            mac_cost_i = float(mac_costs[i])
-            collateral_cost_i = float(collateral_costs[i])
+            # FIX 1: inflation deflator
+            infl = company.inflation_factor(self.current_year)
+
+            auction_cost       = float(payments[i])
+            secondary_cost     = float(trade_costs[i])
+            penalty_cost       = float(penalties[i])
+            investment_cost    = float(invest_costs[i])
+            opex_delta         = company.compute_operational_cost(self.current_year) - company.baseline_opex
+            mac_cost_i         = float(mac_costs[i])
+            collateral_cost_i  = float(collateral_costs[i])
             loan_interest_cost = company.compute_green_loan_cost()
 
-            # Keep operational spending separate from regulatory penalty spending.
             company.record_spending(
-                auction_cost
-                + secondary_cost
-                + investment_cost
-                + mac_cost_i
-                + collateral_cost_i
-                + loan_interest_cost
+                auction_cost + secondary_cost + investment_cost
+                + mac_cost_i + collateral_cost_i + loan_interest_cost
             )
             company.record_capex_spending(investment_cost)
             budget_penalty = company.compute_budget_penalty()
-            capex_penalty = company.compute_capex_penalty()
+            capex_penalty  = company.compute_capex_penalty()
 
-            total_cost = (
-                auction_cost
-                + secondary_cost
-                + investment_cost
-                + opex_delta
-                + budget_penalty
-                + capex_penalty
-                + mac_cost_i
-                + collateral_cost_i
-                + loan_interest_cost
-            )
-            # Origination sting: small immediate RL signal only. Economic cost already
-            # fully captured by principal+interest and multi-year repayment squeeze.
-            loan_sting_coef = float(self.config.get("budget", {}).get(
+            # Three real cost buckets (all deflated by infl)
+            compliance_cost_real = (auction_cost + secondary_cost + mac_cost_i) / infl
+            capital_cost_real    = (investment_cost + opex_delta) / infl
+            soft_penalty_real    = (budget_penalty + capex_penalty + loan_interest_cost) / infl
+
+            anchor_real = anchor_t / infl
+            need        = max(company.compute_estimate_need(), 1e-6)
+
+            if budget_norm_mode == "fixed":
+                budget_real = budget_0_fixed / infl
+            else:
+                budget_real = company.annual_budget / infl
+
+            compliance_denom = max(anchor_real * need, 1.0)
+            soft_denom       = max(budget_real, 1.0)
+
+            compliance_norm = compliance_cost_real / compliance_denom
+            capital_norm    = capital_cost_real    / compliance_denom
+            soft_norm       = soft_penalty_real    / soft_denom
+
+            loan_sting_coef     = float(self.config.get("budget", {}).get(
                 "emergency_loan", {}).get("origination_sting_coef", 0.07))
             loan_draw_this_year = float(getattr(company, '_loan_drawn_this_step', 0.0))
+            loan_sting = 0.0
             if loan_draw_this_year > 0:
                 loan_sting = (loan_draw_this_year / max(company.annual_budget, 1.0)) * loan_sting_coef
-                total_cost += loan_sting * REWARD_SCALE
 
-            # Anchor-normalized cost: time-stable normalisation so equal-efficiency
-            # spending yields equal cost_norm regardless of year. Penalty stays on
-            # static REWARD_SCALE so non-compliance cost escalates nominally.
-            anchor_normalize = bool(reward_cfg.get("anchor_normalize_cost_only", True))
-            if anchor_normalize:
-                anchor_t = compute_fundamental_anchor(self.current_year, self.config)
-                estimated_need = max(company.compute_estimate_need(), 1e-6)
-                cost_denominator = max(anchor_t * estimated_need, 1.0)
-                cost_norm = total_cost / cost_denominator
-            else:
-                anchor_t = None
-                cost_norm = total_cost / REWARD_SCALE
-            # Apply private urgency scalar to penalty (only for learning agents).
-            # This creates private heterogeneity in effective compliance urgency,
-            # destroying symmetric equilibria where all agents free-ride at floor.
-            if i < self.n_agents:
-                urgency_scalar = float(self._urgency_scalars[i])
-            else:
-                urgency_scalar = 1.0
-            penalty_norm = (penalty_cost * urgency_scalar) / REWARD_SCALE
+            cost_norm = compliance_norm + capital_norm + soft_norm + loan_sting
 
-            esg_signal = 0.0
+            urgency_scalar = float(self._urgency_scalars[i]) if i < self.n_agents else 1.0
+
+            shortfall = max(0.0, need - float(
+                (float(precompliance_holdings[i]) if precompliance_holdings is not None else 0.0)
+                + float(trade_qtys[i] if trade_qtys is not None else 0.0)
+            ))
+            scarcity_amp        = 1.0 + scarcity_t
+            penalty_prospective = (shortfall * company.penalty_rate * scarcity_amp * urgency_scalar
+                                   / max(budget_real, 1.0))
+            penalty_realized    = (penalty_cost * urgency_scalar) / max(budget_real, 1.0)
+            penalty_norm        = penalty_prospective + penalty_realized
+
+            # FIX 2+3: ESG — no time decay, budget_real anchor
+            esg_signal       = 0.0
+            esg_anchor_ratio = 0.0
+            gate_activation  = 1.0
+            compliance_gate  = 1.0
+
             if esg_enabled and company.initial_ef > 1e-6:
-                ef_ratio = (company.initial_ef - company.weighted_emission_factor) / company.initial_ef
-                time_ratio = remaining_years / self.n_years
-                esg_raw = esg_scale * ef_ratio * time_ratio
-
-                # Compliance gate: ESG bonus scales quadratically with coverage.
-                # Non-compliant agents lose ESG credit, mirroring real corporate
-                # ESG accreditation loss when sustainability commitments are unmet.
-                annual_need_i = max(
-                    company.compute_estimate_need(), 1e-6
+                ef_ratio    = max(0.0,
+                    (company.initial_ef - company.weighted_emission_factor) / company.initial_ef
                 )
+                green_delta = max(0.0, company.green_frac - company.prev_green_frac)
+                speed_bonus = esg_speed_coef * green_delta
+
+                esg_raw_unanchored = esg_scale * (ef_ratio + speed_bonus)
+                # Cap at 2.0 to prevent small-budget agents from having ESG dominate
+                esg_anchor_ratio = min(compliance_denom / max(budget_real, 1.0), 2.0)
+                esg_raw = esg_raw_unanchored * esg_anchor_ratio
+
+                annual_need_i = max(company.compute_estimate_need(), 1e-6)
                 if precompliance_holdings is not None:
                     coverage_frac = min(1.0, float(precompliance_holdings[i]) / annual_need_i)
                 else:
                     coverage_frac = 1.0
                 gate_activation = min(1.0, max(0.0, 1.0 - self.shaping_weight / 0.5))
                 compliance_gate = coverage_frac ** (2.0 * gate_activation)
-                esg_signal = esg_raw * compliance_gate
-            else:
-                gate_activation = 1.0
-                compliance_gate = 1.0
-                esg_signal = 0.0
+                esg_signal      = esg_raw * compliance_gate
 
             base_reward = float(
-                company.w_cost * (-cost_norm)
+                company.w_cost  * (-cost_norm)
                 + company.w_green * esg_signal
                 - penalty_norm
             )
             base_rewards[i] = base_reward
-            rewards[i] = base_reward
+            rewards[i]      = base_reward
 
-            # Opportunity cost shaping — models the CFO's post-trade
-            # reflection: "each Mt bought on secondary cost me X more than
-            # the auction clearing price". This gives a direct gradient
-            # linking low bids → high secondary spending → negative reward.
-            # Decays with shaping_weight so the equilibrium reward is pure.
             opp_cost_shaping = 0.0
             opp_cost_cfg = reward_cfg.get("opportunity_cost_shaping", {})
             if (opp_cost_cfg.get("enabled", False)
                     and self.shaping_weight > 0
                     and trade_qtys is not None
                     and float(trade_qtys[i]) > 1e-6):
-                sec_buy_qty = float(trade_qtys[i])
+                sec_buy_qty         = float(trade_qtys[i])
                 sec_buy_cost_per_mt = float(trade_costs[i]) / sec_buy_qty
-                opp_cost_per_mt = max(0.0, sec_buy_cost_per_mt - clearing_price)
-                opp_cost_scale = float(opp_cost_cfg.get("scale", 1.0))
-                opp_cost_shaping = -(opp_cost_scale * opp_cost_per_mt * sec_buy_qty
-                                     * self.shaping_weight / REWARD_SCALE)
+                opp_cost_per_mt     = max(0.0, sec_buy_cost_per_mt - clearing_price)
+                opp_cost_scale      = float(opp_cost_cfg.get("scale", 1.0))
+                opp_cost_shaping    = -(opp_cost_scale * opp_cost_per_mt * sec_buy_qty
+                                        * self.shaping_weight / max(budget_real, 1.0))
                 rewards[i] += opp_cost_shaping
 
-            # Coverage gap shaping — immediate per-year signal when the
-            # agent buys less than its compliance need. Models the CFO's
-            # anticipatory concern: "we won X Mt but need Y Mt; the gap will
-            # cost us penalty_rate per Mt later". Decays with shaping_weight.
             coverage_gap_shaping = 0.0
             cov_gap_cfg = reward_cfg.get("coverage_gap_shaping", {})
             if (cov_gap_cfg.get("enabled", False)
                     and self.shaping_weight > 0
                     and allocations is not None):
                 alloc_i = float(allocations[i])
-                need_i = max(float(emissions[i]) + float(old_carry_forward[i])
-                             if old_carry_forward is not None
-                             else float(emissions[i]), 0.1)
+                need_i  = max(float(emissions[i]) + (float(old_carry_forward[i])
+                              if old_carry_forward is not None else 0.0), 0.1)
                 gap = max(0.0, need_i - alloc_i)
                 if gap > 0.01:
                     pen_rate = float(self.config["penalty"]["rate"])
                     cov_scale = float(cov_gap_cfg.get("scale", 0.5))
                     coverage_gap_shaping = -(cov_scale * gap * pen_rate
-                                             * self.shaping_weight / REWARD_SCALE)
+                                             * self.shaping_weight / max(budget_real, 1.0))
                     rewards[i] += coverage_gap_shaping
 
             self._last_reward_channels[i] = {
-                "cost_norm": float(cost_norm),
-                "penalty_norm": float(penalty_norm),
-                "esg_signal": float(esg_signal),
-                "base_reward": float(base_reward),
-                "opp_cost_shaping": float(opp_cost_shaping),
+                "compliance_norm":      float(compliance_norm),
+                "capital_norm":         float(capital_norm),
+                "soft_norm":            float(soft_norm),
+                "cost_norm":            float(cost_norm),
+                "penalty_norm":         float(penalty_norm),
+                "penalty_prospective":  float(penalty_prospective),
+                "penalty_realized":     float(penalty_realized),
+                "scarcity_amp":         float(scarcity_amp),
+                "esg_signal":           float(esg_signal),
+                "esg_anchor_ratio":     float(esg_anchor_ratio),
+                "base_reward":          float(base_reward),
+                "opp_cost_shaping":     float(opp_cost_shaping),
                 "coverage_gap_shaping": float(coverage_gap_shaping),
-                "gate_activation": float(gate_activation),
-                "compliance_gate": float(compliance_gate),
-                "esg_vs_penalty_ratio": (
-                    float(company.w_green * esg_signal) / max(float(penalty_norm), 1e-9)
-                ),
-                "anchor_t": float(anchor_t) if anchor_t is not None else None,
+                "gate_activation":      float(gate_activation),
+                "compliance_gate":      float(compliance_gate),
+                "esg_vs_penalty_ratio": float(company.w_green * esg_signal) / max(float(penalty_norm), 1e-9),
+                "anchor_t":             float(anchor_t),
+                "anchor_real":          float(anchor_real),
+                "budget_real":          float(budget_real),
+                "infl":                 float(infl),
+                "shortfall":            float(shortfall),
             }
 
-        is_final_year = self.current_year >= self.n_years - 1
-        terminal_bank = bool(reward_cfg.get("terminal_bank_value", False))
+        is_final_year  = self.current_year >= self.n_years - 1
+        terminal_bank  = bool(reward_cfg.get("terminal_bank_value", False))
         terminal_queue = bool(reward_cfg.get("terminal_queue_value", True))
 
         if is_final_year:
-            gamma_discount = float(self.config["ppo"].get("gamma", 0.99))
+            gamma_discount        = float(self.config["ppo"].get("gamma", 0.99))
             terminal_payoff_years = float(reward_cfg.get("terminal_payoff_years", 5.0))
-            pen_cfg = self.config["penalty"]
+            pen_cfg     = self.config["penalty"]
             eff_penalty = pen_cfg["rate"] * self._inflation_factor(self.current_year)
             terminal_price = max(clearing_price, self.last_secondary_price, eff_penalty * 0.8)
 
@@ -2612,26 +2612,26 @@ class ETSEnvironment(gym.Env):
                 if active_mask is not None and not bool(active_mask[i]):
                     continue
 
+                infl_t        = company.inflation_factor(self.current_year)
+                budget_real_t = max(company.annual_budget / infl_t, 1.0)
+
                 if terminal_bank:
-                    annual_need = max(company.compute_estimate_need(), 0.1)
+                    annual_need     = max(company.compute_estimate_need(), 0.1)
                     capped_holdings = min(self.holdings[i], 2.0 * annual_need)
-                    ratio = capped_holdings / annual_need
-                    bank_value = np.log1p(ratio) * annual_need * terminal_price / REWARD_SCALE
-                    rewards[i] += bank_value
+                    ratio      = capped_holdings / annual_need
+                    bank_value = np.log1p(ratio) * annual_need * terminal_price / budget_real_t
+                    rewards[i]      += bank_value
                     base_rewards[i] += bank_value
                     terminal_bank_values[i] = bank_value
 
-                # Completion discount prevents end-of-episode queue gaming.
                 if terminal_queue:
                     queue_value = 0.0
                     for item in company._construction_queue:
                         tech_idx = int(item.get("tech_idx", -1))
                         if tech_idx < 0 or tech_idx >= len(company.emission_factors):
                             continue
-
                         years_to_completion = max(
-                            0,
-                            int(item.get("completion_year", self.current_year)) - self.current_year,
+                            0, int(item.get("completion_year", self.current_year)) - self.current_year,
                         )
                         tech_delay = max(float(company.deploy_delays[tech_idx]), 1.0)
                         completion_fraction = float(
@@ -2639,50 +2639,42 @@ class ETSEnvironment(gym.Env):
                         )
                         if completion_fraction <= 0.0:
                             continue
-
                         effective_remaining = max(0.0, terminal_payoff_years - float(years_to_completion))
                         if effective_remaining <= 0.0:
                             continue
-
                         delta_ef = company.weighted_emission_factor - company.emission_factors[tech_idx]
                         if delta_ef <= 0:
                             continue
-
                         frac_delta = float(item.get("frac_delta", 0.0))
                         if frac_delta <= 0.0:
                             continue
-
                         annual_saving_mt = (delta_ef * frac_delta * company.output_mwh) / 1e6
-                        discount = gamma_discount ** years_to_completion
+                        discount    = gamma_discount ** years_to_completion
                         queue_value += (
-                            annual_saving_mt
-                            * effective_remaining
-                            * discount
-                            * completion_fraction
-                            * terminal_price
-                            / REWARD_SCALE
+                            annual_saving_mt * effective_remaining
+                            * discount * completion_fraction
+                            * terminal_price / budget_real_t
                         )
-
-                    rewards[i] += queue_value
+                    rewards[i]      += queue_value
                     base_rewards[i] += queue_value
                     terminal_queue_values[i] = queue_value
 
                 if company._carry_forward > 0:
-                    debt_penalty = (company._carry_forward * terminal_price * 1.5) / REWARD_SCALE
-                    rewards[i] -= debt_penalty
+                    debt_penalty = (company._carry_forward * terminal_price * 1.5) / budget_real_t
+                    rewards[i]      -= debt_penalty
                     base_rewards[i] -= debt_penalty
 
                 if bool(reward_cfg.get("treasury_terminal_value", True)):
                     if company._treasury_enabled and company._treasury_reserve > 0:
-                        t_value = company._treasury_reserve * company._treasury_terminal_rate / REWARD_SCALE
-                        rewards[i] += t_value
+                        t_value = company._treasury_reserve * company._treasury_terminal_rate / budget_real_t
+                        rewards[i]      += t_value
                         terminal_bank_values[i] += t_value
 
-        self._last_terminal_bank_values = terminal_bank_values
-        self._last_terminal_queue_values = terminal_queue_values
+        self._last_terminal_bank_values        = terminal_bank_values
+        self._last_terminal_queue_values       = terminal_queue_values
         self._last_terminal_liquidation_values = terminal_bank_values + terminal_queue_values
-        self._last_reward_base_values = base_rewards
-        self._last_reward_shaping_values = rewards - base_rewards
+        self._last_reward_base_values          = base_rewards
+        self._last_reward_shaping_values       = rewards - base_rewards
 
         return rewards
 

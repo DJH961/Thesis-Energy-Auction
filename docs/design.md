@@ -331,33 +331,47 @@ R_i = w_{cost,i}(-\text{costNorm}_i) + w_{green,i}(\text{esgSignal}_i)
   + \text{terminalValues}_i
 $$
 
-Where:
-- `costNorm` is total non-penalty cost scaled by `REWARD_SCALE = 1000`. Costs include auction, secondary, investment, OPEX delta, soft budget penalty, soft capex penalty, MAC cost, collateral cost, and green-loan interest.
-- `penaltyNorm` is compliance penalty at full strength, scaled by `REWARD_SCALE`.
-- `esgSignal` is the ESG bonus (see below).
-- `shapingTerms` are active shaping channels (see §7.2), decaying to zero over training.
+**Cost normalisation (v8.1.1):** All monetary costs are first deflated by `infl = inflation_factor(t)` to produce real values, then normalised by economically meaningful denominators — no fixed `REWARD_SCALE`. Three buckets:
+
+| Bucket | Costs included | Denominator |
+|---|---|---|
+| `compliance_norm` | auction + secondary + MAC | `compliance_denom = max(anchor_real × need, 1)` |
+| `capital_norm` | investment + OPEX delta | same `compliance_denom` |
+| `soft_norm` | budget penalty + capex penalty + loan interest | `budget_real = annual_budget / infl` |
+
+`anchor_real = compute_fundamental_anchor(t) / infl`. `costNorm = compliance_norm + capital_norm + soft_norm + loan_sting`.
+
+**Penalty normalisation:** Uses `budget_real` as denominator. Two components:
+- **Prospective**: `shortfall × penalty_rate × (1 + scarcity_t) × urgency_scalar / budget_real` — scarcity-amplified expected future penalty, where `scarcity_t = max(0, 1 − cap_t / cap_0)`.
+- **Realized**: `penalty_cost × urgency_scalar / budget_real`.
 
 Objective weight structure:
 - Financial agents (`w_cost=1.0`, `w_green=0.0`): optimize pure cost.
 - ESG-balanced agents (`w_cost=0.5`, `w_green=0.5`): trade off cost and ESG signal.
 
-**ESG signal formula:**
+**ESG signal formula (v8.1.1):**
 
 $$
-esg_i = w_{green,i} \cdot esg\_scale \cdot \frac{ef_{0,i} - ef_{t,i}}{ef_{0,i}} \cdot \frac{t}{T} \cdot coverage\_frac_i^2
+esg\_raw = esg\_scale \cdot \left(\frac{ef_{0,i} - ef_{t,i}}{ef_{0,i}} + speed\_coef \cdot \Delta green_i\right) \cdot esg\_anchor\_ratio \cdot compliance\_gate_i
 $$
 
-where `ef_ratio` is the agent's emission factor improvement since episode start, `time_ratio` is elapsed episode fraction, and `coverage_frac²` is the ESG compliance gate — non-compliant agents (low coverage) receive a suppressed ESG bonus. `esg_scale=2.0`.
+where:
+- `ef_ratio = (ef_0 - ef_t) / ef_0` is cumulative emission-factor improvement.
+- `speed_bonus = speed_coef × max(0, green_frac − prev_green_frac)` rewards current-year greening (default `speed_coef=0.5`).
+- `esg_anchor_ratio = min(compliance_denom / budget_real, 2.0)` — fragility cap: scales ESG with compliance tightness but never exceeds 2×.
+- `compliance_gate = coverage_frac^(2 × gate_activation)` — non-compliant agents (low coverage) receive a suppressed ESG bonus.
+- There is **no** `time_ratio` decay; ESG improvement is equally valuable in early and late years.
+- `esg_signal = w_green × esg_raw`.
 
 **Terminal values** in final year:
 - Bank terminal value with diminishing returns:
 
 $$
 V^{bank}_i = \log\left(1 + \frac{B_i}{\max(\hat{E}_i, 0.1)}\right)
-\cdot \hat{E}_i \cdot \frac{P_T}{\text{REWARD\_SCALE}}
+\cdot \hat{E}_i \cdot \frac{P_T}{budget\_real_i}
 $$
 
-where $B_i$ is banked allowances, $\hat{E}_i$ is annual estimated need, and $P_T$ is the terminal price anchor.
+where $B_i$ is banked allowances, $\hat{E}_i$ is annual estimated need, $P_T$ is the terminal price anchor, and $budget\_real_i = annual\_budget_i / infl_T$.
 
 - Queue terminal value (discounted future emissions savings from queued projects) with a completion-fraction discount to prevent end-of-episode gaming of long-lead projects.
 
@@ -480,7 +494,7 @@ Several mechanisms work together to prevent degenerate floor-bidding equilibria,
 | Mechanism | What it does | Config |
 |---|---|---|
 | **Private Urgency Scalars** | Per-episode LogNormal(0, 0.30) penalty multiplier per agent; destroys symmetric cost structure, making floor bids risky for some agents even when others can afford them | `urgency_scalars.enabled: true` |
-| **ESG Compliance Gate** | `esg_signal × coverage_frac²` — non-compliant agents lose ESG bonus, coupling compliance to the ESG reward stream for balanced agents | `esg.enabled: true` |
+| **ESG Compliance Gate** | `esg_signal × coverage_frac^(2×gate_activation)` — non-compliant agents lose ESG bonus, coupling compliance to the ESG reward stream for balanced agents. `esg_anchor_ratio` (capped at 2.0) also scales ESG with compliance tightness. | `esg.enabled: true` |
 | **Epsilon-greedy Uniform Exploration** | Early-training price bids sampled from Uniform([price_min, price_max]); seeds diverse price history in MA3 and HPP pool | `exploration.mode: "uniform"` |
 | **Historical Policy Pool (HPP)** | Periodic snapshots of past policies; random opponent swap each episode maintains diverse bidding history as opponents | `hpp.enabled: true` |
 | **Coverage Gap Shaping** | Immediate reward signal for compliance shortfall in early training; decays to zero at equilibrium | `coverage_gap_shaping.enabled: true` |

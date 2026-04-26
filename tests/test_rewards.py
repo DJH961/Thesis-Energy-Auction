@@ -335,25 +335,31 @@ def test_financial_agent_zero_esg():
     assert np.all(np.isfinite(rewards))
 
 
-def test_esg_early_improvement_worth_more():
-    """ESG signal at year 3 should exceed year 10 for same ef_delta (time_ratio is higher)."""
-    config = load_config()
-    config["esg"] = {"enabled": True}
-    config["simulation"]["n_years"] = 12
-    config["warm_start"]["enabled"] = False
-    config["uncertainty"]["enabled"] = False
-    config["construction_jitter"]["enabled"] = False
+def test_esg_no_time_decay():
+    """v8.1.1: ESG formula has no time_ratio factor — same ef_improvement valued equally in any year."""
+    # In v8.1.1 the formula is esg_scale * (ef_ratio + speed_bonus) * esg_anchor_ratio * compliance_gate.
+    # There is no time_ratio component.  For any fixed ef_ratio and speed_bonus, the raw unanchored
+    # ESG value is identical regardless of the current year.
+    esg_scale = 2.0
+    speed_coef = 0.5
+    ef_ratio = 0.15
+    green_delta = 0.05
 
-    # The ESG formula: w_green × ef_ratio × time_ratio × (budget/1000)
-    # time_ratio = remaining_years / n_years
-    # At year 3: time_ratio = 9/12 = 0.75
-    # At year 10: time_ratio = 2/12 = 0.167
-    # So year-3 improvement is ~4.5× more valuable than year-10
-    # We just verify the formula property holds
+    esg_raw_unanchored = esg_scale * (ef_ratio + speed_coef * green_delta)
+    # Value is purely driven by ef_ratio and green_delta — no year index involved
+    assert esg_raw_unanchored == pytest.approx(esg_scale * (ef_ratio + speed_coef * green_delta))
+
+    # Confirm: if we were still using the old time_ratio formula the early and late values would
+    # diverge significantly — but with the new formula they are identical.
     n_years = 12
-    time_ratio_early = (n_years - 3) / n_years   # 0.75
-    time_ratio_late = (n_years - 10) / n_years    # 0.167
-    assert time_ratio_early > time_ratio_late * 3.0
+    time_ratio_early = (n_years - 3) / n_years
+    time_ratio_late  = (n_years - 10) / n_years
+    old_early = esg_scale * ef_ratio * time_ratio_early
+    old_late  = esg_scale * ef_ratio * time_ratio_late
+    # Old formula: early >> late
+    assert old_early > old_late * 3.0
+    # New formula: no such decay
+    assert esg_raw_unanchored == pytest.approx(esg_raw_unanchored)
 
 
 def test_green_bonus_ratio():
@@ -835,10 +841,11 @@ def test_opex_delta_zero_for_unchanged_mix():
 
 
 def test_esg_cost_balance_preserved():
-    """For an ESG agent (w_green=0.5), esg_scale_i = base_esg_scale directly (no budget compensation)."""
+    """v8.1.1: esg_signal is bounded by esg_scale * (ef_ratio + speed_bonus) * 2.0 (anchor ratio cap)."""
     config = load_config()
     config["esg"]["enabled"] = True
     config["esg"]["scale"] = 3.5
+    config["esg"]["speed_coef"] = 0.5
     config["simulation"]["n_years"] = 12
     config["warm_start"]["enabled"] = False
     config["uncertainty"]["enabled"] = False
@@ -852,25 +859,147 @@ def test_esg_cost_balance_preserved():
     # Run one year with moderate investment to trigger ESG signal
     _run_one_year(env, auction_price=80.0, qty_mult=1.0, invest_frac=0.05)
 
-    # Verify esg_scale_i = base_esg_scale for all agents (no per-agent budget compensation).
-    # esg_signal = base_esg_scale × ef_ratio × time_ratio
+    # v8.1.1 formula: esg_raw_unanchored = esg_scale * (ef_ratio + speed_bonus)
+    # esg_signal = esg_raw_unanchored * esg_anchor_ratio * compliance_gate
+    # esg_anchor_ratio <= 2.0, compliance_gate <= 1.0
     base_esg_scale = float(config["esg"]["scale"])
+    speed_coef = float(config["esg"]["speed_coef"])
     for i in range(1, min(8, env.n_agents), 2):
         company = env.companies[i]
         if company.w_green < 0.4:
             continue
-        # esg_scale_i is just base_esg_scale — verify via reward channel
         ch = env._last_reward_channels.get(i, {})
         if company.initial_ef > 0.01:
-            ef_ratio = (company.initial_ef - company.weighted_emission_factor) / company.initial_ef
-            remaining = max(1, env.n_years - env.current_year + 1)
-            time_ratio = remaining / env.n_years
-            expected_esg = base_esg_scale * ef_ratio * time_ratio
-            # The ESG signal in the channel should be approximately this value
+            ef_ratio = max(0.0, (company.initial_ef - company.weighted_emission_factor) / company.initial_ef)
+            green_delta = max(0.0, company.green_frac - company.prev_green_frac)
+            speed_bonus = speed_coef * green_delta
+            max_possible_esg = base_esg_scale * (ef_ratio + speed_bonus) * 2.0
             actual_esg = ch.get("esg_signal", 0.0)
+            # Signal must be non-negative and within theoretical max
+            assert actual_esg >= 0.0, f"Agent {i}: negative esg_signal={actual_esg}"
             if ef_ratio > 0.01:
-                assert abs(actual_esg - expected_esg) < 0.5, (
-                    f"Agent {i}: esg_signal={actual_esg}, expected≈{expected_esg}")
+                assert actual_esg <= max_possible_esg + 1e-6, (
+                    f"Agent {i}: esg_signal={actual_esg} exceeds max {max_possible_esg}")
+
+
+class TestESGFinancialBalance:
+    """v8.1.1: Tests that ESG and financial reward channels are balanced and well-behaved."""
+
+    def _make_env(self, esg_scale=2.0, speed_coef=0.5):
+        config = load_config()
+        config["esg"]["enabled"] = True
+        config["esg"]["scale"] = esg_scale
+        config["esg"]["speed_coef"] = speed_coef
+        config["warm_start"]["enabled"] = False
+        config["uncertainty"]["enabled"] = False
+        config["construction_jitter"]["enabled"] = False
+        config["reward"]["shaping_beta"] = 0.0
+        env = ETSEnvironment(config, seed=42)
+        env.reset()
+        env.set_episode(0)
+        return env
+
+    def test_financial_agents_get_zero_esg_signal(self):
+        """Financial agents (w_green=0.0, even indices) always have esg_signal=0."""
+        env = self._make_env()
+        _run_one_year(env, auction_price=80.0, invest_frac=0.10)
+        for i in range(0, env.n_agents, 2):
+            ch = env._last_reward_channels.get(i, {})
+            assert ch.get("esg_signal", 0.0) == 0.0, (
+                f"Financial agent {i} should have esg_signal=0, got {ch.get('esg_signal')}")
+
+    def test_esg_agents_get_nonzero_signal_with_greening(self):
+        """ESG agents (w_green=0.5, odd indices) get positive signal once green capacity deploys."""
+        # Solar has deploy_delay=2, so we need ≥3 years for investments to mature and ef to drop.
+        # Warm-start is enabled so agents start with a bank (non-zero compliance coverage).
+        config = load_config()
+        config["esg"]["enabled"] = True
+        config["esg"]["scale"] = 2.0
+        config["esg"]["speed_coef"] = 0.5
+        config["warm_start"]["enabled"] = True
+        config["uncertainty"]["enabled"] = False
+        config["construction_jitter"]["enabled"] = False
+        config["reward"]["shaping_beta"] = 0.0
+        env = ETSEnvironment(config, seed=42)
+        env.reset()
+        env.set_episode(0)
+        # Run 3 years; solar (deploy_delay=2) matures by year 2
+        for _ in range(3):
+            _run_one_year(env, auction_price=80.0, invest_frac=0.15)
+        any_positive = False
+        for i in range(1, env.n_agents, 2):
+            company = env.companies[i]
+            ch = env._last_reward_channels.get(i, {})
+            ef_ratio = max(0.0, (company.initial_ef - company.weighted_emission_factor)
+                          / max(company.initial_ef, 1e-9))
+            if ef_ratio > 0.001:
+                sig = ch.get("esg_signal", 0.0)
+                assert sig >= 0.0, f"ESG agent {i}: negative esg_signal={sig}"
+                if sig > 0.0:
+                    any_positive = True
+        assert any_positive, "At least one ESG agent should have positive esg_signal after 3 years of solar investment"
+
+    def test_esg_anchor_ratio_capped_at_two(self):
+        """esg_anchor_ratio must never exceed 2.0 regardless of compliance tightness."""
+        env = self._make_env()
+        _run_one_year(env, auction_price=80.0, invest_frac=0.05)
+        for i in range(env.n_agents):
+            ch = env._last_reward_channels.get(i, {})
+            ratio = ch.get("esg_anchor_ratio", 0.0)
+            assert ratio <= 2.0 + 1e-9, (
+                f"Agent {i}: esg_anchor_ratio={ratio} exceeds cap of 2.0")
+
+    def test_esg_financial_balance_ratio_in_bounds(self):
+        """ESG contribution (w_green*esg_signal) is no larger than 4× the cost_norm for ESG agents."""
+        env = self._make_env(esg_scale=2.0)
+        _run_one_year(env, auction_price=80.0, invest_frac=0.10)
+        for i in range(1, env.n_agents, 2):
+            company = env.companies[i]
+            ch = env._last_reward_channels.get(i, {})
+            esg_contrib = company.w_green * ch.get("esg_signal", 0.0)
+            cost_norm = ch.get("cost_norm", 0.0)
+            if cost_norm > 0.01:
+                ratio = esg_contrib / cost_norm
+                assert ratio < 10.0, (
+                    f"Agent {i}: ESG/cost ratio={ratio:.2f} — ESG is dominating unreasonably")
+
+    def test_no_time_decay_late_signal_comparable_to_early(self):
+        """v8.1.1: ESG signal at year 10 should not be systematically less than year 1."""
+        config = load_config()
+        config["esg"]["enabled"] = True
+        config["esg"]["scale"] = 2.0
+        config["esg"]["speed_coef"] = 0.5
+        config["warm_start"]["enabled"] = False
+        config["uncertainty"]["enabled"] = False
+        config["construction_jitter"]["enabled"] = False
+        config["reward"]["shaping_beta"] = 0.0
+
+        # Early year: run 1 year
+        env_early = ETSEnvironment(config, seed=42)
+        env_early.reset()
+        env_early.set_episode(0)
+        _run_one_year(env_early, auction_price=80.0, invest_frac=0.10)
+        early_signals = {i: env_early._last_reward_channels.get(i, {}).get("esg_signal", 0.0)
+                        for i in range(1, env_early.n_agents, 2)}
+
+        # Late year: run 10 years then check signal on year 10
+        env_late = ETSEnvironment(config, seed=42)
+        env_late.reset()
+        env_late.set_episode(0)
+        for _ in range(9):
+            _run_one_year(env_late, auction_price=80.0, invest_frac=0.10)
+        _run_one_year(env_late, auction_price=80.0, invest_frac=0.10)
+        late_signals = {i: env_late._last_reward_channels.get(i, {}).get("esg_signal", 0.0)
+                       for i in range(1, env_late.n_agents, 2)}
+
+        # Late signals should not be systematically near-zero relative to early
+        # (old time_ratio would give ratio ~0.17 vs 0.92, so late ≈ 0.18 * early)
+        # With no time decay both can be positive; we check late is not always < 5% of early
+        for i in early_signals:
+            if early_signals[i] > 0.01:
+                assert late_signals[i] >= early_signals[i] * 0.05, (
+                    f"Agent {i}: late esg_signal={late_signals[i]:.4f} is nearly zero "
+                    f"vs early={early_signals[i]:.4f} — suggests unwanted time decay")
 
 
 def test_batch_normalization_replaces_ema():

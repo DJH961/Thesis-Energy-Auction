@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v8.1.0
+# ETS MARL — Configuration v8.1.1
 #   - 8 learning agents, 0 bots (pure MARL)
 #   - HAPPO sequential policy update, centralized critic
 #   - Fundamental price anchor (MAC-scarcity-penalty formula)
@@ -299,6 +299,8 @@ reward:
   terminal_payoff_years: 5
   treasury_terminal_value: true        # Change 4: treasury NPV added at episode end
   anchor_normalize_cost_only: true     # Change 6: cost_norm = total_cost / (anchor_t × need)
+  budget_norm_anchor: "dynamic"        # v8.1.1: "dynamic" uses annual_budget, "fixed" uses budget_norm_budget_0
+  budget_norm_budget_0: 1000.0         # v8.1.1: reference budget for fixed normalisation mode
 
   # Opportunity cost shaping: per-Mt premium paid on secondary vs auction.
   # Decays with shaping_weight so equilibrium reward is pure.
@@ -321,6 +323,7 @@ reward:
 esg:
   enabled: true
   scale: 2.0
+  speed_coef: 0.5
 
 # ----------------------------------------------------------
 # Opponent modeling — public info per opponent

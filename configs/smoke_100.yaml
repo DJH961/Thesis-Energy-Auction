@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v8.0 (smoke test, 100 episodes)
+# ETS MARL — Configuration v8.1.1 (smoke test, 100 episodes)
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update, centralized critic
 #   - Fundamental price anchor, coverage gap shaping unified
@@ -236,6 +236,8 @@ reward:
   terminal_bank_value: true
   terminal_queue_value: true
   terminal_payoff_years: 5
+  budget_norm_anchor: "dynamic"
+  budget_norm_budget_0: 1000.0
 
   opportunity_cost_shaping:
     enabled: true
@@ -248,6 +250,7 @@ reward:
 esg:
   enabled: true
   scale: 2.0
+  speed_coef: 0.5
 
 opponent_modeling:
   enabled: true

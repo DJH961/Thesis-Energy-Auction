@@ -5,6 +5,27 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.1.1] — 2026-04-26
+
+### Added
+- Inflation-deflated three cost buckets: `compliance_cost_real`, `capital_cost_real`, `soft_penalty_real` — all costs divided by `company.inflation_factor(current_year)` before normalisation.
+- `budget_real` anchor for penalty and ESG normalisation: dynamically equals `company.annual_budget / infl` (mode `"dynamic"`) or a fixed reference budget (mode `"fixed"`). Config keys: `reward.budget_norm_anchor`, `reward.budget_norm_budget_0`.
+- Scarcity-amplified prospective penalty: `shortfall × penalty_rate × (1 + scarcity_t) × urgency_scalar / budget_real`, where `scarcity_t = max(0, 1 − cap_t / cap_0)`.
+- ESG speed bonus: `esg_speed_coef × max(0, green_frac − prev_green_frac)` added inside `esg_raw_unanchored`. Config key: `esg.speed_coef` (default 0.5).
+- ESG fragility cap: `esg_anchor_ratio = min(compliance_denom / budget_real, 2.0)` prevents ESG from dominating for small-budget agents.
+- Extended `_last_reward_channels` with diagnostic fields: `compliance_norm`, `capital_norm`, `soft_norm`, `penalty_prospective`, `penalty_realized`, `scarcity_amp`, `esg_anchor_ratio`, `anchor_real`, `budget_real`, `infl`, `shortfall`.
+
+### Changed
+- Removed fixed `REWARD_SCALE = 1000.0` divisor from `_compute_rewards`; all costs are now normalised by economically meaningful denominators (`compliance_denom` for compliance/capital, `budget_real` for soft/penalty/ESG).
+- ESG signal no longer carries a `time_ratio` decay factor; ESG is equally valued in early and late years. Formula: `esg_raw_unanchored = esg_scale × (ef_ratio + speed_bonus)`.
+- Terminal bank and queue values now scaled by per-agent `budget_real_t` instead of the fixed `REWARD_SCALE`.
+
+### Breaking
+- Old checkpoints produce identical network behaviour but reward scale changes; re-running diagnostics recommended.
+- `_last_reward_channels` keys `cost_norm`, `penalty_norm` are still present; new keys added alongside them.
+
+---
+
 ## [8.1.0] — 2026-04-27
 
 ### Added
