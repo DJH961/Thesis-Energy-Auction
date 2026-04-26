@@ -57,8 +57,11 @@ def build_agents(env: ETSEnvironment, config: dict, seed: int):
     n_agents = config["companies"]["n_agents"]  # learning agents only
 
     # MAPPO: global state = concatenation of learning agents' phase2 obs
+    # When critic_compliance_features is enabled, K_COMPLIANCE extra features per agent are appended.
     centralized = config["ppo"].get("centralized_critic", False)
-    global_state_dim = n_agents * obs2_dim if centralized else 0
+    _cc_features = config["ppo"].get("critic_compliance_features", False)
+    _k_compliance = 4 if _cc_features else 0
+    global_state_dim = n_agents * (obs2_dim + _k_compliance) if centralized else 0
 
     aq = config["auction"]
     inv = config["investment"]
@@ -643,6 +646,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         config["auction"]["pricing_rule"] = "pay_as_bid"  # start with PAB
 
     happo_enabled = config["ppo"].get("happo", False)
+    happo_dynamic_order = config["ppo"].get("happo_dynamic_order", False)
+    happo_perf_ema_alpha = float(config["ppo"].get("happo_perf_ema_alpha", 0.1))
+    critic_compliance_features = config["ppo"].get("critic_compliance_features", False)
+    K_COMPLIANCE = 4  # features per agent appended to global state when critic_compliance_features=true
     clip_eps = config["ppo"].get("clip_eps", 0.2)
 
     if happo_enabled:
@@ -999,6 +1006,16 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # ESG vs penalty ratio warning: consecutive episodes where esg > penalty for non-compliant agent
     _esg_over_penalty_streak = np.zeros(n_agents, dtype=int)
 
+    # HAPPO dynamic ordering: EMA of episode total reward per agent (worst-first update order)
+    agent_perf_ema = np.zeros(n_agents, dtype=np.float64)
+
+    # Critic compliance features: per-agent context vector updated at end of each year
+    # Shape (n_agents, K_COMPLIANCE): [consec_shortfall_norm, ep_shortfall_rate, cumul_penalty_norm, last_shortfall_norm]
+    compliance_ctx = np.zeros((n_agents, K_COMPLIANCE), dtype=np.float32)
+    _consec_shortfall = np.zeros(n_agents, dtype=int)   # consecutive-year shortfall counter
+    _ep_shortfall_count = np.zeros(n_agents, dtype=int) # years with shortfall this episode
+    _ep_penalty_total = np.zeros(n_agents, dtype=np.float64)  # cumulative penalty this episode
+
     # Per-agent entropy boost: when an agent's bid is stuck at floor/ceiling
     # for _stuck_boost_window consecutive episodes, temporarily set its
     # entropy to max(_stuck_boost_coef, base_coef).
@@ -1046,6 +1063,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         obs1, _ = env.reset(seed=episode_seed)
         total_rewards = np.zeros(n_agents)
+        # Reset compliance context at episode start (year-0 uses zeros from previous episode reset)
+        compliance_ctx[:] = 0.0
+        _consec_shortfall[:] = 0
+        _ep_shortfall_count[:] = 0
+        _ep_penalty_total[:] = 0.0
         # Accumulate per-year diagnostic scores for episode-level summary
         ep_diag_accumulator = [{
             "S_financial": 0.0, "S_green": 0.0, "S_composite": 0.0, "count": 0
@@ -1090,8 +1112,15 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             _centralized = config["ppo"].get("centralized_critic", False)
             obs2_dim = obs2.shape[1] if obs2.ndim == 2 else env.companies[0].obs_dim_phase2
             critic_obs_auc = _phase1_batch_to_phase2_value_input(obs1, obs2_dim)
-            global_state_auc = critic_obs_auc.flatten() if _centralized else None
-            global_state_sec = obs2.flatten() if _centralized else None
+            if _centralized and critic_compliance_features:
+                # Append compliance_ctx (last year's outcomes) to each agent's obs before flattening
+                _auc_with_ctx = np.concatenate([critic_obs_auc, compliance_ctx], axis=1)
+                _sec_with_ctx = np.concatenate([obs2, compliance_ctx], axis=1)
+                global_state_auc = _auc_with_ctx.flatten()
+                global_state_sec = _sec_with_ctx.flatten()
+            else:
+                global_state_auc = critic_obs_auc.flatten() if _centralized else None
+                global_state_sec = obs2.flatten() if _centralized else None
 
             # Store auction-phase transition (done=False: episode continues)
             for i in range(n_agents):
@@ -1240,6 +1269,26 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             yr_row["marginal_ef_used"] = round(float(yl.get("marginal_ef_used", getattr(env, "_last_marginal_ef", 0.0))), 4)
             yr_writer.writerow(yr_row)
 
+            # Update compliance_ctx with this year's outcomes (used as critic input NEXT year)
+            if critic_compliance_features:
+                _shortfalls = yl.get("shortfalls", [0.0] * n_agents)
+                _penalties  = yl.get("penalties",  [0.0] * n_agents)
+                _n_years_ep = max(env.n_years, 1)
+                for i in range(n_agents):
+                    _sf = float(_shortfalls[i]) if i < len(_shortfalls) else 0.0
+                    _pen = float(_penalties[i]) if i < len(_penalties) else 0.0
+                    _budget = max(float(env.companies[i].annual_budget), 1.0)
+                    if _sf > 0.0:
+                        _consec_shortfall[i] += 1
+                        _ep_shortfall_count[i] += 1
+                    else:
+                        _consec_shortfall[i] = 0
+                    _ep_penalty_total[i] += _pen
+                    compliance_ctx[i, 0] = float(_consec_shortfall[i]) / _n_years_ep       # consecutive shortfall (normalized)
+                    compliance_ctx[i, 1] = float(_ep_shortfall_count[i]) / (year + 1)      # episode shortfall rate so far
+                    compliance_ctx[i, 2] = _ep_penalty_total[i] / (_budget * _n_years_ep)  # cumulative penalty burden (normalized)
+                    compliance_ctx[i, 3] = _sf / max(_budget / max(yl.get("clearing_price", 1.0), 1.0), 1.0)  # last shortfall (allowance-normalized)
+
             obs1 = obs1_next
             if terminated:
                 break
@@ -1253,6 +1302,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             # discard their buffers so they don't corrupt the current policy update.
             for i in hpp_swapped:
                 agents[i].buffer.clear()
+
+        # HAPPO dynamic order: update per-agent EMA of episode total reward
+        if happo_dynamic_order:
+            agent_perf_ema = (1.0 - happo_perf_ema_alpha) * agent_perf_ema + happo_perf_ema_alpha * total_rewards
 
         # HPP: periodically snapshot current actors into the pool
         if hpp_enabled and episode > 0 and episode % hpp_save_interval == 0:
@@ -1292,9 +1345,13 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     adv, ret, buf = agents[i].compute_gae(last_value=0.0)
                     gae_data.append((adv, ret, buf))
 
-                # 2. Sequential update ordered by initial emission intensity (highest first).
-                # Fixed ordering: highest emitters updated first (before ratio drift).
-                order = sorted(range(n_agents), key=lambda i: env.companies[i].initial_ef, reverse=True)
+                # 2. Sequential update order: worst-to-best by EMA reward (dynamic) or
+                # by initial emission factor (static fallback).
+                # Worst performers go first so they receive the freshest (least drifted) M-factor.
+                if happo_dynamic_order:
+                    order = sorted(range(n_agents), key=lambda i: agent_perf_ema[i])
+                else:
+                    order = sorted(range(n_agents), key=lambda i: env.companies[i].initial_ef, reverse=True)
                 # T = 2 × n_years because split rewards store auction + secondary transitions separately.
                 # Agents with mismatched T (e.g. HPP-cleared buffers) are excluded from the M-factor chain.
                 expected_T = episodes_per_update * n_years * 2

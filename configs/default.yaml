@@ -351,6 +351,9 @@ ppo:
   log_std_max: 0.0
   centralized_critic: true
   happo: true
+  happo_dynamic_order: true      # sort update order worst-to-best by EMA reward each episode
+  happo_perf_ema_alpha: 0.1      # EMA decay for per-agent performance tracking
+  critic_compliance_features: true  # append K=4 compliance features per agent to global state
   critic_lr: 0.001
   critic_hidden_size: 512
   critic_warmup_episodes: 0        # auto: 3% of n_episodes, clamped to [100, 5000]
