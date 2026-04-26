@@ -31,9 +31,8 @@ for i in range(self.n_total):
     if not self._is_agent_active(i):
         continue
     cash = max(0.0, float(self.companies[i].annual_budget
-                          - self.companies[i].budget_spent_this_year))
-    # Include treasury reserve in available cash
-    cash += self.companies[i].get_treasury_available()
+                          - self.companies[i].budget_spent_this_year)
+               + self.companies[i].get_treasury_available())
     bid_p = float(bid_actions[i, 0])
     if bid_p > 1e-6 and cash < bid_p * bid_actions[i, 1] * 0.10:
         # Agent cannot cover even 10% collateral — zero quantity
@@ -62,29 +61,30 @@ auction:
 
 ## Change 2: Budget Envelope Clipping (Price + Quantity)
 
-**Rationale:** Currently only quantity is clipped when budget is tight. The bid price itself is unconstrained relative to budget — an agent can bid €200/t for 2Mt with €50M left, which is economically incoherent. Add a price ceiling derived from budget headroom.
+**Rationale:** Currently only quantity is clipped when budget is tight. The bid price itself is unconstrained relative to budget — an agent can bid €200/t for 2Mt with €50M left, which is economically incoherent. Add a soft price ceiling derived from total cash capacity (operating + treasury).
+
+> ⚠️ Depends on Change 4 (`get_treasury_available`). Implement after Change 4.
 
 ### Files
 - `src/environment/ets_environment.py`
+- `configs/default.yaml`
 
 ### Changes
 
-**`ets_environment.py` → `step_auction()`, after leverage gate, before collateral locking:**
+**`ets_environment.py` → `step_auction()`, after leverage gate, BEFORE collateral locking:**
 
 ```python
-# Budget-envelope price clip: max bid price the agent can actually afford
-# given remaining budget and minimum lot. Prevents price > budget / min_qty.
 budget_price_clip = self.config["auction"].get("budget_price_clip", True)
 if budget_price_clip:
     for i, company in enumerate(self.companies):
         if not self._is_agent_active(i):
             continue
+        # Total cash = operating remaining + full treasury (collateral not yet locked)
         cash = max(1.0, float(company.annual_budget - company.budget_spent_this_year)
                    + company.get_treasury_available())
         bid_q = max(float(bid_actions[i, 1]), 1e-6)
-        # Max supportable price = total available cash / bid quantity
         max_affordable_price = cash / bid_q
-        # Soft clip: only apply if bid_price > 1.5x affordable (hard incoherence threshold)
+        # Soft clip: only fires at >1.5x affordable to allow headroom for collateral
         if bid_actions[i, 0] > 1.5 * max_affordable_price:
             bid_actions[i, 0] = float(np.clip(
                 max_affordable_price,
@@ -92,6 +92,8 @@ if budget_price_clip:
                 float(self.config["auction"]["price_max"]),
             ))
 ```
+
+> **Why 1.5× threshold?** Collateral locking happens after this clip. The 1.5× buffer ensures a bid that looks affordable on total cash is not clipped when collateral subsequently reduces operating cash. Treasury is always available post-collateral, so the buffer only needs to cover the collateral deduction from operating budget.
 
 **`configs/default.yaml`**
 ```yaml
@@ -105,6 +107,8 @@ auction:
 
 **Rationale:** Flat 8% interest on a fixed loan is painless for large budgets. Replace with leverage-scaled interest, immediate reward origination fee, and capex covenant squeeze during repayment.
 
+> ⚠️ The loan is triggered ONLY after operating budget AND treasury reserve are both exhausted (see Settlement Waterfall in Change 4). `shortfall` passed to `apply_emergency_loan()` is always the true residual after those two sources are drained.
+
 ### Files
 - `src/environment/company.py`
 - `src/environment/ets_environment.py`
@@ -117,11 +121,13 @@ auction:
 Replace existing method:
 ```python
 def apply_emergency_loan(self, shortfall: float) -> None:
-    """Emergency loan with leverage-scaled interest rate (credit risk premium)."""
+    """Emergency loan — leverage-scaled rate on true residual after treasury exhausted."""
     loan_cfg = self.config.get("budget", {}).get("emergency_loan", {})
     base_rate = float(loan_cfg.get("interest_rate", 0.08))
     leverage_coef = float(loan_cfg.get("leverage_premium_coef", 0.25))
     leverage_exp = float(loan_cfg.get("leverage_premium_exp", 1.5))
+    # loan_fraction is relative to annual_budget (not total cash incl. treasury)
+    # so large treasury drawdowns don't deflate the leverage signal
     loan_fraction = shortfall / max(self.annual_budget, 1.0)
     effective_rate = base_rate + leverage_coef * (loan_fraction ** leverage_exp)
     principal_with_interest = shortfall * (1.0 + effective_rate)
@@ -130,19 +136,18 @@ def apply_emergency_loan(self, shortfall: float) -> None:
         self._loan_outstanding / max(self._loan_repayment_years, 1)
     )
     self._years_under_loan = self._loan_repayment_years
-    # Store loan fraction for capex squeeze
     self._last_loan_fraction = loan_fraction
+    self._loan_drawn_this_step = shortfall
 ```
 
-Add `_last_loan_fraction = 0.0` to `__init__` and `reset()`.
+Add to `__init__` and `reset()`: `self._last_loan_fraction = 0.0`, `self._loan_drawn_this_step = 0.0`
+Add to `reset_budget()`: `self._loan_drawn_this_step = 0.0`
 
-**`company.py` → `compute_dynamic_budget()` (revenue_based mode) or wherever capex_throughput is used:**
-
-Add capex covenant squeeze (call this at budget set time or expose via property):
+**`company.py` → new property:**
 ```python
 @property
 def effective_capex_throughput(self) -> float:
-    """Capex throughput reduced by debt covenant during loan repayment."""
+    """Capex throughput squeezed by debt covenant during loan repayment."""
     if self._years_under_loan > 0 and self._loan_outstanding > 0:
         loan_burden = self._loan_outstanding / max(self.annual_budget, 1.0)
         squeeze = max(
@@ -154,22 +159,18 @@ def effective_capex_throughput(self) -> float:
     return self.capex_throughput
 ```
 
-In `ets_environment.py` → `step_auction()` investment block, replace all references to `company.capex_throughput` with `company.effective_capex_throughput`.
+In `ets_environment.py` → investment block: replace `company.capex_throughput` → `company.effective_capex_throughput`.
 
-**`ets_environment.py` → `step_secondary()` → `_compute_rewards()`**
+**`ets_environment.py` → `_compute_rewards()`**
 
-After `apply_emergency_loan` calls in `step_auction()`, record loan amounts. Then in `_compute_rewards()`, add origination fee to cost:
 ```python
-# Loan origination fee (immediate sting at borrowing, not deferred)
 loan_sting_coef = float(self.config.get("budget", {}).get(
     "emergency_loan", {}).get("origination_sting_coef", 0.30))
 loan_draw_this_year = float(getattr(company, '_loan_drawn_this_step', 0.0))
 if loan_draw_this_year > 0:
     loan_sting = (loan_draw_this_year / max(company.annual_budget, 1.0)) * loan_sting_coef
-    total_cost += loan_sting * REWARD_SCALE  # unnorm before division below
+    total_cost += loan_sting * REWARD_SCALE
 ```
-
-Store `_loan_drawn_this_step` on company at loan origination; reset to 0 at `reset_budget()`.
 
 **`configs/default.yaml`**
 ```yaml
@@ -179,24 +180,55 @@ budget:
     max_loan_fraction: 0.15
     interest_rate: 0.08
     repayment_years: 3
-    leverage_premium_coef: 0.25   # NEW
-    leverage_premium_exp: 1.5     # NEW
-    capex_squeeze_floor: 0.50     # NEW: min capex throughput during repayment
-    origination_sting_coef: 0.30  # NEW: immediate reward cost at borrowing
+    leverage_premium_coef: 0.25
+    leverage_premium_exp: 1.5
+    capex_squeeze_floor: 0.50
+    origination_sting_coef: 0.30
 ```
 
 ---
 
 ## Change 4: Corporate Treasury Reserve
 
-**Rationale:** Unspent annual budget currently evaporates. Real utilities retain unspent compliance/operating budget in a liquidity reserve (subject to cap + opportunity cost decay) deployable in future crises — before the emergency loan.
+**Rationale:** Unspent annual budget currently evaporates. Real utilities retain unspent compliance/operating budget in a liquidity reserve deployable in future crises — before the emergency loan is triggered.
 
 **Economic grounding:**
 - 60% retention: CFO liquidity policy; 40% returned to shareholders/operations
 - 1.5× cap: ~18 months cash; above this = "overcapitalised" (Moody's liquidity metrics)
 - 5% decay: idle capital opportunity cost (EU utility WACC ~7–9%)
 - Reserve depletes before loan: Myers (1984) pecking-order theory
-- Terminal value at 30%: discounted going-concern balance sheet value
+- Terminal value at 30 cents: discounted going-concern balance sheet value
+
+### Settlement Waterfall (canonical — all cash logic uses this order)
+
+For every winning agent at auction settlement:
+
+```
+1. op_avail   = annual_budget − budget_spent_this_year − collateral_locked[i]
+2. treasury   = get_treasury_available()
+3. loan_limit = max_loan_fraction × annual_budget
+
+Case A: payment ≤ op_avail
+  → record_spending(payment). Treasury untouched. No loan.
+
+Case B: op_avail < payment ≤ op_avail + treasury
+  → record_spending(op_avail)
+  → draw_treasury(payment − op_avail)
+  → No loan.
+
+Case C: op_avail + treasury < payment ≤ op_avail + treasury + loan_limit
+  → record_spending(op_avail)
+  → draw_treasury(treasury)  [full drain]
+  → apply_emergency_loan(payment − op_avail − treasury)
+  → _loan_drawn_this_step = shortfall
+
+Case D: payment > op_avail + treasury + loan_limit
+  → DEFAULT: allocation cancelled, collateral forfeited.
+```
+
+> `agent_cash` passed to `settle_auction()` = `op_avail + treasury` (combined).
+> `max_loan_budgets[i]` passed to `settle_auction()` = `loan_limit` (pure loan headroom, not including treasury).
+> Post-settlement loop in `ets_environment.py` performs the actual waterfall deductions.
 
 ### Files
 - `src/environment/company.py`
@@ -217,12 +249,12 @@ self._treasury_terminal_rate = float(treasury_cfg.get("terminal_value_rate", 0.3
 self._treasury_drawn_this_year = 0.0
 ```
 
-**`company.py` → `reset()`**: add `self._treasury_reserve = 0.0` and `self._treasury_drawn_this_year = 0.0`
+**`company.py` → `reset()`**: add `self._treasury_reserve = 0.0`, `self._treasury_drawn_this_year = 0.0`
 
 **`company.py` → new methods:**
 ```python
 def settle_treasury_year_end(self) -> None:
-    """Roll unspent budget into treasury reserve with cap and decay."""
+    """Roll unspent budget into treasury with cap and decay. Call BEFORE reset_budget()."""
     if not self._treasury_enabled:
         return
     unspent = max(0.0, self.annual_budget - self.budget_spent_this_year)
@@ -236,41 +268,63 @@ def get_treasury_available(self) -> float:
     return float(self._treasury_reserve) if self._treasury_enabled else 0.0
 
 def draw_treasury(self, amount: float) -> float:
+    """Draw from reserve; returns actual amount drawn (capped at balance)."""
     actual = min(float(amount), self._treasury_reserve)
     self._treasury_reserve -= actual
     self._treasury_drawn_this_year += actual
     return actual
 ```
 
-**`ets_environment.py` → `step_auction()` budget reset block (both `revenue_based` and `fixed`):**
+**`ets_environment.py` → `step_auction()` budget reset block (both modes):**
 ```python
-# Call BEFORE apply_loan_repayment and reset_budget:
+# ORDER MATTERS: settle treasury first, then repay loan, then reset budget
 company.settle_treasury_year_end()
 company.apply_loan_repayment()
 company.reset_budget()
 company.reset_capex_budget()
 ```
 
-**`ets_environment.py` → `step_auction()` `agent_cash` array (before `settle_auction` call):**
+**`ets_environment.py` → `step_auction()` — replace existing `agent_cash` construction and post-settlement deduction with the canonical waterfall:**
+
 ```python
-agent_cash = np.array([
-    max(0.0, float(c.annual_budget - c.budget_spent_this_year))
-    + c.get_treasury_available()
-    for c in self.companies
+# ── Pre-settlement cash stacks ──────────────────────────────────────────
+operating_cash = np.array([
+    max(0.0, float(c.annual_budget - c.budget_spent_this_year)
+        - float(self._collateral_locked[i]))
+    for i, c in enumerate(self.companies)
 ])
+treasury_cash = np.array([c.get_treasury_available() for c in self.companies])
+agent_cash = operating_cash + treasury_cash  # combined for settle_auction
+max_loan_budgets = np.array([
+    c._max_loan_fraction * max(c.annual_budget, 1.0) for c in self.companies
+])
+
+actual_alloc, actual_pay, defaults_mask, defaulted_vol, _, loan_amounts = settle_auction(
+    allocations, payments, agent_cash, np.zeros(self.n_total),  # collateral already netted above
+    suspension_length=0,
+    max_loan_budgets=max_loan_budgets,
+)
+
+# ── Post-settlement waterfall deductions ────────────────────────────────
+for i in range(self.n_total):
+    if actual_alloc[i] < 1e-9:
+        continue
+    payment = float(actual_pay[i])
+    op = float(operating_cash[i])
+    treas = float(treasury_cash[i])
+
+    if payment <= op:                        # Case A
+        self.companies[i].record_spending(payment)
+    elif payment <= op + treas:              # Case B
+        self.companies[i].record_spending(op)
+        self.companies[i].draw_treasury(payment - op)
+    else:                                    # Case C (loan covers residual)
+        self.companies[i].record_spending(op)
+        self.companies[i].draw_treasury(treas)
+        self.companies[i].apply_emergency_loan(loan_amounts[i])
 ```
 
-**`ets_environment.py` → `step_auction()` after `settle_auction` returns:**
-For each agent where payment exceeded raw budget, deduct from treasury:
-```python
-for i in range(self.n_total):
-    if allocations[i] > 0 and payments[i] > 0:
-        raw_budget = max(0.0, float(self.companies[i].annual_budget
-                                    - self.companies[i].budget_spent_this_year))
-        overflow = max(0.0, float(payments[i]) - raw_budget)
-        if overflow > 0:
-            self.companies[i].draw_treasury(overflow)
-```
+> Case D (default) is handled by `settle_auction()` itself — `actual_alloc[i] == 0` for defaulters, so the loop skips them.
 
 **`ets_environment.py` → `_compute_rewards()` `is_final_year` block:**
 ```python
@@ -283,14 +337,13 @@ if bool(reward_cfg.get("treasury_terminal_value", True)):
 
 **`company.py` → `get_observation_phase1()`**
 
-Add as new dim after existing base dims (dim index depends on whether suspension dim was removed in Change 1 — with Change 1 applied, base is 35 dims; this becomes dim `[35]`):
+With Change 1 applied (base = 35), add treasury as new dim `[35]`:
 ```python
 treasury_norm = float(np.clip(
     self._treasury_reserve / max(annual_budget, 1.0), 0.0, 2.0
 )) / 2.0    # [35] treasury reserve norm (0=empty, 1.0=at cap)
 ```
-
-Update `obs_dim_phase1` base to `36` (35 base - 1 suspension + 1 treasury = 35... wait: original 36 - 1 suspension + 1 treasury = **36**, unchanged base count).
+Base obs_dim_phase1 = **36** (35 − 1 suspension + 1 treasury = net unchanged from original 36).
 
 **`configs/default.yaml`**
 ```yaml
@@ -310,7 +363,7 @@ reward:
 
 ## Change 5: Phase 2 Compliance Gap Observation
 
-**Rationale:** `compliance_liability_norm` in Phase 2 obs encodes magnitude of exposure but not *direction*. Agents must mentally derive the gap from 4+ inputs. A signed `compliance_gap_norm` gives the policy network a direct gradient target.
+**Rationale:** `compliance_liability_norm` in Phase 2 obs encodes magnitude of exposure but not *direction*. A signed `compliance_gap_norm` gives the policy network a direct gradient target in Phase 2.
 
 ### Files
 - `src/environment/company.py`
@@ -319,21 +372,19 @@ reward:
 
 **`company.py` → `get_observation_phase2()`**
 
-Add one new dimension. Current Phase 2 appends 10 dims (`[base+0]` … `[base+9]`). Add `[base+10]`:
+Add `[base+10]` (current Phase 2 appends 10 dims, `[base+0]`…`[base+9]`):
 
 ```python
-# compliance_gap_norm: signed gap = (emissions + carry_forward - total_holdings) / annual_need
-# Positive = under-covered (need to buy). Negative = over-covered (have surplus).
-total_holdings_now = banked + allocation  # pre-secondary-trade holdings
+# Signed compliance gap: positive = under-covered, negative = over-covered
+total_holdings_now = banked + allocation
 compliance_gap = (emissions + self._carry_forward - total_holdings_now)
 annual_need = max(self.compute_estimate_need(), 1e-6)
 compliance_gap_norm = float(np.clip(compliance_gap / annual_need, -2.0, 2.0)) / 2.0
-# [base+10] signed compliance gap (0.5=balanced, >0.5=short, <0.5=long)
+# [base+10]: 0.5 = balanced, >0.5 = short, <0.5 = surplus
 ```
 
-Append `compliance_gap_norm` to `extra` array (making it 11 elements).
-
-Update `obs_dim_phase2` property: `return self.obs_dim_phase1 + 11` (was `+ 10`).
+Append to `extra` array → 11 elements total.
+Update `obs_dim_phase2`: `return self.obs_dim_phase1 + 11`
 
 ---
 
@@ -364,10 +415,10 @@ Add to `year_log` in `step_secondary()`:
 
 ## Implementation Order
 
-1. **Change 1** — removes suspension state; simplest, no new fields
-2. **Change 3** — loan sting (no obs changes, pure company.py + reward)
-3. **Change 4** — treasury reserve (new state + obs dim shift from Change 1)
-4. **Change 2** — budget price clip (depends on `get_treasury_available` from Change 4)
-5. **Change 5** — Phase 2 obs (standalone, just add dim)
+1. **Change 1** — remove suspension; no new fields, simplest
+2. **Change 3** — loan sting; no obs changes, pure `company.py` + reward
+3. **Change 4** — treasury reserve; new state, obs dim, **canonical waterfall replaces old `agent_cash` + post-hoc loop**
+4. **Change 2** — budget price clip; depends on `get_treasury_available` from Change 4
+5. **Change 5** — Phase 2 obs; standalone
 
 Run smoke test (`configs/smoke_100.yaml`) after each change.
