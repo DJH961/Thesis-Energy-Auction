@@ -86,7 +86,7 @@ def test_rollout_buffer_no_global_state():
 
 def test_build_agents_mappo():
     """build_agents with centralized_critic=true should create critic
-    whose first layer accepts n_agents * obs2_dim input."""
+    whose first layer accepts n_agents * (obs2_dim + K_COMPLIANCE) input."""
     config = _load_config()
     config["ppo"]["centralized_critic"] = True
     env = ETSEnvironment(config, seed=42)
@@ -94,7 +94,9 @@ def test_build_agents_mappo():
 
     n_agents = config["companies"]["n_agents"]
     obs2_dim = env.companies[0].obs_dim_phase2
-    expected_dim = n_agents * obs2_dim
+    K_COMPLIANCE = 4
+    cc_features = config["ppo"].get("critic_compliance_features", False)
+    expected_dim = n_agents * (obs2_dim + (K_COMPLIANCE if cc_features else 0))
 
     fc1_in = agents[0].value_net.fc1.in_features
     assert fc1_in == expected_dim, (
@@ -121,15 +123,14 @@ def test_build_agents_ippo_fallback():
 
 
 def test_estimate_value_global_state():
-    """estimate_value should accept 320D global state in MAPPO mode."""
+    """estimate_value should accept global state of critic input dim in MAPPO mode."""
     config = _load_config()
     config["ppo"]["centralized_critic"] = True
     env = ETSEnvironment(config, seed=42)
     agents = build_agents(env, config, seed=42)
 
-    n_agents = config["companies"]["n_agents"]
-    obs2_dim = env.companies[0].obs_dim_phase2
-    global_state = np.random.randn(n_agents * obs2_dim).astype(np.float32)
+    critic_dim = agents[0].value_net.fc1.in_features
+    global_state = np.random.randn(critic_dim).astype(np.float32)
 
     val = agents[0].estimate_value(global_state)
     assert np.isfinite(val), f"Value should be finite, got {val}"
@@ -194,6 +195,7 @@ def test_mappo_full_episode():
     """Run one full episode with MAPPO and verify PPO update completes."""
     config = _load_config()
     config["ppo"]["centralized_critic"] = True
+    config["ppo"]["critic_compliance_features"] = False  # test uses obs2.flatten() as global state
     config["pretrain"]["enabled"] = False
     config["ppo"]["critic_warmup_episodes"] = 0
     config["ppo"]["mini_batch_size"] = 6  # small batch for single-episode test
@@ -227,6 +229,7 @@ def test_batch_accumulation_buffer_size():
     """After episodes_per_update episodes, buffer should contain ~N*n_years transitions."""
     config = _load_config()
     config["ppo"]["centralized_critic"] = True
+    config["ppo"]["critic_compliance_features"] = False  # test uses obs2.flatten() as global state
     config["pretrain"]["enabled"] = False
     config["ppo"]["episodes_per_update"] = 4
 
@@ -251,6 +254,7 @@ def test_gae_respects_done_flags():
     """GAE should NOT bootstrap across episode boundaries (done=True)."""
     config = _load_config()
     config["ppo"]["centralized_critic"] = True
+    config["ppo"]["critic_compliance_features"] = False  # test uses obs2.flatten() as global state
     config["pretrain"]["enabled"] = False
     config["ppo"]["mini_batch_size"] = 6
 
@@ -281,6 +285,7 @@ def test_separate_optimizers_step():
     """Verify actor_optimizer and critic_optimizer both step correctly."""
     config = _load_config()
     config["ppo"]["centralized_critic"] = True
+    config["ppo"]["critic_compliance_features"] = False  # test uses obs2.flatten() as global state
     config["pretrain"]["enabled"] = False
     config["ppo"]["critic_warmup_episodes"] = 0
     config["ppo"]["mini_batch_size"] = 6

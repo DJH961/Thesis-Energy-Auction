@@ -470,24 +470,24 @@ def test_obs_phase1_shape(config):
     assert obs.dtype == np.float32
 
 def test_obs_phase1_with_opponents(config):
-    """With opponent modeling, obs should have 36 + 6*(N-1) dims."""
+    """With opponent modeling, obs should have 36 + 7*(N-1) dims."""
     config_opp = {**config, "opponent_modeling": {"enabled": True}}
     c = make_company(config_opp, agent_id=0)
-    opponent_obs = np.zeros(6 * 3, dtype=np.float32)  # 3 opponents, 6D each
+    opponent_obs = np.zeros(7 * 3, dtype=np.float32)  # 3 opponents, 7D each
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, opponent_obs=opponent_obs)
-    assert obs.shape == (36 + 18,)
+    assert obs.shape == (36 + 21,)
 
 def test_obs_phase2_extends_phase1(config):
-    """Phase 2 obs = phase1 + 10 extra dims."""
+    """Phase 2 obs = phase1 + 11 extra dims."""
     c = make_company(config, agent_id=0)
     obs1 = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0, expected_price=80.0)
     obs2 = c.get_observation_phase2(
         obs_phase1=obs1, allocation=2.0, clearing_price=80.0,
         emissions=3.0, banked=1.0, emission_shock=0.05, payment=160.0)
-    assert obs2.shape == (36 + 10,)
+    assert obs2.shape == (36 + 11,)
     # First 36 dims should match phase1
     np.testing.assert_array_equal(obs2[:36], obs1)
 

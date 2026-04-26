@@ -246,7 +246,7 @@ Participants can sell from current allocation plus bank (no short selling beyond
 
 ### 6.1 Phase 1 observation
 
-Base dimension: **33**.
+Base dimension: **36**.
 
 Includes:
 - time and cap
@@ -263,26 +263,41 @@ Includes:
 - `[30]` bid_affordability_last: last year's bid total / remaining budget (clipped [0,1])
 - `[31]` loan_outstanding_norm: emergency loan / annual_budget
 - `[32]` years_under_loan_norm: years under active loan / 5
+- `[33]` last_cover_ratio
+- `[34]` own_last_secondary_buy_price (WTP anchor)
+- `[35]` treasury_norm: treasury_reserve / annual_budget (clipped [0,1])
 
 With opponent modeling enabled:
 
 $$
-obsDimPhase1 = 33 + 6 (N_{total} - 1)
+obsDimPhase1 = 36 + 7 (N_{total} - 1)
 $$
 
-Each opponent contributes a public 6D tuple:
-- normalized emissions
-- normalized carry-forward
-- green fraction
-- fossil fraction
-- total queue size
-- budget headroom ratio
+Each opponent contributes a **7D lagged tuple** (year t−1 snapshot, read from `_opponent_snapshots_prev`):
 
-Default (`N_total=8`): phase 1 dimension = `33 + 6 × 7 = 75`.
+| Dim | Signal | Normalisation |
+|-----|--------|---------------|
+| 0 | `verified_emissions` | `/ 10.0` |
+| 1 | `green_frac` | raw [0,1] |
+| 2 | `fossil_frac` | raw [0,1] |
+| 3 | `queue_signal` + N(0,σ) | clipped [0,1] |
+| 4 | `bank_norm` = holdings / annual_need | clipped [0,3] / 3 |
+| 5 | `net_secondary_norm` = (sec_bought − sec_sold) / annual_need | clipped [−1,1] |
+| 6 | `lagged_compliance_gap_norm` = prior (emissions − surrendered) / annual_need | clipped [−1,1] |
+
+**Timing:** Phase 1 reads `_opponent_snapshots_prev` (year t−1). At end of `step_secondary()`, current-year data is written into `_opponent_snapshots`. At the start of the next year's Phase 1, `_opponent_snapshots_prev` holds year t data.
+
+```
+Year t Phase 1 obs reads _opponent_snapshots_prev (year t−1).
+End of year t step_secondary() saves prev, then writes new current snapshot.
+Year t+1 Phase 1 obs reads updated _opponent_snapshots_prev (year t).
+```
+
+Default (`N_total=8`): phase 1 dimension = `36 + 7 × 7 = 85`.
 
 ### 6.2 Phase 2 observation
 
-Phase 2 appends **10** auction-result and compliance-awareness features to phase 1:
+Phase 2 appends **11** auction-result and compliance-awareness features to phase 1:
 - allocation
 - clearing price
 - net compliance position
@@ -293,12 +308,13 @@ Phase 2 appends **10** auction-result and compliance-awareness features to phase
 - collateral_locked_norm: this year's collateral locked / annual_budget
 - budget_remaining_phase2_norm: remaining annual budget after auction / annual_budget
 - compliance_liability_norm: (emissions + carry_forward − bank − allocation) / annual_budget
+- compliance_gap_norm: signed (realized_emissions − surrendered) / annual_need (clipped [−1,1])
 
 $$
-obsDimPhase2 = obsDimPhase1 + 10
+obsDimPhase2 = obsDimPhase1 + 11
 $$
 
-Default (`N_total=8`): phase 2 dimension = `75 + 10 = 85`.
+Default (`N_total=8`): phase 2 dimension = `85 + 11 = 96`.
 
 ## 7. Reward Design
 

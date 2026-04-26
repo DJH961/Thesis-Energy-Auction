@@ -110,6 +110,18 @@ class Company:
         self._loan_outstanding = 0.0
         self._loan_repayment_annual = 0.0
         self._years_under_loan = 0
+        self._last_loan_fraction = 0.0
+        self._loan_drawn_this_step = 0.0
+
+        # Treasury reserve
+        treasury_cfg = budget_cfg.get("treasury_reserve", {})
+        self._treasury_enabled = bool(treasury_cfg.get("enabled", False))
+        self._treasury_reserve = 0.0
+        self._treasury_cap_mult = float(treasury_cfg.get("cap_mult", 1.5))
+        self._treasury_retention = float(treasury_cfg.get("savings_retention_rate", 0.60))
+        self._treasury_decay = float(treasury_cfg.get("decay_rate", 0.05))
+        self._treasury_terminal_rate = float(treasury_cfg.get("terminal_value_rate", 0.30))
+        self._treasury_drawn_this_year = 0.0
 
         # Capex throughput constraint (organizational construction spend cap)
         capex_tp = budget_cfg.get("capex_throughputs", [])
@@ -321,13 +333,21 @@ class Company:
     # ------------------------------------------------------------------
 
     def apply_emergency_loan(self, shortfall: float) -> None:
-        """Record an emergency loan to cover auction settlement shortfall."""
-        self._loan_outstanding += shortfall
+        """Emergency loan — leverage-scaled rate. Call only after treasury is exhausted."""
+        loan_cfg = self.config.get("budget", {}).get("emergency_loan", {})
+        base_rate = float(loan_cfg.get("interest_rate", 0.08))
+        leverage_coef = float(loan_cfg.get("leverage_premium_coef", 0.25))
+        leverage_exp = float(loan_cfg.get("leverage_premium_exp", 1.5))
+        loan_fraction = shortfall / max(self.annual_budget, 1.0)
+        effective_rate = base_rate + leverage_coef * (loan_fraction ** leverage_exp)
+        principal_with_interest = shortfall * (1.0 + effective_rate)
+        self._loan_outstanding += principal_with_interest
         self._loan_repayment_annual = (
-            self._loan_outstanding * (1.0 + self._loan_interest_rate)
-            / max(self._loan_repayment_years, 1)
+            self._loan_outstanding / max(self._loan_repayment_years, 1)
         )
         self._years_under_loan = self._loan_repayment_years
+        self._last_loan_fraction = loan_fraction
+        self._loan_drawn_this_step = shortfall
 
     def apply_loan_repayment(self) -> None:
         """Deduct annual loan repayment from budget at year start."""
@@ -341,6 +361,38 @@ class Company:
     def get_loan_outstanding_norm(self) -> float:
         """Loan outstanding normalized by annual budget."""
         return self._loan_outstanding / max(self.annual_budget, 1.0)
+
+    @property
+    def effective_capex_throughput(self) -> float:
+        if self._years_under_loan > 0 and self._loan_outstanding > 0:
+            loan_burden = self._loan_outstanding / max(self.annual_budget, 1.0)
+            squeeze = max(
+                float(self.config.get("budget", {}).get("emergency_loan", {})
+                      .get("capex_squeeze_floor", 0.50)),
+                1.0 - loan_burden
+            )
+            return self.capex_throughput * squeeze
+        return self.capex_throughput
+
+    def settle_treasury_year_end(self) -> None:
+        """Roll unspent budget into treasury. Call BEFORE apply_loan_repayment() and reset_budget()."""
+        if not self._treasury_enabled:
+            return
+        unspent = max(0.0, self.annual_budget - self.budget_spent_this_year)
+        self._treasury_reserve += unspent * self._treasury_retention
+        cap = self._treasury_cap_mult * max(self.annual_budget, 1.0)
+        self._treasury_reserve = min(self._treasury_reserve, cap)
+        self._treasury_reserve *= (1.0 - self._treasury_decay)
+        self._treasury_drawn_this_year = 0.0
+
+    def get_treasury_available(self) -> float:
+        return float(self._treasury_reserve) if self._treasury_enabled else 0.0
+
+    def draw_treasury(self, amount: float) -> float:
+        actual = min(float(amount), self._treasury_reserve)
+        self._treasury_reserve -= actual
+        self._treasury_drawn_this_year += actual
+        return actual
 
     # ------------------------------------------------------------------
     # Investment (greening-only)
@@ -563,6 +615,7 @@ class Company:
     def reset_budget(self):
         self.budget_spent_this_year = 0.0
         self.green_loan_utilized = 0.0
+        self._loan_drawn_this_step = 0.0
 
     def record_spending(self, amount: float):
         self.budget_spent_this_year += float(amount)
@@ -732,7 +785,6 @@ class Company:
                                withhold_rate=0.24,
                                budget_spent: float = 0.0,
                                annual_budget: float = 1e9,
-                               suspension_remaining_norm: float = 0.0,
                                collateral_load_last: float = 0.0,
                                bid_affordability_last: float = 0.0,
                                n_years: int = 12,
@@ -740,7 +792,7 @@ class Company:
                                own_last_secondary_buy_price: float = 0.0,
                                cumulative_coverage_ratio: float = 1.0):
         """
-        Phase 1 observation (pre-auction): 36D base + 6*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 36D base + 7*(N-1) opponent dims.
 
         Base 36 dims:
         [0]  time (normalized)
@@ -765,22 +817,22 @@ class Company:
         [25] own bank ratio (clipped [0, 5], normalized by /5)
         [26] predicted MSR withholding fraction of cap
         [27] budget_headroom (1.0=fresh, 0.0=at limit, negative=overspent)
-        [28] suspension_remaining_norm: rounds still suspended / suspension_length
-             (0=not suspended, 1=fully suspended; helps avoid bids that lead to default)
-        [29] collateral_load_last: last year's collateral locked / annual_budget
+        [28] collateral_load_last: last year's collateral locked / annual_budget
              (clipped [0,1]; high → overbid risk; agents learn to stay below budget)
-        [30] bid_affordability_last: last year's bid_total / budget_remaining (clipped [0,1])
-        [31] loan_outstanding_norm: emergency loan outstanding / annual_budget
-        [32] years_under_loan_norm: remaining loan years / n_years
-        [33] last_cover_ratio: auction_supply / total_demand (clipped [0,3], /3)
+        [29] bid_affordability_last: last year's bid_total / budget_remaining (clipped [0,1])
+        [30] loan_outstanding_norm: emergency loan outstanding / annual_budget
+        [31] years_under_loan_norm: remaining loan years / n_years
+        [32] last_cover_ratio: auction_supply / total_demand (clipped [0,3], /3)
              WTP signal: low cover_ratio → high competition → should bid higher
-        [34] own_last_secondary_buy_price: (own last sec buy price / price_max)
+        [33] own_last_secondary_buy_price: (own last sec buy price / price_max)
              WTP signal: high secondary cost → agent should bid more at auction
-        [35] cumulative_coverage_ratio: cumul_alloc / cumul_emissions (clipped [0,2], /2)
+        [34] cumulative_coverage_ratio: cumul_alloc / cumul_emissions (clipped [0,2], /2)
              Long-run compliance signal: <1 means persistently under-buying
+        [35] treasury_norm: treasury_reserve / annual_budget (clipped [0,2], /2)
 
-        Opponent dims (if opponent_modeling enabled, 6D per opponent):
-        [36..] = (emissions/10, carry_forward/5, green_frac, fossil_frac, queue_total, is_active) per opponent
+        Opponent dims (if opponent_modeling enabled, 7D per opponent):
+        [36..] = (emissions/10, green_frac, fossil_frac, queue_noisy, bank_norm,
+                  net_secondary_norm, lagged_compliance_gap_norm) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
@@ -802,6 +854,9 @@ class Company:
             -0.5,
             1.0,
         ))
+        treasury_norm = float(np.clip(
+            self._treasury_reserve / max(annual_budget, 1.0), 0.0, 2.0
+        )) / 2.0
 
         base = np.array([
             year / 12.0,                          # [0] normalized by n_years
@@ -832,14 +887,14 @@ class Company:
             own_bank_ratio,                          # [25] own bank ratio
             predicted_withhold,                      # [26] predicted MSR withhold share
             budget_headroom,                         # [27] budget headroom signal
-            float(np.clip(suspension_remaining_norm, 0.0, 1.0)),  # [28] suspension signal
-            float(np.clip(collateral_load_last, 0.0, 1.0)),       # [29] collateral load last year
-            float(np.clip(bid_affordability_last, 0.0, 1.0)),     # [30] bid affordability
-            self.get_loan_outstanding_norm(),                      # [31] loan outstanding norm
-            float(self._years_under_loan / max(n_years, 1)),      # [32] years under loan norm
-            float(np.clip(last_cover_ratio, 0.0, 3.0)) / 3.0,    # [33] WTP: auction cover ratio
-            float(np.clip(own_last_secondary_buy_price, 0.0, pn)) / pn,  # [34] WTP: own sec buy price
-            float(np.clip(cumulative_coverage_ratio, 0.0, 2.0)) / 2.0,  # [35] cumulative coverage
+            float(np.clip(collateral_load_last, 0.0, 1.0)),       # [28] collateral load last year
+            float(np.clip(bid_affordability_last, 0.0, 1.0)),     # [29] bid affordability
+            self.get_loan_outstanding_norm(),                      # [30] loan outstanding norm
+            float(self._years_under_loan / max(n_years, 1)),      # [31] years under loan norm
+            float(np.clip(last_cover_ratio, 0.0, 3.0)) / 3.0,    # [32] WTP: auction cover ratio
+            float(np.clip(own_last_secondary_buy_price, 0.0, pn)) / pn,  # [33] WTP: own sec buy price
+            float(np.clip(cumulative_coverage_ratio, 0.0, 2.0)) / 2.0,  # [34] cumulative coverage
+            treasury_norm,                                         # [35] treasury reserve norm
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -897,6 +952,11 @@ class Company:
             0.0, 2.0,
         ))
 
+        total_holdings_now = banked + allocation
+        compliance_gap = (emissions + self._carry_forward - total_holdings_now)
+        compliance_gap_norm = float(np.clip(compliance_gap / estimated_need, -2.0, 2.0)) / 2.0
+        # [base+10]: >0=short (under-covered), <0=surplus
+
         extra = np.array([
             allocation / 5.0,                                                       # [base+0]
             clearing_price / self._price_norm,                                      # [base+1]
@@ -908,20 +968,22 @@ class Company:
             float(np.clip(collateral_locked_norm, 0.0, 1.0)),                      # [base+7]
             budget_remaining_phase2_norm,                                           # [base+8]
             compliance_liability_norm,                                              # [base+9]
+            compliance_gap_norm,                                                    # [base+10]
         ], dtype=np.float32)
         return np.concatenate([obs_phase1, extra])
 
     @property
     def obs_dim_phase1(self) -> int:
-        """36 base dims + 6*(N_total-1) opponent dims. See get_observation_phase1 for full layout."""
+        """36 base dims + 7*(N_total-1) opponent dims. See get_observation_phase1 for full layout."""
+        opp_dims = self.config.get("opponent_obs", {}).get("dims_per_opponent", 7)
         if self._opponent_modeling and self._n_total > 1:
-            return 36 + 6 * (self._n_total - 1)
+            return 36 + opp_dims * (self._n_total - 1)
         return 36
 
     @property
     def obs_dim_phase2(self) -> int:
-        """obs_dim_phase1 + 10 auction-result dims. See get_observation_phase2 for full layout."""
-        return self.obs_dim_phase1 + 10
+        """obs_dim_phase1 + 11 auction-result dims. See get_observation_phase2 for full layout."""
+        return self.obs_dim_phase1 + 11
 
     # ------------------------------------------------------------------
     # Reset
@@ -945,3 +1007,7 @@ class Company:
         self._loan_outstanding = 0.0
         self._loan_repayment_annual = 0.0
         self._years_under_loan = 0
+        self._last_loan_fraction = 0.0
+        self._loan_drawn_this_step = 0.0
+        self._treasury_reserve = 0.0
+        self._treasury_drawn_this_year = 0.0

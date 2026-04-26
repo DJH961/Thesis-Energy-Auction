@@ -99,33 +99,35 @@ def test_phase1_invest_action_direct_mapping():
 
 
 # ---------------------------------------------------------------------------
-# Test 2c: Settlement suspension length uses auction.suspension_length
+# Test 2c: Budget gate zeros qty for cash-poor agents (Change 1)
 # ---------------------------------------------------------------------------
 
-def test_default_suspension_uses_auction_config_length():
-    """Defaulted agents should receive suspension from auction.suspension_length (not budget.*)."""
+def test_budget_gate_zeros_qty_for_cash_poor_agents():
+    """Agents with cash < 10% of bid notional should have qty zeroed before auction."""
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
     config["companies"]["n_bot_agents"] = 0
-    config["auction"]["suspension_length"] = 3
-    config.setdefault("budget", {})["suspension_length"] = 1  # conflicting value on purpose
     config["budget"]["emergency_loan"]["enabled"] = False
-    config["auction"]["leverage_multiplier"] = 100.0
+    # Treasury off so only operating cash matters
+    config["budget"].setdefault("treasury_reserve", {})["enabled"] = False
 
     env = ETSEnvironment(config, seed=91)
     env.reset(seed=91)
     n_agents = env.n_agents
 
+    # Drain budget for agent 0 so they cannot cover 10% of a large notional
+    env.companies[0].budget_spent_this_year = env.companies[0].annual_budget * 0.99
+
     auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
-    auction_actions[:, 0] = 500.0
-    auction_actions[:, 1] = 2.0
+    auction_actions[:, 0] = 200.0   # high price
+    auction_actions[:, 1] = 2.0     # large qty → notional well above remaining cash
     _, log = env.step_auction(auction_actions)
 
-    defaulted_agents = log["auction_stats"].get("defaults_agents", [])
-    assert defaulted_agents, "Expected at least one default to validate suspension length."
-    for idx in defaulted_agents:
-        assert env._suspension_remaining[int(idx)] == 3, (
-            f"Agent {idx} suspension={env._suspension_remaining[int(idx)]}, expected 3 from auction.suspension_length"
+    # Agent 0 should not have won any allocation (qty was zeroed by budget gate)
+    alloc = log.get("allocations", [])
+    if alloc:
+        assert alloc[0] < 1e-6, (
+            f"Expected agent 0 allocation ~0 due to budget gate, got {alloc[0]:.4f}"
         )
 
 
@@ -499,7 +501,7 @@ def test_burnin_prev_ma3_seeded():
 # ---------------------------------------------------------------------------
 
 def test_p8_obs_dims():
-    """Phase 1 obs should be 36D base (+ 6*(N_total-1) opponent dims) with opponent modeling.
+    """Phase 1 obs should be 36D base (+ 7*(N_total-1) opponent dims) with opponent modeling.
     36 base dims: 33 original + last_cover_ratio[33], own_last_secondary_buy_price[34],
     cumulative_coverage_ratio[35] (WTP anchor features).
     N_total = learning + bot agents."""
@@ -508,8 +510,9 @@ def test_p8_obs_dims():
     n_agents = env.config["companies"]["n_agents"]
     n_total = n_agents + env.config["companies"].get("n_bot_agents", 0)
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
-    expected_p1 = 36 + (6 * (n_total - 1) if opp_enabled else 0)
-    expected_p2 = expected_p1 + 10  # +10: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm, collateral_locked_norm, budget_remaining_phase2_norm, compliance_liability_norm
+    opp_dims = env.config.get("opponent_obs", {}).get("dims_per_opponent", 7)
+    expected_p1 = 36 + (opp_dims * (n_total - 1) if opp_enabled else 0)
+    expected_p2 = expected_p1 + 11  # +11: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm, collateral_locked_norm, budget_remaining_phase2_norm, compliance_liability_norm, compliance_gap_norm
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
     )

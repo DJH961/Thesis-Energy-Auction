@@ -5,6 +5,29 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.1.0] — 2026-04-27
+
+### Added
+- Corporate treasury reserve (unspent budget retention at 60%, 1.5× cap, 5% decay, terminal NPV)
+- Leverage-scaled emergency loan with capex covenant squeeze (`effective_capex_throughput`)
+- Anchor-normalised cost reward (`cost_norm = total_cost / (anchor_t × estimated_need)`; `penalty_norm` still uses static `REWARD_SCALE`)
+- 7D lagged opponent observation with 1-year two-buffer lag (emissions, green_frac, fossil_frac, queue_noisy, bank_norm, net_secondary_norm, lagged_compliance_gap_norm)
+- Phase 2 signed compliance gap dimension (`compliance_gap_norm` at `base+10`)
+- Budget price clipping: soft clip at 1.5× max_affordable_price, collateral-aware
+
+### Changed
+- Suspension mechanism replaced by budget-based bid gate (cash < 10% of notional → qty zeroed)
+- Settlement logic unified under canonical waterfall (operating → treasury → loan → default)
+- Opponent obs default mode: `lagged` (7D); `full_info` (6D) available for ablation
+- Year-end order: `settle_treasury_year_end()` → `apply_loan_repayment()` → `reset_budget()` → `reset_capex_budget()`
+
+### Breaking
+- Phase 1 obs: `36 + 7*(N−1)` dims (was `36 + 6*(N−1)`)
+- Phase 2 obs: Phase 1 + 11 dims (was Phase 1 + 10)
+- Old checkpoints incompatible unless `opponent_obs.mode: full_info` and legacy reward config
+
+---
+
 ## v8.0.1
 
 **Bug fix: MSR cancellation threshold, emergency release gate, burn-in reserve clamp, dynamic budget ceiling, EU ETS calibration**

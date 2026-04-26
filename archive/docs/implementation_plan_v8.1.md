@@ -1,6 +1,6 @@
-# Implementation Plan v10 — Budget Reform & Compliance Visibility
+# Implementation Plan v8.1 — Budget Reform & Compliance Visibility
 
-> Supersedes v9. Fixes: section order matches implementation order; lag-buffer semantics corrected; collateral-aware price clipping; `_last_compliance_gaps` fully specified; loan sting reframed; treasury dim comment corrected; smoke test acceptance criteria added.
+Fixes: section order matches implementation order; lag-buffer semantics corrected; collateral-aware price clipping; `_last_compliance_gaps` fully specified; loan sting reframed; treasury dim comment corrected; smoke test acceptance criteria added.
 >
 > **Scope: 8 changes. Sections are ordered to match implementation order — implement top to bottom.**
 

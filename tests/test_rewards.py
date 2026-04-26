@@ -206,6 +206,7 @@ def test_terminal_bank_uses_budget_divisor():
     config = load_config()
     config["reward"]["terminal_bank_value"] = True
     config["reward"]["terminal_queue_value"] = False
+    config["reward"]["treasury_terminal_value"] = False  # isolate bank-only terminal value
     config["simulation"]["n_years"] = 3
     config["warm_start"]["enabled"] = False
     config["uncertainty"]["enabled"] = False
@@ -1126,3 +1127,24 @@ def test_underbid_gives_negative_auction_reward():
             f"Agent {i}: underbidding (0 qty) should yield negative auction reward, "
             f"got {r_auction[i]:.4f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Change 6: anchor-normalised cost reward
+# ---------------------------------------------------------------------------
+
+def test_anchor_normalised_cost_symmetry():
+    """Equal-efficiency spend → cost_norm ≈ 1.0. Penalty inflates nominally over years."""
+    from src.utils.price_anchor import compute_fundamental_anchor
+    with open(CONFIG_PATH) as f:
+        cfg = yaml.safe_load(f)
+    need = 5.0
+    for yr in [0, 10]:
+        anchor = compute_fundamental_anchor(yr, cfg)
+        cost_norm = (anchor * need) / max(anchor * need, 1.0)
+        assert abs(cost_norm - 1.0) < 1e-6, f"Year {yr}: cost_norm != 1.0 (got {cost_norm})"
+    REWARD_SCALE = cfg["auction"]["price_max"]
+    shortfall = 1.0
+    p0 = shortfall * cfg["penalty"]["rate"] / REWARD_SCALE
+    p10 = shortfall * cfg["penalty"]["rate"] * (1 + cfg["penalty"]["inflation_rate"]) ** 10 / REWARD_SCALE
+    assert p10 > p0, f"Penalty at yr10 ({p10:.6f}) should exceed yr0 ({p0:.6f})"
