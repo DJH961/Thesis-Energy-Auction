@@ -17,6 +17,8 @@ EU ETS references:
 """
 
 
+import warnings
+
 # Legislative TNAC thresholds from Decision (EU) 2015/1814 (as amended).
 TNAC_LOWER_REF = 400.0
 TNAC_MID_REF = 833.0
@@ -70,6 +72,25 @@ class CapSchedule:
         # These provide more stable MSR behavior when penalty rates vary
         self.price_containment_absolute = msr.get("price_containment_absolute", 200.0)
         self.price_release_absolute = msr.get("price_release_absolute", 300.0)
+
+        # Whether emergency MSR price-release is active (disable to suppress
+        # procyclical reserve injection during low-price regimes)
+        self.price_release_enabled = bool(msr.get("price_release_enabled", True))
+
+        # Sanity-check: warn if absolute thresholds exceed the auction price ceiling
+        price_max = float(config.get("auction", {}).get("price_max", 250.0))
+        if self.price_containment_absolute >= price_max:
+            warnings.warn(
+                f"[CapSchedule] price_containment_absolute ({self.price_containment_absolute} EUR/t) "
+                f">= price_max ({price_max} EUR/t); containment trigger is unreachable.",
+                UserWarning, stacklevel=2,
+            )
+        if self.price_release_absolute >= price_max:
+            warnings.warn(
+                f"[CapSchedule] price_release_absolute ({self.price_release_absolute} EUR/t) "
+                f">= price_max ({price_max} EUR/t); release trigger is unreachable.",
+                UserWarning, stacklevel=2,
+            )
 
         # Internal MSR reserve (starts empty)
         self._msr_reserve = 0.0
@@ -281,13 +302,9 @@ class CapSchedule:
         tnac = self._prev_tnac  # 1-year lag (already stored from last get_auction_volume)
         auction_vol = cap_t
 
-        # Read-only snapshot: apply cancellation cap to reserve without mutation
-        prev_auction_vol = self.volume_history[-1] if self.volume_history else cap_t
-        # Mirror live _apply_msr cancellation-floor logic so previewed supply
-        # matches actual auction-year behavior under identical lagged state.
-        prev_cap = self.get_cap(year - 1) if year > 0 else self.cap_year_0
-        prev_auction_vol = max(prev_auction_vol, prev_cap)
-        msr_snap = max(0.0, self._msr_reserve - max(0.0, self._msr_reserve - prev_auction_vol))
+        # Read-only snapshot: apply tnac_lower-based cancellation cap without mutation.
+        # Mirrors the live _apply_msr cancellation logic.
+        msr_snap = max(0.0, self._msr_reserve - max(0.0, self._msr_reserve - self.tnac_lower))
 
         # Inflation-adjusted penalty rate
         if penalty_rate > 0 and inflation_rate >= 0:
@@ -298,10 +315,9 @@ class CapSchedule:
         release_threshold = min(eff_penalty * 2.5, 450.0)
 
         # Emergency release check (same logic as _apply_msr, read-only)
-        if clearing_price >= release_threshold:
+        # Skipped entirely when price_release_enabled=False.
+        if self.price_release_enabled and clearing_price >= release_threshold:
             # Keep preview parity with live _apply_msr: no special year<2 bypass.
-            # Early-year behavior is driven by whether _prev_ma3 exists (seeded in
-            # burn-in when enabled), not by absolute year index.
             no_prior_ma3 = self._prev_ma3 is None
             smoothed_spike = (
                 no_prior_ma3 or
@@ -421,14 +437,11 @@ class CapSchedule:
         # since the burn-in loop builds historical state without a true prior year.
         tnac = current_tnac if force_msr else self._prev_tnac
 
-        # MSR cancellation: cancel holdings exceeding previous year's auction volume.
-        # The cancellation floor is at least the previous year's cap so that
-        # distorted auction volumes (e.g. from large rollovers) do not cause
-        # premature cancellation of legitimate MSR reserves.
-        prev_auction_vol = self.volume_history[-1] if self.volume_history else auction_vol
-        prev_cap = self.get_cap(year - 1) if year > 0 else self.cap_year_0
-        prev_auction_vol = max(prev_auction_vol, prev_cap)
-        excess = max(0, self._msr_reserve - prev_auction_vol)
+        # MSR cancellation: cancel holdings exceeding tnac_lower.
+        # Anchoring to tnac_lower (not previous auction volume) prevents the
+        # reserve from being inflated by rollover-distorted volumes and matches
+        # the legislative intent of keeping MSR holdings below the lower TNAC band.
+        excess = max(0.0, self._msr_reserve - self.tnac_lower)
         self._msr_reserve -= excess
         self._total_cancelled += excess
 
@@ -447,25 +460,27 @@ class CapSchedule:
         # Combined emergency-release trigger.
         # Requires BOTH absolute threshold AND smoothed price spike (or no history).
         # Smoothed check prevents spurious firing on single-auction anomalies.
-        absolute_trigger = clearing_price >= release_threshold
-        if absolute_trigger:
-            # Smoothed-spike check: price_ma3 > 2.5× prev_ma3, or no prior MA3.
-            # year < 2 bypass removed — _prev_ma3 is seeded during burn-in so
-            # the guard is active from year 0 of the real episode.
-            no_prior_ma3 = self._prev_ma3 is None
-            smoothed_spike = (
-                no_prior_ma3 or
-                (price_ma3 is not None and self._prev_ma3 is not None
-                 and price_ma3 > 2.5 * self._prev_ma3)
-            )
-            if smoothed_spike:
-                release = min(self.emergency_release_amount, self._msr_reserve)
-                self._msr_reserve -= release
-                auction_vol += release
-                self._msr_event_counts["emergency_release"] += 1
-                self._last_msr_withheld = 0.0
-                self._last_msr_released = float(release)
-                return auction_vol
+        # Disabled entirely when price_release_enabled=False (config flag).
+        if self.price_release_enabled:
+            absolute_trigger = clearing_price >= release_threshold
+            if absolute_trigger:
+                # Smoothed-spike check: price_ma3 > 2.5× prev_ma3, or no prior MA3.
+                # year < 2 bypass removed — _prev_ma3 is seeded during burn-in so
+                # the guard is active from year 0 of the real episode.
+                no_prior_ma3 = self._prev_ma3 is None
+                smoothed_spike = (
+                    no_prior_ma3 or
+                    (price_ma3 is not None and self._prev_ma3 is not None
+                     and price_ma3 > 2.5 * self._prev_ma3)
+                )
+                if smoothed_spike:
+                    release = min(self.emergency_release_amount, self._msr_reserve)
+                    self._msr_reserve -= release
+                    auction_vol += release
+                    self._msr_event_counts["emergency_release"] += 1
+                    self._last_msr_withheld = 0.0
+                    self._last_msr_released = float(release)
+                    return auction_vol
 
         # Containment: suppress withdrawal when prices are already elevated
         if clearing_price >= containment_threshold:

@@ -5,6 +5,45 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## v8.0.1
+
+**Bug fix: MSR cancellation threshold, emergency release gate, burn-in reserve clamp, dynamic budget ceiling, EU ETS calibration**
+
+### MSR cancellation threshold fix (`src/environment/cap_schedule.py`)
+- **Bug**: `_apply_msr` cancelled MSR holdings above `max(prev_auction_vol, prev_cap)`, which varied with rollover-distorted auction volumes and could suppress legitimate reserves or cause premature cancellation.
+- **Fix**: Cancel holdings above `self.tnac_lower` instead. This anchors cancellation to the legislative lower TNAC band (a stable, config-driven threshold) and removes the `prev_auction_vol` / `prev_cap` dependency entirely.
+- `preview_auction_volume` mirror updated identically: `msr_snap = max(0.0, self._msr_reserve - max(0.0, self._msr_reserve - self.tnac_lower))`.
+
+### Emergency price-release gate (`src/environment/cap_schedule.py`, `configs/default.yaml`)
+- Added `msr.price_release_enabled: false` config flag (default `true` for backward compat).
+- When `false`, the combined emergency-release block is skipped entirely in both `_apply_msr` and `preview_auction_volume`.
+- Disabled by default in v8.0.1 to prevent procyclical reserve injection during early low-price episodes.
+
+### Absolute price threshold tightening (`configs/default.yaml`)
+- `msr.price_containment_absolute`: 350 → **175 EUR/t**
+- `msr.price_release_absolute`: 450 → **212 EUR/t**
+- Both now sit below `auction.price_max = 250 EUR/t`; price_max sanity-check warnings added to `CapSchedule.__init__` via `warnings.warn`.
+
+### Burn-in MSR reserve clamp (`src/environment/ets_environment.py`)
+- After the hidden burn-in loop and before `_calibrate_post_init_bank`, clamp `cap_schedule._msr_reserve = min(_msr_reserve, tnac_lower)`.
+- Prevents burn-in from overfilling the reserve beyond the lower band, matching the real 2026 EU ETS starting state.
+
+### Dynamic budget ceiling (`src/environment/company.py`, `configs/default.yaml`)
+- Added `budget.dynamic_budget_ceiling_multiplier: 1.5`.
+- `compute_dynamic_budget` now caps its output at `min(dynamic_budget, annual_budget × ceiling_mult)`, preventing revenue windfalls from inflating available budgets unboundedly.
+
+### EU ETS calibration anchoring (`configs/default.yaml`)
+- `ets.cap_overhead_pct`: 0.02 → **0.12** (reflects real 2026 EU ETS ~15% overhead).
+- `msr.tnac_upper_ratio`: 0.36 → **0.68** (derived from band_width / (LRF × cap_0) ≈ 10 years, matching EU ETS design intent).
+- `ets.initial_bank_fraction`: 0.10 → **0.81** — jointly calibrated with `tnac_upper_ratio` so TNAC starts at 1.05 × tnac_upper, replicating the real 2026 EU ETS observed ratio (1,148 / 1,096 = 1.05).
+- All downstream parameters (`tnac_lower`, `tnac_mid`, `release_amount`) auto-derive from `tnac_upper_ratio` in `market_calibration.py` — no further code changes needed.
+
+### Training log: collateral clip events (`scripts/train.py`)
+- Per-episode `_collateral_clip_events` total now surfaced in the Warnings line when non-zero: `collateralClip=<N>`.
+- Legend updated to document the new counter.
+
+---
+
 ## v8.0.0
 
 **Tabula-Rasa Retirement, Fundamental Price Anchor, WTP-Uniform Exploration, Coverage Shaping Unification**

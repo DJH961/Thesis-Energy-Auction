@@ -905,6 +905,13 @@ class ETSEnvironment(gym.Env):
         # not inflate the year-0 auction volume of the real episode.
         self.cap_schedule._unsold_rollover_pending = 0.0
 
+        # Reflect real 2026 EU ETS starting state: MSR reserve must not exceed
+        # tnac_lower. Burn-in can overfill the reserve; clamp it here before
+        # the calibration step adjusts agent holdings.
+        self.cap_schedule._msr_reserve = min(
+            self.cap_schedule._msr_reserve, self.cap_schedule.tnac_lower
+        )
+
         self._calibrate_post_init_bank(ws_cfg)
 
     def _calibrate_post_init_bank(self, ws_cfg: dict):

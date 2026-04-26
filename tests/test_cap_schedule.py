@@ -15,6 +15,7 @@ import pytest
 from src.environment.cap_schedule import CapSchedule
 
 BASE_CONFIG = {
+    "auction": {"price_max": 500.0},
     "ets": {
         "cap_year_0": 14.60,
         "lrf_phase1": 0.043,
@@ -278,32 +279,25 @@ def test_msr_reset():
 
 
 def test_msr_cancellation():
-    """MSR cancellation: holdings above max(prev_auction_vol, prev_cap) are cancelled."""
+    """MSR cancellation: holdings above tnac_lower are cancelled."""
     s = make_schedule(msr_enabled=True, seed_prev_tnac=4.0)
-    # Manually set reserve and volume history
+    # tnac_lower = 1.92 (from BASE_CONFIG)
     s._msr_reserve = 20.0
-    s.volume_history = [10.0]
 
-    # Call get_auction_volume to trigger cancellation
-    # cancellation floor = max(volume_history[-1], get_cap(year-1))
-    #                    = max(10.0, get_cap(0)) = max(10.0, 14.60) = 14.60
     vol = s.get_auction_volume(year=1, tnac=4.0)
-    expected_floor = max(10.0, s.get_cap(0))   # 14.60
 
-    # Reserve should be reduced to the cancellation floor
-    assert s._msr_reserve == pytest.approx(expected_floor, rel=1e-5)
-    # Total cancelled should equal the excess above the floor
-    assert s._total_cancelled == pytest.approx(20.0 - expected_floor, rel=1e-5)
+    # Reserve should be clamped down to tnac_lower
+    assert s._msr_reserve == pytest.approx(s.tnac_lower, rel=1e-5)
+    # Total cancelled = excess above tnac_lower
+    assert s._total_cancelled == pytest.approx(20.0 - s.tnac_lower, rel=1e-5)
 
 
 def test_msr_no_cancellation_when_below():
-    """No cancellation when MSR reserve is below previous auction volume."""
+    """No cancellation when MSR reserve is at or below tnac_lower."""
     s = make_schedule(msr_enabled=True, seed_prev_tnac=4.0)
-    # Set reserve below previous auction volume
-    s._msr_reserve = 5.0
-    s.volume_history = [10.0]
+    # Set reserve strictly below tnac_lower (1.92)
+    s._msr_reserve = 1.5
 
-    # Call get_auction_volume
     vol = s.get_auction_volume(year=1, tnac=4.0)
 
     # No cancellation should have occurred

@@ -97,6 +97,9 @@ class Company:
             self.debt_headroom = float(debt_headrooms[agent_id])
         self._budget_ema_alpha = float(budget_cfg.get("budget_ema_alpha", 0.3))
         self._budget_ema: Optional[float] = None
+        self._dynamic_budget_ceiling_mult = float(
+            budget_cfg.get("dynamic_budget_ceiling_multiplier", 1e9)
+        )
 
         # Emergency loan facility (B1)
         loan_cfg = budget_cfg.get("emergency_loan", {})
@@ -300,7 +303,9 @@ class Company:
         inf = self.inflation_factor(current_year)
         revenue = self.compute_revenue(marginal_ef, carbon_price, inf)
         opex = self.compute_operational_cost(current_year)
-        return max(1.0, revenue - opex + self.debt_headroom)
+        dynamic_budget = max(1.0, revenue - opex + self.debt_headroom)
+        ceiling = self.annual_budget * self._dynamic_budget_ceiling_mult
+        return min(dynamic_budget, ceiling)
 
     def set_annual_budget(self, value: float) -> None:
         """Set annual budget and update exponential moving average."""

@@ -143,7 +143,8 @@ def main():
             a1_indices = np.zeros(n_agents, dtype=int)
             for i in range(n_agents):
                 action_vec, a1_idx = agents[i].select_auction_action(
-                    obs1[i], env.companies[i], price_ma3, config, epsilon=0.0)
+                    obs1[i], env.companies[i], price_ma3, config,
+                    epsilon=0.0, current_year=year)
                 auction_actions[i] = action_vec
                 a1_indices[i] = a1_idx
 
@@ -154,7 +155,8 @@ def main():
             for i in range(n_agents):
                 action_vec, _ = agents[i].select_secondary_action(
                     obs2[i], env.companies[i], env._phase1_clearing_price,
-                    config, a1_idx=a1_indices[i], epsilon=0.0)
+                    config, a1_idx=a1_indices[i], epsilon=0.0,
+                    current_year=year)
                 secondary_actions[i] = action_vec
 
             obs1, rewards, terminated, _, info = env.step_secondary(secondary_actions)

@@ -48,8 +48,9 @@ ets:
     withhold_rate: 0.24
     release_frac: 0.0638297872
     activation_year: 1
-    price_containment_absolute: 350
-    price_release_absolute: 450
+    price_containment_absolute: 175
+    price_release_absolute: 212
+    price_release_enabled: false
     emergency_release_frac: 0.08
     min_auction_frac: 0.10
 

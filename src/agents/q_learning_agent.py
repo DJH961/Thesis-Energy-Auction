@@ -46,9 +46,10 @@ class StateDiscretizer:
     _OBS_CF = 20          # carry_forward / 5
 
     # Bin edges: value <= edge[0] → 0, edge[0] < value <= edge[1] → 1, else → 2
+    # Price bins recalibrated for v8 price_max=250: 0.30→75 EUR/t, 0.55→137 EUR/t
     _BINS = {
         "time":       [0.33, 0.67],    # early / mid / late episode
-        "price":      [0.15, 0.40],    # low / medium / high carbon price
+        "price":      [0.30, 0.55],    # low / medium / high carbon price
         "green":      [0.35, 0.65],    # dirty / mixed / green mix
         "gap":        [0.10, 0.60],    # deficit / balanced / surplus  (gap/5 scale)
         "cf":         [0.01, 0.20],    # none / some / heavy carry-forward
@@ -140,7 +141,7 @@ class ActionProfileMapper:
     N_SECONDARY_PROFILES = 4
 
     def get_auction_action(self, profile_idx: int, company, price_ma3: float,
-                           config: dict) -> np.ndarray:
+                           config: dict, current_year: int = 0) -> np.ndarray:
         """
         Convert Phase-1 profile index to a 6D continuous action vector.
 
@@ -154,6 +155,8 @@ class ActionProfileMapper:
             3-year moving average clearing price.
         config : dict
             Full config dictionary.
+        current_year : int
+            Current simulation year (0-based), used to compute inflation-adjusted penalty.
 
         Returns
         -------
@@ -167,7 +170,11 @@ class ActionProfileMapper:
         qty_low = aq.get("qty_mult_low", 0.3)
         qty_high = aq.get("qty_mult_high", 2.0)
         max_invest = inv["max_invest_frac"]
-        penalty_rate = config.get("penalty", {}).get("rate", 100.0)
+        # Use inflation-adjusted penalty rate if the company exposes it
+        if hasattr(company, "effective_penalty_rate"):
+            penalty_rate = company.effective_penalty_rate(current_year)
+        else:
+            penalty_rate = config.get("penalty", {}).get("rate", 100.0)
 
         # Base anchor price
         anchor = max(price_min, min(price_ma3, penalty_rate))
@@ -221,7 +228,8 @@ class ActionProfileMapper:
         ], dtype=np.float32)
 
     def get_secondary_action(self, profile_idx: int, company,
-                             clearing_price: float, config: dict) -> np.ndarray:
+                             clearing_price: float, config: dict,
+                             current_year: int = 0) -> np.ndarray:
         """
         Convert Phase-2 profile index to a 2D continuous action vector.
 
@@ -232,48 +240,48 @@ class ActionProfileMapper:
         company : Company
             The company object.
         clearing_price : float
-            Current auction clearing price.
+            Current auction clearing price (EUR/t).
         config : dict
             Full config dictionary.
+        current_year : int
+            Current simulation year (0-based), unused here but kept for API symmetry.
 
         Returns
         -------
         action : np.ndarray, shape (2,)
-            [sec_price_multiplier, sec_qty]
+            [sec_price_abs (EUR/t), sec_qty]  — absolute price; env clips to valid range
         """
         aq = config["auction"]
         trading = config.get("trading", {})
         qty_max = aq["quantity_max"]
-        sec_low = trading.get("sec_mult_low", 0.8)
-        sec_high = trading.get("sec_mult_high", 1.3)
-
-        # Estimate surplus/deficit
-        need = company.compute_estimate_need()
+        # Use clearing_price as anchor; ensure it is at least the configured minimum
+        sec_price_min = trading.get("sec_price_min", aq.get("price_min", 45.0))
+        anchor = max(float(clearing_price), sec_price_min)
 
         profiles = {
-            0: {  # Hold
-                "price_mult": 1.0,
+            0: {  # Hold — qty=0 so price irrelevant; use anchor as safe placeholder
+                "price": anchor,
                 "qty": 0.0,
             },
-            1: {  # Sell surplus
-                "price_mult": 1.1,
+            1: {  # Sell surplus — ask a slight premium over clearing
+                "price": anchor * 1.1,
                 "qty": -min(1.0, qty_max),  # sell 1 Mt
             },
-            2: {  # Buy shortfall
-                "price_mult": 1.2,
+            2: {  # Buy shortfall — pay a moderate premium
+                "price": anchor * 1.2,
                 "qty": min(1.0, qty_max),   # buy 1 Mt
             },
-            3: {  # Aggressive buy
-                "price_mult": sec_high,
+            3: {  # Aggressive buy — pay a high premium; env caps at sec_price_max
+                "price": anchor * 1.5,
                 "qty": min(2.0, qty_max),   # buy 2 Mt
             },
         }
 
         p = profiles[profile_idx]
-        price_mult = float(np.clip(p["price_mult"], sec_low, sec_high))
+        price = float(p["price"])  # env will clip to [sec_price_min, sec_price_max]
         qty = float(np.clip(p["qty"], -qty_max, qty_max))
 
-        return np.array([price_mult, qty], dtype=np.float32)
+        return np.array([price, qty], dtype=np.float32)
 
     @staticmethod
     def auction_profile_names() -> list:
@@ -330,7 +338,8 @@ class QLearningAgent:
 
     def select_auction_action(self, obs: np.ndarray, company,
                               price_ma3: float, config: dict,
-                              epsilon: float = 0.0) -> Tuple[np.ndarray, int]:
+                              epsilon: float = 0.0,
+                              current_year: int = 0) -> Tuple[np.ndarray, int]:
         """
         Select a Phase-1 action using ε-greedy over auction profiles.
 
@@ -352,13 +361,14 @@ class QLearningAgent:
             profile_idx = int(np.argmax(q_auction))
 
         action_vec = self.mapper.get_auction_action(
-            profile_idx, company, price_ma3, config)
+            profile_idx, company, price_ma3, config, current_year=current_year)
         return action_vec, profile_idx
 
     def select_secondary_action(self, obs: np.ndarray, company,
                                 clearing_price: float, config: dict,
                                 a1_idx: int,
-                                epsilon: float = 0.0) -> Tuple[np.ndarray, int]:
+                                epsilon: float = 0.0,
+                                current_year: int = 0) -> Tuple[np.ndarray, int]:
         """
         Select a Phase-2 action using ε-greedy over secondary profiles.
 
@@ -382,7 +392,7 @@ class QLearningAgent:
             profile_idx = int(np.argmax(q_sec))
 
         action_vec = self.mapper.get_secondary_action(
-            profile_idx, company, clearing_price, config)
+            profile_idx, company, clearing_price, config, current_year=current_year)
         return action_vec, profile_idx
 
     def update(self, state: int, a1_idx: int, a2_idx: int,

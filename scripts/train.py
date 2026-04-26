@@ -386,7 +386,8 @@ def _print_training_legend():
     print("  │     lowAlloc    Allocation < 30% of auction volume (severe under-bidding)")
     print("  │     priceFloor  Clearing price hit the reserve floor (~30 €/t)")
     print("  │     priceCeil   Clearing price ≥ 90% of price_max (near hard cap)")
-    print("  │     auctFail    Auction failed entirely (no valid bids or all below reserve)")
+    print("  │     auctFail       Auction failed entirely (no valid bids or all below reserve)")
+    print("  │     collateralClip Total bid rescales due to collateral budget limit (episode sum)")
     print("  │     lowDemand   Total bid demand < 70% of supply (weak market)")
     print("  │     noInvest    All agents chose invest_frac ≈ 0 (no green investment)")
     print("  │     debtSpiral  Agent had 3+ consecutive shortfall years (chronic non-compliance)")
@@ -2113,7 +2114,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             if _stuck_parts:
                 print(f"  Stuck states (learning, >= {_broken_window}ep): "
                       f"{' | '.join(_stuck_parts)}")
-            print(f"  Warnings (year-step counts): {warn_detail}")
+            _clip_total = sum(env._collateral_clip_events.values())
+            _clip_str = f"  collateralClip={_clip_total}" if _clip_total > 0 else ""
+            print(f"  Warnings (year-step counts): {warn_detail}{_clip_str}")
 
             print(sep)
 
