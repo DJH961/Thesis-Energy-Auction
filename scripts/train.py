@@ -307,8 +307,9 @@ class EntropyConditionTracker:
         raw_start = ppo_cfg.get("entropy_decay_start", -1)
 
         # Auto-scale: -1 means "compute from n_episodes"; 0 means "start immediately"
+        entropy_decay_frac = float(ppo_cfg.get("entropy_decay_frac", 0.90))
         self.decay_start = raw_start if raw_start >= 0 else int(0.05 * n_episodes)
-        self.decay_window = raw_window if raw_window >= 0 else int(0.90 * n_episodes)
+        self.decay_window = raw_window if raw_window >= 0 else int(entropy_decay_frac * n_episodes)
 
     def update(self, episode: int) -> float:
         """Return current entropy coefficient based on episode number."""
@@ -628,9 +629,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     # Reward shaping decay schedule: allow auto-scaling from n_episodes.
     reward_cfg = config.setdefault("reward", {})
+    shaping_decay_frac = float(reward_cfg.get("shaping_decay_frac", 0.40))
     shaping_decay_eps, shaping_decay_auto = _resolve_auto_episode_count(
         reward_cfg.get("shaping_decay_episode", 0), n_episodes,
-        frac=0.40, min_count=500, max_count=80000,
+        frac=shaping_decay_frac, min_count=500, max_count=80000,
     )
     reward_cfg["shaping_decay_episode"] = shaping_decay_eps
 
@@ -761,9 +763,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     explore_cfg = config.get("exploration", {})
     eps_start = explore_cfg.get("epsilon_start", 0.0)
     eps_final = explore_cfg.get("epsilon_final", 0.0)
+    eps_decay_frac = float(explore_cfg.get("epsilon_decay_frac", 0.75))
     eps_decay_episodes, eps_decay_auto = _resolve_auto_episode_count(
         explore_cfg.get("epsilon_decay_episodes", 0), n_episodes,
-        frac=0.75, min_count=1000, max_count=100000,
+        frac=eps_decay_frac, min_count=1000, max_count=100000,
     )
     if eps_start > 0.0:
         auto_note = " [auto]" if eps_decay_auto else ""

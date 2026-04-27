@@ -790,11 +790,13 @@ class Company:
                                n_years: int = 12,
                                last_cover_ratio: float = 1.0,
                                own_last_secondary_buy_price: float = 0.0,
-                               cumulative_coverage_ratio: float = 1.0):
+                               cumulative_coverage_ratio: float = 1.0,
+                               cap_ahead_3y_ratio: float = 1.0,
+                               cap_ahead_6y_ratio: float = 1.0):
         """
-        Phase 1 observation (pre-auction): 36D base + 7*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 38D base + 7*(N-1) opponent dims.
 
-        Base 36 dims:
+        Base 38 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
@@ -829,9 +831,11 @@ class Company:
         [34] cumulative_coverage_ratio: cumul_alloc / cumul_emissions (clipped [0,2], /2)
              Long-run compliance signal: <1 means persistently under-buying
         [35] treasury_norm: treasury_reserve / annual_budget (clipped [0,2], /2)
+        [36] cap_ahead_3y_ratio: cap(t+3) / cap(t) clipped [0,1] — 3-year scarcity lookahead
+        [37] cap_ahead_6y_ratio: cap(t+6) / cap(t) clipped [0,1] — 6-year scarcity lookahead
 
         Opponent dims (if opponent_modeling enabled, 7D per opponent):
-        [36..] = (emissions/10, green_frac, fossil_frac, queue_noisy, bank_norm,
+        [38..] = (emissions/10, green_frac, fossil_frac, queue_noisy, bank_norm,
                   net_secondary_norm, lagged_compliance_gap_norm) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
@@ -895,6 +899,8 @@ class Company:
             float(np.clip(own_last_secondary_buy_price, 0.0, pn)) / pn,  # [33] WTP: own sec buy price
             float(np.clip(cumulative_coverage_ratio, 0.0, 2.0)) / 2.0,  # [34] cumulative coverage
             treasury_norm,                                         # [35] treasury reserve norm
+            float(np.clip(cap_ahead_3y_ratio, 0.0, 1.0)),        # [36] 3-year cap scarcity lookahead
+            float(np.clip(cap_ahead_6y_ratio, 0.0, 1.0)),        # [37] 6-year cap scarcity lookahead
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -974,11 +980,11 @@ class Company:
 
     @property
     def obs_dim_phase1(self) -> int:
-        """36 base dims + 7*(N_total-1) opponent dims. See get_observation_phase1 for full layout."""
+        """38 base dims + 7*(N_total-1) opponent dims. See get_observation_phase1 for full layout."""
         opp_dims = self.config.get("opponent_obs", {}).get("dims_per_opponent", 7)
         if self._opponent_modeling and self._n_total > 1:
-            return 36 + opp_dims * (self._n_total - 1)
-        return 36
+            return 38 + opp_dims * (self._n_total - 1)
+        return 38
 
     @property
     def obs_dim_phase2(self) -> int:

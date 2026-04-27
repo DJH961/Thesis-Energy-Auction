@@ -71,10 +71,10 @@ def test_tabula_rasa_disabled_is_noop(monkeypatch):
 
     resolved = _capture_config_after_train_overrides(monkeypatch, cfg)
 
-    # Expected defaults: pretrain off, KL anchor off, exploration uniform
+    # Expected defaults: pretrain off, KL anchor off, exploration anchored (WTP-centered)
     assert resolved["pretrain"]["enabled"] is False
     assert resolved["ppo"]["kl_anchor_beta"] == pytest.approx(0.0)
-    assert resolved["exploration"]["mode"] == "uniform"
+    assert resolved["exploration"]["mode"] == "anchored"
     assert resolved["exploration"]["auction_anchors"] is None
 
 

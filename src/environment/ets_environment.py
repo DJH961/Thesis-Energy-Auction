@@ -2630,14 +2630,21 @@ class ETSEnvironment(gym.Env):
             eff_pen_rate       = max(company.effective_penalty_rate(self.current_year), 1e-9)
             shortfall_realized = float(penalty_cost) / eff_pen_rate
 
+            # Divide by (infl × compliance_denom) = anchor_t × need so the
+            # penalty is on the same scale as compliance_norm_cash and is
+            # genuinely more expensive than simply buying at the market price.
+            # Using budget_real (~3-5× larger) made penalty_realized ~3-5×
+            # too weak, creating a reward incentive to skip compliance.
             penalty_realized = (shortfall_realized * company.penalty_rate * urgency_scalar
-                                / max(budget_real, 1.0))
+                                / max(infl * compliance_denom, 1.0))
 
             anchor_next_real = anchor_next_nom / infl
             scarcity_amp     = 1.0 + scarcity_t
             cf_debt          = float(company._carry_forward)
+            # anchor_next_real and compliance_denom are both in real M€ — ratio is
+            # inflation-invariant (cost of remediating carry-forward at next anchor).
             remediation_cost = (cf_debt * anchor_next_real * scarcity_amp * urgency_scalar
-                                / max(budget_real, 1.0))
+                                / max(compliance_denom, 1.0))
 
             penalty_norm = penalty_realized + remediation_cost
             # Kept for diagnostic backward compatibility (old key name, new meaning).
@@ -2966,6 +2973,16 @@ class ETSEnvironment(gym.Env):
         msr_reserve = self.cap_schedule.msr_reserve()
         opp_mode = self.config.get("opponent_obs", {}).get("mode", "lagged")
 
+        # Cap scarcity lookahead: forward cap ratios for investment/banking planning
+        cap_ahead_3y_ratio = float(np.clip(
+            self.cap_schedule.get_cap(min(self.current_year + 3, self.n_years - 1))
+            / max(cap_t, 1e-6), 0.0, 1.0
+        ))
+        cap_ahead_6y_ratio = float(np.clip(
+            self.cap_schedule.get_cap(min(self.current_year + 6, self.n_years - 1))
+            / max(cap_t, 1e-6), 0.0, 1.0
+        ))
+
         obs_list = []
         for i in range(self.n_agents):  # only learning agents get observations
             c = self.companies[i]
@@ -3014,6 +3031,8 @@ class ETSEnvironment(gym.Env):
                 cumulative_coverage_ratio=float(
                     self._cumulative_alloc[i] / max(self._cumulative_emissions[i], 0.1)
                 ) if self._cumulative_emissions[i] > 0.01 else 1.0,
+                cap_ahead_3y_ratio=cap_ahead_3y_ratio,
+                cap_ahead_6y_ratio=cap_ahead_6y_ratio,
             )
             obs_list.append(obs_i)
 

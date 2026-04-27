@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v8.3.0
+# ETS MARL — Configuration v8.3.1
 #   - 8 learning agents, 0 bots (pure MARL)
 #   - HAPPO sequential policy update, centralized critic
 #   - Fundamental price anchor (MAC-scarcity-penalty formula)
@@ -292,7 +292,8 @@ reward:
   clip_max: 10.0
   shaping_beta: 7.0                # green_delta bonus weight
   shaping_gamma: 1.0               # queue bonus weight
-  shaping_decay_episode: 0         # auto: 40% of n_episodes, clamped to [500, 80000]
+  shaping_decay_episode: 0         # auto: shaping_decay_frac × n_episodes, clamped to [500, 80000]
+  shaping_decay_frac: 0.10         # Fix 4: frees plasticity early (was 0.40)
   shaping_weight_floor: 0.0
   terminal_bank_value: true
   terminal_queue_value: true
@@ -378,7 +379,8 @@ ppo:
   entropy_coef: 0.08
   entropy_coef_final: 0.025
   entropy_decay_start: -1          # -1 = auto (5% of n_episodes); 0 = start immediately
-  entropy_decay_window: -1         # -1 = auto (90% of n_episodes)
+  entropy_decay_window: -1         # -1 = auto (entropy_decay_frac × n_episodes)
+  entropy_decay_frac: 0.60         # Fix 4: faster stabilization (was 0.90)
   value_coef: 0.5
   max_grad_norm: 0.5
   n_epochs: 5
@@ -511,10 +513,11 @@ hpp:
 # lock-in by ensuring early exploration covers the full range.
 # ----------------------------------------------------------
 exploration:
-  mode: "uniform"
+  mode: "anchored"                  # Fix 3: Gaussian around WTP (was "uniform")
   epsilon_start: 0.25
-  epsilon_final: 0.05
-  epsilon_decay_episodes: 0        # auto: 75% of n_episodes, clamped to [1000, 100000]
+  epsilon_final: 0.03               # Fix 3: lower mature noise floor (was 0.05)
+  epsilon_decay_episodes: 0         # auto: epsilon_decay_frac × n_episodes, clamped to [1000, 100000]
+  epsilon_decay_frac: 0.30          # Fix 3: faster decay to exploitation (was 0.75)
   auction_anchors: null            # null = fundamental-anchor initialization (via inject_fundamental_anchor)
   secondary_anchors: null
 

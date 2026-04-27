@@ -5,6 +5,76 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.3.1]
+
+### Added — Cap scarcity lookahead in observation (Fix 5)
+
+Two new dimensions added to the Phase 1 observation base vector (36 → 38D base):
+
+| Index | Name | Formula | Purpose |
+|---|---|---|---|
+| [36] | `cap_ahead_3y_ratio` | `cap(t+3) / cap(t)`, clipped [0,1] | 3-year tightening signal |
+| [37] | `cap_ahead_6y_ratio` | `cap(t+6) / cap(t)`, clipped [0,1] | 6-year tightening signal |
+
+Values near 1.0 mean low near-term scarcity; values below 0.8 signal sustained cap tightening
+that makes early banking or abatement investment rational. Computed in `ets_environment.py` via
+`cap_schedule.get_cap()` and passed to `company.get_observation_phase1()`.
+
+`obs_dim_phase1` property updated from `36 + opp_dims*(N-1)` to `38 + opp_dims*(N-1)`.
+
+**Files changed:** `src/environment/company.py`, `src/environment/ets_environment.py`,
+`tests/test_company.py` (3 asserts), `tests/test_environment.py:514`.
+
+### Changed — Exploration and schedule auto-scaling (Fix 3 & 4)
+
+All three decay schedules now read their auto-scale fraction from `configs/default.yaml` so the
+schedule adapts proportionally to any episode count. Setting a value to `0` (auto) uses the
+fraction; set it to an explicit integer to hard-override.
+
+| Parameter | Config key | Old auto frac | New auto frac | At 100k eps |
+|---|---|---|---|---|
+| `epsilon_decay_episodes` | `exploration.epsilon_decay_frac` | 0.75 | **0.20** | 20 000 |
+| `entropy_decay_window` | `ppo.entropy_decay_frac` | 0.90 | **0.30** | 30 000 |
+| `shaping_decay_episode` | `reward.shaping_decay_frac` | 0.40 | **0.10** | 10 000 |
+
+Additional exploration changes:
+
+- `exploration.mode`: `"uniform"` → `"anchored"` (Gaussian centered on WTP, Fix 3)
+- `exploration.epsilon_final`: 0.05 → 0.03 (lower mature noise floor, Fix 3)
+
+**Files changed:** `configs/default.yaml` (new `*_frac` keys), `scripts/train.py`
+(`EntropyConditionTracker`, epsilon and shaping resolution calls).
+
+### Fixed — Penalty normalization denominator (non-compliance incentive bug)
+
+`penalty_realized` and `remediation_cost` were both divided by `budget_real`
+(annual budget / infl ≈ 800–1500 M€), while `compliance_norm_cash` is divided by
+`compliance_denom` (anchor_real × need ≈ 200–400 M€). The 3–5× mismatch in scale
+meant the reward signal from non-compliance was systematically weaker than the
+reward signal from compliance, creating a marginal incentive to skip compliance.
+
+**Example (1 Mt shortfall, anchor=80 €/t, need=3 Mt, budget=800 M€):**
+
+| Term | Old formula | Value | New formula | Value |
+|---|---|---|---|---|
+| `compliance_norm_cash` (1 Mt at anchor) | cost / compliance_denom | 0.333 | unchanged | 0.333 |
+| `penalty_realized` (1 Mt shortfall) | 138.75 / budget_real | **0.173** | 138.75 / (infl × compliance_denom) | **0.578** |
+
+Old: skipping compliance nets +0.16 reward per Mt → agents non-compliant 1–6 of 12 years.
+New: skipping compliance costs −0.245 reward per Mt → strong deterrent.
+
+**Fix:** Changed denominator of `penalty_realized` from `budget_real` to
+`infl × compliance_denom` (= `anchor_t × need`, the nominal compliance scale).
+Changed denominator of `remediation_cost` from `budget_real` to `compliance_denom`
+(`anchor_next_real` already carries the `/infl`, so the ratio stays inflation-invariant).
+
+Both penalties are now on the same reward scale as compliance costs and correctly
+exceed the market price (138.75 > 80 €/t), matching EU ETS design intent.
+
+**Files changed:** `src/environment/ets_environment.py` (lines ~2633, ~2639).
+
+---
+
 ## [8.3.0]
 
 ### Added — Banking timing signal
