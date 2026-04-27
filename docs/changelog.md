@@ -5,7 +5,125 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
-## [8.1.1] — 2026-04-26
+## [8.2.0]
+
+Full reward audit — six bugs identified and fixed across `_compute_rewards`
+and `compute_auction_rewards`. Documented in `archive/docs/reward_redesign_v8_2.md`.
+
+### Bugs fixed
+
+- **Bug 1 — Penalty double-counted.** `penalty_norm` previously summed
+  `penalty_prospective + penalty_realized` where both were driven by the same
+  shortfall at the same penalty rate, charging non-compliance at 2×–3× the real
+  economic cost. (Fix A)
+
+- **Bug 2 — `capital_norm` wrong denominator.** Investment costs were divided by
+  `compliance_denom` (≈€175M) instead of `budget_real` (≈€724M), over-penalizing
+  green capex by ~4× and systematically discouraging the green transition the
+  simulation is designed to teach. (Fix B)
+
+- **Bug 3 — No revenue baseline (documented, not implemented).** Revenue had never
+  entered the reward despite being listed in the design intent. This created a
+  structural reward ceiling of zero for pure-financial agents. Fix C (re-adding
+  revenue) was designed but deliberately excluded: electricity revenue is a
+  pass-through that agents cannot materially influence by changing bidding or
+  investment strategy, so including it adds a large constant without providing a
+  useful gradient. The positive-reward problem is addressed instead via `esg.scale`
+  (see Fix D). Revenue continues to be logged in `per_agent_diag` for diagnostics.
+
+- **Bug 4 — `esg_anchor_ratio` silently muted ESG, breaking 50:50 balance.**
+  `esg_anchor_ratio = min(compliance_denom / budget_real, 2.0)` evaluated to
+  ≈0.07–0.24 in practice, scaling the ESG signal down by ~5× and producing an
+  effective 80:20 cost:ESG weighting instead of the intended 50:50. (Fix D)
+
+- **Bug 5 — Inflation invariance violated.** `penalty_realized` carried inflation
+  quadratically: the inflated `penalty_cost` numerator was divided by the deflated
+  `budget_real` denominator, resulting in a net `infl²` factor. By year 11
+  (cumulative infl ≈ 1.24) penalties were ~1.54× more punishing than year 0 —
+  directly contradicting the stated design goal of year-invariant reward scale. (Fix A)
+
+- **Bug 6 — Phase-1 and Phase-2 rewards on different scales.** `compute_auction_rewards`
+  used a fixed `/1000` scale while `_compute_rewards` used budget-relative
+  normalization. Subtracting them in `train.py` to get `r_secondary` was
+  dimensionally inconsistent, producing a ~7× gradient imbalance between the
+  auction and secondary policy heads. (Fix E)
+
+### Changed
+
+- **Fix A — Penalty split into realized payment + forward remediation.**
+  `penalty_realized` is now reconstructed in real terms (base rate, no inflation
+  multiplication); `remediation_cost` represents carry-forward debt valued at
+  next-year market anchor under scarcity. The scarcity "catch-up is harder" intent
+  is preserved without double-charging the penalty rate.
+
+- **Fix B — `capital_norm` divided by `budget_real`.** Investment now competes
+  against the agent's actual budget envelope rather than its allowance bill.
+
+- **Fix D — `esg_anchor_ratio` removed from ESG formula.** `esg_scale` is now the
+  sole calibration knob. `esg_anchor_ratio` is retained in `_last_reward_channels`
+  as `1.0` for log backward-compatibility but no longer multiplied into `esg_raw`.
+  Default `esg.scale` raised to `2.0` so that a mid-journey ESG agent
+  (`ef_ratio ≈ 0.5`) contributes roughly equal ESG and financial weight. Fully
+  greened compliant agents (`ef_ratio ≈ 1.0`) can achieve a slightly positive net
+  reward without requiring revenue in the signal.
+
+- **Fix E — `compute_auction_rewards` budget-relative normalization.** Auction
+  rewards now use the same `compliance_denom` / `budget_real` denominators as
+  `_compute_rewards`. Phase-1 and Phase-2 gradients are proportionally consistent.
+
+- **ESG compliance gate linearized.** Replaced `coverage_frac^(2 × gate_activation)`
+  with `compliance_gate = coverage_frac` (linear). The quadratic form suppressed
+  the ESG signal exactly when scarcity is high and greening matters most (late
+  years, low coverage).
+
+- **Terminal queue guard made smooth.** Replaced hard `if effective_remaining < 1.0:
+  continue` with `remaining_scale = min(1.0, effective_remaining / 2.0)` multiplied
+  into the queue value. Projects taper continuously: 0 years → 0% credit, 1 year →
+  50%, ≥2 years → 100%. Removes the cliff while still discouraging last-minute
+  investments.
+
+- **Terminal bank formula piecewise.** Replaced `log(1 + ratio)` with a piecewise
+  formula: linear below annual need (ratio < 1), log above. The linear lower branch
+  provides a stronger bidding incentive under terminal scarcity; the log upper
+  branch preserves diminishing returns for overbanking.
+
+- **`loan_sting` normalizer fixed.** Emergency-loan origination cost now divided by
+  `budget_real` (inflation-deflated) instead of `company.annual_budget` (nominal),
+  consistent with all other reward normalization.
+
+### Diagnostic channel changes (`_last_reward_channels`)
+
+| Key | Status | Notes |
+|---|---|---|
+| `compliance_norm` | unchanged | |
+| `capital_norm` | redefined | now `/ budget_real` (was `/ compliance_denom`) |
+| `soft_norm` | unchanged | |
+| `cost_norm` | unchanged | sum of above three + `loan_sting` |
+| `revenue_norm` | NEW (always 0.0) | revenue removed from reward; key retained for log compatibility |
+| `penalty_norm` | redefined | now `penalty_realized + remediation_cost` |
+| `penalty_realized` | redefined | real-terms realized penalty (base rate, inflation-invariant) |
+| `penalty_prospective` | alias | now equals `remediation_cost` (kept for back-compat) |
+| `remediation_cost` | NEW | carry-forward debt × next-year anchor × scarcity |
+| `anchor_next_real` | NEW | expected next-year market anchor (real terms) |
+| `carry_forward_debt` | NEW | `company._carry_forward` after compliance |
+| `esg_signal` | redefined | no longer multiplied by `esg_anchor_ratio` |
+| `esg_anchor_ratio` | redefined | always `1.0` (legacy log channel) |
+| `base_reward` | redefined | revenue term removed |
+
+`_last_auction_reward_channels`: all keys now record budget-normalized values
+instead of `value / 1000`. Two new keys: `compliance_norm`, `capital_norm`.
+
+### Removed
+
+- `price_ma3_now` computation inside `_compute_rewards` (no longer needed once
+  revenue is removed; `step_secondary` computes its own copy for `per_agent_diag`).
+- `gate_activation` re-assignment inside the ESG block; variable retains its
+  initialised value of `1.0` and is still logged for back-compatibility.
+- `esg_anchor_ratio` as an active ESG multiplier (retained as a `1.0` log channel).
+
+---
+
+## [8.1.1]
 
 ### Added
 - Inflation-deflated three cost buckets: `compliance_cost_real`, `capital_cost_real`, `soft_penalty_real` — all costs divided by `company.inflation_factor(current_year)` before normalisation.
@@ -26,7 +144,7 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
-## [8.1.0] — 2026-04-27
+## [8.1.0]
 
 ### Added
 - Corporate treasury reserve (unspent budget retention at 60%, 1.5× cap, 5% decay, terminal NPV)

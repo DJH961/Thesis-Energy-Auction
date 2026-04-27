@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v8.1.1
+# ETS MARL — Configuration v8.2.0
 #   - 8 learning agents, 0 bots (pure MARL)
 #   - HAPPO sequential policy update, centralized critic
 #   - Fundamental price anchor (MAC-scarcity-penalty formula)

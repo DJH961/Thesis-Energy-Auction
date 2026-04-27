@@ -202,8 +202,6 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
                 inflation_rate=inflation_rate,
                 price_ma3=price_ma3,
             ) + env._defaulted_volume_pending
-            suspension_length = int(config["auction"].get("suspension_length", 2))
-
             auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
             for i in range(n_agents):
                 company = env.companies[i]
@@ -213,8 +211,6 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
                     reserve_price=env._compute_dynamic_reserve(),
                     auction_volume=float(this_year_auction_volume),
                     cap_t=float(cap_t),
-                    suspension_remaining=int(env._suspension_remaining[i]),
-                    suspension_length=suspension_length,
                     collateral_load_last=float(env._last_collateral_load[i]),
                     loan_outstanding_norm=company.get_loan_outstanding_norm(),
                 )
@@ -381,7 +377,8 @@ def _print_training_legend():
     print("  │  Event board is printed as a separate section below the bot rows")
     print()
     print("  ┌─ EVENT BOARD  (separate visual block)")
-    print("  │  Defaults/Suspensions by agent: A#/B#:<count> (how many year-events)")
+    print("  │  Defaults by agent: A#/B#:<count>  (year-events where agent could not cover auction payment)")
+    print("  │  Treasury/Loan: agents that drew treasury reserves or took emergency loans this episode")
     print("  │  Stuck states (learning agents): one line only if any condition occurs")
     print("  │  Format: ceiling=A#:<streak_ep> | floor=A#:<streak_ep> | zeroQty=A#:<streak_ep>")
     print("  │  Warnings (year-step counts) are printed here, not on the Health line")
@@ -2136,21 +2133,44 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             print("  Event Board:")
 
             _default_counts = {}
+            _treasury_drawn_counts = {}
+            _loan_counts = {}
+            _loan_peak = {}
             for yl in env.episode_log:
                 _as = yl.get("auction_stats", {})
-                _def_list = _as.get("defaults_agents", [])
-                for _di in _def_list:
+                for _di in _as.get("defaults_agents", []):
                     _idx = int(_di)
                     _default_counts[_idx] = _default_counts.get(_idx, 0) + 1
+                for _idx, _td in enumerate(yl.get("treasury_drawn", [])):
+                    if float(_td) > 0:
+                        _treasury_drawn_counts[_idx] = _treasury_drawn_counts.get(_idx, 0) + 1
+                for _idx, _lo in enumerate(yl.get("loan_outstanding", [])):
+                    _lo = float(_lo)
+                    if _lo > 0:
+                        _loan_counts[_idx] = _loan_counts.get(_idx, 0) + 1
+                        _loan_peak[_idx] = max(_loan_peak.get(_idx, 0.0), _lo)
 
             if _default_counts:
                 _def_items = []
                 for _idx in sorted(_default_counts):
                     _tag = f"A{_idx + 1}" if _idx < n_agents else f"B{_idx - n_agents + 1}"
                     _def_items.append(f"{_tag}:{_default_counts[_idx]}")
-                print(f"  Defaults/Suspensions by agent (count): {'  '.join(_def_items)}")
+                print(f"  Defaults by agent (year-count): {'  '.join(_def_items)}")
             else:
-                print("  Defaults/Suspensions by agent (count): none")
+                print("  Defaults by agent: none")
+
+            if _treasury_drawn_counts:
+                _tr_items = []
+                for _idx in sorted(_treasury_drawn_counts):
+                    _tag = f"A{_idx + 1}" if _idx < n_agents else f"B{_idx - n_agents + 1}"
+                    _tr_items.append(f"{_tag}:{_treasury_drawn_counts[_idx]}yr")
+                print(f"  Treasury drawn (years): {'  '.join(_tr_items)}")
+            if _loan_counts:
+                _ln_items = []
+                for _idx in sorted(_loan_counts):
+                    _tag = f"A{_idx + 1}" if _idx < n_agents else f"B{_idx - n_agents + 1}"
+                    _ln_items.append(f"{_tag}:{_loan_counts[_idx]}yr/pk{_loan_peak[_idx]:.0f}M€")
+                print(f"  Emergency loans (years/peak outstanding): {'  '.join(_ln_items)}")
 
             _stuck_ceil_agents = [
                 f"A{i+1}:{int(v)}ep" for i, v in enumerate(_streak_ceil) if v >= _broken_window

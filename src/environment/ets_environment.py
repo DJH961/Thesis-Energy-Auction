@@ -1787,44 +1787,65 @@ class ETSEnvironment(gym.Env):
         """
         Compute per-agent intermediate reward for the auction phase.
 
-        Pure cost signal: negative sum of all phase-1 costs normalized by
-        a fixed scale (REWARD_SCALE = 1000 M€). No shaping terms — the
-        penalty in phase 2 provides the natural gradient for winning
-        sufficient allowances.
+        Uses the SAME budget-relative, inflation-invariant normalization as
+        ``_compute_rewards`` (Phase 2). Each cost bucket is deflated by the
+        agent's cumulative inflation factor and divided by the natural
+        denominator for its kind (``anchor_real × need`` for compliance,
+        ``budget_real`` for capital and the coverage-gap penalty).
 
-        Must be called after step_auction() and before step_secondary().
+        This guarantees that ``r_secondary = rewards − r_auction`` (computed
+        in ``train.py``) is dimensionally consistent: the auction-head and
+        secondary-head policy gradients live on the same scale, instead of
+        the previous mismatch (Phase 1 used a flat ``REWARD_SCALE = 1000``,
+        Phase 2 used ``budget_real ≈ 700`` → Phase-1 gradient was ~7× weaker
+        than Phase-2 for the same underlying error).
+
+        Must be called after ``step_auction()`` and before ``step_secondary()``.
 
         Returns
         -------
         r_auction : np.ndarray, shape (n_agents,)
             Auction-phase reward per learning agent (negative = cost).
         """
-        REWARD_SCALE = 1000.0
         r_auction = np.zeros(self.n_agents)
+        anchor_t  = compute_fundamental_anchor(self.current_year, self.config)
+
         for i in range(self.n_agents):
             company = self.companies[i]
+            infl    = company.inflation_factor(self.current_year)
 
-            auction_cost = float(self._phase1_payments[i])
-            investment_cost = float(self._phase1_invest_costs[i])
-            opex_delta = company.compute_operational_cost(self.current_year) - company.baseline_opex
-            mac_cost_i = float(self._phase1_mac_costs[i])
-            collateral_cost_i = float(self._collateral_locked[i]) * float(
-                self.config["auction"]["collateral"].get("collateral_rate", 0.05))
+            budget_real      = max(company.annual_budget / infl, 1.0)
+            anchor_real      = anchor_t / infl
+            need             = max(company.compute_estimate_need(), 1e-6)
+            compliance_denom = max(anchor_real * need, 1.0)
 
-            total_cost = (auction_cost + collateral_cost_i + investment_cost
-                          + opex_delta + mac_cost_i)
+            auction_cost      = float(self._phase1_payments[i]) / infl
+            invest_cost       = float(self._phase1_invest_costs[i]) / infl
+            opex_delta        = (company.compute_operational_cost(self.current_year)
+                                 - company.baseline_opex) / infl
+            mac_cost_i        = float(self._phase1_mac_costs[i]) / infl
+            collateral_cost_i = (float(self._collateral_locked[i]) *
+                                 float(self.config["auction"]["collateral"]
+                                       .get("collateral_rate", 0.05))) / infl
 
-            coverage_gap = max(0.0, company.compute_estimate_need() - float(self._phase1_allocations[i]))
-            gap_penalty = coverage_gap * company.effective_penalty_rate(self.current_year) / REWARD_SCALE
+            compliance_norm = (auction_cost + mac_cost_i + collateral_cost_i) / compliance_denom
+            capital_norm    = (invest_cost + opex_delta) / budget_real
 
-            r_auction[i] = -(total_cost / REWARD_SCALE) - gap_penalty
+            coverage_gap = max(0.0, need - float(self._phase1_allocations[i]))
+            # Use BASE penalty_rate (not effective) for inflation invariance:
+            # numerator stays in real terms, denominator (budget_real) carries the 1/infl.
+            gap_penalty = (coverage_gap * company.penalty_rate) / budget_real
+
+            r_auction[i] = -(compliance_norm + capital_norm) - gap_penalty
 
             self._last_auction_reward_channels[i] = {
-                "auction_cost": float(auction_cost / REWARD_SCALE),
-                "collateral_cost": float(collateral_cost_i / REWARD_SCALE),
-                "investment_cost": float(investment_cost / REWARD_SCALE),
-                "opex_delta": float(opex_delta / REWARD_SCALE),
-                "mac_cost": float(mac_cost_i / REWARD_SCALE),
+                "auction_cost":         float(auction_cost),
+                "collateral_cost":      float(collateral_cost_i),
+                "investment_cost":      float(invest_cost),
+                "opex_delta":           float(opex_delta),
+                "mac_cost":             float(mac_cost_i),
+                "compliance_norm":      float(compliance_norm),
+                "capital_norm":         float(capital_norm),
                 "coverage_gap_penalty": float(gap_penalty),
             }
         return r_auction
@@ -2441,7 +2462,10 @@ class ETSEnvironment(gym.Env):
         scarcity_t = max(0.0, 1.0 - cap_t / max(cap_0, 1e-9))
 
         # Cache anchor once — avoid redundant calls per agent
-        anchor_t = compute_fundamental_anchor(self.current_year, self.config)
+        anchor_t        = compute_fundamental_anchor(self.current_year, self.config)
+        # Next-year anchor used by the forward-looking remediation term in penalty_norm.
+        next_year       = min(self.current_year + 1, self.n_years - 1)
+        anchor_next_nom = compute_fundamental_anchor(next_year, self.config)
 
         for i, company in enumerate(self.companies):
             if active_mask is not None and not bool(active_mask[i]):
@@ -2483,8 +2507,12 @@ class ETSEnvironment(gym.Env):
             compliance_denom = max(anchor_real * need, 1.0)
             soft_denom       = max(budget_real, 1.0)
 
+            # Fix B: capital_norm is normalized by budget_real (soft_denom),
+            # not by compliance_denom. Investment is a budget commitment,
+            # not an allowance commitment. Previously this over-penalized
+            # green capex by ~4× (budget_real / compliance_denom ratio).
             compliance_norm = compliance_cost_real / compliance_denom
-            capital_norm    = capital_cost_real    / compliance_denom
+            capital_norm    = capital_cost_real    / soft_denom
             soft_norm       = soft_penalty_real    / soft_denom
 
             loan_sting_coef     = float(self.config.get("budget", {}).get(
@@ -2492,21 +2520,42 @@ class ETSEnvironment(gym.Env):
             loan_draw_this_year = float(getattr(company, '_loan_drawn_this_step', 0.0))
             loan_sting = 0.0
             if loan_draw_this_year > 0:
-                loan_sting = (loan_draw_this_year / max(company.annual_budget, 1.0)) * loan_sting_coef
+                loan_sting = (loan_draw_this_year / max(budget_real, 1.0)) * loan_sting_coef
 
             cost_norm = compliance_norm + capital_norm + soft_norm + loan_sting
 
             urgency_scalar = float(self._urgency_scalars[i]) if i < self.n_agents else 1.0
 
-            shortfall = max(0.0, need - float(
-                (float(precompliance_holdings[i]) if precompliance_holdings is not None else 0.0)
-                + float(trade_qtys[i] if trade_qtys is not None else 0.0)
-            ))
-            scarcity_amp        = 1.0 + scarcity_t
-            penalty_prospective = (shortfall * company.penalty_rate * scarcity_amp * urgency_scalar
-                                   / max(budget_real, 1.0))
-            penalty_realized    = (penalty_cost * urgency_scalar) / max(budget_real, 1.0)
-            penalty_norm        = penalty_prospective + penalty_realized
+            # Fix A + Fix 5 (penalty math):
+            # Old design summed penalty_realized + penalty_prospective at the
+            # same shortfall × penalty_rate, double-charging non-compliance
+            # at 2×–3× the real penalty. New design separates the two
+            # genuinely different economic costs:
+            #   (1) penalty_realized  — money paid THIS year for shortfall.
+            #       Reconstructed in REAL terms from penalty_cost (which was
+            #       computed at the inflated effective rate) so the reward
+            #       stays inflation-invariant.
+            #   (2) remediation_cost  — carry-forward debt must be repaid
+            #       NEXT year by buying replacement allowances at the
+            #       expected market price (next-year anchor) under scarcity.
+            #       Honors the original "scarcity makes catch-up harder"
+            #       intent without re-charging the penalty rate.
+            eff_pen_rate       = max(company.effective_penalty_rate(self.current_year), 1e-9)
+            shortfall_realized = float(penalty_cost) / eff_pen_rate
+
+            penalty_realized = (shortfall_realized * company.penalty_rate * urgency_scalar
+                                / max(budget_real, 1.0))
+
+            anchor_next_real = anchor_next_nom / infl
+            scarcity_amp     = 1.0 + scarcity_t
+            cf_debt          = float(company._carry_forward)
+            remediation_cost = (cf_debt * anchor_next_real * scarcity_amp * urgency_scalar
+                                / max(budget_real, 1.0))
+
+            penalty_norm = penalty_realized + remediation_cost
+            # Kept for diagnostic backward compatibility (old key name, new meaning).
+            penalty_prospective = remediation_cost
+            shortfall = shortfall_realized
 
             # FIX 2+3: ESG — no time decay, budget_real anchor
             esg_signal       = 0.0
@@ -2521,18 +2570,24 @@ class ETSEnvironment(gym.Env):
                 green_delta = max(0.0, company.green_frac - company.prev_green_frac)
                 speed_bonus = esg_speed_coef * green_delta
 
-                esg_raw_unanchored = esg_scale * (ef_ratio + speed_bonus)
-                # Cap at 2.0 to prevent small-budget agents from having ESG dominate
-                esg_anchor_ratio = min(compliance_denom / max(budget_real, 1.0), 2.0)
-                esg_raw = esg_raw_unanchored * esg_anchor_ratio
+                # Fix D: drop esg_anchor_ratio. The previous formula multiplied
+                # ESG by `compliance_denom / budget_real` (~0.07–0.24 in practice),
+                # silently shrinking ESG by ~5×. Combined with w_green=0.5 this
+                # produced an effective ~80:20 cost:ESG split instead of the
+                # intended 50:50. With this fix esg_scale alone calibrates the
+                # ESG magnitude — default 1.0 yields esg_raw ≈ 1.0 for a fully
+                # decarbonized agent, matching the natural scale of
+                # (revenue_norm − cost_norm) so 50:50 weights → 50:50 effect.
+                esg_raw = esg_scale * (ef_ratio + speed_bonus)
+                esg_anchor_ratio = 1.0  # retained as a logged channel for back-compat
+                # esg_scale alone calibrates magnitude (esg_anchor_ratio dropped in v8.2)
 
                 annual_need_i = max(company.compute_estimate_need(), 1e-6)
                 if precompliance_holdings is not None:
                     coverage_frac = min(1.0, float(precompliance_holdings[i]) / annual_need_i)
                 else:
                     coverage_frac = 1.0
-                gate_activation = min(1.0, max(0.0, 1.0 - self.shaping_weight / 0.5))
-                compliance_gate = coverage_frac ** (2.0 * gate_activation)
+                compliance_gate = coverage_frac  # linear, no squaring (v8.2)
                 esg_signal      = esg_raw * compliance_gate
 
             base_reward = float(
@@ -2578,12 +2633,14 @@ class ETSEnvironment(gym.Env):
                 "capital_norm":         float(capital_norm),
                 "soft_norm":            float(soft_norm),
                 "cost_norm":            float(cost_norm),
+                "revenue_norm":         0.0,   # v8.2: revenue removed from reward; kept for log compatibility
                 "penalty_norm":         float(penalty_norm),
-                "penalty_prospective":  float(penalty_prospective),
+                "penalty_prospective":  float(penalty_prospective),  # alias of remediation_cost
                 "penalty_realized":     float(penalty_realized),
+                "remediation_cost":     float(remediation_cost),
                 "scarcity_amp":         float(scarcity_amp),
                 "esg_signal":           float(esg_signal),
-                "esg_anchor_ratio":     float(esg_anchor_ratio),
+                "esg_anchor_ratio":     float(esg_anchor_ratio),     # legacy: now always 1.0
                 "base_reward":          float(base_reward),
                 "opp_cost_shaping":     float(opp_cost_shaping),
                 "coverage_gap_shaping": float(coverage_gap_shaping),
@@ -2592,9 +2649,11 @@ class ETSEnvironment(gym.Env):
                 "esg_vs_penalty_ratio": float(company.w_green * esg_signal) / max(float(penalty_norm), 1e-9),
                 "anchor_t":             float(anchor_t),
                 "anchor_real":          float(anchor_real),
+                "anchor_next_real":     float(anchor_next_nom / infl),
                 "budget_real":          float(budget_real),
                 "infl":                 float(infl),
                 "shortfall":            float(shortfall),
+                "carry_forward_debt":   float(company._carry_forward),
             }
 
         is_final_year  = self.current_year >= self.n_years - 1
@@ -2619,7 +2678,12 @@ class ETSEnvironment(gym.Env):
                     annual_need     = max(company.compute_estimate_need(), 0.1)
                     capped_holdings = min(self.holdings[i], 2.0 * annual_need)
                     ratio      = capped_holdings / annual_need
-                    bank_value = np.log1p(ratio) * annual_need * terminal_price / budget_real_t
+                    # v8.2: linear below need (stronger bidding incentive under scarcity),
+                    # log above need (overbanking still not incentivized).
+                    if ratio < 1.0:
+                        bank_value = ratio * annual_need * terminal_price / budget_real_t
+                    else:
+                        bank_value = np.log1p(ratio) * annual_need * terminal_price / budget_real_t
                     rewards[i]      += bank_value
                     base_rewards[i] += bank_value
                     terminal_bank_values[i] = bank_value
@@ -2640,7 +2704,8 @@ class ETSEnvironment(gym.Env):
                         if completion_fraction <= 0.0:
                             continue
                         effective_remaining = max(0.0, terminal_payoff_years - float(years_to_completion))
-                        if effective_remaining <= 0.0:
+                        remaining_scale = min(1.0, effective_remaining / 2.0)
+                        if remaining_scale <= 0.0:
                             continue
                         delta_ef = company.weighted_emission_factor - company.emission_factors[tech_idx]
                         if delta_ef <= 0:
@@ -2654,6 +2719,7 @@ class ETSEnvironment(gym.Env):
                             annual_saving_mt * effective_remaining
                             * discount * completion_fraction
                             * terminal_price / budget_real_t
+                            * remaining_scale
                         )
                     rewards[i]      += queue_value
                     base_rewards[i] += queue_value

@@ -1,6 +1,6 @@
-# ETS MARL — v8.0 (HAPPO/PPO)
+# ETS MARL (HAPPO/PPO)
 
-This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System. The default profile (`v8.0`) runs **8 pure learning agents** with no heuristic bots.
+This is the **active, main version** of the carbon market simulation. It uses modern reinforcement learning (PPO/HAPPO) to simulate energy companies competing in a simplified EU Emissions Trading System. The default profile runs **8 pure learning agents** with no heuristic bots.
 
 Recent changes and release-specific details are tracked in `docs/changelog.md`.
 
@@ -98,14 +98,16 @@ The agents use **HAPPO (Heterogeneous-Agent PPO)**, a multi-agent reinforcement 
 - Behavioral cloning pretraining and KL-anchor regularization are **disabled by default** in v8 (config: `pretrain.enabled: false`, `ppo.kl_anchor_beta: 0.0`)
 - Over 100,000 episodes, agents converge on sophisticated market strategies
 
-The reward signal balances:
-- **Revenue** from selling electricity (including carbon cost passthrough)
-- **Total costs** including allowances, trading, investing, operations, MAC, and penalties (folded into one cost signal)
-- **Bid collateral cost** on overbidding spread (`auction.collateral`): `rate × hold_fraction × max(0, bid - clearing) × qty_won`
-- **Opportunity cost of capital** on post-compliance banked allowances (`reward.opportunity_cost_rate`)
-- **Green investment shaping** — bonus for increasing green fraction (decays over training), scaled by (0.2 + w_green)
-- **ESG signal** — saved-carbon-years formula: `w_green × ef_ratio × time_ratio × (budget/1000)`, rewarding early emission reductions more than late ones
-- **Terminal values** — bank value (/1000 scaling) and ESG terminal queue value with γ^years_late discount
+The reward signal is a pure cost+ESG+penalty formulation — electricity revenue is **not** included in the reward gradient (it is logged separately but cannot be influenced by bidding strategy):
+
+`R = w_cost × (−cost_norm) + w_green × esg_signal − penalty_norm`
+
+- **cost_norm**: inflation-adjusted sum of compliance, capital, soft-budget, and loan costs, normalised by economic denominators
+- **ESG signal** — saved-carbon-years: `esg_scale × ef_ratio × compliance_gate`, where `compliance_gate = coverage_frac` (linear gate)
+- **penalty_norm**: non-compliance penalty normalised by `budget_real`
+- **Green investment shaping** — bonus for increasing green fraction (decays over training), scaled by `(0.2 + w_green)`
+- **Terminal bank value**: piecewise — linear below annual need (ratio < 1), log above (diminishing returns on overbanking)
+- **Terminal queue value**: in-construction projects valued by discounted future carbon savings with `γ^years_late` discount
 
 ### Key Mechanisms
 
@@ -116,7 +118,7 @@ The reward signal balances:
 - **Capex throughput cap**: Organizational constraint on annual construction spend (M€), modelling permitting pipeline capacity, EPC contractor access, and management bandwidth. Independent of the financial budget — a company can afford more investment than it can physically deliver.
 - **Static reserve price**: Auction floor price at €45/t (just below MAC cost, prevents degenerate floor equilibrium)
 - **Phantom bidder** (available, disabled by default): A synthetic financial intermediary participant can be enabled (`phantom_bidder.enabled: true`) to represent financial sector demand (~40% of EU ETS volume). When enabled, it bids at each primary auction with a LogNormal price anchored near 60% of the effective penalty and 15–35% of supply as quantity, consuming supply that would otherwise be available to compliance agents. See `docs/design.md §11`.
-- **ESG compliance gate**: ESG bonus is multiplied by `coverage_frac²`, so non-compliant agents receive proportionally reduced ESG credit. Prevents ESG from masking compliance failures.
+- **ESG compliance gate**: ESG bonus is multiplied by `coverage_frac` (linear), so non-compliant agents receive proportionally reduced ESG credit. The earlier quadratic form was removed because squaring eliminated the signal under scarcity in late years when it matters most.
 - **Private urgency scalars**: Per-episode LogNormal scalar multiplied into each agent's effective penalty, creating heterogeneous compliance pressure and breaking symmetric equilibria.
 - **Auction bid collateral**: overbids above clearing incur a real capital lock-up cost on awarded quantity (`auction.collateral.enabled`)
 - **Collateral affordability guardrail**: if collateral lock-up is unaffordable, bids are clipped in two steps (quantity first, then price if needed) to preserve feasible participation

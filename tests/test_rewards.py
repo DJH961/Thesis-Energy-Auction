@@ -939,29 +939,47 @@ class TestESGFinancialBalance:
                     any_positive = True
         assert any_positive, "At least one ESG agent should have positive esg_signal after 3 years of solar investment"
 
-    def test_esg_anchor_ratio_capped_at_two(self):
-        """esg_anchor_ratio must never exceed 2.0 regardless of compliance tightness."""
+    def test_esg_anchor_ratio_is_legacy_constant(self):
+        """esg_anchor_ratio is retained as 1.0 in reward channels for log backward-compatibility."""
         env = self._make_env()
         _run_one_year(env, auction_price=80.0, invest_frac=0.05)
         for i in range(env.n_agents):
             ch = env._last_reward_channels.get(i, {})
+            # 0.0 means not an ESG agent; 1.0 is the fixed legacy value
             ratio = ch.get("esg_anchor_ratio", 0.0)
-            assert ratio <= 2.0 + 1e-9, (
-                f"Agent {i}: esg_anchor_ratio={ratio} exceeds cap of 2.0")
+            assert ratio in (0.0, 1.0), (
+                f"Agent {i}: esg_anchor_ratio={ratio} — expected 0.0 (non-ESG) or 1.0 (legacy constant)")
 
     def test_esg_financial_balance_ratio_in_bounds(self):
-        """ESG contribution (w_green*esg_signal) is no larger than 4× the cost_norm for ESG agents."""
+        """ESG contribution (w_green*esg_signal) should be roughly 40–400% of cost_norm for
+        ESG agents after green investments have matured (solar delay=2yr, so run 5 years)."""
         env = self._make_env(esg_scale=2.0)
-        _run_one_year(env, auction_price=80.0, invest_frac=0.10)
+        # Run 5 years with steady green investment so solar (2yr delay) matures.
+        for _ in range(5):
+            _run_one_year(env, auction_price=80.0, invest_frac=0.15)
+        checked = 0
         for i in range(1, env.n_agents, 2):
             company = env.companies[i]
             ch = env._last_reward_channels.get(i, {})
+            ef_ratio = max(0.0,
+                (company.initial_ef - company.weighted_emission_factor) / max(company.initial_ef, 1e-9))
+            if ef_ratio < 0.05:
+                continue  # not greened enough yet to test balance
+            compliance_gate = ch.get("compliance_gate", 0.0)
+            if compliance_gate < 0.5:
+                continue  # non-compliant: ESG suppression is intentional, not a calibration issue
             esg_contrib = company.w_green * ch.get("esg_signal", 0.0)
-            cost_norm = ch.get("cost_norm", 0.0)
-            if cost_norm > 0.01:
-                ratio = esg_contrib / cost_norm
-                assert ratio < 10.0, (
-                    f"Agent {i}: ESG/cost ratio={ratio:.2f} — ESG is dominating unreasonably")
+            cost_norm = ch.get("cost_norm", 1.0)
+            if cost_norm <= 0.01:
+                continue
+            ratio = esg_contrib / cost_norm
+            assert 0.1 < ratio < 10.0, (
+                f"Agent {i}: ESG/cost ratio={ratio:.2f} (ef_ratio={ef_ratio:.3f}, gate={compliance_gate:.2f}) — "
+                f"expected 0.1–10.0 with esg_scale=2.0 after 5 years of greening")
+            checked += 1
+        assert checked > 0, (
+            "No compliant ESG agents had ef_ratio > 0.05 after 5 years of invest_frac=0.15 — "
+            "check investment is delivering green capacity and agents are buying allowances")
 
     def test_no_time_decay_late_signal_comparable_to_early(self):
         """v8.1.1: ESG signal at year 10 should not be systematically less than year 1."""

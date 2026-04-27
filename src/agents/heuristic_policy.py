@@ -83,8 +83,6 @@ def auction_action(
     valuation_noise: float = 0.0,
     urgency_multiplier: float = 1.0,
     urgency_denom: float = 1.5,
-    suspension_remaining: int = 0,
-    suspension_length: int = 2,
     collateral_load_last: float = 0.0,
     loan_outstanding_norm: float = 0.0,
 ) -> np.ndarray:
@@ -119,12 +117,6 @@ def auction_action(
         Per-bot persistent urgency multiplier. Default: 1.0.
     urgency_denom : float, optional
         Urgency denominator (replaces hardcoded 1.5 in coverage_ratio / 1.5). Default: 1.5.
-    suspension_remaining : int, optional
-        Rounds the agent is still suspended (0 = not suspended). When > 0 the
-        environment forces a zero bid anyway; we return a zero bid here too so
-        BC targets match enforced behaviour.
-    suspension_length : int, optional
-        Total suspension length in rounds (used for normalisation only).
     collateral_load_last : float, optional
         Last year's collateral locked / annual_budget [0, 1]. High values mean
         the agent over-committed; the heuristic scales qty_mult down to stay
@@ -144,13 +136,6 @@ def auction_action(
     if reserve_price is None:
         reserve_price = config["ets"].get("reserve_price", 0.0)
     is_green = (company.agent_id % 2) == 1  # odd indices = green-objective
-
-    # Suspension guard: env will force zero bid, return matching zero target so
-    # BC warm-start does not train the policy to bid when suspended.
-    if suspension_remaining > 0:
-        price_min = float(aq["price_min"])
-        logits = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
-        return np.array([price_min, 0.0, 0.0, *logits], dtype=np.float32)
 
     # --- Penalty rate (valuation ceiling) ---
     pen_cfg = config.get("penalty", {})
