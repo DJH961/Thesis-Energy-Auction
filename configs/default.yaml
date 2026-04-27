@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v8.2.0
+# ETS MARL — Configuration v8.3.0
 #   - 8 learning agents, 0 bots (pure MARL)
 #   - HAPPO sequential policy update, centralized critic
 #   - Fundamental price anchor (MAC-scarcity-penalty formula)
@@ -42,10 +42,10 @@ ets:
   # Calibration anchor: band_width / (LRF × cap_0) ≈ 10 years, matching EU ETS design intent.
   # initial_bank_fraction set jointly so TNAC/tnac_upper = 1.05 at episode start
   # (2026 observed: 1,148 Mt / 1,096 Mt = 1.05).
-  initial_bank_fraction: 0.81
+  initial_bank_fraction: 0.5
   # +12% cap overhead: reflects real 2026 EU ETS ~15% overhead; slightly conservative
   # for micro-ETS scale.
-  cap_overhead_pct: 0.12
+  cap_overhead_pct: 0.10
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044
@@ -315,10 +315,24 @@ reward:
     enabled: true
     scale: 0.5
 
+  # Banking timing signal: imputes bank drawdown at clearing price to eliminate
+  # the zero-bid free-compliance exploit, and rewards good intertemporal timing.
+  banking_signal:
+    enabled: true
+    w_banking: 0.3          # weight on timing P&L (clearing_price - cost_basis) × drawdown
+    w_imputed: 1.0          # weight on imputed bank drawdown added to compliance_norm
+    imputed_cap_factor: 2.0 # cap imputed norm at N × compliance_denom to prevent scale blowup
+    initial_bank_cost_factor: 0.80  # pre-banked cost basis = fundamental_anchor(0) × factor
+
+  # Blended compliance gate for ESG signal: linear above threshold, approaches
+  # quadratic below (threshold - width). Avoids hard penalty under scarcity.
+  compliance_gate_blend_threshold: 0.90
+  compliance_gate_blend_width: 0.30
+
 # ----------------------------------------------------------
 # ESG signal — saved-carbon-years formula
 # esg = w_green × esg_scale × ef_ratio × time_ratio × compliance_gate
-# compliance_gate = coverage_frac² (suppresses ESG for non-compliant agents)
+# compliance_gate = coverage_frac^(1+blend): linear near full compliance, approaches quadratic under scarcity
 # ----------------------------------------------------------
 esg:
   enabled: true

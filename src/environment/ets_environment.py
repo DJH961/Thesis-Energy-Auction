@@ -269,6 +269,10 @@ class ETSEnvironment(gym.Env):
         self._mac_reductions = np.zeros(self.n_total)
         self._mac_costs = np.zeros(self.n_total)
 
+        # Banking timing signal: per-agent weighted-average cost basis of holdings.
+        # Initialized each episode; updated after auction and secondary purchases.
+        self._bank_cost_basis = np.zeros(self.n_total)
+
         # Terminal liquidation components from the latest reward computation.
         # These are logged into year_log so notebook diagnostics can mirror
         # the exact reward logic without re-implementing formulas.
@@ -510,6 +514,14 @@ class ETSEnvironment(gym.Env):
         self._collateral_clip_events = {i: 0 for i in range(self.n_total)}
         self._current_marginal_ef = 0.0
         self._build_episode_inflation_path()
+
+        # Seed bank cost basis for the banking timing signal.
+        # Pre-banked allowances are treated as acquired below the year-0 anchor,
+        # reflecting that holdings were built when prices were historically lower.
+        banking_cfg = self.config.get("reward", {}).get("banking_signal", {})
+        _init_factor = float(banking_cfg.get("initial_bank_cost_factor", 0.80))
+        _anchor_0 = compute_fundamental_anchor(0, self.config)
+        self._bank_cost_basis = np.full(self.n_total, _anchor_0 * _init_factor)
 
         if self._fade_enabled:
             n_active_bots = self._resolve_fade_active_bots(self.current_episode)
@@ -1691,6 +1703,20 @@ class ETSEnvironment(gym.Env):
         self._phase1_mac_costs = mac_costs
         self._phase1_log = log
 
+        # Update per-agent bank cost basis with newly acquired auction allowances.
+        # Weighted-average: (old_basis × old_bank + clearing_price × alloc) / new_bank.
+        if clearing_price > 0.0:
+            for _i in range(self.n_total):
+                _alloc_i = float(allocations[_i])
+                if _alloc_i < 1e-9:
+                    continue
+                _old_bank = max(float(self.holdings[_i]), 0.0)
+                _new_bank = _old_bank + _alloc_i
+                self._bank_cost_basis[_i] = (
+                    (self._bank_cost_basis[_i] * _old_bank + clearing_price * _alloc_i)
+                    / _new_bank
+                )
+
         # Compute bid affordability for next year's observation
         bid_prices = self._phase1_bid_prices
         bid_qtys = self._phase1_bid_quantities
@@ -1923,6 +1949,20 @@ class ETSEnvironment(gym.Env):
 
         self.last_secondary_price = secondary_clearing
         self.last_secondary_volume = secondary_volume
+
+        # Update bank cost basis for secondary purchases (buyers only).
+        if secondary_clearing > 0.0:
+            for _i in range(self.n_total):
+                _sec_qty = float(trade_qtys[_i])
+                if _sec_qty < 1e-9:
+                    continue
+                _sec_price = float(trade_costs[_i]) / _sec_qty
+                _old_bank = max(float(self.holdings[_i]) + float(allocations[_i]), 0.0)
+                _new_bank = _old_bank + _sec_qty
+                self._bank_cost_basis[_i] = (
+                    (self._bank_cost_basis[_i] * _old_bank + _sec_price * _sec_qty)
+                    / _new_bank
+                )
 
         # Update secondary profit EMA
         for i in range(self.n_total):
@@ -2467,6 +2507,13 @@ class ETSEnvironment(gym.Env):
         next_year       = min(self.current_year + 1, self.n_years - 1)
         anchor_next_nom = compute_fundamental_anchor(next_year, self.config)
 
+        # Banking timing signal config (read once outside agent loop)
+        banking_cfg     = reward_cfg.get("banking_signal", {})
+        banking_enabled = bool(banking_cfg.get("enabled", True))
+        _w_banking      = float(banking_cfg.get("w_banking", 0.3))
+        _w_imputed      = float(banking_cfg.get("w_imputed", 1.0))
+        _imputed_cap_factor = float(banking_cfg.get("imputed_cap_factor", 2.0))
+
         for i, company in enumerate(self.companies):
             if active_mask is not None and not bool(active_mask[i]):
                 continue
@@ -2507,11 +2554,42 @@ class ETSEnvironment(gym.Env):
             compliance_denom = max(anchor_real * need, 1.0)
             soft_denom       = max(budget_real, 1.0)
 
+            # Banking timing signal —————————————————————————————————————
+            # bank_drawdown: portion of the compliance obligation met by pre-
+            # existing banked allowances rather than fresh market purchases.
+            #   imputed_bank_norm: marks that drawdown to the current clearing
+            #     price so the compliance norm is the same whether the agent
+            #     bought or drew — killing the zero-bid free-compliance shortcut.
+            #   banking_signal: timing P&L = drawdown × (price − cost_basis),
+            #     rewarding cheap-bank/expensive-market and penalising the reverse.
+            bank_drawdown_i      = 0.0
+            imputed_bank_norm_i  = 0.0
+            banking_signal_i     = 0.0
+            if (banking_enabled
+                    and precompliance_holdings is not None
+                    and allocations is not None
+                    and trade_qtys is not None):
+                _bank_start    = max(float(precompliance_holdings[i]) - float(allocations[i]), 0.0)
+                _net_sec_buy   = max(0.0, float(trade_qtys[i]))
+                _total_new     = float(allocations[i]) + _net_sec_buy
+                _total_oblig   = (float(emissions[i])
+                                  + (float(old_carry_forward[i]) if old_carry_forward is not None else 0.0))
+                bank_drawdown_i = max(0.0, min(_bank_start, _total_oblig - _total_new))
+                # Imputed compliance cost: drawdown marked to clearing price, real terms
+                _imputed_real   = bank_drawdown_i * clearing_price / infl
+                _imputed_cap    = _imputed_cap_factor * compliance_denom
+                imputed_bank_norm_i = min(_imputed_real, _imputed_cap) / compliance_denom
+                # Timing P&L: profit from having banked at cost_basis vs current price
+                _profit_real    = bank_drawdown_i * (clearing_price - self._bank_cost_basis[i]) / infl
+                banking_signal_i = _w_banking * _profit_real / compliance_denom
+            # ——————————————————————————————————————————————————————————
+
             # Fix B: capital_norm is normalized by budget_real (soft_denom),
             # not by compliance_denom. Investment is a budget commitment,
             # not an allowance commitment. Previously this over-penalized
             # green capex by ~4× (budget_real / compliance_denom ratio).
-            compliance_norm = compliance_cost_real / compliance_denom
+            compliance_norm_cash = compliance_cost_real / compliance_denom
+            compliance_norm = compliance_norm_cash + _w_imputed * imputed_bank_norm_i
             capital_norm    = capital_cost_real    / soft_denom
             soft_norm       = soft_penalty_real    / soft_denom
 
@@ -2596,13 +2674,26 @@ class ETSEnvironment(gym.Env):
                     coverage_frac = min(1.0, float(precompliance_holdings[i]) / annual_need_i)
                 else:
                     coverage_frac = 1.0
-                compliance_gate = coverage_frac  # linear, no squaring (v8.2)
+                gate_blend_threshold = float(reward_cfg.get("compliance_gate_blend_threshold", 0.90))
+                gate_blend_width     = float(reward_cfg.get("compliance_gate_blend_width", 0.30))
+                gate_blend      = max(0.0, min(1.0, (gate_blend_threshold - coverage_frac) / gate_blend_width))
+                compliance_gate = coverage_frac ** (1.0 + gate_blend)
+                gate_activation = float(1.0 + gate_blend)
                 esg_signal      = esg_raw * compliance_gate
 
+            if allocations is not None:
+                coverage_frac_auction = min(
+                    float(allocations[i]) / max(company.compute_estimate_need(), 1e-6), 1.0
+                )
+            else:
+                coverage_frac_auction = 1.0
+            financial_reward = coverage_frac_auction * company.w_cost * (-cost_norm_centered)
+
             base_reward = float(
-                company.w_cost  * (-cost_norm_centered)
+                financial_reward
                 + company.w_green * esg_signal
                 - penalty_norm
+                + banking_signal_i
             )
             base_rewards[i] = base_reward
             rewards[i]      = base_reward
@@ -2639,11 +2730,18 @@ class ETSEnvironment(gym.Env):
 
             self._last_reward_channels[i] = {
                 "compliance_norm":           float(compliance_norm),
+                "compliance_norm_cash":      float(compliance_norm_cash),
+                "imputed_bank_norm":         float(imputed_bank_norm_i),
+                "bank_drawdown":             float(bank_drawdown_i),
+                "bank_cost_basis":           float(self._bank_cost_basis[i]),
+                "banking_signal":            float(banking_signal_i),
                 "capital_norm":              float(capital_norm),
                 "soft_norm":                 float(soft_norm),
                 "cost_norm":                 float(cost_norm),
                 "expected_compliance_norm":  float(expected_compliance_norm),
                 "cost_norm_centered":        float(cost_norm_centered),
+                "coverage_frac_auction":     float(coverage_frac_auction),
+                "financial_reward":          float(financial_reward),
                 "revenue_norm":         0.0,   # v8.2: revenue removed from reward; kept for log compatibility
                 "penalty_norm":         float(penalty_norm),
                 "penalty_prospective":  float(penalty_prospective),  # alias of remediation_cost

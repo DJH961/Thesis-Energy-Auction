@@ -5,6 +5,103 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.3.0]
+
+### Added — Banking timing signal
+
+Agents previously had a structural incentive to zero-bid at auction: drawing from
+their bank to cover compliance cost nothing in the reward, so skipping the auction
+was always rational. This release closes that loophole and adds an explicit
+intertemporal timing signal.
+
+#### Root cause (exploit)
+
+`compliance_norm` was computed purely from cash payments. An agent holding banked
+allowances could satisfy its full compliance obligation at zero cash cost, receiving
+no penalty and no reward cost — making zero-bidding a dominated strategy that left
+unsold allowances rolling over into the next year's supply, depressing prices and
+amplifying the exploit.
+
+#### Fix A — Imputed bank drawdown in `compliance_norm`
+
+Bank drawdown (the portion of compliance met by pre-existing holdings rather than
+fresh market purchases) is now marked to the current clearing price and added to
+`compliance_norm` via a new `imputed_bank_norm` term:
+
+```
+compliance_norm = compliance_norm_cash + w_imputed × imputed_bank_norm
+```
+
+where `imputed_bank_norm = min(drawdown × clearing_price / infl, cap) / compliance_denom`.
+
+An agent drawing 3 Mt from its bank when the market clears at €80/t now faces the
+same compliance cost as an agent that bought those 3 Mt fresh. Zero-bidding is no
+longer costless.
+
+#### Fix B — Banking timing P&L signal
+
+A per-agent `banking_signal` rewards (or penalises) good intertemporal allocation:
+
+```
+banking_signal = w_banking × drawdown × (clearing_price − cost_basis) / (infl × compliance_denom)
+```
+
+where `cost_basis` is the weighted-average price paid for currently held allowances.
+Agents that accumulated allowances cheaply and draw them when prices are high receive
+a positive signal; agents that banked expensively and draw when the market is cheap
+receive a negative signal. The two fixes are orthogonal: Fix A removes the zero-bid
+exploit; Fix B adds a pure timing gradient on top.
+
+#### Double-reward prevention
+
+By construction the two signals do not interact: Fix A makes the compliance cost
+identical whether allowances were bought or drawn, so no "budget savings" bonus
+exists. Fix B then adds only the timing P&L — the value of having bought at a
+different point in time.
+
+#### Cost basis tracking
+
+- `_bank_cost_basis[i]` (new `np.ndarray`, `n_total`) — per-agent weighted-average
+  acquisition cost, updated after each auction allocation and secondary purchase.
+- Initialised at `reset()` to `fundamental_anchor(year=0) × initial_bank_cost_factor`
+  (default 0.80), reflecting that pre-episode holdings were accumulated when prices
+  were historically lower.
+
+### Changed
+
+- `compliance_norm` now includes the imputed bank term when `banking_signal.enabled=True`.
+  `compliance_norm_cash` (the pure cash component) is exposed separately for diagnostics.
+
+### Config (`reward.banking_signal`)
+
+```yaml
+banking_signal:
+  enabled: true
+  w_banking: 0.3           # weight on timing P&L signal
+  w_imputed: 1.0           # weight on imputed bank drawdown in compliance_norm
+  imputed_cap_factor: 2.0  # cap imputed_bank_norm at N × compliance_denom
+  initial_bank_cost_factor: 0.80  # pre-banked cost = fundamental_anchor(0) × factor
+```
+
+### Diagnostic channel changes (`_last_reward_channels`)
+
+| Key | Status | Notes |
+|---|---|---|
+| `compliance_norm_cash` | NEW | cash-only component of `compliance_norm` |
+| `imputed_bank_norm` | NEW | mark-to-market imputed cost of bank drawdown |
+| `bank_drawdown` | NEW | Mt drawn from bank to cover compliance |
+| `bank_cost_basis` | NEW | weighted-average acquisition price of current holdings |
+| `banking_signal` | NEW | timing P&L reward term |
+
+### Tests
+
+`tests/test_banking_signal.py` — 20 new tests covering: cost basis init and update
+mechanics, drawdown calculation, imputed cost equality, cap behaviour, signal
+direction (positive/negative/zero), disabled mode, channel presence and finiteness,
+and scale sanity (signal does not dominate the gradient).
+
+---
+
 ## [8.2.0]
 
 Full reward audit — six bugs identified and fixed across `_compute_rewards`
