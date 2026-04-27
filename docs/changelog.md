@@ -91,6 +91,17 @@ and `compute_auction_rewards`. Documented in `archive/docs/reward_redesign_v8_2.
   `budget_real` (inflation-deflated) instead of `company.annual_budget` (nominal),
   consistent with all other reward normalization.
 
+- **`cost_norm` centered for reward comparability.** `base_reward` now uses
+  `w_cost × (−cost_norm_centered)` where `cost_norm_centered = cost_norm − 1.0`.
+  By construction, `compliance_denom = anchor_real × annual_need`, so a fully-compliant
+  agent buying exactly at the anchor pays `compliance_norm = 1.0`. Subtracting 1.0
+  centers the cost contribution at zero for normal operation: zero = perfectly efficient,
+  positive = under-spent, negative = over-spent. This makes financial and ESG reward
+  scales comparable — a financial agent at normal operation achieves R ≈ 0 (the same
+  break-even as a mid-journey ESG agent) without changing the ESG signal or adding any
+  agent-type–specific conditional logic. `cost_norm_centered` and
+  `expected_compliance_norm` added to `_last_reward_channels` for diagnostics.
+
 ### Diagnostic channel changes (`_last_reward_channels`)
 
 | Key | Status | Notes |

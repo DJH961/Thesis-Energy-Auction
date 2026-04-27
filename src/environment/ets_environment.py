@@ -2524,6 +2524,15 @@ class ETSEnvironment(gym.Env):
 
             cost_norm = compliance_norm + capital_norm + soft_norm + loan_sting
 
+            # cost_norm is centered at the expected compliance cost so that zero = perfect
+            # efficiency, positive = under-spent, negative = over-spent. By construction,
+            # compliance_denom = anchor_real × annual_need, so a fully-compliant agent
+            # buying exactly at the anchor pays compliance_norm = 1.0. Subtracting 1.0
+            # makes both financial and ESG reward scales comparable: a financial agent
+            # at normal operation scores R = 0 (same break-even as a mid-journey ESG agent).
+            expected_compliance_norm = 1.0
+            cost_norm_centered       = cost_norm - expected_compliance_norm
+
             urgency_scalar = float(self._urgency_scalars[i]) if i < self.n_agents else 1.0
 
             # Fix A + Fix 5 (penalty math):
@@ -2591,7 +2600,7 @@ class ETSEnvironment(gym.Env):
                 esg_signal      = esg_raw * compliance_gate
 
             base_reward = float(
-                company.w_cost  * (-cost_norm)
+                company.w_cost  * (-cost_norm_centered)
                 + company.w_green * esg_signal
                 - penalty_norm
             )
@@ -2629,10 +2638,12 @@ class ETSEnvironment(gym.Env):
                     rewards[i] += coverage_gap_shaping
 
             self._last_reward_channels[i] = {
-                "compliance_norm":      float(compliance_norm),
-                "capital_norm":         float(capital_norm),
-                "soft_norm":            float(soft_norm),
-                "cost_norm":            float(cost_norm),
+                "compliance_norm":           float(compliance_norm),
+                "capital_norm":              float(capital_norm),
+                "soft_norm":                 float(soft_norm),
+                "cost_norm":                 float(cost_norm),
+                "expected_compliance_norm":  float(expected_compliance_norm),
+                "cost_norm_centered":        float(cost_norm_centered),
                 "revenue_norm":         0.0,   # v8.2: revenue removed from reward; kept for log compatibility
                 "penalty_norm":         float(penalty_norm),
                 "penalty_prospective":  float(penalty_prospective),  # alias of remediation_cost
