@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.environment.ets_environment import ETSEnvironment
 from src.agents.ppo_agent import PPOAgent
+from src.utils.preflight import run_preflight_checks
 import src.agents.heuristic_policy as heuristic_policy
 
 
@@ -621,6 +622,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             "(exploration, ppo, reward, hpp, pretrain). "
             "See the tabula_rasa block in default.yaml for ablation reference values."
         )
+
+    # Preflight validation: catch common config errors (mismatched array lengths,
+    # malformed mix vectors, off-by-one bot counts, invalid auction bounds, etc.)
+    # before any environment or agents are constructed. Same checks are exercised
+    # by tests/test_preflight.py against configs/default.yaml.
+    run_preflight_checks(config)
 
     n_agents = config["companies"]["n_agents"]
     n_episodes = config["simulation"]["n_episodes"]
