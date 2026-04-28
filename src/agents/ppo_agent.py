@@ -882,10 +882,10 @@ class PPOAgent:
         # timesteps (via the per-phase running RewardNormalizer EMAs that
         # persist across episodes). This preserves the Markov assumption GAE
         # relies on while still giving each phase its own scale.
-        phases_list = list(self.buffer.phases)
+        phases_buf = self.buffer.phases
         for t in range(len(rewards)):
             r_raw = float(rewards[t])
-            if phases_list[t] == 'auction':
+            if phases_buf[t] == 'auction':
                 r_norm = self._auc_reward_normalizer.update_and_normalize(r_raw)
             else:
                 r_norm = self._sec_reward_normalizer.update_and_normalize(r_raw)
