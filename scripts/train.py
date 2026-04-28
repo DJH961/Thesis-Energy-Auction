@@ -25,6 +25,7 @@ import datetime
 import io
 import math
 import os
+import random
 import sys
 import time
 import yaml
@@ -42,7 +43,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.environment.ets_environment import ETSEnvironment
 from src.agents.ppo_agent import PPOAgent
+from src.utils.preflight import run_preflight_checks
 import src.agents.heuristic_policy as heuristic_policy
+
+
+def _clone_state_dict(sd: dict) -> dict:
+    """Cheap snapshot of a torch state_dict for HPP pool storage.
+
+    `copy.deepcopy` recursively walks the dict and clones each tensor via the
+    pickling machinery — ~10–100x slower than directly calling `.clone()`.
+    For HPP we only need a value-detached copy of each leaf tensor on CPU.
+    """
+    return {k: v.detach().clone() for k, v in sd.items()}
 
 
 def load_config(path: str) -> dict:
@@ -288,7 +300,7 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
 
 class EntropyConditionTracker:
     """
-    P2: Time-based entropy decay with auto-scaling.
+    Time-based entropy decay with auto-scaling.
 
     Entropy stays at coef_init for the first `decay_start` episodes
     (allowing BC warm-start and critic warmup to settle), then decays
@@ -610,6 +622,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # Reproducibility: seed all RNGs before any stochastic operation
     np.random.seed(seed)
     torch.manual_seed(seed)
+    random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
@@ -621,6 +634,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             "(exploration, ppo, reward, hpp, pretrain). "
             "See the tabula_rasa block in default.yaml for ablation reference values."
         )
+
+    # Preflight validation: catch common config errors (mismatched array lengths,
+    # malformed mix vectors, off-by-one bot counts, invalid auction bounds, etc.)
+    # before any environment or agents are constructed. Same checks are exercised
+    # by tests/test_preflight.py against configs/default.yaml.
+    run_preflight_checks(config)
 
     n_agents = config["companies"]["n_agents"]
     n_episodes = config["simulation"]["n_episodes"]
@@ -805,8 +824,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         for i in range(n_agents):
             for _ in range(seed_count):
                 hpp_pools[i].append((
-                    copy.deepcopy(agents[i].auction_policy.state_dict()),
-                    copy.deepcopy(agents[i].secondary_policy.state_dict()),
+                    _clone_state_dict(agents[i].auction_policy.state_dict()),
+                    _clone_state_dict(agents[i].secondary_policy.state_dict()),
                 ))
             hpp_min_pool_sizes[i] = seed_count
         print(f"HPP heuristic seed: {seed_count} BC snapshots seeded into each of "
@@ -892,7 +911,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     ]
     for i in range(n_agents):
         ep_fields += [f"streak_ceil_A{i+1}", f"streak_floor_A{i+1}", f"streak_zeroqty_A{i+1}"]
-    # F: Episode-mean diagnostic scores per learning agent (F3)
+    # Episode-mean diagnostic scores per learning agent
     for i in range(n_agents):
         ep_fields += [f"diag_S_financial_A{i+1}", f"diag_S_green_A{i+1}",
                       f"diag_S_composite_A{i+1}"]
@@ -941,7 +960,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"bid_coverage_A{i+1}",
                       f"bid_to_reserve_A{i+1}",
                       f"invest_tech_choice_A{i+1}",
-                      # F: Diagnostic scores (F2)
+                      # Diagnostic scores
                       f"diag_S_financial_A{i+1}",
                       f"diag_S_green_A{i+1}",
                       f"diag_S_composite_A{i+1}",
@@ -956,8 +975,32 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
 
+    # Year-row write buffer.
+    # The year log is the highest-volume CSV (n_episodes × n_years rows × ~270
+    # fields). Buffering rows in memory and flushing via `writerows()` in
+    # chunks halves Python-level dispatch overhead vs. one `writerow()` per
+    # year and amortizes file I/O. The buffer is also flushed at episode end
+    # so partial-episode crashes never lose more than the in-flight episode.
+    _yr_row_buffer: list = []
+    _yr_buffer_cap = 256  # rows before mid-episode flush; ~one episode @12yr × ~20 episodes
+
+    def _yr_write(row: dict) -> None:
+        _yr_row_buffer.append(row)
+        if len(_yr_row_buffer) >= _yr_buffer_cap:
+            yr_writer.writerows(_yr_row_buffer)
+            _yr_row_buffer.clear()
+
+    def _yr_flush_buffer() -> None:
+        if _yr_row_buffer:
+            yr_writer.writerows(_yr_row_buffer)
+            _yr_row_buffer.clear()
+
     # Register CSV cleanup so files are closed even on crash
     def _close_csvs():
+        try:
+            _yr_flush_buffer()
+        except Exception:
+            pass
         if not ep_csv.closed:
             ep_csv.close()
         if not yr_csv.closed:
@@ -989,6 +1032,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     def _flush_csv_logs(current_episode: int, force: bool = False) -> None:
         if force or ((current_episode + 1) % csv_flush_interval == 0):
+            _yr_flush_buffer()
             ep_csv.flush()
             yr_csv.flush()
             # fsync keeps data safer on abrupt termination.
@@ -1084,8 +1128,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 if hpp_pools[i] and episode_rng.random() < hpp_swap_prob:
                     # Save current actor weights
                     hpp_swapped[i] = (
-                        copy.deepcopy(agents[i].auction_policy.state_dict()),
-                        copy.deepcopy(agents[i].secondary_policy.state_dict()),
+                        _clone_state_dict(agents[i].auction_policy.state_dict()),
+                        _clone_state_dict(agents[i].secondary_policy.state_dict()),
                     )
                     # Load random historical policy for action selection
                     hist_auc, hist_sec = hpp_pools[i][
@@ -1158,9 +1202,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             # Secondary reward = total reward - auction reward
             r_secondary = rewards - r_auction[:n_agents]
 
-            # Store raw rewards; RewardNormalizer is for monitoring only.
-            for i in range(n_agents):
-                agents[i].normalize_reward(rewards[i])  # update stats for logging only
+            # Note (audit fix 1.8): the previous `normalize_reward()` call here
+            # only updated EMA stats whose return value was discarded — i.e.
+            # decorative dead code. Per-phase causal reward normalization now
+            # lives inside PPOAgent.compute_gae() (audit fix 1.7), so no
+            # normalizer update is needed at the rollout site. Raw rewards are
+            # what enters the buffer, exactly as before.
 
             # Store secondary-phase transition
             for i in range(n_agents):
@@ -1272,27 +1319,42 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             except Exception:
                 pass  # diagnostic scoring is non-critical
             yr_row["marginal_ef_used"] = round(float(yl.get("marginal_ef_used", getattr(env, "_last_marginal_ef", 0.0))), 4)
-            yr_writer.writerow(yr_row)
+            _yr_write(yr_row)
 
             # Update compliance_ctx with this year's outcomes (used as critic input NEXT year)
             if critic_compliance_features:
-                _shortfalls = yl.get("shortfalls", [0.0] * n_agents)
-                _penalties  = yl.get("penalties",  [0.0] * n_agents)
+                _shortfalls_raw = yl.get("shortfalls", [0.0] * n_agents)
+                _penalties_raw  = yl.get("penalties",  [0.0] * n_agents)
                 _n_years_ep = max(env.n_years, 1)
-                for i in range(n_agents):
-                    _sf = float(_shortfalls[i]) if i < len(_shortfalls) else 0.0
-                    _pen = float(_penalties[i]) if i < len(_penalties) else 0.0
-                    _budget = max(float(env.companies[i].annual_budget), 1.0)
-                    if _sf > 0.0:
-                        _consec_shortfall[i] += 1
-                        _ep_shortfall_count[i] += 1
-                    else:
-                        _consec_shortfall[i] = 0
-                    _ep_penalty_total[i] += _pen
-                    compliance_ctx[i, 0] = float(_consec_shortfall[i]) / _n_years_ep       # consecutive shortfall (normalized)
-                    compliance_ctx[i, 1] = float(_ep_shortfall_count[i]) / (year + 1)      # episode shortfall rate so far
-                    compliance_ctx[i, 2] = _ep_penalty_total[i] / (_budget * _n_years_ep)  # cumulative penalty burden (normalized)
-                    compliance_ctx[i, 3] = _sf / max(_budget / max(yl.get("clearing_price", 1.0), 1.0), 1.0)  # last shortfall (allowance-normalized)
+                # Right-pad / truncate to n_agents and convert to ndarray once.
+                _sf_arr = np.zeros(n_agents, dtype=np.float64)
+                _pen_arr = np.zeros(n_agents, dtype=np.float64)
+                _m = min(n_agents, len(_shortfalls_raw))
+                if _m > 0:
+                    _sf_arr[:_m] = np.asarray(_shortfalls_raw[:_m], dtype=np.float64)
+                _m = min(n_agents, len(_penalties_raw))
+                if _m > 0:
+                    _pen_arr[:_m] = np.asarray(_penalties_raw[:_m], dtype=np.float64)
+                _budgets = np.array(
+                    [max(float(env.companies[i].annual_budget), 1.0) for i in range(n_agents)],
+                    dtype=np.float64,
+                )
+
+                # Vectorized counter updates. Slice assignment (`[:] = ...`) is
+                # used so the array identity is preserved — the per-episode
+                # reset elsewhere does `_consec_shortfall[:] = 0` and depends
+                # on the same underlying buffer.
+                _has_sf = _sf_arr > 0.0
+                _consec_shortfall[:] = np.where(_has_sf, _consec_shortfall + 1, 0)
+                _ep_shortfall_count += _has_sf.astype(_ep_shortfall_count.dtype)
+                _ep_penalty_total += _pen_arr
+
+                _allowance_norm = np.maximum(
+                    _budgets / max(yl.get("clearing_price", 1.0), 1.0), 1.0)
+                compliance_ctx[:, 0] = _consec_shortfall / _n_years_ep
+                compliance_ctx[:, 1] = _ep_shortfall_count / (year + 1)
+                compliance_ctx[:, 2] = _ep_penalty_total / (_budgets * _n_years_ep)
+                compliance_ctx[:, 3] = _sf_arr / _allowance_norm
 
             obs1 = obs1_next
             if terminated:
@@ -1308,16 +1370,23 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             for i in hpp_swapped:
                 agents[i].buffer.clear()
 
-        # HAPPO dynamic order: update per-agent EMA of episode total reward
+        # HAPPO dynamic order: update per-agent EMA of episode total reward.
+        # Zero out swapped agents' contributions: their rewards came from
+        # historical policies, not the current policies we are about to update.
         if happo_dynamic_order:
-            agent_perf_ema = (1.0 - happo_perf_ema_alpha) * agent_perf_ema + happo_perf_ema_alpha * total_rewards
+            ema_rewards = total_rewards.copy()
+            if hpp_swapped:
+                for i in hpp_swapped:
+                    if 0 <= i < len(ema_rewards):
+                        ema_rewards[i] = agent_perf_ema[i]  # leave EMA unchanged for swapped agent
+            agent_perf_ema = (1.0 - happo_perf_ema_alpha) * agent_perf_ema + happo_perf_ema_alpha * ema_rewards
 
         # HPP: periodically snapshot current actors into the pool
         if hpp_enabled and episode > 0 and episode % hpp_save_interval == 0:
             for i in range(n_agents):
                 hpp_pools[i].append((
-                    copy.deepcopy(agents[i].auction_policy.state_dict()),
-                    copy.deepcopy(agents[i].secondary_policy.state_dict()),
+                    _clone_state_dict(agents[i].auction_policy.state_dict()),
+                    _clone_state_dict(agents[i].secondary_policy.state_dict()),
                 ))
 
         # === PPO Update (batched: every episodes_per_update episodes) ===
@@ -1364,7 +1433,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 # T = 2 × n_years because split rewards store auction + secondary transitions separately.
                 # Agents with mismatched T (e.g. HPP-cleared buffers) are excluded from the M-factor chain.
                 expected_T = episodes_per_update * n_years * 2
-                cumulative_ratio = torch.ones(expected_T, 1)
+                # Keep cumulative ratio on the agents' device so update_happo()
+                # doesn't pay a CPU↔GPU round-trip per agent in the chain.
+                _happo_device = agents[0].device if n_agents > 0 else torch.device("cpu")
+                cumulative_ratio = torch.ones(expected_T, 1, device=_happo_device)
 
                 for j in order:
                     adv_j, ret_j, buf_j = gae_data[j]
@@ -1400,9 +1472,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     if actor_update and T_j == expected_T:
                         ratio_j = agents[j].compute_post_update_ratio(buf_j)
                         clipped_j = torch.clamp(ratio_j, 1 - clip_eps, 1 + clip_eps)
-                        cumulative_ratio = (
-                            cumulative_ratio * clipped_j.detach().cpu()
-                        )
+                        # Stay on-device — advantage_weights.to(...) inside
+                        # update_happo is then a no-op for the next agent.
+                        cumulative_ratio = cumulative_ratio * clipped_j.detach()
 
                 # Reorder losses to match agent index (not update order)
                 ordered_losses = latest_losses
@@ -1433,23 +1505,25 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                         loss = agents[i].update(last_value=0.0, actor_update=actor_update)
                     latest_losses.append(loss)
 
-            # --- Cosine LR decay (applied after each PPO update batch) ---
-            frac = episode / max(n_episodes - 1, 1)
-            if lr_decay_mode == "cosine":
-                actor_lr_now = lr_min + 0.5 * (actor_lr_init - lr_min) * (1 + math.cos(math.pi * frac))
-                for agent in agents:
-                    for pg in agent.auction_optimizer.param_groups:
-                        pg["lr"] = actor_lr_now
-                    for pg in agent.secondary_optimizer.param_groups:
-                        pg["lr"] = actor_lr_now
-            if critic_lr_decay_mode == "cosine":
-                critic_lr_now = critic_lr_min_val + 0.5 * (critic_lr_init - critic_lr_min_val) * (1 + math.cos(math.pi * frac))
-                for agent in agents:
-                    for pg in agent.critic_optimizer.param_groups:
-                        pg["lr"] = critic_lr_now
         else:
             # Non-update episode: keep buffers, report no losses
             latest_losses = [None] * n_agents
+
+        # --- Cosine LR decay (applied EVERY episode, not just on update episodes,
+        # so the schedule advances smoothly when episodes_per_update > 1) ---
+        frac = episode / max(n_episodes - 1, 1)
+        if lr_decay_mode == "cosine":
+            actor_lr_now = lr_min + 0.5 * (actor_lr_init - lr_min) * (1 + math.cos(math.pi * frac))
+            for agent in agents:
+                for pg in agent.auction_optimizer.param_groups:
+                    pg["lr"] = actor_lr_now
+                for pg in agent.secondary_optimizer.param_groups:
+                    pg["lr"] = actor_lr_now
+        if critic_lr_decay_mode == "cosine":
+            critic_lr_now = critic_lr_min_val + 0.5 * (critic_lr_init - critic_lr_min_val) * (1 + math.cos(math.pi * frac))
+            for agent in agents:
+                for pg in agent.critic_optimizer.param_groups:
+                    pg["lr"] = critic_lr_now
 
         for i in range(n_agents):
             if i < len(latest_losses) and latest_losses[i]:
@@ -1715,7 +1789,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             for i in range(n_total_agents)
         ]
 
-        # P5/P6/P8 episode aggregates for diagnostics
+        # Episode aggregates for emission/CF-noise/secondary diagnostics
         ep_mean_shock = [                                              # mean |ε| over years
             np.mean([abs(yl.get("emission_shocks", [0] * n_total_agents)[i])
                      for yl in env.episode_log])
@@ -2265,6 +2339,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             n_keep_milestones=int(prune_cfg.get("n_keep_milestones", 20)),
         )
 
+    _yr_flush_buffer()
     ep_csv.close()
     yr_csv.close()
     print(f"\nDone — seed {seed}. Logs: {ep_path}, {yr_path}")

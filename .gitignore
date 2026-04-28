@@ -210,3 +210,19 @@ __marimo__/
 *.csv
 *.pt
 *.pkl
+
+# Azure Machine Learning / Azure cloud
+.amlignore
+.amlignore.amltmp
+azureml-models/
+azureml_runs/
+.azureml/
+outputs/
+logs/
+snapshot/
+mlruns/
+# Azure Functions
+local.settings.json
+# Azure storage / credential files
+*.azureauth
+*.publishsettings

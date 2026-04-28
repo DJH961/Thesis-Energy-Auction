@@ -100,6 +100,8 @@ def test_reserve_price():
     assert alloc[0] == pytest.approx(1.0)
     assert alloc[1] == pytest.approx(0.0)
     assert alloc[2] == pytest.approx(0.0)
+    # Total allocation must equal the only valid demand (1.0 Mt), not the q_cap.
+    assert alloc.sum() == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------

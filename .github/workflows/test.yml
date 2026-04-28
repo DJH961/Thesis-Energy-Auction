@@ -9,9 +9,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ets_marl_happo_current
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

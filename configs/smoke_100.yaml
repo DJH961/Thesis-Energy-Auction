@@ -3,8 +3,8 @@
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update, centralized critic
 #   - Fundamental price anchor, coverage gap shaping unified
-#   - Phantom bidder enabled for supply-squeeze testing
-#   - Uniform exploration, no BC, no KL anchor
+#   - Phantom bidder disabled (matches default.yaml)
+#   - Anchored exploration (matches default.yaml), no BC, no KL anchor
 # ============================================================
 
 simulation:
@@ -33,7 +33,7 @@ technologies:
 # ----------------------------------------------------------
 ets:
   cap_year_0_override: null
-  initial_bank_fraction: 0.10
+  initial_bank_fraction: 0.5     # match default.yaml (was 0.10)
   cap_overhead_pct: 0.08
 
   lrf_phase1: 0.043
@@ -57,6 +57,8 @@ ets:
   banking: true
   reserve_price: 45.0
   reserve_price_mode: "static"
+  reserve_discount: 0.80             # match default.yaml: dynamic-mode discount on MA3
+  reserve_initial: 50.0              # match default.yaml: dynamic-mode pre-MA3 fallback
   unsold_to_msr: false
   max_rollover_multiplier: 1.5
   price_history_anchor: "auction"
@@ -125,7 +127,7 @@ auction:
   quantity_max: 3.0
   bid_change_limit:
     enabled: true
-    value: 50.0
+    value: 75.0          # match default.yaml (was 50.0)
   qty_mult_low: 0.5
   qty_mult_high: 2.0
   max_agent_share: 1.0
@@ -140,7 +142,8 @@ auction:
     max_collateral_budget_share: 0.50
     min_qty_floor_frac: 0.5
   leverage_multiplier: 3.0
-  suspension_length: 2
+  suspension_length: 0     # match default.yaml (was 2; budget gate replaces suspension)
+  budget_price_clip: true  # match default.yaml (soft clip at 1.5× max_affordable_price)
   carry_forward_defaults: true
 
 trading:
@@ -162,6 +165,7 @@ budget:
   budget_ema_alpha: 0.3
   annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
+  dynamic_budget_ceiling_multiplier: 1.5   # match default.yaml: cap revenue-based budget
   overspend_penalty_coef: 0.5
   contingency_zone: 0.10
   hard_cap_multiplier: 1.20
@@ -178,6 +182,16 @@ budget:
     max_loan_fraction: 0.15
     interest_rate: 0.08
     repayment_years: 3
+    leverage_premium_coef: 0.25      # match default.yaml
+    leverage_premium_exp: 1.5
+    capex_squeeze_floor: 0.50
+    origination_sting_coef: 0.07
+  treasury_reserve:                  # match default.yaml: corporate treasury buffer
+    enabled: true
+    retention_fraction: 0.60
+    cap_multiple: 1.5
+    decay_rate: 0.05
+    terminal_value_rate: 0.30
   suspension_length: 1
 
 green_finance:
@@ -211,6 +225,7 @@ penalty:
   carry_forward_cap: 0.0
 
 price:
+  initial_expected: 70.0           # match default.yaml: synthetic burn-in seed / year-0 target
   banking_premium_mult: 1.4
   burnin_std: 10.0
   ar1_persistence: 0.85
@@ -234,11 +249,14 @@ reward:
   clip_max: 10.0
   shaping_beta: 7.0
   shaping_gamma: 1.0
-  shaping_decay_episode: 0         # auto: 40% of n_episodes
+  shaping_decay_episode: 0         # auto: shaping_decay_frac × n_episodes
+  shaping_decay_frac: 0.10         # match default.yaml
   shaping_weight_floor: 0.0
   terminal_bank_value: true
   terminal_queue_value: true
   terminal_payoff_years: 5
+  treasury_terminal_value: true        # match default.yaml: treasury NPV at episode end
+  anchor_normalize_cost_only: true     # match default.yaml: cost_norm = total_cost / (anchor_t × need)
   budget_norm_anchor: "dynamic"
   budget_norm_budget_0: 1000.0
 
@@ -250,13 +268,30 @@ reward:
     enabled: true
     scale: 0.5
 
+  banking_signal:                    # match default.yaml: bank-drawdown timing signal
+    enabled: true
+    w_banking: 0.3
+    w_imputed: 1.0
+    imputed_cap_factor: 5.0
+    initial_bank_cost_factor: 0.80
+
+  compliance_gate_blend_threshold: 0.90  # match default.yaml
+  compliance_gate_blend_width: 0.30
+
 esg:
   enabled: true
   scale: 2.0
   speed_coef: 0.5
+  speed_coef_late: 0.8               # match default.yaml: late-investment ESG bonus
 
 opponent_modeling:
   enabled: true
+
+opponent_obs:                        # match default.yaml: opponent observation encoding
+  mode: "lagged"
+  lag_years: 1
+  queue_noise_sigma: 0.15
+  dims_per_opponent: 7
 
 agent_cycling:
   enabled: false
@@ -273,6 +308,7 @@ ppo:
   entropy_coef_final: 0.025
   entropy_decay_start: -1
   entropy_decay_window: -1
+  entropy_decay_frac: 0.70           # match default.yaml: faster stabilization
   value_coef: 0.5
   max_grad_norm: 0.5
   n_epochs: 5
@@ -287,12 +323,17 @@ ppo:
   log_std_min: -2.5
   log_std_max: 0.0
   centralized_critic: true
+  critic_compliance_features: true   # match default.yaml: append K=4 compliance features per agent to global state
   happo: true
+  happo_dynamic_order: true          # match default.yaml: sort update order worst-to-best by EMA reward
+  happo_perf_ema_alpha: 0.1          # match default.yaml: EMA decay for per-agent performance tracking
   critic_lr: 0.001
   critic_hidden_size: 512
   critic_warmup_episodes: 0
   lr_decay: cosine
   lr_min: 0.00001
+  critic_lr_decay: cosine             # match default.yaml
+  critic_lr_min: 0.00005              # match default.yaml
   target_kl: 0.02
   kl_anchor_beta: 0.0
   kl_anchor_decay_episodes: 0
@@ -331,6 +372,7 @@ warm_start:
   queue_mu_onshore: 1.5
   queue_mu_offshore: 0.5
   queue_mu_solar: 2.0
+  msr_initial_reserve_frac: 0.23     # match default.yaml: MSR seed as fraction of cap_year_0
 
 logging:
   log_interval: 10
@@ -368,14 +410,17 @@ hpp:
   seed_count: 2
 
 # ----------------------------------------------------------
-# Exploration: wide uniform for smoke test
-# High epsilon ensures full price-range coverage in 100 episodes.
+# Exploration: anchored Gaussian (matches default.yaml).
+# Smoke runs the production exploration mode so this path is exercised
+# in CI rather than the legacy uniform mode.
 # ----------------------------------------------------------
 exploration:
-  mode: "uniform"
-  epsilon_start: 0.50
-  epsilon_final: 0.05
+  mode: "anchored"
+  epsilon_start: 0.25
+  epsilon_final: 0.02
   epsilon_decay_episodes: 0
+  epsilon_decay_frac: 0.45
+  anchor_boost: 1.14
   auction_anchors: null
   secondary_anchors: null
 
@@ -395,9 +440,9 @@ budget_curriculum:
   budget_end: 1.0
   decay_frac: 0.30
 
-# Phantom bidder enabled for smoke test to exercise supply-squeeze paths.
+# Phantom bidder disabled to match default.yaml (production runs without phantom).
 phantom_bidder:
-  enabled: true
+  enabled: false
   qty_frac_lo: 0.15
   qty_frac_hi: 0.35
   price_lognormal_sigma: 0.35

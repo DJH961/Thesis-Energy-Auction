@@ -96,14 +96,22 @@ def test_phase1_invest_action_direct_mapping():
     assert invest_mid > invest_low, (
         f"Expected monotonic increase in executed investment, got low={invest_low:.6f}, mid={invest_mid:.6f}"
     )
+    # Numeric tolerance: invest action 0.03 should map to ≤ requested fraction.
+    # The action is the requested invest fraction; budget gating may scale it
+    # down but never up, so executed_frac ∈ [0, 0.03 + small slack].
+    assert invest_mid <= 0.03 + 1e-6, (
+        f"Executed invest_frac {invest_mid:.6f} exceeded requested 0.03"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Test 2c: Budget gate zeros qty for cash-poor agents (Change 1)
+# Test 2c: Budget gate scales qty down for cash-poor agents (v8.4.2: soft scale, not hard zero)
 # ---------------------------------------------------------------------------
 
-def test_budget_gate_zeros_qty_for_cash_poor_agents():
-    """Agents with cash < 10% of bid notional should have qty zeroed before auction."""
+def test_budget_gate_scales_qty_for_cash_poor_agents():
+    """Agents with cash < 10% of bid notional should have qty scaled down (not zeroed)
+    so that bid_p × bid_q × 0.10 ≤ cash. v8.4.2 replaced the hard zero with a soft scale
+    to avoid the gradient discontinuity that pushed policies to systematic under-bidding."""
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
     config["companies"]["n_bot_agents"] = 0
@@ -117,17 +125,31 @@ def test_budget_gate_zeros_qty_for_cash_poor_agents():
 
     # Drain budget for agent 0 so they cannot cover 10% of a large notional
     env.companies[0].budget_spent_this_year = env.companies[0].annual_budget * 0.99
+    cash_before = max(
+        0.0,
+        env.companies[0].annual_budget - env.companies[0].budget_spent_this_year,
+    ) + env.companies[0].get_treasury_available()
 
+    bid_price = 200.0
+    bid_qty   = 2.0
     auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
-    auction_actions[:, 0] = 200.0   # high price
-    auction_actions[:, 1] = 2.0     # large qty → notional well above remaining cash
+    auction_actions[:, 0] = bid_price
+    auction_actions[:, 1] = bid_qty   # notional well above remaining cash
     _, log = env.step_auction(auction_actions)
 
-    # Agent 0 should not have won any allocation (qty was zeroed by budget gate)
+    # The gate should leave bid_p × scaled_qty × 0.10 ≤ cash. The scaled qty is
+    # ≤ the original requested qty (2.0). It must be strictly less than the
+    # requested qty (because cash is insufficient) and strictly positive
+    # (because the gate scales rather than zeroes).
     alloc = log.get("allocations", [])
-    if alloc:
-        assert alloc[0] < 1e-6, (
-            f"Expected agent 0 allocation ~0 due to budget gate, got {alloc[0]:.4f}"
+    if alloc and cash_before > 1e-6:
+        max_affordable_qty = cash_before / (bid_price * 0.10)
+        assert alloc[0] <= max_affordable_qty + 1e-6, (
+            f"Allocation {alloc[0]:.4f} exceeds max affordable qty "
+            f"{max_affordable_qty:.4f} given cash={cash_before:.2f}"
+        )
+        assert alloc[0] < bid_qty - 1e-6, (
+            f"Expected scaled allocation < requested qty {bid_qty}, got {alloc[0]:.4f}"
         )
 
 

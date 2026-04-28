@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v8.4.1
+# ETS MARL — Configuration v8.4.2
 #   - 8 learning agents, 0 bots (pure MARL)
 #   - HAPPO sequential policy update, centralized critic
 #   - Fundamental price anchor (MAC-scarcity-penalty formula)
@@ -13,6 +13,12 @@ simulation:
   n_years: 12
   n_episodes: 100000
   seeds: [42, 123, 456]
+
+# Device for PPO networks. "auto" picks CUDA if available, else CPU.
+# For these tiny MLPs (~123-D input, 2 FC layers) CPU is almost always faster
+# than GPU on multi-core machines (kernel-launch overhead > matmul cost).
+# Override to "cpu" or "cuda" to force.
+device: auto
 
 
 # ----------------------------------------------------------
@@ -43,7 +49,7 @@ ets:
   # initial_bank_fraction set jointly so TNAC/tnac_upper = 1.05 at episode start
   # (2026 observed: 1,148 Mt / 1,096 Mt = 1.05).
   initial_bank_fraction: 0.5
-  # +12% cap overhead: reflects real 2026 EU ETS ~15% overhead; slightly conservative
+  # +10% cap overhead: reflects real 2026 EU ETS ~15% overhead; slightly conservative
   # for micro-ETS scale.
   cap_overhead_pct: 0.10
 
@@ -70,6 +76,11 @@ ets:
   banking: true
   reserve_price: 45.0              # auction bid floor (below MAC=48, prevents degenerate equilibrium)
   reserve_price_mode: "static"
+  # Dynamic-reserve parameters (only consulted when reserve_price_mode: "dynamic").
+  # In dynamic mode: effective_reserve = max(reserve_price, reserve_discount × MA3_price);
+  # before any MA3 history exists, max(reserve_price, reserve_initial) is used.
+  reserve_discount: 0.80
+  reserve_initial: 50.0
   unsold_to_msr: false
   max_rollover_multiplier: 1.5
   price_history_anchor: "auction"  # only successful auction clears enter MA3
@@ -101,7 +112,14 @@ companies:
     - [0.5, 0.5]   # A8: balanced ESG
 
   # Heuristic bot agents (indexed after learning agents).
-  # bot arrays must stay in sync with n_bot_agents.
+  # NOTE: bot_* arrays below have length 8 as a "configuration shelf" so they
+  # remain valid templates when n_bot_agents is increased. The first
+  # n_bot_agents entries are used; the rest are dead. WARNING — when changing
+  # n_bot_agents to N, REVIEW each bot_* array's first N entries: stale entries
+  # at index ≥ N continue to exist but become inactive only at runtime, while
+  # entries 0..N-1 still drive bot behaviour. Mismatched / outdated entries in
+  # the active prefix will silently change the simulation.
+  # preflight (src/utils/preflight.py) only enforces len(arr) >= n_bot_agents.
   n_bot_agents: 0
   bot_initial_mix:
     - [0.40, 0.40, 0.10, 0.05, 0.05]   # B1: coal-heavy (id=8)
@@ -259,6 +277,7 @@ penalty:
 # banking_premium_mult: multiplier on MAC to account for banking option value.
 # ----------------------------------------------------------
 price:
+  initial_expected: 70.0           # Synthetic burn-in price seed; expected year-0 clearing target
   banking_premium_mult: 1.4        # MAC × 1.4 = ~67 EUR/t at year 0
   burnin_std: 10.0
   ar1_persistence: 0.85
@@ -303,8 +322,8 @@ reward:
   terminal_payoff_years: 5
   treasury_terminal_value: true        # Change 4: treasury NPV added at episode end
   anchor_normalize_cost_only: true     # Change 6: cost_norm = total_cost / (anchor_t × need)
-  budget_norm_anchor: "dynamic"        # v8.1.1: "dynamic" uses annual_budget, "fixed" uses budget_norm_budget_0
-  budget_norm_budget_0: 1000.0         # v8.1.1: reference budget for fixed normalisation mode
+  budget_norm_anchor: "dynamic"        # "dynamic" uses annual_budget, "fixed" uses budget_norm_budget_0
+  budget_norm_budget_0: 1000.0         # reference budget for fixed normalisation mode
 
   # Opportunity cost shaping: per-Mt premium paid on secondary vs auction.
   # Decays with shaping_weight so equilibrium reward is pure.
@@ -325,7 +344,7 @@ reward:
     enabled: true
     w_banking: 0.3          # weight on timing P&L (clearing_price - cost_basis) × drawdown
     w_imputed: 1.0          # weight on imputed bank drawdown added to compliance_norm
-    imputed_cap_factor: 2.0 # cap imputed norm at N × compliance_denom to prevent scale blowup
+    imputed_cap_factor: 5.0 # cap imputed norm at N × compliance_denom (v8.4.2: 2.0→5.0; old cap bound at clearing>2×anchor and made bank-draw cheaper than auction-buy in spikes)
     initial_bank_cost_factor: 0.80  # pre-banked cost basis = fundamental_anchor(0) × factor
 
   # Blended compliance gate for ESG signal: linear above threshold, approaches

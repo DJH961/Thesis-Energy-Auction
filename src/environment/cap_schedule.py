@@ -171,11 +171,33 @@ class CapSchedule:
             reduction += lrf * self.cap_year_0
         return max(0.0, self.cap_year_0 - reduction)
 
+    def _effective_penalty(self, year: int, penalty_rate: float,
+                           inflation_rate: float = 0.0,
+                           inflation_factor: float = None) -> float:
+        """
+        Compute the inflation-adjusted penalty for the given year.
+
+        When ``inflation_factor`` is provided (cumulative product of per-year
+        rates), it is used directly: ``eff = penalty_rate × inflation_factor``.
+        Otherwise falls back to the constant-rate compounding formula
+        ``eff = penalty_rate × (1 + inflation_rate) ** year``.
+
+        Returns 138.75 (year-0 base) when ``penalty_rate <= 0``.
+        """
+        if penalty_rate <= 0:
+            return 138.75
+        if inflation_factor is not None:
+            return float(penalty_rate) * float(inflation_factor)
+        if inflation_rate < 0:
+            return float(penalty_rate)
+        return float(penalty_rate) * ((1.0 + float(inflation_rate)) ** int(year))
+
     def get_auction_volume(self, year: int, tnac: float,
                           clearing_price: float = 0.0,
                           price_max: float = 120.0,
                           penalty_rate: float = 0.0,
                           inflation_rate: float = 0.0,
+                          inflation_factor: float = None,
                           force_msr: bool = False,
                           price_ma3: float = None) -> float:
         """
@@ -222,6 +244,7 @@ class CapSchedule:
                                           price_max=price_max,
                                           penalty_rate=penalty_rate,
                                           inflation_rate=inflation_rate,
+                                          inflation_factor=inflation_factor,
                                           force_msr=force_msr,
                                           price_ma3=price_ma3)
             if self._last_msr_withheld > 0.0:
@@ -267,6 +290,7 @@ class CapSchedule:
     def preview_auction_volume(self, year: int, clearing_price: float = 0.0,
                                price_max: float = 120.0, penalty_rate: float = 0.0,
                                inflation_rate: float = 0.0,
+                               inflation_factor: float = None,
                                price_ma3: float = None) -> float:
         """
         Read-only preview of this year's auction volume for Phase 1 observations.
@@ -306,11 +330,8 @@ class CapSchedule:
         # Mirrors the live _apply_msr cancellation logic.
         msr_snap = max(0.0, self._msr_reserve - max(0.0, self._msr_reserve - self.tnac_lower))
 
-        # Inflation-adjusted penalty rate
-        if penalty_rate > 0 and inflation_rate >= 0:
-            eff_penalty = penalty_rate * ((1.0 + inflation_rate) ** year)
-        else:
-            eff_penalty = 138.75
+        # Inflation-adjusted penalty rate (uses cumulative inflation_factor if provided)
+        eff_penalty = self._effective_penalty(year, penalty_rate, inflation_rate, inflation_factor)
         containment_threshold = eff_penalty * 1.8
         release_threshold = min(eff_penalty * 2.5, 450.0)
 
@@ -373,16 +394,17 @@ class CapSchedule:
                    price_max: float = 120.0,
                    penalty_rate: float = 0.0,
                    inflation_rate: float = 0.0,
+                   inflation_factor: float = None,
                    force_msr: bool = False,
                    price_ma3: float = None) -> float:
         """
         Apply MSR rules to the auction volume.
 
-        A2: 1-year TNAC lag — MSR uses self._prev_tnac (end of previous
+        1-year TNAC lag — MSR uses self._prev_tnac (end of previous
         year) rather than current TNAC. If _prev_tnac is None (no prior
         year exists), MSR is skipped unless force_msr=True.
 
-        Rules (EU ETS Decision 2015/1814 + A4 smoothed price trigger):
+        Rules (EU ETS Decision 2015/1814 + smoothed price trigger):
           1. If price meets combined emergency-release trigger: emergency
              release from reserve (breaks procyclical loop where high
              prices + high TNAC cause further supply withdrawal).
@@ -446,10 +468,9 @@ class CapSchedule:
         self._total_cancelled += excess
 
         # Compute inflation-adjusted penalty rate (effective penalty at this year)
-        if penalty_rate > 0 and inflation_rate >= 0:
-            eff_penalty = penalty_rate * ((1.0 + inflation_rate) ** year)
-        else:
-            eff_penalty = penalty_rate if penalty_rate > 0 else 138.75  # fallback base rate
+        # Prefers inflation_factor (cumulative) when caller supplies it (e.g. when
+        # the env uses random per-year rates); falls back to (1+rate)**year otherwise.
+        eff_penalty = self._effective_penalty(year, penalty_rate, inflation_rate, inflation_factor)
 
         # Dynamic absolute thresholds based on inflation-adjusted penalty
         # Containment threshold: ~1.8× effective penalty (~250 EUR/t at year 0)

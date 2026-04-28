@@ -153,7 +153,7 @@ class PPOAgent:
         self.config = config
         self.obs_dim_phase1 = obs_dim_phase1
         # Seeded RNG for reproducible mini-batch shuffling
-        self._rng = np.random.default_rng(seed if seed is not None else 0 + agent_id)
+        self._rng = np.random.default_rng((seed if seed is not None else 0) + agent_id)
         ppo = config["ppo"]
 
         self.gamma = ppo["gamma"]
@@ -169,7 +169,17 @@ class PPOAgent:
         self.gae_min_std = float(max(1e-8, reward_cfg.get("gae_min_std", 0.1)))
         self.target_kl = ppo.get("target_kl", 0.0)  # KL early stopping; 0 = disabled
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Device selection. Tiny MLPs (~123-dim input, two FC layers) are almost
+        # always faster on CPU than GPU because kernel-launch overhead exceeds the
+        # matmul cost. Allow override via config["device"]:
+        #   "auto" (default) → cuda if available else cpu
+        #   "cpu"            → force CPU (recommended for thesis runs)
+        #   "cuda"/"cuda:0"  → force GPU
+        device_cfg = str(config.get("device", "auto")).lower()
+        if device_cfg == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device_cfg)
         hidden = ppo["hidden_size"]
         log_std_min = ppo.get("log_std_min", -2.0)
         log_std_max = ppo.get("log_std_max", 1.0)
@@ -202,7 +212,9 @@ class PPOAgent:
                 config.get("price", {}).get("initial_expected", 80.0)
             )
 
-        # WTP-anchored exploration parameters (Approach C+D: escape floor-price trap)
+        # WTP-anchored exploration parameters (anchors exploration on
+        # willingness-to-pay rather than expected price, to escape the
+        # floor-price self-reinforcement trap).
         penalty_cfg = config.get("penalty", {})
         self._wtp_penalty_rate = float(penalty_cfg.get("rate", 138.75))
         companies_cfg = config.get("companies", {})
@@ -264,7 +276,7 @@ class PPOAgent:
         self.critic_extra_epochs = ppo.get("critic_extra_epochs", 0)
         self.critic_huber = ppo.get("critic_huber", False)
         self.critic_huber_delta = ppo.get("critic_huber_delta", 10.0)
-        self.normalize_returns = ppo.get("normalize_returns", True)
+        self.normalize_returns = ppo.get("normalize_returns", False)
         self.clip_value = ppo.get("clip_value", False)
 
         # Initialize critic loss function
@@ -276,6 +288,13 @@ class PPOAgent:
         reward_cfg = config.get("reward", {})
         norm_alpha = reward_cfg.get("normalizer_alpha", 0.01)
         self._reward_normalizer = RewardNormalizer(alpha=norm_alpha)
+        # Per-phase causal reward normalizers (audit fix 1.7): replace the
+        # previous episode-wide phase-mean/std normalization (which used future
+        # rewards to normalize past ones, breaking GAE's Markov assumption).
+        # These are updated in temporal order inside compute_gae() so each
+        # reward is normalized using only stats from prior timesteps.
+        self._auc_reward_normalizer = RewardNormalizer(alpha=norm_alpha)
+        self._sec_reward_normalizer = RewardNormalizer(alpha=norm_alpha)
         self._reward_clip_min = reward_cfg.get("clip_min", -10.0)
         self._reward_clip_max = reward_cfg.get("clip_max", 10.0)
 
@@ -356,11 +375,12 @@ class PPOAgent:
         so that the PPO importance ratio remains correct.
 
         ``last_secondary_buy_price``: price this agent paid per Mt on the
-        secondary market last year. Used for Approach C+D — shifts the WTP
-        exploration anchor upward so agents learn to bid above floor when
-        the secondary market is expensive.
+        secondary market last year. Shifts the WTP exploration anchor upward
+        so agents learn to bid above floor when the secondary market is
+        expensive.
         """
-        obs_t = torch.FloatTensor(obs1).unsqueeze(0).to(self.device)
+        obs_t = torch.from_numpy(np.ascontiguousarray(obs1, dtype=np.float32)
+                                 ).unsqueeze(0).to(self.device)
         with torch.no_grad():
             action, raw, log_prob = self.auction_policy.act(obs_t, deterministic)
 
@@ -371,8 +391,8 @@ class PPOAgent:
                 if self.exploration_mode == "uniform":
                     rand_action = low + (high - low) * torch.rand_like(action)
 
-                    # WTP-anchored exploration (Approach C+D): anchor exploration
-                    # on willingness-to-pay instead of expected price.
+                    # WTP-anchored exploration: anchor exploration on
+                    # willingness-to-pay instead of expected price.
                     # This breaks the floor-price self-reinforcement loop where
                     # expected_price = floor → exploration samples near floor →
                     # clearing price = floor → expected_price stays at floor.
@@ -391,15 +411,16 @@ class PPOAgent:
                     # WTP budget: what can the agent afford per tonne
                     wtp_budget = available_budget / need_mt if need_mt > 0.01 else price_max
 
-                    # Approach C: shift anchor to secondary buy price if higher
+                    # Shift anchor up to last secondary buy price if higher:
                     # "Last year I paid 280 on secondary → I should bid at least
                     # that much at auction to avoid overpaying again."
                     wtp_base = min(wtp_economic, wtp_budget)
                     if last_secondary_buy_price > 0.0:
                         wtp_base = max(wtp_base, last_secondary_buy_price)
 
-                    # Approach D: blend — bid floor = 0.5 * sec_price + 0.5 * econ
-                    # This softens the shift so agents don't jump to full sec price
+                    # Soften the shift by blending with the economic anchor when
+                    # secondary price exceeds it, so agents do not jump to the
+                    # full secondary price.
                     if last_secondary_buy_price > wtp_economic and last_secondary_buy_price > 0.0:
                         wtp_base = 0.5 * last_secondary_buy_price + 0.5 * wtp_economic
 
@@ -433,10 +454,10 @@ class PPOAgent:
                     wtp_e = compute_fundamental_anchor(current_year, self.config) * _boost
                     wtp_b = avail / need_mt if need_mt > 0.01 else price_max
                     wtp_base = min(wtp_e, wtp_b)
-                    # Approach C: shift anchor to secondary buy price if higher
+                    # Shift anchor up to last secondary buy price if higher
                     if last_secondary_buy_price > 0.0:
                         wtp_base = max(wtp_base, last_secondary_buy_price)
-                    # Approach D: blend when secondary > economic
+                    # Blend with economic anchor when secondary price exceeds it
                     if last_secondary_buy_price > wtp_e and last_secondary_buy_price > 0.0:
                         wtp_base = 0.5 * last_secondary_buy_price + 0.5 * wtp_e
                     wtp_anc = float(np.clip(wtp_base, price_min, price_max))
@@ -481,7 +502,8 @@ class PPOAgent:
 
         Epsilon-greedy in physical space (same approach as auction actions).
         """
-        obs_t = torch.FloatTensor(obs2).unsqueeze(0).to(self.device)
+        obs_t = torch.from_numpy(np.ascontiguousarray(obs2, dtype=np.float32)
+                                 ).unsqueeze(0).to(self.device)
         with torch.no_grad():
             action, raw, log_prob = self.secondary_policy.act(obs_t, deterministic)
 
@@ -531,9 +553,10 @@ class PPOAgent:
 
     def estimate_value(self, obs: np.ndarray) -> float:
         """V(s) — from local obs2 (IPPO) or global state (MAPPO)."""
-        obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            return self.value_net(obs_t).cpu().item()
+            obs_t = torch.from_numpy(np.ascontiguousarray(obs, dtype=np.float32)
+                                     ).unsqueeze(0).to(self.device)
+            return self.value_net(obs_t).item()
 
     # ------------------------------------------------------------------
     # Storage
@@ -565,36 +588,43 @@ class PPOAgent:
         if len(self.buffer) < 2:
             return None
 
-        obs1_np = np.nan_to_num(np.array(self.buffer.obs1), nan=0.0, posinf=1e6, neginf=-1e6)
-        obs2_np = np.nan_to_num(np.array(self.buffer.obs2), nan=0.0, posinf=1e6, neginf=-1e6)
-
-        obs1 = torch.FloatTensor(obs1_np).to(self.device)
-        obs2 = torch.FloatTensor(obs2_np).to(self.device)
+        # Single list→numpy→torch conversion path with on-tensor sanitisation.
+        # Avoids the previous double-pass (np.array → np.nan_to_num → torch.FloatTensor → .to).
+        obs1 = torch.nan_to_num(
+            torch.from_numpy(np.asarray(self.buffer.obs1, dtype=np.float32)).to(self.device),
+            nan=0.0, posinf=1e6, neginf=-1e6)
+        obs2 = torch.nan_to_num(
+            torch.from_numpy(np.asarray(self.buffer.obs2, dtype=np.float32)).to(self.device),
+            nan=0.0, posinf=1e6, neginf=-1e6)
 
         # MAPPO: use global states for centralized critic if available
         if self.centralized_critic and len(self.buffer.global_states) > 0:
-            critic_input = torch.FloatTensor(
-                np.array(self.buffer.global_states)).to(self.device)
+            critic_input = torch.from_numpy(
+                np.asarray(self.buffer.global_states, dtype=np.float32)).to(self.device)
         else:
             critic_input = obs2
 
-        auc_raw = torch.FloatTensor(np.array(self.buffer.auction_raw)).to(self.device)
-        sec_raw = torch.FloatTensor(np.array(self.buffer.secondary_raw)).to(self.device)
-        old_auc_lp = torch.FloatTensor(np.array(self.buffer.auction_logp)).to(self.device)
-        old_sec_lp = torch.FloatTensor(np.array(self.buffer.secondary_logp)).to(self.device)
+        auc_raw = torch.from_numpy(
+            np.asarray(self.buffer.auction_raw, dtype=np.float32)).to(self.device)
+        sec_raw = torch.from_numpy(
+            np.asarray(self.buffer.secondary_raw, dtype=np.float32)).to(self.device)
+        old_auc_lp = torch.from_numpy(
+            np.asarray(self.buffer.auction_logp, dtype=np.float32)).to(self.device)
+        old_sec_lp = torch.from_numpy(
+            np.asarray(self.buffer.secondary_logp, dtype=np.float32)).to(self.device)
 
         # Phase mask: True = auction transition (obs1-space), False = secondary (obs2-space).
         # Auction policy is trained only on auction rows; secondary only on secondary rows.
-        is_auction = torch.BoolTensor(
-            [p == 'auction' for p in self.buffer.phases]).to(self.device)
+        is_auction = torch.tensor(
+            [p == 'auction' for p in self.buffer.phases],
+            dtype=torch.bool, device=self.device)
 
-        rewards = np.array(self.buffer.rewards, dtype=np.float32)
-        dones = np.array(self.buffer.dones, dtype=np.float32)
-        values = np.array(self.buffer.values, dtype=np.float32)
-
-        rewards = np.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
-        dones = np.nan_to_num(dones, nan=1.0, posinf=1.0, neginf=1.0)
-        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        rewards = np.nan_to_num(np.asarray(self.buffer.rewards, dtype=np.float32),
+                                nan=0.0, posinf=0.0, neginf=0.0)
+        dones = np.nan_to_num(np.asarray(self.buffer.dones, dtype=np.float32),
+                              nan=1.0, posinf=1.0, neginf=1.0)
+        values = np.nan_to_num(np.asarray(self.buffer.values, dtype=np.float32),
+                               nan=0.0, posinf=0.0, neginf=0.0)
 
         T = len(rewards)
         advantages = np.zeros(T, dtype=np.float32)
@@ -609,24 +639,24 @@ class PPOAgent:
         advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
         returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
 
-        adv_t = torch.FloatTensor(advantages).to(self.device).unsqueeze(1)
-        ret_t = torch.FloatTensor(returns).to(self.device).unsqueeze(1)
+        adv_t = torch.from_numpy(advantages).to(self.device).unsqueeze(1)
+        ret_t = torch.from_numpy(returns).to(self.device).unsqueeze(1)
 
         # Return normalization
         if self.normalize_returns and T > 1:
             ret_mean = ret_t.mean()
             ret_std = ret_t.std()
-            if ret_std > 1e-8:
-                ret_t = (ret_t - ret_mean) / (ret_std + 1e-8)
+            if ret_std > self.gae_min_std:
+                ret_t = (ret_t - ret_mean) / torch.clamp(ret_std, min=self.gae_min_std)
 
         if self.normalize_advantages and T > 1:
-            adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+            adv_t = (adv_t - adv_t.mean()) / torch.clamp(adv_t.std(), min=self.gae_min_std)
 
         adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Convert old values to tensor for value clipping
-        old_values_t = torch.FloatTensor(values).to(self.device).unsqueeze(1) if self.clip_value else None
+        old_values_t = torch.from_numpy(values).to(self.device).unsqueeze(1) if self.clip_value else None
 
         # Critic extra epochs: warm up critic before main PPO loop
         if self.critic_extra_epochs > 0:
@@ -693,8 +723,10 @@ class PPOAgent:
                     if is_auc_mb.any():
                         auc_lp_new, auc_ent = self.auction_policy.evaluate(
                             obs1[mb][is_auc_mb], auc_raw[mb][is_auc_mb])
+                        # Wide clamp: NaN/Inf guard only. The PPO clipped surrogate
+                        # below is responsible for the trust-region constraint.
                         auc_log_ratio = torch.clamp(
-                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -2.0, 2.0)
+                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -20.0, 20.0)
                         auc_ratio = torch.exp(auc_log_ratio)
                         auc_adv = adv_t[mb][is_auc_mb]
                         auc_surr1 = auc_ratio * auc_adv
@@ -707,7 +739,7 @@ class PPOAgent:
                         sec_lp_new, sec_ent = self.secondary_policy.evaluate(
                             obs2[mb][sec_mb], sec_raw[mb][sec_mb])
                         sec_log_ratio = torch.clamp(
-                            sec_lp_new - old_sec_lp[mb][sec_mb], -2.0, 2.0)
+                            sec_lp_new - old_sec_lp[mb][sec_mb], -20.0, 20.0)
                         sec_ratio = torch.exp(sec_log_ratio)
                         sec_adv = adv_t[mb][sec_mb]
                         sec_surr1 = sec_ratio * sec_adv
@@ -835,54 +867,55 @@ class PPOAgent:
         if len(self.buffer) < 2:
             return None, None, None
 
-        obs1_np = np.nan_to_num(np.array(self.buffer.obs1), nan=0.0, posinf=1e6, neginf=-1e6)
-        obs2_np = np.nan_to_num(np.array(self.buffer.obs2), nan=0.0, posinf=1e6, neginf=-1e6)
-
-        obs1 = torch.FloatTensor(obs1_np).to(self.device)
-        obs2 = torch.FloatTensor(obs2_np).to(self.device)
+        obs1 = torch.nan_to_num(
+            torch.from_numpy(np.asarray(self.buffer.obs1, dtype=np.float32)).to(self.device),
+            nan=0.0, posinf=1e6, neginf=-1e6)
+        obs2 = torch.nan_to_num(
+            torch.from_numpy(np.asarray(self.buffer.obs2, dtype=np.float32)).to(self.device),
+            nan=0.0, posinf=1e6, neginf=-1e6)
 
         if self.centralized_critic and len(self.buffer.global_states) > 0:
-            critic_input = torch.FloatTensor(
-                np.array(self.buffer.global_states)).to(self.device)
+            critic_input = torch.from_numpy(
+                np.asarray(self.buffer.global_states, dtype=np.float32)).to(self.device)
         else:
             critic_input = obs2
 
-        auc_raw = torch.FloatTensor(np.array(self.buffer.auction_raw)).to(self.device)
-        sec_raw = torch.FloatTensor(np.array(self.buffer.secondary_raw)).to(self.device)
-        old_auc_lp = torch.FloatTensor(np.array(self.buffer.auction_logp)).to(self.device)
-        old_sec_lp = torch.FloatTensor(np.array(self.buffer.secondary_logp)).to(self.device)
+        auc_raw = torch.from_numpy(
+            np.asarray(self.buffer.auction_raw, dtype=np.float32)).to(self.device)
+        sec_raw = torch.from_numpy(
+            np.asarray(self.buffer.secondary_raw, dtype=np.float32)).to(self.device)
+        old_auc_lp = torch.from_numpy(
+            np.asarray(self.buffer.auction_logp, dtype=np.float32)).to(self.device)
+        old_sec_lp = torch.from_numpy(
+            np.asarray(self.buffer.secondary_logp, dtype=np.float32)).to(self.device)
 
         # Phase mask: True = auction transition (obs1-space), False = secondary (obs2-space).
         # Exposed in buf_tensors so update_happo() can apply each policy loss to the
         # correct rows without cross-contaminating obs dimensions.
-        is_auction_t = torch.BoolTensor(
-            [p == 'auction' for p in self.buffer.phases]).to(self.device)
+        is_auction_t = torch.tensor(
+            [p == 'auction' for p in self.buffer.phases],
+            dtype=torch.bool, device=self.device)
 
-        rewards = np.nan_to_num(np.array(self.buffer.rewards, dtype=np.float32),
+        rewards = np.nan_to_num(np.asarray(self.buffer.rewards, dtype=np.float32),
                                 nan=0.0, posinf=0.0, neginf=0.0)
-        dones = np.nan_to_num(np.array(self.buffer.dones, dtype=np.float32),
+        dones = np.nan_to_num(np.asarray(self.buffer.dones, dtype=np.float32),
                               nan=1.0, posinf=1.0, neginf=1.0)
-        values = np.nan_to_num(np.array(self.buffer.values, dtype=np.float32),
+        values = np.nan_to_num(np.asarray(self.buffer.values, dtype=np.float32),
                                nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Phase-aware reward normalization for GAE computation.
-        # Auction and secondary rewards have different distributions; normalizing
-        # each phase separately preserves learning signal in both heads.
-        phase_is_auction = np.array([p == 'auction' for p in self.buffer.phases], dtype=bool)
-        phase_is_secondary = ~phase_is_auction
-        _EPS_STD = self.gae_min_std
-
-        if phase_is_auction.any():
-            auc_rewards = rewards[phase_is_auction]
-            auc_mu = auc_rewards.mean()
-            auc_std = max(auc_rewards.std(), _EPS_STD)
-            rewards[phase_is_auction] = np.clip((auc_rewards - auc_mu) / auc_std, -10.0, 10.0)
-
-        if phase_is_secondary.any():
-            sec_rewards = rewards[phase_is_secondary]
-            sec_mu = sec_rewards.mean()
-            sec_std = max(sec_rewards.std(), _EPS_STD)
-            rewards[phase_is_secondary] = np.clip((sec_rewards - sec_mu) / sec_std, -10.0, 10.0)
+        # Phase-aware CAUSAL reward normalization (audit fix 1.7).
+        # Walk forward in time; for each reward, use ONLY stats from prior
+        # timesteps (via the per-phase running RewardNormalizer EMAs that
+        # persist across episodes). This preserves the Markov assumption GAE
+        # relies on while still giving each phase its own scale.
+        phases_buf = self.buffer.phases
+        for t in range(len(rewards)):
+            r_raw = float(rewards[t])
+            if phases_buf[t] == 'auction':
+                r_norm = self._auc_reward_normalizer.update_and_normalize(r_raw)
+            else:
+                r_norm = self._sec_reward_normalizer.update_and_normalize(r_raw)
+            rewards[t] = float(np.clip(r_norm, -10.0, 10.0))
 
         # GAE
         T = len(rewards)
@@ -914,24 +947,24 @@ class PPOAgent:
             for yr in range(n_years_buf)
         ], dtype=np.float32)
 
-        adv_t = torch.FloatTensor(advantages).to(self.device).unsqueeze(1)
-        ret_t = torch.FloatTensor(returns).to(self.device).unsqueeze(1)
+        adv_t = torch.from_numpy(advantages).to(self.device).unsqueeze(1)
+        ret_t = torch.from_numpy(returns).to(self.device).unsqueeze(1)
 
         # Return normalization
         if self.normalize_returns and T > 1:
             ret_mean = ret_t.mean()
             ret_std = ret_t.std()
-            if ret_std > 1e-8:
-                ret_t = (ret_t - ret_mean) / (ret_std + 1e-8)
+            if ret_std > self.gae_min_std:
+                ret_t = (ret_t - ret_mean) / torch.clamp(ret_std, min=self.gae_min_std)
 
         if self.normalize_advantages and T > 1:
-            adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+            adv_t = (adv_t - adv_t.mean()) / torch.clamp(adv_t.std(), min=self.gae_min_std)
 
         adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Convert old values to tensor for value clipping
-        old_values_t = torch.FloatTensor(values).to(self.device).unsqueeze(1) if self.clip_value else None
+        old_values_t = torch.from_numpy(values).to(self.device).unsqueeze(1) if self.clip_value else None
 
         buf_tensors = {
             "obs1": obs1, "obs2": obs2, "critic_input": critic_input,
@@ -983,8 +1016,8 @@ class PPOAgent:
             weighted_adv = adv_t * advantage_weights.to(self.device)
             # HAPPO weighted-advantage re-normalization
             w_std = weighted_adv.std()
-            if w_std > 1e-6:
-                weighted_adv = (weighted_adv - weighted_adv.mean()) / (w_std + 1e-8)
+            if w_std > self.gae_min_std:
+                weighted_adv = (weighted_adv - weighted_adv.mean()) / torch.clamp(w_std, min=self.gae_min_std)
         else:
             weighted_adv = adv_t
 
@@ -1027,8 +1060,10 @@ class PPOAgent:
                     if is_auc_mb.any():
                         auc_lp_new, auc_ent = self.auction_policy.evaluate(
                             obs1[mb][is_auc_mb], auc_raw[mb][is_auc_mb])
+                        # Wide clamp: NaN/Inf guard only. The PPO clipped surrogate
+                        # below is responsible for the trust-region constraint.
                         auc_log_ratio = torch.clamp(
-                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -2.0, 2.0)
+                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -20.0, 20.0)
                         auc_ratio = torch.exp(auc_log_ratio)
                         auc_adv = weighted_adv[mb][is_auc_mb]
                         auc_surr1 = auc_ratio * auc_adv
@@ -1041,7 +1076,7 @@ class PPOAgent:
                         sec_lp_new, sec_ent = self.secondary_policy.evaluate(
                             obs2[mb][sec_mb], sec_raw[mb][sec_mb])
                         sec_log_ratio = torch.clamp(
-                            sec_lp_new - old_sec_lp[mb][sec_mb], -2.0, 2.0)
+                            sec_lp_new - old_sec_lp[mb][sec_mb], -20.0, 20.0)
                         sec_ratio = torch.exp(sec_log_ratio)
                         sec_adv = weighted_adv[mb][sec_mb]
                         sec_surr1 = sec_ratio * sec_adv

@@ -18,7 +18,7 @@ This document describes the **ETS MARL** simulation: a stylised multi-agent rein
 
 ## 1. Scope and Purpose
 
-This document describes the active architecture in `ets_marl_happo_current`.
+This document describes the active architecture of the simulation in this repository.
 
 The model is a stylized EU ETS micro-market with configurable participants:
 - 8 learning agents (PPO with HAPPO-style sequential updates)
@@ -48,6 +48,12 @@ All winners pay the same clearing price (the marginal accepted bid).
   exceeds `max_collateral_budget_share × remaining_budget`.
 - The collateral clip is for training stability during exploration (not an economic mechanism);
   non-zero clip events indicate heuristic/environment mismatch.
+- A **bid change limit (PCL)** caps year-over-year price moves at `auction.bid_change_limit.value`
+  EUR/t (year 0 always unconstrained). The PCL reference is
+  `max(price_ma3, fundamental_anchor(year))` so it does not drift below the equilibrium price
+  in low-price regimes. PCL clip signals are exposed as observation dimensions for gradient feedback.
+- A soft budget price clip clamps a bid to ~1.5× the agent's max affordable price (kept as a
+  separate observation dimension so the policy can still see when it was clipped).
 - If enabled, under-subscription can cancel the auction; default behavior is to clear partial demand.
 - Unsold volume is configurable: rolled into next year's auction supply (default) or absorbed into the MSR reserve.
 
@@ -61,7 +67,7 @@ $$
 cap_{0} = E_{system} \cdot (1 + overhead)
 $$
 
-where $E_{system}$ is the sum of initial emissions across all active participants. A manual override (`cap_year_0_override`) is supported for controlled experiments. The default `cap_overhead_pct: 0.02` (+2%) creates a small initial supply surplus that compounds into meaningful scarcity by mid-episode via the LRF.
+where $E_{system}$ is the sum of initial emissions across all active participants. A manual override (`cap_year_0_override`) is supported for controlled experiments. The default `cap_overhead_pct: 0.10` (+10%) reflects the real 2026 EU ETS overhead (~15%), slightly conservative for the micro-ETS scale; combined with the LRF schedule it produces growing scarcity from mid-episode onward.
 
 Annual cap follows a linear LRF schedule:
 
@@ -84,8 +90,10 @@ Three-band withholding based on legislative TNAC proportions from Decision (EU) 
 - If lower threshold ≤ TNAC < mid threshold: no TNAC-triggered intake.
 - If TNAC < lower threshold: release fixed volume from reserve.
 - Threshold scaling preserves lower:mid:upper = 400:833:1096 when mapped to simulation scale
-  (`tnac_upper_ratio=0.36`, `tnac_mid_ratio=0.2737`, `tnac_lower_ratio=0.1314` of CAP_0).
-- Release fraction = 6.4% of CAP_0 per year.
+  (default `tnac_upper_ratio=0.68`; `tnac_mid_ratio` and `tnac_lower_ratio` default to `null`
+  and are derived from the upper ratio so the legislative proportions are preserved at any
+  simulation scale).
+- Release fraction is a configurable fraction of CAP_0 per year (default ≈6.4%).
 
 **1-year TNAC lag:** MSR uses *prior-year* TNAC (`_prev_tnac`), not the current year's holdings. This follows Decision (EU) 2015/1814 Art. 1(5), with intake regime updates from Decision (EU) 2023/852. Year 0 has no MSR intervention unless `force_msr=True` (burn-in mode).
 
@@ -213,9 +221,22 @@ where `revenue` comes from `Company.compute_revenue()` (electricity sales with c
 When agents face auction default, an emergency loan is issued instead of immediate suspension:
 
 - **Trigger**: Shortfall at auction settlement exceeds remaining budget but falls within `max_loan_fraction × annual_budget` (15%).
-- **Mechanics**: `apply_emergency_loan(shortfall)` adds the shortfall plus accrued interest (`loan_interest_rate=8%`) to `_loan_outstanding`. Annual repayment is deducted at year start via `apply_loan_repayment()`.
+- **Mechanics**: `apply_emergency_loan(shortfall)` adds the shortfall plus accrued interest (`loan_interest_rate=8%`) plus a leverage premium that scales with the loan-to-budget fraction. Annual repayment is deducted at year start via `apply_loan_repayment()` over `repayment_years`.
+- **Capex squeeze**: While a loan is outstanding the effective capex throughput is squeezed to `capex_squeeze_floor × throughput`, modelling lender restrictions on discretionary investment.
+- **Origination sting**: An immediate one-time reward penalty (`origination_sting_coef × annual_budget`) discourages strategic loan-cycling.
 - **Tracking**: `_loan_outstanding`, `_loan_repayment_annual`, `_years_under_loan` are maintained on the `Company` object and exposed in observations (see §6).
 - **Heuristic loan-awareness**: Bots with outstanding loans reduce auction quantity (−30%), investment (−50%), and secondary buy volume (−40%).
+
+### 4.9 Corporate treasury reserve
+
+When `budget.treasury_reserve.enabled=true`, a fraction of each year's positive operating
+surplus is retained as a corporate treasury buffer:
+
+- **Retention**: `retention_fraction` (default 0.60) of `revenue − operating_costs` is added to `_treasury_reserve` each year.
+- **Cap and decay**: Treasury is capped at `cap_multiple × annual_budget` (default 1.5×) and decays at `decay_rate` per year (default 5%) to model idle cash erosion.
+- **Drawdown**: The treasury can be drawn down to cover compliance/investment shocks before triggering an emergency loan.
+- **Terminal value**: At episode end the remaining treasury is valued at `terminal_value_rate` (default 0.30) and added to reward (see §7).
+- **Observation**: `treasury_norm = treasury_reserve / annual_budget` (clipped [0,1]) is exposed in Phase 1 obs.
 
 ## 5. Two-Phase Yearly Decision Process
 
@@ -246,7 +267,7 @@ Participants can sell from current allocation plus bank (no short selling beyond
 
 ### 6.1 Phase 1 observation
 
-Base dimension: **36**.
+Base dimension: **43**.
 
 Includes:
 - time and cap
@@ -257,20 +278,17 @@ Includes:
 - TNAC proxy
 - effective reserve signal
 - secondary volume and profit signal
-- `[27]` budget headroom (1 – budget_spent / annual_budget)
-- `[28]` safety/collateral dims
-- `[29]` collateral load last
-- `[30]` bid_affordability_last: last year's bid total / remaining budget (clipped [0,1])
-- `[31]` loan_outstanding_norm: emergency loan / annual_budget
-- `[32]` years_under_loan_norm: years under active loan / 5
-- `[33]` last_cover_ratio
-- `[34]` own_last_secondary_buy_price (WTP anchor)
-- `[35]` treasury_norm: treasury_reserve / annual_budget (clipped [0,1])
+- budget headroom (`1 − budget_spent / annual_budget`)
+- safety / collateral dims (collateral load last, bid affordability last)
+- emergency-loan state (loan outstanding norm, years under loan norm, last cover ratio, treasury norm)
+- own last secondary buy price (WTP anchor)
+- bid-change-limit / soft-clip dims: PCL headroom, bid-price clip signal, soft-budget price clip
+  signal, qty clip ratio, invest clip ratio (year 0 always unconstrained)
 
 With opponent modeling enabled:
 
 $$
-obsDimPhase1 = 36 + 7 (N_{total} - 1)
+obsDimPhase1 = 43 + 7 (N_{total} - 1)
 $$
 
 Each opponent contributes a **7D lagged tuple** (year t−1 snapshot, read from `_opponent_snapshots_prev`):
@@ -293,11 +311,11 @@ End of year t step_secondary() saves prev, then writes new current snapshot.
 Year t+1 Phase 1 obs reads updated _opponent_snapshots_prev (year t).
 ```
 
-Default (`N_total=8`): phase 1 dimension = `36 + 7 × 7 = 85`.
+Default (`N_total=8`): phase 1 dimension = `43 + 7 × 7 = 92`.
 
 ### 6.2 Phase 2 observation
 
-Phase 2 appends **11** auction-result and compliance-awareness features to phase 1:
+Phase 2 appends **12** auction-result, compliance-awareness, and clip features to phase 1:
 - allocation
 - clearing price
 - net compliance position
@@ -309,12 +327,13 @@ Phase 2 appends **11** auction-result and compliance-awareness features to phase
 - budget_remaining_phase2_norm: remaining annual budget after auction / annual_budget
 - compliance_liability_norm: (emissions + carry_forward − bank − allocation) / annual_budget
 - compliance_gap_norm: signed (realized_emissions − surrendered) / annual_need (clipped [−1,1])
+- last_sec_qty_clip_ratio: secondary-market quantity clip signal (clipped [−1,1])
 
 $$
-obsDimPhase2 = obsDimPhase1 + 11
+obsDimPhase2 = obsDimPhase1 + 12
 $$
 
-Default (`N_total=8`): phase 2 dimension = `85 + 11 = 96`.
+Default (`N_total=8`): phase 2 dimension = `92 + 12 = 104`.
 
 ## 7. Reward Design
 
@@ -364,7 +383,11 @@ $$
 where:
 - `ef_ratio = (ef_0 - ef_t) / ef_0` is cumulative emission-factor improvement.
 - `speed_bonus = speed_coef × max(0, green_frac − prev_green_frac)` rewards current-year greening (default `speed_coef=0.5`).
-- `compliance_gate = coverage_frac` — linear gate: non-compliant agents receive a proportionally suppressed ESG bonus. The quadratic form used in v8.1.x was dropped because squaring eliminated the ESG signal under scarcity in final years, exactly when it matters most.
+- `compliance_gate` is a smooth blend that approaches linear `coverage_frac` above
+  `compliance_gate_blend_threshold` and softens below — non-compliant agents receive a
+  proportionally suppressed ESG bonus without a hard cliff under late-year scarcity.
+  The earlier strict-quadratic gate was dropped because squaring eliminated the ESG
+  signal under scarcity in final years, exactly when it matters most.
 - `esg_anchor_ratio` is retained in `_last_reward_channels` as `1.0` for backward log compatibility but no longer multiplied into `esg_raw`.
 - There is **no** `time_ratio` decay; ESG improvement is equally valuable in early and late years.
 - `esg_signal = esg_raw × compliance_gate` (before applying `w_green`).
@@ -384,17 +407,21 @@ where $r_i = B_i / \max(\hat{E}_i, 0.1)$, $B_i$ is banked allowances, $\hat{E}_i
 
 - Queue terminal value (discounted future emissions savings from queued projects) with a completion-fraction discount to prevent end-of-episode gaming of long-lead projects. A smooth `remaining_scale = min(1.0, effective_remaining / 2.0)` factor tapers credit for projects with less than two payoff years remaining rather than applying a hard cutoff.
 
+- Treasury terminal value (`reward.treasury_terminal_value=true`): the corporate treasury reserve held at episode end is valued at `treasury_reserve.terminal_value_rate`, so retained surplus is not silently discarded and the agent has an incentive to manage operating margin in addition to compliance cost.
+
 Terminal price anchor uses `max(auction_clearing, secondary_clearing, 80% of inflation-adjusted penalty rate)`.
 
 ### 7.2 Shaping channels
 
-Two shaping channels are active during training; both decay toward zero so the equilibrium reward is pure:
+Three shaping channels are active during training; all decay toward zero so the equilibrium reward is pure:
 
 **Opportunity cost shaping** (`opportunity_cost_shaping.enabled=true`, `scale=1.0`): Rewards agents in proportion to the cost premium paid on secondary market purchases relative to the auction price. This creates an early-training incentive to win enough allowances at auction rather than overpaying on the secondary market.
 
 **Coverage gap shaping** (`coverage_gap_shaping.enabled=true`, `scale=0.5`): Provides an immediate negative signal when an agent's auction allocation falls short of its compliance need. This bootstraps compliance-seeking behavior before the agent has accumulated enough penalty experiences to learn from them.
 
-Both shaping terms decay with the `shaping_weight` schedule (auto: 40% of n_episodes, floor=0.0).
+**Banking signal** (`reward.banking_signal.enabled=true`): Imputes a cost basis on bank drawdowns at the clearing price (eliminating the zero-bid free-compliance exploit) and adds an explicit timing P&L term `(clearing_price − cost_basis) × drawdown` to reward agents for buying cheap and surrendering expensive. Imputed compliance cost is capped at `imputed_cap_factor × compliance_denom` to prevent scale blowup.
+
+The two compliance-shaping terms decay with the `shaping_weight` schedule (`reward.shaping_decay_frac` of `n_episodes`, floor=0.0); the banking signal is a permanent reward channel.
 
 ### 7.3 Diagnostic Scores
 
@@ -445,7 +472,7 @@ This avoids cold-start artifacts where agents begin with zero banks and empty qu
 
 **Private urgency scalars** (`urgency_scalars.enabled=true`): Each agent draws a per-episode LogNormal(0, σ=0.30) multiplier applied to its effective penalty rate. This creates private heterogeneous compliance pressure — two agents with identical holdings face different effective penalties in the same year. Scalars are re-drawn each episode, destroying the symmetric cost structure that sustains floor-bidding equilibria.
 
-**Epsilon-greedy exploration** (`mode="uniform"`): With probability ε (decaying from 0.25 to 0.05 over 75% of training), bid prices are sampled from Uniform([price_min, price_max]) rather than from the policy distribution. This prevents early lock-in to floor prices by ensuring exploration covers the full price range.
+**Epsilon-greedy exploration** (`exploration.mode`): With probability ε (decaying from 0.25 to 0.02 over a configurable fraction of training), bid prices are sampled from an exploration distribution rather than from the policy distribution. The default `"anchored"` mode draws from a Gaussian centered on the agent's WTP anchor (~MAC + 0.5×(penalty − MAC)); the `"uniform"` mode samples side-balanced 50/50 below/above the WTP anchor and is retained for ablation. Either way, exploration is anchored to economically meaningful prices rather than the raw `[price_min, price_max]` range.
 
 **Historical Policy Pool (HPP):** Anti-regression mechanism maintaining a pool of 10 past actor snapshots. Each episode, each agent is independently swapped to a historical snapshot with probability 0.20. This ensures agents always face a diverse opponent distribution, preventing coordination on degenerate equilibria. `seed_heuristic=false` — BC-seeding of the pool is disabled since behavioral cloning pretraining is off by default.
 
@@ -503,9 +530,25 @@ Several mechanisms work together to prevent degenerate floor-bidding equilibria,
 | Mechanism | What it does | Config |
 |---|---|---|
 | **Private Urgency Scalars** | Per-episode LogNormal(0, 0.30) penalty multiplier per agent; destroys symmetric cost structure, making floor bids risky for some agents even when others can afford them | `urgency_scalars.enabled: true` |
-| **ESG Compliance Gate** | `esg_signal × coverage_frac` (linear) — non-compliant agents receive a proportionally reduced ESG bonus, coupling compliance to the ESG reward stream for balanced agents. The earlier quadratic form (`coverage_frac^(2×gate_activation)`) was removed because squaring eliminated the ESG signal under scarcity in late years. `esg_anchor_ratio` is retained in diagnostic logs as `1.0` but no longer multiplied into `esg_raw`. | `esg.enabled: true` |
-| **Epsilon-greedy Uniform Exploration** | Early-training price bids sampled from Uniform([price_min, price_max]); seeds diverse price history in MA3 and HPP pool | `exploration.mode: "uniform"` |
+| **ESG Compliance Gate** | `esg_signal × compliance_gate(coverage_frac)` — a smooth blend that approaches linear `coverage_frac` above `compliance_gate_blend_threshold` and softens below, so non-compliant agents receive a proportionally reduced ESG bonus without a hard cliff under scarcity. `esg_anchor_ratio` is retained in diagnostic logs as `1.0` but no longer multiplied into `esg_raw`. | `esg.enabled: true` |
+| **Anchored Exploration** | Early-training price bids sampled from a Gaussian (or side-balanced uniform) around the WTP anchor; seeds diverse but economically grounded price history in MA3 and HPP pool | `exploration.mode: "anchored"` |
 | **Historical Policy Pool (HPP)** | Periodic snapshots of past policies; random opponent swap each episode maintains diverse bidding history as opponents | `hpp.enabled: true` |
 | **Coverage Gap Shaping** | Immediate reward signal for compliance shortfall in early training; decays to zero at equilibrium | `coverage_gap_shaping.enabled: true` |
 
 These mechanisms are complementary: urgency scalars break symmetric compliance costs, the ESG gate creates compliance-reward coupling for balanced agents, and exploration plus HPP seed diverse price histories that the MA3 anchor preserves.
+
+## 12. Preflight Validation
+
+Before any training run, ``train.py`` calls ``src.utils.preflight.run_preflight_checks(config)``.
+This catches common configuration mistakes before any expensive setup happens — mismatched
+array lengths between ``n_agents`` and ``initial_mix`` / ``reward_weights`` /
+``annual_budgets``, mix vectors that don't sum to 1, off-by-one bot counts in budget arrays,
+inverted auction price bounds, MSR thresholds out of order, ``penalty.rate`` set below
+``mac.coal_to_gas_cost`` (which would make non-compliance cheaper than abatement), and
+retired flags such as ``tabula_rasa.enabled=true``.
+
+All issues are reported in a single ``PreflightError`` so a misconfigured training run can be
+fixed in one round-trip rather than one error at a time. The same checks are exercised by
+``tests/test_preflight.py`` against ``configs/default.yaml`` and ``configs/smoke_100.yaml``,
+so config drift is caught as part of the regular test suite.
+

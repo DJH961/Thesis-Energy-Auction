@@ -5,6 +5,133 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.4.2]
+
+Bug-fix release addressing defects identified in the under-bidding analysis
+(`docs/BUGS_AND_ISSUES.md`, sections 1–6).
+
+### PPO numerics (`src/agents/ppo_agent.py`)
+- **1.5** Advantage / return / HAPPO weighted-advantage normalization now uses
+  `torch.clamp(std, min=gae_min_std)` instead of `+ 1e-8` (the configured floor was
+  previously unused).
+- **1.6** Widened `log_ratio` pre-clamp from `[-2, 2]` to `[-20, 20]` so the PPO
+  clipped surrogate `clamp(ratio, 1±ε)` is solely responsible for the trust region.
+- **1.7** Phase-aware reward normalization in `compute_gae()` is now causal: two
+  per-phase running EMA `RewardNormalizer`s walk the trajectory in temporal order.
+- **1.16** `normalize_returns` code default aligned with YAML (`True` → `False`).
+- **6.7** Parenthesized `default_rng(seed if … else 0 + agent_id)` for readability.
+
+### Training loop (`scripts/train.py`)
+- **1.8** Removed the discarded `RewardNormalizer.normalize_reward()` call (1.7
+  makes it redundant).
+- **1.9** Seed Python `random` alongside `numpy` / `torch` in `train_one_seed`.
+- **1.10** Cosine LR decay moved out of the `is_update_episode` gate so it advances
+  every episode.
+- **2.9** Skip `agent_perf_ema` update for HPP-swapped agents (their rollout came
+  from a historical policy).
+
+### Cap schedule (`src/environment/cap_schedule.py`, `ets_environment.py`)
+- **2.5** Unified MSR effective-penalty calculation behind `_effective_penalty()`.
+  New optional `inflation_factor` parameter takes precedence over `(1+rate)**year`
+  compounding so MSR thresholds are correct under
+  `penalty.inflation_random_std` / `inflation_random_window`.
+
+### Environment (`src/environment/ets_environment.py`)
+- **3.10** One-shot warning when `auction.carry_forward_defaults=false` silently
+  drops defaulted volume from supply.
+
+### Config alignment
+- **1.11 / 3.9** Added `ets.reserve_discount`, `ets.reserve_initial`, and
+  `price.initial_expected` to `configs/default.yaml` with documented defaults.
+- **2.18** Corrected `+12%`→`+10%` cap-overhead comment.
+- **1.13** Stronger inline warning on bot-array length vs `n_bot_agents`.
+- **1.12** Synced every non-`tabula_rasa` key from `default.yaml` into
+  `configs/smoke_100.yaml` (treasury_reserve, banking_signal, opponent_obs, plus
+  PPO schedule keys).
+- **1.14 / 1.15 / 2.19 / 3.1 / 3.2 / 3.4 / 3.7** Re-aligned smoke with default for
+  `phantom_bidder.enabled`, `exploration.mode`, `ets.initial_bank_fraction`,
+  `auction.bid_change_limit.value`, `auction.suspension_length`,
+  `auction.budget_price_clip`, `budget.dynamic_budget_ceiling_multiplier`,
+  `ppo.critic_compliance_features`.
+
+### Tests (`tests/`)
+- **5.5 / 5.6 / 5.7** Tightened three assertions: under-subscribed
+  `alloc.sum() == 1.0`; invest action `executed ≤ requested`; `_make_env` default
+  `bcl_value` 50→75 to match production.
+
+### Confirmed false positives (no change)
+- **1.1 / 1.2** `settle_compliance_realized()` does not modify holdings; the env's
+  `holdings - total_obligation` is the single surrender step. CF growth is linear.
+- **1.3** `settle_auction()` zeros defaulter allocations, so
+  `auction_volume - allocations.sum() - defaulted` is correctly mutually exclusive
+  with `_defaulted_volume_pending`.
+- **1.4** `mac_cost` is in EUR/tCO2 (per its comparison to `carbon_price`); units
+  `MtCO2 × EUR/tCO2 = M€` ✓.
+
+---
+
+### Fixed — `gap_penalty` denominator mismatch (auction-phase reward)
+
+`compute_auction_rewards()` divided `gap_penalty` by `budget_real` while `compliance_norm`
+was divided by `compliance_denom (= anchor_real × need)`. With `budget_real ≈ 10 ×
+compliance_denom`, a missed Mt saved ~1.0 of `compliance_norm` but cost only ~0.2 of
+`gap_penalty` — an explicit gradient toward leaving coverage gaps.
+
+**Fix:** `gap_penalty` now uses `compliance_denom`, matching `compliance_norm`. Because the
+numerator still uses `penalty_rate` (≈ 138.75) and the implicit per-Mt buy cost is
+`anchor_real` (≈ 67), a missed Mt is now strictly more expensive than buying it.
+
+**Files changed:** `src/environment/ets_environment.py` (`compute_auction_rewards()`).
+
+### Fixed — Soft 10% budget gate (Phase-1 cash-coverage check)
+
+`step_auction()` zeroed `bid_q` whenever cash < 10% × `bid_p` × `bid_q`. The hard zero
+created a gradient discontinuity, and the resulting `bid_qty_clip_ratio` observation
+(dim [41]) fed the truncation back to the policy, which converged on whatever fit under
+the cliff.
+
+**Fix:** The gate now scales `bid_q` down to `cash / (bid_p × 0.10)` instead of zeroing
+it. The agent still respects the cash constraint but retains a smooth gradient.
+
+**Files changed:** `src/environment/ets_environment.py` (`step_auction()` budget gate
+block), `tests/test_environment.py` (`test_budget_gate_scales_qty_for_cash_poor_agents`,
+renamed and updated for soft-scale semantics).
+
+### Fixed — `coverage_frac_auction` only gates savings, not costs
+
+`_compute_rewards()` set `financial_reward = coverage_frac_auction × w_cost ×
+(-cost_norm_centered)`. The multiplicative gate was symmetric: it scaled both the
+positive savings branch (when `cost_norm_centered < 0`) and the negative cost branch
+(when `cost_norm_centered > 0`). The asymmetry that emerged in expectation —
+"skip the auction" → reward 0 vs. "win at clearing ≥ anchor" → reward < 0 — incentivised
+under-bidding.
+
+**Fix:** the gate is now applied **only** when `cost_norm_centered < 0` (agent under-spent
+relative to expected cost). On the cost branch, `financial_reward = w_cost ×
+(-cost_norm_centered)` is unscaled, so over-buying is no longer subsidised by partial
+coverage. (No additive penalty added — per design directive.)
+
+**Files changed:** `src/environment/ets_environment.py` (`_compute_rewards()` financial-
+reward block).
+
+### Changed — `banking_signal.imputed_cap_factor` raised 2.0 → 5.0
+
+With `imputed_cap_factor = 2.0` and `compliance_denom = anchor × need`, the imputed
+bank-drawdown norm saturated whenever `clearing_price > 2 × anchor` (≈ 134 EUR at
+year 0). Above that threshold, drawing from the bank cost less in reward terms than
+buying the same Mt at clearing — inverting the buy-vs-draw incentive in price spikes
+and biasing policies toward larger banks and smaller auction bids.
+
+**Fix:** raise the cap to `5.0 × compliance_denom`. The cap now binds only above
+~5 × anchor (≈ 335 EUR), well into emergency price-containment territory, so the
+imputed cost tracks clearing price linearly across the realistic auction range.
+The `min(...)` clamp is retained to bound reward in pathological spikes, which is
+already further bounded by the standard reward clip.
+
+**Files changed:** `configs/default.yaml` (`reward.banking_signal.imputed_cap_factor`).
+
+---
+
 ## [8.4.1]
 
 ### Changed — PCL reference floored at fundamental anchor

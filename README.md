@@ -21,7 +21,7 @@ An optional heuristic bot layer (8 fixed-policy agents, `smoke_100.yaml`) is ava
 
 Each "episode" simulates **12 years** of a carbon market. Every year:
 
-1. The government sets a **cap** — the total CO2 allowed. This cap **shrinks each year** (by about 4.3-4.4%) to push companies toward cleaner energy. The cap starts at ~2% above total initial emissions (`cap_overhead_pct: 0.02`), creating a modest supply shortfall that grows as the cap declines.
+1. The government sets a **cap** — the total CO2 allowed. This cap **shrinks each year** (by about 4.3-4.4%) to push companies toward cleaner energy. The cap starts above total initial emissions by `ets.cap_overhead_pct` (default 0.10), and the actual year-0 cap is calibrated dynamically from the active participants' emissions unless `ets.cap_year_0_override` is set.
 2. Companies participate in an **auction** where they bid for emission allowances (each allowance = right to emit 1 tonne of CO2).
 3. The auction uses a **uniform price** — everyone pays the same price, which is the lowest winning bid. This is how the real EU ETS works.
 4. Companies that don't have enough allowances to cover their emissions face a **penalty** (base **€138.75/t in 2026**, indexed from €132.06 in 2024; plus carry-forward obligations).
@@ -29,9 +29,9 @@ Each "episode" simulates **12 years** of a carbon market. Every year:
 6. A **Market Stability Reserve (MSR)** automatically adjusts the auction supply based on the total number of allowances in circulation (TNAC). The MSR implements the EU ETS post-2023 reform including:
    - **1-year TNAC lag**: MSR uses the *prior year's* TNAC, matching EU ETS Decision 2015/1814 (Art. 1(5)). Year 0 has no MSR intervention.
    - **Three-band withholding**: Uses legislative TNAC proportions lower:mid:upper = 400:833:1096. Above upper: withhold 24% of total TNAC. Between mid and upper: withhold TNAC − mid. Below mid: no intake.
-   - **Updated thresholds**: `tnac_lower_ratio` corrected to 0.1314, `tnac_mid_ratio` 0.2737, `tnac_upper_ratio` 0.36 (anchor).
+   - **Threshold derivation**: `tnac_upper_ratio` is set in config; `tnac_mid_ratio` and `tnac_lower_ratio` default to `null` and are derived from `tnac_upper_ratio` so the legislative 400:833:1096 proportions are preserved at any simulation scale.
    - **Cancellation mechanism**: MSR holdings exceeding the previous year's auction volume are permanently cancelled.
-   - **Smoothed price trigger**: Emergency release requires both an absolute threshold breach (≥ 85% of penalty / 300 EUR/t) *and* a MA3 price spike > 2.5× prior year's MA3.
+   - **Smoothed price trigger**: Emergency release requires both an absolute threshold breach *and* a MA3 price spike > 2.5× the prior year's MA3 (disabled by default in `default.yaml`).
 
 ### Terminal Value Rewards
 
@@ -44,7 +44,7 @@ Both can be independently enabled/disabled via config flags (`reward.terminal_ba
 
 ### The Companies (Agents)
 
-The default `v8.0` profile uses **8 learning agents** (PPO/HAPPO) and **no heuristic bots** (`n_bot_agents: 0`). The smoke/ablation config (`smoke_100.yaml`) includes 8 additional heuristic bot agents for validation.
+The default profile uses **8 learning agents** (PPO/HAPPO) and **no heuristic bots** (`n_bot_agents: 0`). The smoke/ablation config (`smoke_100.yaml`) includes 8 additional heuristic bot agents for validation.
 
 **Learning Agents (A1-A8)** — organized into 4 archetypes (2 of each — one financially-motivated, one ESG-balanced):
 
@@ -90,49 +90,53 @@ The agents use **HAPPO (Heterogeneous-Agent PPO)**, a multi-agent reinforcement 
 
 - Each agent has a centralized critic that sees the global state, enabling coordinated learning
 - **Fundamental price anchor** (`src/utils/price_anchor.py`): Each episode, the auction policy price head is seeded to an economically grounded anchor (~67 EUR/t at yr0, rising to ~101 EUR/t by yr11) derived from MAC cost, cap scarcity, and penalty rate. This replaces behavioral cloning as the initialization mechanism.
-- **WTP-uniform exploration**: Epsilon-random auction prices sample 50/50 below/above the agent's willingness-to-pay anchor (~93 EUR/t), keeping exploration economically grounded rather than flat-uniform across the full price range.
-- **Epsilon-greedy exploration** decays from 25% to 5% over training, preventing policy collapse
+- **WTP-anchored exploration** (`exploration.mode: "anchored"`): Epsilon-random auction prices are sampled from a Gaussian centered on the agent's willingness-to-pay anchor (~MAC + 0.5×(penalty − MAC)), keeping exploration economically grounded rather than flat-uniform across the full price range. A `"uniform"` mode (side-balanced around the WTP anchor) is also available as an ablation.
+- **Epsilon-greedy exploration** decays from 25% to 2% over training, preventing policy collapse
 - **Historical Policy Pool** maintains past policy snapshots for opponent diversity
 - **Auto-scaled schedules**: warmup, exploration decay, and HPP timing scale automatically with `n_episodes`
 - Hidden burn-in warm-start initializes banks, MSR reserve, and price history before visible year 0
-- Behavioral cloning pretraining and KL-anchor regularization are **disabled by default** in v8 (config: `pretrain.enabled: false`, `ppo.kl_anchor_beta: 0.0`)
+- Behavioral cloning pretraining and KL-anchor regularization are **disabled by default** (config: `pretrain.enabled: false`, `ppo.kl_anchor_beta: 0.0`)
 - Over 100,000 episodes, agents converge on sophisticated market strategies
 
 The reward signal is a pure cost+ESG+penalty formulation — electricity revenue is **not** included in the reward gradient (it is logged separately but cannot be influenced by bidding strategy):
 
-`R = w_cost × (−cost_norm) + w_green × esg_signal − penalty_norm`
+`R = w_cost × (−cost_norm) + w_green × esg_signal − penalty_norm + shaping + terminal_values`
 
-- **cost_norm**: inflation-adjusted sum of compliance, capital, soft-budget, and loan costs, normalised by economic denominators
-- **ESG signal** — saved-carbon-years: `esg_scale × ef_ratio × compliance_gate`, where `compliance_gate = coverage_frac` (linear gate)
-- **penalty_norm**: non-compliance penalty normalised by `budget_real`
-- **Green investment shaping** — bonus for increasing green fraction (decays over training), scaled by `(0.2 + w_green)`
+- **cost_norm**: inflation-adjusted compliance + capital + soft-budget + loan costs, normalised by economic denominators (`anchor × need` for compliance, `annual_budget` for capital/soft buckets)
+- **Banking signal**: imputes a cost basis on bank drawdowns at the clearing price, eliminating the zero-bid free-compliance exploit and rewarding good intertemporal timing (`reward.banking_signal`)
+- **ESG signal** — saved-carbon-years: `esg_scale × (ef_ratio + speed_coef × Δgreen) × compliance_gate` (compliance gate is a smooth blend that approaches linear above the threshold and softer below)
+- **penalty_norm**: non-compliance penalty normalised by `budget_real`, including a prospective scarcity-amplified expected-future-penalty term
+- **Coverage gap shaping**: optional per-agent reward bonus for closing the gap between auction allocation and compliance need (decays to zero)
+- **Opportunity cost shaping**: rewards agents in proportion to the cost premium paid on the secondary vs auction (decays to zero)
+- **Green investment shaping**: bonus for increasing green fraction (decays over training), scaled by `(0.2 + w_green)`
 - **Terminal bank value**: piecewise — linear below annual need (ratio < 1), log above (diminishing returns on overbanking)
-- **Terminal queue value**: in-construction projects valued by discounted future carbon savings with `γ^years_late` discount
+- **Terminal queue value**: in-construction projects valued by discounted future carbon savings with a smooth completion-fraction discount
+- **Treasury terminal value**: corporate treasury reserve (year-end operating surplus retained at `retention_fraction`, decaying at `decay_rate`) is valued at episode end via `treasury_terminal_value`
 
 ### Key Mechanisms
 
 - **Inflation path**: Annual inflation is sampled from historical calibration **N(μ=2.0%, σ=1.5%)**, then applied economy-wide to nominal costs
 - **MAC fuel-switching**: When carbon prices exceed €48/t (ICIS mid-range switching cost), companies automatically switch up to 20% of coal dispatch to gas (short-run operational change, not investment)
 - **Electricity revenue**: Companies earn revenue from electricity sales, with carbon costs partially passed through to electricity prices (90%). Green generators benefit from the same revenue with lower carbon costs.
-- **Unified financial envelope**: Each company has a single annual budget covering all spending (compliance + capex + MAC), calibrated to realistic revenue retention (~€724M for 10 TWh). Coal-heavy companies have the tightest budgets due to higher fuel OPEX.
+- **Unified financial envelope**: Each company has a single annual budget covering all spending (compliance + capex + MAC). With `budget.mode: revenue_based`, the budget is computed from `Company.compute_revenue()` (electricity revenue with carbon-cost passthrough) minus operating costs plus an archetype-specific debt headroom, with EMA smoothing.
 - **Capex throughput cap**: Organizational constraint on annual construction spend (M€), modelling permitting pipeline capacity, EPC contractor access, and management bandwidth. Independent of the financial budget — a company can afford more investment than it can physically deliver.
 - **Static reserve price**: Auction floor price at €45/t (just below MAC cost, prevents degenerate floor equilibrium)
 - **Phantom bidder** (available, disabled by default): A synthetic financial intermediary participant can be enabled (`phantom_bidder.enabled: true`) to represent financial sector demand (~40% of EU ETS volume). When enabled, it bids at each primary auction with a LogNormal price anchored near 60% of the effective penalty and 15–35% of supply as quantity, consuming supply that would otherwise be available to compliance agents. See `docs/design.md §11`.
-- **ESG compliance gate**: ESG bonus is multiplied by `coverage_frac` (linear), so non-compliant agents receive proportionally reduced ESG credit. The earlier quadratic form was removed because squaring eliminated the signal under scarcity in late years when it matters most.
+- **ESG compliance gate**: ESG bonus is multiplied by a smooth gate that approaches linear `coverage_frac` above the threshold (`compliance_gate_blend_threshold`) and softens below — non-compliant agents receive proportionally reduced ESG credit without a hard cliff under late-year scarcity.
 - **Private urgency scalars**: Per-episode LogNormal scalar multiplied into each agent's effective penalty, creating heterogeneous compliance pressure and breaking symmetric equilibria.
 - **Auction bid collateral**: overbids above clearing incur a real capital lock-up cost on awarded quantity (`auction.collateral.enabled`)
 - **Collateral affordability guardrail**: if collateral lock-up is unaffordable, bids are clipped in two steps (quantity first, then price if needed) to preserve feasible participation
-- **Budget headroom observation**: Phase-1 dim `[27]` reports current annual budget headroom (`1.0` fresh, `0.0` at limit, negative overspend)
-- **Revenue-based dynamic budget**: When `budget.mode: revenue_based`, annual budgets are computed from `Company.compute_revenue()` (electricity revenue with carbon-cost passthrough) minus operating costs plus archetype-specific debt headroom. EMA smoothing prevents erratic year-to-year swings.
-- **Emergency loan system**: When a company faces auction default, an emergency loan covers the shortfall (up to `max_loan_fraction × annual_budget`) instead of immediate suspension. Loans carry interest (default 8%) with annual repayment deducted at year start.
+- **Bid change limit (PCL)**: Year-over-year bid price changes are capped at `auction.bid_change_limit.value` EUR/t (year 0 is unconstrained). The PCL reference is `max(price_ma3, fundamental_anchor(year))` so it doesn't drift below the equilibrium price during low-price regimes. Clip signals are exposed as observation dimensions for gradient feedback.
+- **Budget headroom observation**: Phase-1 observation reports current annual budget headroom (`1.0` fresh, `0.0` at limit, negative on overspend), plus separate dims for bid-price clip, soft-budget price clip, qty clip ratio, and invest-clip ratio.
+- **Emergency loan system**: When a company faces auction default, an emergency loan covers the shortfall (up to `max_loan_fraction × annual_budget`) instead of immediate suspension. Loans carry interest (default 8%) plus a leverage premium, with annual repayment deducted at year start. While a loan is outstanding the effective capex throughput is squeezed to a configurable floor.
+- **Corporate treasury reserve**: Year-end operating surplus is retained at `retention_fraction` (capped at `cap_multiple × annual_budget`, decaying at `decay_rate`) and provides a buffer that smooths year-to-year compliance shocks. Valued at episode end via `treasury_terminal_value`.
 - **Budget hardening**: Tiered penalty regime — free spending up to 100% of budget, quadratic penalty in [100%, 115%], steep growth above. Investment hard gate scales down `invest_frac` if total projected spending would exceed the hard cap.
 - **Heuristic loan-awareness**: Bots with emergency loans reduce auction quantity (−30%), investment (−50%), and secondary buy volume (−40%) proportional to loan pressure.
 - **Carry-forward**: Non-compliance shortfall is added to next year's obligation (capped at 1.0×, modelling standard carry-forward)
 - **Hidden burn-in warm-start**: A configurable pre-period (`warm_start.burnin_enabled`) seeds realistic bank holdings, MSR reserve, and MA3 history before year 0
 - **Fundamentals-based heuristic**: Bot bidding uses MAC→penalty gradient (`mac_cost + urgency × (penalty - mac_cost)`), removing dependence on price moving average
 - **Absolute-price secondary market**: Secondary prices are expressed in €/t (not as multipliers), clipped to [sec_price_min, 2× effective penalty rate]
-- **ESG signal**: Saved-carbon-years formula rewards emission factor improvements proportional to remaining time, gated by w_green and the compliance gate
-- **WTP-uniform exploration** (v8): epsilon-random auction prices are sampled 50/50 under vs over the agent's willingness-to-pay anchor (~93 EUR/t = MAC + 0.5×(penalty-MAC)), preventing bias from asymmetric price bounds. The tabula-rasa override is retired; `tabula_rasa.enabled=true` raises an error.
+- **Tabula-rasa is retired**: setting `tabula_rasa.enabled: true` raises an error; the block is kept in `default.yaml` purely as an ablation reference.
 - **Coverage gap shaping** (`reward.coverage_gap_shaping`): optional per-agent reward bonus for closing the gap between allowance coverage and emissions; single unified block
 
 ## Project Structure
@@ -159,9 +163,8 @@ Thesis-Energy-Auction/
 │   │   └── market_clearing_ets.py  # Runs the uniform-price auction
 │   │
 │   └── utils/
-│       ├── logger.py             # Logs training metrics
-│       ├── replay_buffer.py      # Stores past experiences for learning
-│       └── price_anchor.py       # Fundamental price anchor (MAC + scarcity + penalty)
+│       ├── price_anchor.py       # Fundamental price anchor (MAC + scarcity + penalty)
+│       └── preflight.py          # Config validation run before training starts
 │
 ├── configs/
 │   ├── default.yaml              # Full 100k-episode training config (8 learning agents, 0 bots)
@@ -174,6 +177,7 @@ Thesis-Energy-Auction/
 │   └── evaluate_qlearning.py     # Evaluates the Q-learning baseline
 │
 ├── tests/                        # Automated tests
+│   ├── test_preflight.py         # Config validation that runs before training
 │   ├── test_market_clearing.py   # Tests the auction works correctly
 │   ├── test_cap_schedule.py      # Tests the cap schedule and MSR
 │   ├── test_environment.py       # Tests the full simulation
@@ -184,7 +188,16 @@ Thesis-Energy-Auction/
 │   ├── test_clipped_gaussian.py  # Tests clipped Gaussian policy
 │   ├── test_anchors.py           # Tests action anchor initialization and fundamental anchor injection
 │   ├── test_price_anchor.py      # Tests compute_fundamental_anchor() calibration
-│   └── test_tabula_rasa.py       # Tests tabula-rasa retirement and WTP-uniform exploration
+│   ├── test_banking_signal.py    # Tests bank-drawdown imputation and timing P&L
+│   ├── test_bid_change_limit.py  # Tests year-over-year bid change limit + obs dims
+│   ├── test_bot_features.py      # Tests bot enhanced noise and fade schedule
+│   ├── test_compliance_validation.py # Bot-only compliance smoke test
+│   ├── test_green_finance.py     # Tests optional green-finance loan boost
+│   ├── test_market_calibration.py    # Tests emission-weighted cap calibration
+│   ├── test_phantom_bidder.py    # Tests phantom-bidder anchor independence
+│   ├── test_qlearning_actions.py # Tests Q-learning baseline action mapping
+│   ├── test_tabula_rasa.py       # Tests tabula-rasa retirement and exploration sampling
+│   └── test_training_smoke.py    # End-to-end short training run smoke test
 │
 ├── notebooks/
 │   ├── ets_marl - Full Run & Analysis.ipynb   # Full training run and results analysis
@@ -281,14 +294,19 @@ The most important settings you might want to change:
 | `simulation.n_years` | 12 | How many years each episode simulates |
 | `companies.n_agents` | 8 | Number of learning agents (PPO) |
 | `companies.n_bot_agents` | 0 | Number of heuristic bot agents (0 = pure MARL; `smoke_100.yaml` uses 8) |
-| `ets.cap_overhead_pct` | 0.02 | Year-0 cap overhead over total initial emissions |
+| `ets.cap_overhead_pct` | 0.10 | Year-0 cap overhead over total initial emissions |
 | `ets.cap_year_0_override` | `null` | Optional hard override for year-0 cap |
+| `ets.msr.tnac_upper_ratio` | 0.68 | TNAC upper-band threshold as fraction of cap_year_0; mid/lower derived to preserve 400:833:1096 |
 | `auction.price_max` | 250 | Maximum bid price (€/tonne) |
+| `auction.bid_change_limit.value` | 75 | Max year-over-year bid price change (€/t); year 0 unconstrained |
 | `penalty.rate` | 138.75 | Fine per excess tonne of CO2 (€), base level at simulation year-0 (2026) |
-| `pretrain.enabled` | false | Behavioral cloning warm-start from heuristic policy (disabled by default in v8) |
-| `ppo.kl_anchor_beta` | 0.0 | KL-anchor regularization toward BC policy (disabled by default in v8) |
+| `pretrain.enabled` | false | Behavioral cloning warm-start from heuristic policy (disabled by default) |
+| `ppo.kl_anchor_beta` | 0.0 | KL-anchor regularization toward BC policy (disabled by default) |
 | `phantom_bidder.enabled` | false | Synthetic financial intermediary demand (disabled by default) |
 | `urgency_scalars.enabled` | true | Per-agent LogNormal penalty multiplier (creates private heterogeneity) |
+| `exploration.mode` | `anchored` | `anchored` Gaussian around WTP, or `uniform` side-balanced around WTP (ablation) |
+| `exploration.epsilon_start` | 0.25 | Initial epsilon-greedy exploration rate |
+| `exploration.epsilon_final` | 0.02 | Mature epsilon noise floor |
 | `auction.collateral.enabled` | true | Enables EU ETS-style bid collateral opportunity-cost term on overbids |
 | `auction.collateral.collateral_rate` | 0.15 | Annualized margin rate applied to locked collateral |
 | `auction.collateral.collateral_fraction` | 0.20 | Fraction of notional bid value posted as collateral |
@@ -298,16 +316,23 @@ The most important settings you might want to change:
 | `bots.fade_schedule.enabled` | false | Enables episode-based bot retirement and automatic market recalibration |
 | `penalty.inflation_rate` | 0.020 | Mean annual inflation for nominal indexing (μ) |
 | `penalty.inflation_random_std` | 0.015 | Annual inflation standard deviation (σ), sampled with a normal distribution |
+| `reward.banking_signal.enabled` | true | Imputes bank drawdowns at clearing price + timing P&L |
+| `reward.opportunity_cost_shaping.enabled` | true | Decaying bonus for low secondary-vs-auction premium |
+| `reward.coverage_gap_shaping.enabled` | true | Decaying signal when auction allocation falls short of need |
 | `reward.terminal_bank_value` | true | Value banked allowances at episode end |
 | `reward.terminal_queue_value` | true | Value in-construction projects at episode end |
 | `reward.terminal_payoff_years` | 5 | Horizon for terminal queue value NPV calculation |
+| `reward.treasury_terminal_value` | true | Value retained corporate treasury at episode end |
 | `budget.mode` | `revenue_based` | Budget calculation method (`revenue_based` or `fixed`) |
 | `budget.emergency_loan.enabled` | `true` | Emergency loans prevent auction defaults |
 | `budget.emergency_loan.max_loan_fraction` | 0.15 | Max loan as fraction of annual budget |
 | `budget.emergency_loan.interest_rate` | 0.08 | Annual interest rate on emergency loans |
+| `budget.treasury_reserve.enabled` | true | Retain a fraction of year-end operating surplus as a buffer |
+| `budget.treasury_reserve.retention_fraction` | 0.60 | Fraction of operating surplus retained each year |
+| `budget.treasury_reserve.cap_multiple` | 1.5 | Treasury cap as multiple of `annual_budget` |
 | `budget.hard_cap_fraction` | 1.15 | Hard cap on spending as fraction of budget |
 | `budget.soft_zone_start` | 1.0 | Budget fraction where soft penalty begins |
-| `budget.investment_hard_gate` | `true` | Scale investment if would exceed hard cap |
+| `budget.investment_hard_gate` | `true` | Scale investment if it would exceed the hard cap |
 
 ## Understanding the Output
 
