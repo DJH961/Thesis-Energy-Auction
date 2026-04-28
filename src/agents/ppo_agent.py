@@ -605,10 +605,9 @@ class PPOAgent:
 
         # Phase mask: True = auction transition (obs1-space), False = secondary (obs2-space).
         # Auction policy is trained only on auction rows; secondary only on secondary rows.
-        is_auction = torch.from_numpy(
-            np.fromiter((p == 'auction' for p in self.buffer.phases),
-                        dtype=np.bool_, count=len(self.buffer.phases))
-        ).to(self.device)
+        is_auction = torch.tensor(
+            [p == 'auction' for p in self.buffer.phases],
+            dtype=torch.bool, device=self.device)
 
         rewards = np.nan_to_num(np.asarray(self.buffer.rewards, dtype=np.float32),
                                 nan=0.0, posinf=0.0, neginf=0.0)
@@ -883,10 +882,9 @@ class PPOAgent:
         # Phase mask: True = auction transition (obs1-space), False = secondary (obs2-space).
         # Exposed in buf_tensors so update_happo() can apply each policy loss to the
         # correct rows without cross-contaminating obs dimensions.
-        is_auction_t = torch.from_numpy(
-            np.fromiter((p == 'auction' for p in self.buffer.phases),
-                        dtype=np.bool_, count=len(self.buffer.phases))
-        ).to(self.device)
+        is_auction_t = torch.tensor(
+            [p == 'auction' for p in self.buffer.phases],
+            dtype=torch.bool, device=self.device)
 
         rewards = np.nan_to_num(np.asarray(self.buffer.rewards, dtype=np.float32),
                                 nan=0.0, posinf=0.0, neginf=0.0)

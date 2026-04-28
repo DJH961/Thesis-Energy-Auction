@@ -150,9 +150,10 @@ class Company:
         # State: technology mix vector [coal, gas, onshore, offshore, solar]
         self.mix = np.array(initial_mix, dtype=np.float64)
         assert abs(self.mix.sum() - 1.0) < 1e-6, f"Mix must sum to 1.0, got {self.mix.sum()}"
-        # Hot-method memoization (invalidated on mix / queue / carry_forward / consecutive_successes
-        # mutation via _invalidate_state_cache()). Eliminates repeated arithmetic across
-        # observation construction, reward computation, and heuristic policy calls.
+        # Hot-method memoization (invalidated on mix / queue / carry_forward /
+        # consecutive_successes mutation via _invalidate_state_cache()).
+        # Eliminates repeated arithmetic across observation construction, reward
+        # computation, and heuristic policy calls.
         self._cache_emissions = None
         self._cache_estimate_need = None
         self._cache_p_fail = None
