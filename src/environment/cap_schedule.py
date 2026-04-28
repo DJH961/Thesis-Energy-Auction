@@ -378,11 +378,11 @@ class CapSchedule:
         """
         Apply MSR rules to the auction volume.
 
-        A2: 1-year TNAC lag — MSR uses self._prev_tnac (end of previous
+        1-year TNAC lag — MSR uses self._prev_tnac (end of previous
         year) rather than current TNAC. If _prev_tnac is None (no prior
         year exists), MSR is skipped unless force_msr=True.
 
-        Rules (EU ETS Decision 2015/1814 + A4 smoothed price trigger):
+        Rules (EU ETS Decision 2015/1814 + smoothed price trigger):
           1. If price meets combined emergency-release trigger: emergency
              release from reserve (breaks procyclical loop where high
              prices + high TNAC cause further supply withdrawal).

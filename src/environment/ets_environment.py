@@ -188,7 +188,7 @@ class ETSEnvironment(gym.Env):
         self._secondary_profit_ema = np.zeros(self.n_total)
         self._ema_alpha = 0.1
 
-        # Per-agent last secondary buy price (for WTP anchor feedback, Approach C+D)
+        # Per-agent last secondary buy price (feeds the WTP exploration anchor)
         self._last_secondary_buy_price = np.zeros(self.n_total)
         self._cumulative_alloc = np.zeros(self.n_total)
         self._cumulative_emissions = np.zeros(self.n_total)
@@ -222,7 +222,7 @@ class ETSEnvironment(gym.Env):
         # Default carry-forward tracking
         # _defaulted_volume_pending: allowance volume returned by defaults to add next year
         self._defaulted_volume_pending = 0.0
-        # Opponent snapshot buffers for 7D lagged opponent obs (Change 7)
+        # Opponent snapshot buffers for 7D lagged opponent obs
         self._opponent_snapshots      = np.zeros((self.n_total, 7), dtype=float)
         self._opponent_snapshots_prev = np.zeros((self.n_total, 7), dtype=float)
         self._sec_bought              = np.zeros(self.n_total, dtype=float)
@@ -326,10 +326,10 @@ class ETSEnvironment(gym.Env):
         self._last_reward_channels: dict = {}
         self._last_auction_reward_channels: dict = {}
 
-        # Per-agent per-year diagnostics (M1, validation diagnostics)
+        # Per-agent per-year diagnostics (validation diagnostics)
         self._last_per_agent_diag: dict = {}
 
-        # Emission factor diagnostics (M1)
+        # Emission factor diagnostics
         self._last_system_ef = 0.0
         self._last_marginal_ef = 0.0
         self._current_marginal_ef = 0.0
@@ -911,7 +911,7 @@ class ETSEnvironment(gym.Env):
                 self.last_clearing_price = clipped_price
                 # Seed _prev_ma3 with the MA3 that now includes this clearing so
                 # that year 0 of the real episode has a valid MA3 history and the
-                # A4 smoothed guard is active from the start.
+                # smoothed price guard is active from the start.
                 ma3_now = float(
                     sum(self._price_history[-3:]) / len(self._price_history[-3:])
                 )
@@ -1022,7 +1022,7 @@ class ETSEnvironment(gym.Env):
 
     def _apply_warm_start(self, ws_cfg: dict):
         """
-        P7 fallback warm-start seeding (when burn-in is disabled).
+        Fallback warm-start seeding (used when burn-in is disabled).
 
         (A) Seed construction queues.
         (B) Seed initial bank: sample from Uniform(bank_min, bank_max) × annual_need.
@@ -1176,7 +1176,7 @@ class ETSEnvironment(gym.Env):
         bank_start = self.holdings.copy()
         log["bank_start"] = bank_start.tolist()
 
-        # 1. P6: Cancellation check — before matured investments
+        # 1. Cancellation check — before matured investments
         cancellations = np.zeros(self.n_total, dtype=int)
         cancel_recoveries = np.zeros(self.n_total)
         jitter_cfg = self.config.get("construction_jitter", {})
@@ -1193,7 +1193,7 @@ class ETSEnvironment(gym.Env):
         for company in self.companies:
             company.apply_matured_investments(year)
 
-        # ---- Revenue-based dynamic budget (A3) ----
+        # ---- Revenue-based dynamic budget ----
         budget_mode = self.config.get("budget", {}).get("mode", "fixed")
         if budget_mode == "revenue_based":
             # Smoothed price: MA3 from price history, padded with initial_expected
@@ -1293,7 +1293,7 @@ class ETSEnvironment(gym.Env):
         )
         auction_actions = np.concatenate([auction_actions, bot_auc], axis=0)
 
-        # 4. P5: Generate correlated emission shocks
+        # 4. Generate correlated emission shocks
         # ε_it = ρ × η_t + √(1-ρ²) × ξ_it,  η_t ~ N(0,1),  ξ_it ~ N(0,1)
         unc_cfg = self.config.get("uncertainty", {})
         if unc_cfg.get("enabled", False):
@@ -1307,7 +1307,7 @@ class ETSEnvironment(gym.Env):
             epsilons = np.zeros(self.n_total)
         self._current_emission_shocks = epsilons
 
-        # 5. P6: Generate capacity factor noise per tech per agent
+        # 5. Generate capacity factor noise per tech per agent
         cf_sigma = np.array(jitter_cfg.get("cf_sigma", [0.0, 0.0, 0.08, 0.08, 0.05]))
         cf_noise = np.zeros((self.n_total, 5))
         if jitter_cfg.get("enabled", False):
@@ -1317,7 +1317,7 @@ class ETSEnvironment(gym.Env):
                         cf_noise[i, t] = float(self.rng.normal(0, cf_sigma[t]))
         self._current_cf_noise = cf_noise
 
-        # 6. Compute realized emissions (CF noise → P6, demand shock → P5)
+        # 6. Compute realized emissions (capacity-factor noise + demand shock applied)
         realized_emissions = np.zeros(self.n_total)
         for i, company in enumerate(self.companies):
             if not self._is_agent_active(i):
@@ -1473,7 +1473,7 @@ class ETSEnvironment(gym.Env):
             aq = float(bid_actions[i, 1])
             self._last_bid_qty_clip_ratio[i] = float(np.clip(aq / max(rq, 1e-6), 0.0, 1.0)) if rq > 1e-6 else 1.0
 
-        # Budget price clip (Change 2): soft clip at 1.5x max affordable price.
+        # Budget price clip: soft clip at 1.5x max affordable price.
         budget_price_clip = self.config["auction"].get("budget_price_clip", True)
         self._last_budget_price_clip[:] = 0.0
         if budget_price_clip:
@@ -2068,13 +2068,13 @@ class ETSEnvironment(gym.Env):
                     self._ema_alpha * margin +
                     (1 - self._ema_alpha) * self._secondary_profit_ema[i]
                 )
-                # Approach C+D: record what this agent actually paid on secondary
+                # Record what this agent actually paid on secondary (feeds WTP anchor)
                 self._last_secondary_buy_price[i] = cost_per_mt
 
         # Holdings after secondary market
         holdings = self.holdings + allocations + trade_qtys
 
-        # Collateral cost: rate × locked collateral from Phase 1 (E2/E4).
+        # Collateral cost: rate × locked collateral from Phase 1.
         # self._collateral_locked is computed in step_auction() as:
         #   collateral_fraction × max(0, bid_price − reserve) × bid_qty
         # Charging rate × locked_amount is equivalent to the financing cost of
@@ -2383,13 +2383,13 @@ class ETSEnvironment(gym.Env):
         return self.step_secondary(actions[:, 6:])
 
     # ------------------------------------------------------------------
-    # Secondary market — double auction (P8 improvements)
+    # Secondary market — double auction
     # ------------------------------------------------------------------
 
     def _settle_double_auction(self, allocations, secondary_prices,
                                 secondary_qtys, clearing_price):
         """
-        Double auction with P8 improvements:
+        Double auction:
           - Spread tolerance: trades clear if buyer_price + tol >= seller_price
           - Short positions: agents can sell from banked holdings (not only allocation)
           - Returns (trade_costs, trade_qtys, secondary_clearing_price, total_volume)
@@ -2546,7 +2546,7 @@ class ETSEnvironment(gym.Env):
         return trade_costs, trade_qtys, sec_clearing, total_qty, liquidity_pool_info
 
     # ------------------------------------------------------------------
-    # Reward function (P3 + P4 + P8 improvements)
+    # Reward function
     # ------------------------------------------------------------------
 
     def _compute_rewards(self, payments, trade_costs, penalties,
@@ -2942,7 +2942,7 @@ class ETSEnvironment(gym.Env):
 
     def compute_diagnostic_score(self, agent_id: int = None) -> dict:
         """
-        F2: Compute interpretable diagnostic scores for agents.
+        Compute interpretable diagnostic scores for agents.
 
         Returns a dict with three normalized components (each in [0, 1]):
           S_financial: cost efficiency (lower total cost = higher score)
@@ -2997,7 +2997,7 @@ class ETSEnvironment(gym.Env):
         return results
 
     def _compute_price_ma3(self) -> float:
-        """P1: 3-year moving average of clearing price.
+        """3-year moving average of clearing price.
         When auctions have failed for ≥2 consecutive years, blend toward
         expected_price to prevent stale MA3 from misleading agents.
         """

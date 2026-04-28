@@ -202,7 +202,9 @@ class PPOAgent:
                 config.get("price", {}).get("initial_expected", 80.0)
             )
 
-        # WTP-anchored exploration parameters (Approach C+D: escape floor-price trap)
+        # WTP-anchored exploration parameters (anchors exploration on
+        # willingness-to-pay rather than expected price, to escape the
+        # floor-price self-reinforcement trap).
         penalty_cfg = config.get("penalty", {})
         self._wtp_penalty_rate = float(penalty_cfg.get("rate", 138.75))
         companies_cfg = config.get("companies", {})
@@ -356,9 +358,9 @@ class PPOAgent:
         so that the PPO importance ratio remains correct.
 
         ``last_secondary_buy_price``: price this agent paid per Mt on the
-        secondary market last year. Used for Approach C+D — shifts the WTP
-        exploration anchor upward so agents learn to bid above floor when
-        the secondary market is expensive.
+        secondary market last year. Shifts the WTP exploration anchor upward
+        so agents learn to bid above floor when the secondary market is
+        expensive.
         """
         obs_t = torch.FloatTensor(obs1).unsqueeze(0).to(self.device)
         with torch.no_grad():
@@ -371,8 +373,8 @@ class PPOAgent:
                 if self.exploration_mode == "uniform":
                     rand_action = low + (high - low) * torch.rand_like(action)
 
-                    # WTP-anchored exploration (Approach C+D): anchor exploration
-                    # on willingness-to-pay instead of expected price.
+                    # WTP-anchored exploration: anchor exploration on
+                    # willingness-to-pay instead of expected price.
                     # This breaks the floor-price self-reinforcement loop where
                     # expected_price = floor → exploration samples near floor →
                     # clearing price = floor → expected_price stays at floor.
@@ -391,15 +393,16 @@ class PPOAgent:
                     # WTP budget: what can the agent afford per tonne
                     wtp_budget = available_budget / need_mt if need_mt > 0.01 else price_max
 
-                    # Approach C: shift anchor to secondary buy price if higher
+                    # Shift anchor up to last secondary buy price if higher:
                     # "Last year I paid 280 on secondary → I should bid at least
                     # that much at auction to avoid overpaying again."
                     wtp_base = min(wtp_economic, wtp_budget)
                     if last_secondary_buy_price > 0.0:
                         wtp_base = max(wtp_base, last_secondary_buy_price)
 
-                    # Approach D: blend — bid floor = 0.5 * sec_price + 0.5 * econ
-                    # This softens the shift so agents don't jump to full sec price
+                    # Soften the shift by blending with the economic anchor when
+                    # secondary price exceeds it, so agents do not jump to the
+                    # full secondary price.
                     if last_secondary_buy_price > wtp_economic and last_secondary_buy_price > 0.0:
                         wtp_base = 0.5 * last_secondary_buy_price + 0.5 * wtp_economic
 
@@ -433,10 +436,10 @@ class PPOAgent:
                     wtp_e = compute_fundamental_anchor(current_year, self.config) * _boost
                     wtp_b = avail / need_mt if need_mt > 0.01 else price_max
                     wtp_base = min(wtp_e, wtp_b)
-                    # Approach C: shift anchor to secondary buy price if higher
+                    # Shift anchor up to last secondary buy price if higher
                     if last_secondary_buy_price > 0.0:
                         wtp_base = max(wtp_base, last_secondary_buy_price)
-                    # Approach D: blend when secondary > economic
+                    # Blend with economic anchor when secondary price exceeds it
                     if last_secondary_buy_price > wtp_e and last_secondary_buy_price > 0.0:
                         wtp_base = 0.5 * last_secondary_buy_price + 0.5 * wtp_e
                     wtp_anc = float(np.clip(wtp_base, price_min, price_max))
