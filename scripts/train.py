@@ -975,8 +975,32 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
 
+    # Year-row write buffer.
+    # The year log is the highest-volume CSV (n_episodes × n_years rows × ~270
+    # fields). Buffering rows in memory and flushing via `writerows()` in
+    # chunks halves Python-level dispatch overhead vs. one `writerow()` per
+    # year and amortizes file I/O. The buffer is also flushed at episode end
+    # so partial-episode crashes never lose more than the in-flight episode.
+    _yr_row_buffer: list = []
+    _YR_BUFFER_CAP = 256  # rows before mid-episode flush; ~one episode @12yr × ~20 episodes
+
+    def _yr_write(row: dict) -> None:
+        _yr_row_buffer.append(row)
+        if len(_yr_row_buffer) >= _YR_BUFFER_CAP:
+            yr_writer.writerows(_yr_row_buffer)
+            _yr_row_buffer.clear()
+
+    def _yr_flush_buffer() -> None:
+        if _yr_row_buffer:
+            yr_writer.writerows(_yr_row_buffer)
+            _yr_row_buffer.clear()
+
     # Register CSV cleanup so files are closed even on crash
     def _close_csvs():
+        try:
+            _yr_flush_buffer()
+        except Exception:
+            pass
         if not ep_csv.closed:
             ep_csv.close()
         if not yr_csv.closed:
@@ -1008,6 +1032,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
     def _flush_csv_logs(current_episode: int, force: bool = False) -> None:
         if force or ((current_episode + 1) % csv_flush_interval == 0):
+            _yr_flush_buffer()
             ep_csv.flush()
             yr_csv.flush()
             # fsync keeps data safer on abrupt termination.
@@ -1294,27 +1319,40 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             except Exception:
                 pass  # diagnostic scoring is non-critical
             yr_row["marginal_ef_used"] = round(float(yl.get("marginal_ef_used", getattr(env, "_last_marginal_ef", 0.0))), 4)
-            yr_writer.writerow(yr_row)
+            _yr_write(yr_row)
 
             # Update compliance_ctx with this year's outcomes (used as critic input NEXT year)
             if critic_compliance_features:
-                _shortfalls = yl.get("shortfalls", [0.0] * n_agents)
-                _penalties  = yl.get("penalties",  [0.0] * n_agents)
+                _shortfalls_raw = yl.get("shortfalls", [0.0] * n_agents)
+                _penalties_raw  = yl.get("penalties",  [0.0] * n_agents)
                 _n_years_ep = max(env.n_years, 1)
-                for i in range(n_agents):
-                    _sf = float(_shortfalls[i]) if i < len(_shortfalls) else 0.0
-                    _pen = float(_penalties[i]) if i < len(_penalties) else 0.0
-                    _budget = max(float(env.companies[i].annual_budget), 1.0)
-                    if _sf > 0.0:
-                        _consec_shortfall[i] += 1
-                        _ep_shortfall_count[i] += 1
-                    else:
-                        _consec_shortfall[i] = 0
-                    _ep_penalty_total[i] += _pen
-                    compliance_ctx[i, 0] = float(_consec_shortfall[i]) / _n_years_ep       # consecutive shortfall (normalized)
-                    compliance_ctx[i, 1] = float(_ep_shortfall_count[i]) / (year + 1)      # episode shortfall rate so far
-                    compliance_ctx[i, 2] = _ep_penalty_total[i] / (_budget * _n_years_ep)  # cumulative penalty burden (normalized)
-                    compliance_ctx[i, 3] = _sf / max(_budget / max(yl.get("clearing_price", 1.0), 1.0), 1.0)  # last shortfall (allowance-normalized)
+                # Right-pad / truncate to n_agents and convert to ndarray once.
+                _sf_arr = np.zeros(n_agents, dtype=np.float64)
+                _pen_arr = np.zeros(n_agents, dtype=np.float64)
+                _m = min(n_agents, len(_shortfalls_raw))
+                if _m > 0:
+                    _sf_arr[:_m] = np.asarray(_shortfalls_raw[:_m], dtype=np.float64)
+                _m = min(n_agents, len(_penalties_raw))
+                if _m > 0:
+                    _pen_arr[:_m] = np.asarray(_penalties_raw[:_m], dtype=np.float64)
+                _budgets = np.array(
+                    [max(float(env.companies[i].annual_budget), 1.0) for i in range(n_agents)],
+                    dtype=np.float64,
+                )
+
+                # Vectorized counter updates (in-place to keep array identity
+                # so per-episode reset via `[:] = 0` continues to work).
+                _has_sf = _sf_arr > 0.0
+                _consec_shortfall[:] = np.where(_has_sf, _consec_shortfall + 1, 0)
+                _ep_shortfall_count += _has_sf.astype(_ep_shortfall_count.dtype)
+                _ep_penalty_total += _pen_arr
+
+                _allowance_norm = np.maximum(
+                    _budgets / max(yl.get("clearing_price", 1.0), 1.0), 1.0)
+                compliance_ctx[:, 0] = _consec_shortfall / _n_years_ep
+                compliance_ctx[:, 1] = _ep_shortfall_count / (year + 1)
+                compliance_ctx[:, 2] = _ep_penalty_total / (_budgets * _n_years_ep)
+                compliance_ctx[:, 3] = _sf_arr / _allowance_norm
 
             obs1 = obs1_next
             if terminated:
@@ -2299,6 +2337,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             n_keep_milestones=int(prune_cfg.get("n_keep_milestones", 20)),
         )
 
+    _yr_flush_buffer()
     ep_csv.close()
     yr_csv.close()
     print(f"\nDone — seed {seed}. Logs: {ep_path}, {yr_path}")

@@ -169,7 +169,17 @@ class PPOAgent:
         self.gae_min_std = float(max(1e-8, reward_cfg.get("gae_min_std", 0.1)))
         self.target_kl = ppo.get("target_kl", 0.0)  # KL early stopping; 0 = disabled
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Device selection. Tiny MLPs (~123-dim input, two FC layers) are almost
+        # always faster on CPU than GPU because kernel-launch overhead exceeds the
+        # matmul cost. Allow override via config["device"]:
+        #   "auto" (default) → cuda if available else cpu
+        #   "cpu"            → force CPU (recommended for thesis runs)
+        #   "cuda"/"cuda:0"  → force GPU
+        device_cfg = str(config.get("device", "auto")).lower()
+        if device_cfg == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device_cfg)
         hidden = ppo["hidden_size"]
         log_std_min = ppo.get("log_std_min", -2.0)
         log_std_max = ppo.get("log_std_max", 1.0)
