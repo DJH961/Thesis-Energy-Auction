@@ -3,8 +3,8 @@
 #   - 8 learning agents + 8 heuristic bot agents (16 total)
 #   - HAPPO sequential policy update, centralized critic
 #   - Fundamental price anchor, coverage gap shaping unified
-#   - Phantom bidder enabled for supply-squeeze testing
-#   - Uniform exploration, no BC, no KL anchor
+#   - Phantom bidder disabled (matches default.yaml)
+#   - Anchored exploration (matches default.yaml), no BC, no KL anchor
 # ============================================================
 
 simulation:
@@ -33,7 +33,7 @@ technologies:
 # ----------------------------------------------------------
 ets:
   cap_year_0_override: null
-  initial_bank_fraction: 0.10
+  initial_bank_fraction: 0.5     # match default.yaml (was 0.10)
   cap_overhead_pct: 0.08
 
   lrf_phase1: 0.043
@@ -125,7 +125,7 @@ auction:
   quantity_max: 3.0
   bid_change_limit:
     enabled: true
-    value: 50.0
+    value: 75.0          # match default.yaml (was 50.0)
   qty_mult_low: 0.5
   qty_mult_high: 2.0
   max_agent_share: 1.0
@@ -140,7 +140,8 @@ auction:
     max_collateral_budget_share: 0.50
     min_qty_floor_frac: 0.5
   leverage_multiplier: 3.0
-  suspension_length: 2
+  suspension_length: 0     # match default.yaml (was 2; budget gate replaces suspension)
+  budget_price_clip: true  # match default.yaml (soft clip at 1.5× max_affordable_price)
   carry_forward_defaults: true
 
 trading:
@@ -162,6 +163,7 @@ budget:
   budget_ema_alpha: 0.3
   annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
+  dynamic_budget_ceiling_multiplier: 1.5   # match default.yaml: cap revenue-based budget
   overspend_penalty_coef: 0.5
   contingency_zone: 0.10
   hard_cap_multiplier: 1.20
@@ -287,6 +289,7 @@ ppo:
   log_std_min: -2.5
   log_std_max: 0.0
   centralized_critic: true
+  critic_compliance_features: true   # match default.yaml: append K=4 compliance features per agent to global state
   happo: true
   critic_lr: 0.001
   critic_hidden_size: 512
@@ -368,14 +371,17 @@ hpp:
   seed_count: 2
 
 # ----------------------------------------------------------
-# Exploration: wide uniform for smoke test
-# High epsilon ensures full price-range coverage in 100 episodes.
+# Exploration: anchored Gaussian (matches default.yaml).
+# Smoke runs the production exploration mode so this path is exercised
+# in CI rather than the legacy uniform mode.
 # ----------------------------------------------------------
 exploration:
-  mode: "uniform"
-  epsilon_start: 0.50
-  epsilon_final: 0.05
+  mode: "anchored"
+  epsilon_start: 0.25
+  epsilon_final: 0.02
   epsilon_decay_episodes: 0
+  epsilon_decay_frac: 0.45
+  anchor_boost: 1.14
   auction_anchors: null
   secondary_anchors: null
 
@@ -395,9 +401,9 @@ budget_curriculum:
   budget_end: 1.0
   decay_frac: 0.30
 
-# Phantom bidder enabled for smoke test to exercise supply-squeeze paths.
+# Phantom bidder disabled to match default.yaml (production runs without phantom).
 phantom_bidder:
-  enabled: true
+  enabled: false
   qty_frac_lo: 0.15
   qty_frac_hi: 0.35
   price_lognormal_sigma: 0.35

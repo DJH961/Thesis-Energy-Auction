@@ -153,7 +153,7 @@ class PPOAgent:
         self.config = config
         self.obs_dim_phase1 = obs_dim_phase1
         # Seeded RNG for reproducible mini-batch shuffling
-        self._rng = np.random.default_rng(seed if seed is not None else 0 + agent_id)
+        self._rng = np.random.default_rng((seed if seed is not None else 0) + agent_id)
         ppo = config["ppo"]
 
         self.gamma = ppo["gamma"]
@@ -266,7 +266,7 @@ class PPOAgent:
         self.critic_extra_epochs = ppo.get("critic_extra_epochs", 0)
         self.critic_huber = ppo.get("critic_huber", False)
         self.critic_huber_delta = ppo.get("critic_huber_delta", 10.0)
-        self.normalize_returns = ppo.get("normalize_returns", True)
+        self.normalize_returns = ppo.get("normalize_returns", False)
         self.clip_value = ppo.get("clip_value", False)
 
         # Initialize critic loss function
@@ -619,11 +619,11 @@ class PPOAgent:
         if self.normalize_returns and T > 1:
             ret_mean = ret_t.mean()
             ret_std = ret_t.std()
-            if ret_std > 1e-8:
-                ret_t = (ret_t - ret_mean) / (ret_std + 1e-8)
+            if ret_std > self.gae_min_std:
+                ret_t = (ret_t - ret_mean) / torch.clamp(ret_std, min=self.gae_min_std)
 
         if self.normalize_advantages and T > 1:
-            adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+            adv_t = (adv_t - adv_t.mean()) / torch.clamp(adv_t.std(), min=self.gae_min_std)
 
         adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
@@ -696,8 +696,10 @@ class PPOAgent:
                     if is_auc_mb.any():
                         auc_lp_new, auc_ent = self.auction_policy.evaluate(
                             obs1[mb][is_auc_mb], auc_raw[mb][is_auc_mb])
+                        # Wide clamp: NaN/Inf guard only. The PPO clipped surrogate
+                        # below is responsible for the trust-region constraint.
                         auc_log_ratio = torch.clamp(
-                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -2.0, 2.0)
+                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -20.0, 20.0)
                         auc_ratio = torch.exp(auc_log_ratio)
                         auc_adv = adv_t[mb][is_auc_mb]
                         auc_surr1 = auc_ratio * auc_adv
@@ -710,7 +712,7 @@ class PPOAgent:
                         sec_lp_new, sec_ent = self.secondary_policy.evaluate(
                             obs2[mb][sec_mb], sec_raw[mb][sec_mb])
                         sec_log_ratio = torch.clamp(
-                            sec_lp_new - old_sec_lp[mb][sec_mb], -2.0, 2.0)
+                            sec_lp_new - old_sec_lp[mb][sec_mb], -20.0, 20.0)
                         sec_ratio = torch.exp(sec_log_ratio)
                         sec_adv = adv_t[mb][sec_mb]
                         sec_surr1 = sec_ratio * sec_adv
@@ -924,11 +926,11 @@ class PPOAgent:
         if self.normalize_returns and T > 1:
             ret_mean = ret_t.mean()
             ret_std = ret_t.std()
-            if ret_std > 1e-8:
-                ret_t = (ret_t - ret_mean) / (ret_std + 1e-8)
+            if ret_std > self.gae_min_std:
+                ret_t = (ret_t - ret_mean) / torch.clamp(ret_std, min=self.gae_min_std)
 
         if self.normalize_advantages and T > 1:
-            adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+            adv_t = (adv_t - adv_t.mean()) / torch.clamp(adv_t.std(), min=self.gae_min_std)
 
         adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
@@ -986,8 +988,8 @@ class PPOAgent:
             weighted_adv = adv_t * advantage_weights.to(self.device)
             # HAPPO weighted-advantage re-normalization
             w_std = weighted_adv.std()
-            if w_std > 1e-6:
-                weighted_adv = (weighted_adv - weighted_adv.mean()) / (w_std + 1e-8)
+            if w_std > self.gae_min_std:
+                weighted_adv = (weighted_adv - weighted_adv.mean()) / torch.clamp(w_std, min=self.gae_min_std)
         else:
             weighted_adv = adv_t
 
@@ -1030,8 +1032,10 @@ class PPOAgent:
                     if is_auc_mb.any():
                         auc_lp_new, auc_ent = self.auction_policy.evaluate(
                             obs1[mb][is_auc_mb], auc_raw[mb][is_auc_mb])
+                        # Wide clamp: NaN/Inf guard only. The PPO clipped surrogate
+                        # below is responsible for the trust-region constraint.
                         auc_log_ratio = torch.clamp(
-                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -2.0, 2.0)
+                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -20.0, 20.0)
                         auc_ratio = torch.exp(auc_log_ratio)
                         auc_adv = weighted_adv[mb][is_auc_mb]
                         auc_surr1 = auc_ratio * auc_adv
@@ -1044,7 +1048,7 @@ class PPOAgent:
                         sec_lp_new, sec_ent = self.secondary_policy.evaluate(
                             obs2[mb][sec_mb], sec_raw[mb][sec_mb])
                         sec_log_ratio = torch.clamp(
-                            sec_lp_new - old_sec_lp[mb][sec_mb], -2.0, 2.0)
+                            sec_lp_new - old_sec_lp[mb][sec_mb], -20.0, 20.0)
                         sec_ratio = torch.exp(sec_log_ratio)
                         sec_adv = weighted_adv[mb][sec_mb]
                         sec_surr1 = sec_ratio * sec_adv

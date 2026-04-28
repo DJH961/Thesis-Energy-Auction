@@ -825,6 +825,7 @@ class ETSEnvironment(gym.Env):
                 price_max=price_max,
                 penalty_rate=base_penalty_rate,
                 inflation_rate=inflation_rate,
+                inflation_factor=self._inflation_factor(burnin_year),
                 force_msr=True,
                 price_ma3=burnin_price_ma3,
             )
@@ -1243,6 +1244,7 @@ class ETSEnvironment(gym.Env):
         base_auction_volume = self.cap_schedule.get_auction_volume(
             year, tnac, self.last_clearing_price, price_max,
             base_penalty_rate, inflation_rate,
+            inflation_factor=self._inflation_factor(year),
             price_ma3=price_ma3,
         )
         auction_volume = base_auction_volume
@@ -1260,6 +1262,16 @@ class ETSEnvironment(gym.Env):
             if self.config["auction"].get("carry_forward_defaults", True):
                 auction_volume += self._defaulted_volume_pending
                 defaulted_rolled_in = self._defaulted_volume_pending
+            else:
+                # Defaulted volume is silently dropped from supply when toggle is
+                # off; warn once per episode so this is not invisible.
+                if not getattr(self, "_warned_defaults_dropped", False):
+                    print(
+                        f"[warn] auction.carry_forward_defaults=false: "
+                        f"{self._defaulted_volume_pending:.3f} Mt of defaulted volume "
+                        f"is being dropped from supply at year {year}."
+                    )
+                    self._warned_defaults_dropped = True
             self._defaulted_volume_pending = 0.0
         log["defaulted_volume_rolled_in"] = round(defaulted_rolled_in, 4)
 
@@ -3061,6 +3073,7 @@ class ETSEnvironment(gym.Env):
             price_max=price_max,
             penalty_rate=base_penalty_rate,
             inflation_rate=inflation_rate,
+            inflation_factor=self._inflation_factor(self.current_year),
             price_ma3=price_ma3,
         )
         # Include both rollover channels that are added in step_auction.

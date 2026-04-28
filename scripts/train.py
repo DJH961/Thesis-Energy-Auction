@@ -25,6 +25,7 @@ import datetime
 import io
 import math
 import os
+import random
 import sys
 import time
 import yaml
@@ -611,6 +612,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # Reproducibility: seed all RNGs before any stochastic operation
     np.random.seed(seed)
     torch.manual_seed(seed)
+    random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
@@ -1315,9 +1317,16 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             for i in hpp_swapped:
                 agents[i].buffer.clear()
 
-        # HAPPO dynamic order: update per-agent EMA of episode total reward
+        # HAPPO dynamic order: update per-agent EMA of episode total reward.
+        # Zero out swapped agents' contributions: their rewards came from
+        # historical policies, not the current policies we are about to update.
         if happo_dynamic_order:
-            agent_perf_ema = (1.0 - happo_perf_ema_alpha) * agent_perf_ema + happo_perf_ema_alpha * total_rewards
+            ema_rewards = total_rewards.copy()
+            if hpp_swapped:
+                for i in hpp_swapped:
+                    if 0 <= i < len(ema_rewards):
+                        ema_rewards[i] = agent_perf_ema[i]  # leave EMA unchanged for swapped agent
+            agent_perf_ema = (1.0 - happo_perf_ema_alpha) * agent_perf_ema + happo_perf_ema_alpha * ema_rewards
 
         # HPP: periodically snapshot current actors into the pool
         if hpp_enabled and episode > 0 and episode % hpp_save_interval == 0:
@@ -1440,23 +1449,25 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                         loss = agents[i].update(last_value=0.0, actor_update=actor_update)
                     latest_losses.append(loss)
 
-            # --- Cosine LR decay (applied after each PPO update batch) ---
-            frac = episode / max(n_episodes - 1, 1)
-            if lr_decay_mode == "cosine":
-                actor_lr_now = lr_min + 0.5 * (actor_lr_init - lr_min) * (1 + math.cos(math.pi * frac))
-                for agent in agents:
-                    for pg in agent.auction_optimizer.param_groups:
-                        pg["lr"] = actor_lr_now
-                    for pg in agent.secondary_optimizer.param_groups:
-                        pg["lr"] = actor_lr_now
-            if critic_lr_decay_mode == "cosine":
-                critic_lr_now = critic_lr_min_val + 0.5 * (critic_lr_init - critic_lr_min_val) * (1 + math.cos(math.pi * frac))
-                for agent in agents:
-                    for pg in agent.critic_optimizer.param_groups:
-                        pg["lr"] = critic_lr_now
         else:
             # Non-update episode: keep buffers, report no losses
             latest_losses = [None] * n_agents
+
+        # --- Cosine LR decay (applied EVERY episode, not just on update episodes,
+        # so the schedule advances smoothly when episodes_per_update > 1) ---
+        frac = episode / max(n_episodes - 1, 1)
+        if lr_decay_mode == "cosine":
+            actor_lr_now = lr_min + 0.5 * (actor_lr_init - lr_min) * (1 + math.cos(math.pi * frac))
+            for agent in agents:
+                for pg in agent.auction_optimizer.param_groups:
+                    pg["lr"] = actor_lr_now
+                for pg in agent.secondary_optimizer.param_groups:
+                    pg["lr"] = actor_lr_now
+        if critic_lr_decay_mode == "cosine":
+            critic_lr_now = critic_lr_min_val + 0.5 * (critic_lr_init - critic_lr_min_val) * (1 + math.cos(math.pi * frac))
+            for agent in agents:
+                for pg in agent.critic_optimizer.param_groups:
+                    pg["lr"] = critic_lr_now
 
         for i in range(n_agents):
             if i < len(latest_losses) and latest_losses[i]:

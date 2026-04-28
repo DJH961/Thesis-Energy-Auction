@@ -43,7 +43,7 @@ ets:
   # initial_bank_fraction set jointly so TNAC/tnac_upper = 1.05 at episode start
   # (2026 observed: 1,148 Mt / 1,096 Mt = 1.05).
   initial_bank_fraction: 0.5
-  # +12% cap overhead: reflects real 2026 EU ETS ~15% overhead; slightly conservative
+  # +10% cap overhead: reflects real 2026 EU ETS ~15% overhead; slightly conservative
   # for micro-ETS scale.
   cap_overhead_pct: 0.10
 
@@ -70,6 +70,11 @@ ets:
   banking: true
   reserve_price: 45.0              # auction bid floor (below MAC=48, prevents degenerate equilibrium)
   reserve_price_mode: "static"
+  # Dynamic-reserve parameters (only consulted when reserve_price_mode: "dynamic").
+  # In dynamic mode: effective_reserve = max(reserve_price, reserve_discount × MA3_price);
+  # before any MA3 history exists, max(reserve_price, reserve_initial) is used.
+  reserve_discount: 0.80
+  reserve_initial: 50.0
   unsold_to_msr: false
   max_rollover_multiplier: 1.5
   price_history_anchor: "auction"  # only successful auction clears enter MA3
@@ -259,6 +264,7 @@ penalty:
 # banking_premium_mult: multiplier on MAC to account for banking option value.
 # ----------------------------------------------------------
 price:
+  initial_expected: 70.0           # Synthetic burn-in price seed; expected year-0 clearing target
   banking_premium_mult: 1.4        # MAC × 1.4 = ~67 EUR/t at year 0
   burnin_std: 10.0
   ar1_persistence: 0.85
