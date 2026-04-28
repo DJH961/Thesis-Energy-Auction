@@ -222,6 +222,9 @@ class ETSEnvironment(gym.Env):
         # Default carry-forward tracking
         # _defaulted_volume_pending: allowance volume returned by defaults to add next year
         self._defaulted_volume_pending = 0.0
+        # One-shot diagnostic flag: emit a warning the first time defaulted volume
+        # is dropped due to auction.carry_forward_defaults=false.
+        self._warned_defaults_dropped = False
         # Opponent snapshot buffers for 7D lagged opponent obs
         self._opponent_snapshots      = np.zeros((self.n_total, 7), dtype=float)
         self._opponent_snapshots_prev = np.zeros((self.n_total, 7), dtype=float)
@@ -1264,8 +1267,8 @@ class ETSEnvironment(gym.Env):
                 defaulted_rolled_in = self._defaulted_volume_pending
             else:
                 # Defaulted volume is silently dropped from supply when toggle is
-                # off; warn once per episode so this is not invisible.
-                if not getattr(self, "_warned_defaults_dropped", False):
+                # off; warn once per env instance so this is not invisible.
+                if not self._warned_defaults_dropped:
                     print(
                         f"[warn] auction.carry_forward_defaults=false: "
                         f"{self._defaulted_volume_pending:.3f} Mt of defaulted volume "
