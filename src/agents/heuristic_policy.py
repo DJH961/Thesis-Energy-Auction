@@ -161,13 +161,13 @@ def auction_action(
             urgency_boost = max(0.0, 1.0 - supply_ratio) * 0.3
     urgency = min(1.0, (urgency + urgency_boost) * urgency_multiplier)
     market_anchor = max(mac_cost, price_ma3) + valuation_noise
-    # --- C1: Target quantity (needed early for wtp_budget ceiling) ---
+    # --- Target quantity (needed early for wtp_budget ceiling) ---
     qty_target_raw = annual_need + 0.1 * annual_need * urgency
     qty_mult_raw = qty_target_raw / max(annual_need, 1e-6)
     qty_mult_clipped = float(np.clip(qty_mult_raw, aq.get("qty_mult_low", 0.3), aq.get("qty_mult_high", 2.0)))
     qty_clipped = qty_mult_clipped * annual_need  # EUR-denominator for wtp_budget
 
-    # --- C1: Mid bid price — dual-ceiling WTP ---
+    # --- Mid bid price — dual-ceiling WTP ---
     # Economic ceiling: penalty + expected future price incentivises buying before penalty
     expected_future_price = price_ma3
     wtp_economic = market_anchor + urgency * max(0.0, penalty_rate + expected_future_price - market_anchor)
@@ -315,10 +315,10 @@ def secondary_action(
     """
     Heuristic Phase-2 (secondary market) action.
 
-        C2/C3: Smarter secondary with compliance-risk awareness:
-      - Never sells when carry_forward debt exists (C3)
-      - Boosts buying in final years (C3: compliance risk)
-      - Scales buy qty by budget headroom to avoid overspending (C2)
+    Compliance-risk-aware secondary trading:
+      - Never sells when carry_forward debt exists.
+      - Boosts buying in final years (compliance-risk premium).
+      - Scales buy qty by budget headroom to avoid overspending.
 
     Returns
     -------

@@ -289,7 +289,7 @@ def pretrain_behavioral_cloning(agents, env, config: dict,
 
 class EntropyConditionTracker:
     """
-    P2: Time-based entropy decay with auto-scaling.
+    Time-based entropy decay with auto-scaling.
 
     Entropy stays at coef_init for the first `decay_start` episodes
     (allowing BC warm-start and critic warmup to settle), then decays
@@ -899,7 +899,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     ]
     for i in range(n_agents):
         ep_fields += [f"streak_ceil_A{i+1}", f"streak_floor_A{i+1}", f"streak_zeroqty_A{i+1}"]
-    # F: Episode-mean diagnostic scores per learning agent (F3)
+    # Episode-mean diagnostic scores per learning agent
     for i in range(n_agents):
         ep_fields += [f"diag_S_financial_A{i+1}", f"diag_S_green_A{i+1}",
                       f"diag_S_composite_A{i+1}"]
@@ -948,7 +948,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                       f"bid_coverage_A{i+1}",
                       f"bid_to_reserve_A{i+1}",
                       f"invest_tech_choice_A{i+1}",
-                      # F: Diagnostic scores (F2)
+                      # Diagnostic scores
                       f"diag_S_financial_A{i+1}",
                       f"diag_S_green_A{i+1}",
                       f"diag_S_composite_A{i+1}",
@@ -1722,7 +1722,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             for i in range(n_total_agents)
         ]
 
-        # P5/P6/P8 episode aggregates for diagnostics
+        # Episode aggregates for emission/CF-noise/secondary diagnostics
         ep_mean_shock = [                                              # mean |ε| over years
             np.mean([abs(yl.get("emission_shocks", [0] * n_total_agents)[i])
                      for yl in env.episode_log])

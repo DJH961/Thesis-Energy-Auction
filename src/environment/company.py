@@ -101,7 +101,7 @@ class Company:
             budget_cfg.get("dynamic_budget_ceiling_multiplier", 1e9)
         )
 
-        # Emergency loan facility (B1)
+        # Emergency loan facility
         loan_cfg = budget_cfg.get("emergency_loan", {})
         self._loan_enabled = bool(loan_cfg.get("enabled", False))
         self._max_loan_fraction = float(loan_cfg.get("max_loan_fraction", 0.15))
@@ -765,7 +765,8 @@ class Company:
         return shortfall * self.effective_penalty_rate(current_year)
 
     # ------------------------------------------------------------------
-    # Observations — Phase 1: 33D base (+5*(N-1) opponent) | Phase 2: +10
+    # Observations — Phase 1: 43D base (+7*(N-1) opponent) | Phase 2: +12
+    # See get_observation_phase1 / get_observation_phase2 for the full layout.
     # ------------------------------------------------------------------
 
     def get_observation_phase1(self, year, cap_t, last_clearing_price,

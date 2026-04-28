@@ -273,7 +273,7 @@ def settle_auction(
     max_loan_budgets: np.ndarray = None,
 ):
     """
-    E4: Post-clearing settlement — check each winner can pay; handle defaults.
+    Post-clearing settlement — check each winner can pay; handle defaults.
 
     For each winning agent, the cash available for payment is reduced by any
     collateral already locked pre-bid (margin deposit).  If the remaining cash
