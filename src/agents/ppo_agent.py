@@ -278,6 +278,13 @@ class PPOAgent:
         reward_cfg = config.get("reward", {})
         norm_alpha = reward_cfg.get("normalizer_alpha", 0.01)
         self._reward_normalizer = RewardNormalizer(alpha=norm_alpha)
+        # Per-phase causal reward normalizers (audit fix 1.7): replace the
+        # previous episode-wide phase-mean/std normalization (which used future
+        # rewards to normalize past ones, breaking GAE's Markov assumption).
+        # These are updated in temporal order inside compute_gae() so each
+        # reward is normalized using only stats from prior timesteps.
+        self._auc_reward_normalizer = RewardNormalizer(alpha=norm_alpha)
+        self._sec_reward_normalizer = RewardNormalizer(alpha=norm_alpha)
         self._reward_clip_min = reward_cfg.get("clip_min", -10.0)
         self._reward_clip_max = reward_cfg.get("clip_max", 10.0)
 
@@ -870,24 +877,19 @@ class PPOAgent:
         values = np.nan_to_num(np.array(self.buffer.values, dtype=np.float32),
                                nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Phase-aware reward normalization for GAE computation.
-        # Auction and secondary rewards have different distributions; normalizing
-        # each phase separately preserves learning signal in both heads.
-        phase_is_auction = np.array([p == 'auction' for p in self.buffer.phases], dtype=bool)
-        phase_is_secondary = ~phase_is_auction
-        _EPS_STD = self.gae_min_std
-
-        if phase_is_auction.any():
-            auc_rewards = rewards[phase_is_auction]
-            auc_mu = auc_rewards.mean()
-            auc_std = max(auc_rewards.std(), _EPS_STD)
-            rewards[phase_is_auction] = np.clip((auc_rewards - auc_mu) / auc_std, -10.0, 10.0)
-
-        if phase_is_secondary.any():
-            sec_rewards = rewards[phase_is_secondary]
-            sec_mu = sec_rewards.mean()
-            sec_std = max(sec_rewards.std(), _EPS_STD)
-            rewards[phase_is_secondary] = np.clip((sec_rewards - sec_mu) / sec_std, -10.0, 10.0)
+        # Phase-aware CAUSAL reward normalization (audit fix 1.7).
+        # Walk forward in time; for each reward, use ONLY stats from prior
+        # timesteps (via the per-phase running RewardNormalizer EMAs that
+        # persist across episodes). This preserves the Markov assumption GAE
+        # relies on while still giving each phase its own scale.
+        phases_list = list(self.buffer.phases)
+        for t in range(len(rewards)):
+            r_raw = float(rewards[t])
+            if phases_list[t] == 'auction':
+                r_norm = self._auc_reward_normalizer.update_and_normalize(r_raw)
+            else:
+                r_norm = self._sec_reward_normalizer.update_and_normalize(r_raw)
+            rewards[t] = float(np.clip(r_norm, -10.0, 10.0))
 
         # GAE
         T = len(rewards)

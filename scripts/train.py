@@ -1167,9 +1167,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             # Secondary reward = total reward - auction reward
             r_secondary = rewards - r_auction[:n_agents]
 
-            # Store raw rewards; RewardNormalizer is for monitoring only.
-            for i in range(n_agents):
-                agents[i].normalize_reward(rewards[i])  # update stats for logging only
+            # Note (audit fix 1.8): the previous `normalize_reward()` call here
+            # only updated EMA stats whose return value was discarded — i.e.
+            # decorative dead code. Per-phase causal reward normalization now
+            # lives inside PPOAgent.compute_gae() (audit fix 1.7), so no
+            # normalizer update is needed at the rollout site. Raw rewards are
+            # what enters the buffer, exactly as before.
 
             # Store secondary-phase transition
             for i in range(n_agents):

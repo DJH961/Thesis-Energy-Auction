@@ -11,6 +11,36 @@ Bug-fix release addressing four reward-shaping and action-gating defects identif
 the under-bidding analysis. All four pushed the policy toward bidding less quantity than
 needed for compliance.
 
+### Fixed — Phase-aware reward normalization was non-causal (audit 1.7)
+
+`PPOAgent.compute_gae()` previously normalized auction- and secondary-phase rewards
+using the mean / std of the *entire* completed trajectory. The reward at year *t* was
+therefore divided by statistics that included rewards from years > *t*, leaking
+future information into the GAE recursion and breaking the Markov assumption GAE
+relies on.
+
+**Fix:** added two per-phase running EMA `RewardNormalizer` instances (sharing
+`reward.normalizer_alpha`) on each PPOAgent. `compute_gae()` now walks the trajectory
+in temporal order and normalizes each reward using only the EMAs accumulated from
+prior timesteps (and prior episodes), making the per-phase normalization strictly
+causal. Phase-specific scaling is preserved.
+
+**Files changed:** `src/agents/ppo_agent.py`.
+
+### Removed — Discarded `RewardNormalizer.normalize_reward()` call in train.py (audit 1.8)
+
+`scripts/train.py` called `agents[i].normalize_reward(rewards[i])` once per
+secondary-phase step but discarded the return value. The inline comment ("update
+stats for logging only") confirmed the value was decorative — yet the call still
+incurred per-step compute and gave a misleading impression that
+`reward.normalizer_alpha` affected training.
+
+**Fix:** removed the dead call. Per-phase causal normalization (1.7 above) now
+happens inside `PPOAgent.compute_gae()`, so no rollout-time normalizer update is
+needed. Raw rewards still enter the buffer exactly as before.
+
+**Files changed:** `scripts/train.py`.
+
 ### Fixed — PPO advantage / return normalization NaN path (audit 1.5)
 
 Both `compute_gae()` and `update()` divided by `adv.std() + 1e-8` (and analogously for
@@ -166,6 +196,34 @@ the same values as default for:
 - `ppo.critic_compliance_features` (added, `true`)
 
 **Files changed:** `configs/smoke_100.yaml`.
+
+### Aligned — Smoke config now mirrors every key in default.yaml (audit 1.12)
+
+`configs/smoke_100.yaml` was missing ~20 keys present in `default.yaml`, including
+entire blocks (`budget.treasury_reserve`, `reward.banking_signal`, `opponent_obs`)
+and several PPO schedule keys (`entropy_decay_frac`, `happo_dynamic_order`,
+`happo_perf_ema_alpha`, `critic_lr_decay`, `critic_lr_min`). When the production
+default is changed, the smoke harness silently kept old behaviour because the
+fallback default in code was used instead.
+
+**Fix:** synced every non-`tabula_rasa` key from `default.yaml` into
+`configs/smoke_100.yaml` with the same default values. The `tabula_rasa` block is
+deliberately not included — it is reference-only ablation in default.yaml and
+smoke does not need it.
+
+**Files changed:** `configs/smoke_100.yaml`.
+
+### Documentation — Stronger warning on bot-array length vs `n_bot_agents` (audit 1.13)
+
+`bot_initial_mix` / `bot_reward_weights` are length 8 even when `n_bot_agents=0`,
+so changing `n_bot_agents` to N silently activates the *first* N entries which
+might be stale. Preflight only enforces `len(arr) >= n_bot_agents`.
+
+**Fix:** expanded the inline comment in `default.yaml` to explicitly warn that
+the first N entries drive simulation behaviour and must be reviewed when
+`n_bot_agents` is changed.
+
+**Files changed:** `configs/default.yaml`.
 
 ### Documentation — `default.yaml` cap-overhead comment corrected (audit 2.18)
 

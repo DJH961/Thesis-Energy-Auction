@@ -106,7 +106,14 @@ companies:
     - [0.5, 0.5]   # A8: balanced ESG
 
   # Heuristic bot agents (indexed after learning agents).
-  # bot arrays must stay in sync with n_bot_agents.
+  # NOTE: bot_* arrays below have length 8 as a "configuration shelf" so they
+  # remain valid templates when n_bot_agents is increased. The first
+  # n_bot_agents entries are used; the rest are dead. WARNING — when changing
+  # n_bot_agents to N, REVIEW each bot_* array's first N entries: stale entries
+  # at index ≥ N continue to exist but become inactive only at runtime, while
+  # entries 0..N-1 still drive bot behaviour. Mismatched / outdated entries in
+  # the active prefix will silently change the simulation.
+  # preflight (src/utils/preflight.py) only enforces len(arr) >= n_bot_agents.
   n_bot_agents: 0
   bot_initial_mix:
     - [0.40, 0.40, 0.10, 0.05, 0.05]   # B1: coal-heavy (id=8)
