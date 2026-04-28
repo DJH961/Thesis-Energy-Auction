@@ -1456,7 +1456,11 @@ class ETSEnvironment(gym.Env):
         self._phase1_bid_prices = bid_actions[:, 0].copy()
         self._phase1_bid_quantities = bid_actions[:, 1].copy()  # Mt after multiplier expansion
 
-        # Budget-based gate: agents who cannot cover 10% of bid notional get qty zeroed.
+        # Budget-based gate: agents who cannot cover 10% of bid notional get qty
+        # scaled (NOT zeroed) so the bid fits within available cash. Hard zero
+        # caused a gradient discontinuity and, combined with the bid_qty_clip_ratio
+        # observation feedback, drove policies to under-bid systematically.
+        # v8.4.2 bug fix: replace hard zero with a soft scale.
         for i in range(self.n_total):
             if not self._is_agent_active(i):
                 continue
@@ -1464,8 +1468,13 @@ class ETSEnvironment(gym.Env):
                                   - self.companies[i].budget_spent_this_year)
                        + self.companies[i].get_treasury_available())
             bid_p = float(bid_actions[i, 0])
-            if bid_p > 1e-6 and cash < bid_p * bid_actions[i, 1] * 0.10:
-                bid_actions[i, 1] = 0.0
+            bid_q = float(bid_actions[i, 1])
+            if bid_p > 1e-6 and bid_q > 1e-6:
+                required_cash = bid_p * bid_q * 0.10
+                if cash < required_cash:
+                    # Scale qty so that bid_p × bid_q × 0.10 == cash
+                    max_affordable_qty = cash / (bid_p * 0.10)
+                    bid_actions[i, 1] = max(0.0, max_affordable_qty)
 
         # Record bid qty clip ratios (actual / requested after all gates)
         for i in range(self.n_agents):
@@ -1933,8 +1942,14 @@ class ETSEnvironment(gym.Env):
 
             coverage_gap = max(0.0, need - float(self._phase1_allocations[i]))
             # Use BASE penalty_rate (not effective) for inflation invariance:
-            # numerator stays in real terms, denominator (budget_real) carries the 1/infl.
-            gap_penalty = (coverage_gap * company.penalty_rate) / budget_real
+            # numerator stays in real terms, denominator carries the 1/infl.
+            # v8.4.2 bug fix: normalize by ``compliance_denom`` (= anchor_real × need),
+            # the same denominator as ``compliance_norm``. Previously this used
+            # ``budget_real`` (~10× larger), so a missed Mt saved ~1.0 of compliance_norm
+            # but cost only ~0.2 of gap_penalty — an explicit gradient toward leaving
+            # gaps. Matching denominators makes a missed Mt strictly more expensive
+            # than buying at the anchor (since penalty_rate > anchor_real).
+            gap_penalty = (coverage_gap * company.penalty_rate) / compliance_denom
 
             r_auction[i] = -(compliance_norm + capital_norm) - gap_penalty
 
@@ -2770,7 +2785,16 @@ class ETSEnvironment(gym.Env):
                 )
             else:
                 coverage_frac_auction = 1.0
-            financial_reward = coverage_frac_auction * company.w_cost * (-cost_norm_centered)
+            # v8.4.2 bug fix: apply the coverage gate ONLY when the financial reward
+            # is a saving (cost_norm_centered < 0 → -cost_norm_centered > 0). Gating
+            # the cost branch too made "skip the auction" (reward=0) dominate
+            # "win at clearing ≥ anchor" (reward<0), pushing policies toward
+            # under-bidding. Costs are now applied at full weight regardless of
+            # coverage; only over-savings get coverage-discounted.
+            if cost_norm_centered < 0.0:
+                financial_reward = coverage_frac_auction * company.w_cost * (-cost_norm_centered)
+            else:
+                financial_reward = company.w_cost * (-cost_norm_centered)
 
             base_reward = float(
                 financial_reward

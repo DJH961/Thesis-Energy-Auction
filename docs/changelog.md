@@ -5,6 +5,74 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.4.2]
+
+Bug-fix release addressing four reward-shaping and action-gating defects identified in
+the under-bidding analysis. All four pushed the policy toward bidding less quantity than
+needed for compliance.
+
+### Fixed — `gap_penalty` denominator mismatch (auction-phase reward)
+
+`compute_auction_rewards()` divided `gap_penalty` by `budget_real` while `compliance_norm`
+was divided by `compliance_denom (= anchor_real × need)`. With `budget_real ≈ 10 ×
+compliance_denom`, a missed Mt saved ~1.0 of `compliance_norm` but cost only ~0.2 of
+`gap_penalty` — an explicit gradient toward leaving coverage gaps.
+
+**Fix:** `gap_penalty` now uses `compliance_denom`, matching `compliance_norm`. Because the
+numerator still uses `penalty_rate` (≈ 138.75) and the implicit per-Mt buy cost is
+`anchor_real` (≈ 67), a missed Mt is now strictly more expensive than buying it.
+
+**Files changed:** `src/environment/ets_environment.py` (`compute_auction_rewards()`).
+
+### Fixed — Soft 10% budget gate (Phase-1 cash-coverage check)
+
+`step_auction()` zeroed `bid_q` whenever cash < 10% × `bid_p` × `bid_q`. The hard zero
+created a gradient discontinuity, and the resulting `bid_qty_clip_ratio` observation
+(dim [41]) fed the truncation back to the policy, which converged on whatever fit under
+the cliff.
+
+**Fix:** The gate now scales `bid_q` down to `cash / (bid_p × 0.10)` instead of zeroing
+it. The agent still respects the cash constraint but retains a smooth gradient.
+
+**Files changed:** `src/environment/ets_environment.py` (`step_auction()` budget gate
+block), `tests/test_environment.py` (`test_budget_gate_scales_qty_for_cash_poor_agents`,
+renamed and updated for soft-scale semantics).
+
+### Fixed — `coverage_frac_auction` only gates savings, not costs
+
+`_compute_rewards()` set `financial_reward = coverage_frac_auction × w_cost ×
+(-cost_norm_centered)`. The multiplicative gate was symmetric: it scaled both the
+positive savings branch (when `cost_norm_centered < 0`) and the negative cost branch
+(when `cost_norm_centered > 0`). The asymmetry that emerged in expectation —
+"skip the auction" → reward 0 vs. "win at clearing ≥ anchor" → reward < 0 — incentivised
+under-bidding.
+
+**Fix:** the gate is now applied **only** when `cost_norm_centered < 0` (agent under-spent
+relative to expected cost). On the cost branch, `financial_reward = w_cost ×
+(-cost_norm_centered)` is unscaled, so over-buying is no longer subsidised by partial
+coverage. (No additive penalty added — per design directive.)
+
+**Files changed:** `src/environment/ets_environment.py` (`_compute_rewards()` financial-
+reward block).
+
+### Changed — `banking_signal.imputed_cap_factor` raised 2.0 → 5.0
+
+With `imputed_cap_factor = 2.0` and `compliance_denom = anchor × need`, the imputed
+bank-drawdown norm saturated whenever `clearing_price > 2 × anchor` (≈ 134 EUR at
+year 0). Above that threshold, drawing from the bank cost less in reward terms than
+buying the same Mt at clearing — inverting the buy-vs-draw incentive in price spikes
+and biasing policies toward larger banks and smaller auction bids.
+
+**Fix:** raise the cap to `5.0 × compliance_denom`. The cap now binds only above
+~5 × anchor (≈ 335 EUR), well into emergency price-containment territory, so the
+imputed cost tracks clearing price linearly across the realistic auction range.
+The `min(...)` clamp is retained to bound reward in pathological spikes, which is
+already further bounded by the standard reward clip.
+
+**Files changed:** `configs/default.yaml` (`reward.banking_signal.imputed_cap_factor`).
+
+---
+
 ## [8.4.1]
 
 ### Changed — PCL reference floored at fundamental anchor
