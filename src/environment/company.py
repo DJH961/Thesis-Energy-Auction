@@ -799,9 +799,9 @@ class Company:
                                last_bid_qty_clip_ratio: float = 1.0,
                                last_invest_clip_ratio: float = 1.0):
         """
-        Phase 1 observation (pre-auction): 42D base + 7*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 43D base + 7*(N-1) opponent dims.
 
-        Base 42 dims:
+        Base 43 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
@@ -840,15 +840,17 @@ class Company:
         [37] cap_ahead_6y_ratio: cap(t+6) / cap(t) clipped [0,1] — 6-year scarcity lookahead
         [38] pcl_headroom_norm: (pcl_ceiling - price_ma3) / price_max clipped [0,1]
              Headroom to upper bid-change bound; 1.0 = unconstrained
-        [39] combined price clip signal: min(last_bid_price_clip, last_budget_price_clip) / price_max, signed [-1,1]
-             Most-negative of PCL clip and budget clip; negative if clipped down; zero if unconstrained
-        [40] last_bid_qty_clip_ratio: actual_qty / requested_qty clipped [0,1]
+        [39] last_bid_price_clip: (actual_bid - requested_bid) / price_max, signed [-1,1]
+             PCL clip only; negative if clipped down by bid-change limit; zero if unconstrained
+        [40] last_budget_price_clip: (actual_bid - requested_bid) / price_max, signed [-1,1]
+             Budget clip only; negative if clipped down by budget affordability gate; zero if unconstrained
+        [41] last_bid_qty_clip_ratio: actual_qty / requested_qty clipped [0,1]
              1.0 = no qty gate fired; <1 = leverage/collateral/budget gate reduced qty
-        [41] last_invest_clip_ratio: actual_invest_frac / requested_invest_frac clipped [0,1]
+        [42] last_invest_clip_ratio: actual_invest_frac / requested_invest_frac clipped [0,1]
              1.0 = no cap applied; <1 = budget/capex gate reduced investment
 
         Opponent dims (if opponent_modeling enabled, 7D per opponent):
-        [42..] = (emissions/10, green_frac, fossil_frac, queue_noisy, bank_norm,
+        [43..] = (emissions/10, green_frac, fossil_frac, queue_noisy, bank_norm,
                   net_secondary_norm, lagged_compliance_gap_norm) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
@@ -915,9 +917,10 @@ class Company:
             float(np.clip(cap_ahead_3y_ratio, 0.0, 1.0)),        # [36] 3-year cap scarcity lookahead
             float(np.clip(cap_ahead_6y_ratio, 0.0, 1.0)),        # [37] 6-year cap scarcity lookahead
             float(np.clip((pcl_ceiling - price_signal) / pn, 0.0, 1.0)),   # [38] pcl headroom norm
-            float(np.clip(min(last_bid_price_clip, last_budget_price_clip) / pn, -1.0, 1.0)),  # [39] combined price clip (signed)
-            float(np.clip(last_bid_qty_clip_ratio, 0.0, 1.0)),             # [40] bid qty clip ratio
-            float(np.clip(last_invest_clip_ratio, 0.0, 1.0)),              # [41] invest frac clip ratio
+            float(np.clip(last_bid_price_clip / pn, -1.0, 1.0)),          # [39] PCL price clip (signed)
+            float(np.clip(last_budget_price_clip / pn, -1.0, 1.0)),       # [40] budget price clip (signed)
+            float(np.clip(last_bid_qty_clip_ratio, 0.0, 1.0)),            # [41] bid qty clip ratio
+            float(np.clip(last_invest_clip_ratio, 0.0, 1.0)),             # [42] invest frac clip ratio
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -1003,11 +1006,11 @@ class Company:
 
     @property
     def obs_dim_phase1(self) -> int:
-        """42 base dims + 7*(N_total-1) opponent dims. See get_observation_phase1 for full layout."""
+        """43 base dims + 7*(N_total-1) opponent dims. See get_observation_phase1 for full layout."""
         opp_dims = self.config.get("opponent_obs", {}).get("dims_per_opponent", 7)
         if self._opponent_modeling and self._n_total > 1:
-            return 42 + opp_dims * (self._n_total - 1)
-        return 42
+            return 43 + opp_dims * (self._n_total - 1)
+        return 43
 
     @property
     def obs_dim_phase2(self) -> int:

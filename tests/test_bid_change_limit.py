@@ -10,11 +10,12 @@ Covers:
   - _last_bid_price_clip records signed deviation (negative if clipped down)
   - _last_bid_qty_clip_ratio, _last_invest_clip_ratio initialized to 1.0
   - Obs dim [38] = pcl_headroom_norm in [0, 1]
-  - Obs dim [39] = bid price clip signal, signed
-  - Obs dim [40] = bid qty clip ratio in [0, 1]
-  - Obs dim [41] = invest frac clip ratio in [0, 1]
+  - Obs dim [39] = PCL bid price clip signal, signed
+  - Obs dim [40] = budget price clip signal, signed
+  - Obs dim [41] = bid qty clip ratio in [0, 1]
+  - Obs dim [42] = invest frac clip ratio in [0, 1]
   - Phase 2 obs dim [base+11] = sec qty clip ratio
-  - obs_dim_phase1 = 42 (no opp modeling) or 42 + 7*(N-1)
+  - obs_dim_phase1 = 43 (no opp modeling) or 43 + 7*(N-1)
   - obs_dim_phase2 = obs_dim_phase1 + 12
 """
 
@@ -293,15 +294,15 @@ class TestBCLClipSignalMagnitude:
 
 class TestObsDimensions:
 
-    def test_obs_dim_phase1_base_42(self):
-        """obs_dim_phase1 == 42 when opponent modeling is disabled."""
+    def test_obs_dim_phase1_base_43(self):
+        """obs_dim_phase1 == 43 when opponent modeling is disabled."""
         env = _make_env()
-        assert env.companies[0].obs_dim_phase1 == 42, (
-            f"Expected obs_dim_phase1=42, got {env.companies[0].obs_dim_phase1}"
+        assert env.companies[0].obs_dim_phase1 == 43, (
+            f"Expected obs_dim_phase1=43, got {env.companies[0].obs_dim_phase1}"
         )
 
     def test_obs_dim_phase1_with_opp_modeling(self):
-        """obs_dim_phase1 == 42 + 7*(n_total-1) with opponent modeling enabled."""
+        """obs_dim_phase1 == 43 + 7*(n_total-1) with opponent modeling enabled."""
         cfg = _load_config()
         cfg["opponent_modeling"]["enabled"] = True
         cfg["auction"]["bid_change_limit"] = {"enabled": True, "value": 50.0}
@@ -309,7 +310,7 @@ class TestObsDimensions:
         env.reset(seed=42)
         n = env.n_total
         opp_dims = cfg.get("opponent_obs", {}).get("dims_per_opponent", 7)
-        expected = 42 + opp_dims * (n - 1)
+        expected = 43 + opp_dims * (n - 1)
         assert env.companies[0].obs_dim_phase1 == expected, (
             f"Expected obs_dim_phase1={expected}, got {env.companies[0].obs_dim_phase1}"
         )
@@ -354,7 +355,7 @@ class TestObsDimensions:
 
 
 # ---------------------------------------------------------------------------
-# Obs dim [38]-[41] values
+# Obs dim [38]-[42] values
 # ---------------------------------------------------------------------------
 
 class TestObsClipDimValues:
@@ -372,7 +373,7 @@ class TestObsClipDimValues:
             )
 
     def test_obs_39_bid_price_clip_signal_range(self):
-        """Obs dim [39] (bid price clip signal) is in [-1, 1]."""
+        """Obs dim [39] (PCL bid price clip signal) is in [-1, 1]."""
         env = _make_env(bcl_enabled=True, bcl_value=50.0)
         _run_full_year(env, bid_price=80.0)
         _run_auction_step(env, bid_price=240.0)  # extreme bid → clipped
@@ -399,26 +400,37 @@ class TestObsClipDimValues:
                 f"Agent {i}: obs[39]={val:.4f} should be ≤ 0 when bid clipped down"
             )
 
-    def test_obs_40_qty_clip_ratio_in_unit_interval(self):
-        """Obs dim [40] (bid qty clip ratio) is in [0, 1]."""
+    def test_obs_40_budget_price_clip_signal_range(self):
+        """Obs dim [40] (budget price clip signal) is in [-1, 1]."""
         env = _make_env()
-        _run_auction_step(env, bid_price=80.0, qty_mult=2.0)
+        _run_auction_step(env, bid_price=80.0)
         obs = env._get_obs_phase1()
         for i in range(env.n_agents):
             val = float(obs[i, 40])
-            assert 0.0 <= val <= 1.0 + 1e-6, (
-                f"Agent {i}: obs[40]={val:.4f} outside [0,1]"
+            assert -1.0 - 1e-6 <= val <= 1.0 + 1e-6, (
+                f"Agent {i}: obs[40]={val:.4f} outside [-1,1]"
             )
 
-    def test_obs_41_invest_clip_ratio_in_unit_interval(self):
-        """Obs dim [41] (invest frac clip ratio) is in [0, 1]."""
+    def test_obs_41_qty_clip_ratio_in_unit_interval(self):
+        """Obs dim [41] (bid qty clip ratio) is in [0, 1]."""
         env = _make_env()
-        _run_auction_step(env, bid_price=80.0, invest_frac=0.5)
+        _run_auction_step(env, bid_price=80.0, qty_mult=2.0)
         obs = env._get_obs_phase1()
         for i in range(env.n_agents):
             val = float(obs[i, 41])
             assert 0.0 <= val <= 1.0 + 1e-6, (
                 f"Agent {i}: obs[41]={val:.4f} outside [0,1]"
+            )
+
+    def test_obs_42_invest_clip_ratio_in_unit_interval(self):
+        """Obs dim [42] (invest frac clip ratio) is in [0, 1]."""
+        env = _make_env()
+        _run_auction_step(env, bid_price=80.0, invest_frac=0.5)
+        obs = env._get_obs_phase1()
+        for i in range(env.n_agents):
+            val = float(obs[i, 42])
+            assert 0.0 <= val <= 1.0 + 1e-6, (
+                f"Agent {i}: obs[42]={val:.4f} outside [0,1]"
             )
 
     def test_obs_dim39_zero_when_no_clip(self):

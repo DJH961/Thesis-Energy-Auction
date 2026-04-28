@@ -19,25 +19,27 @@ not the linear LRF approximation.
 
 **Files changed:** `src/environment/ets_environment.py` (`step_auction()` PCL block).
 
-### Added — Budget price clip tracked and merged into observation dim [39]
+### Added — Budget price clip tracked as separate observation dim [40]
 
 The soft budget clip (bid price clamped to 1.5× max affordable price) was silently
 modifying actions with no gradient signal back to the agent.
 
 **Fix:** `_last_budget_price_clip` (shape `n_total`, reset to 0 each episode) stores
-`clipped_price − original_bid` (negative when clipped down). Dim [39] in the Phase 1
-observation is now the combined clip signal:
+`clipped_price − original_bid` (negative when clipped down). The Phase 1 observation
+now exposes both clip signals as independent dims:
 
-```
-obs[39] = min(last_bid_price_clip, last_budget_price_clip) / price_max   # clipped [−1, 1]
-```
+| Index | Name | Formula | Source |
+|---|---|---|---|
+| [39] | `last_bid_price_clip` | `(actual − requested) / price_max`, signed [-1,1] | PCL gate only |
+| [40] | `last_budget_price_clip` | `(actual − requested) / price_max`, signed [-1,1] | Budget gate only |
 
-This takes the most-negative of the PCL clip and the budget clip, giving the agent a
-single signed feedback signal that reflects whichever constraint was binding.
+Dims [40]–[41] (qty clip, invest clip) shift to [41]–[42]. **Phase 1 base: 42 → 43 dims.**
 
 **Files changed:** `src/environment/ets_environment.py` (`__init__`, `reset()`,
 `step_auction()`, `_get_obs_phase1()` call site), `src/environment/company.py`
-(`get_observation_phase1()` signature and dim [39] computation).
+(`get_observation_phase1()` signature, docstring, array, `obs_dim_phase1` property),
+`tests/test_bid_change_limit.py` (dim references, new `test_obs_40_budget_price_clip_signal_range`),
+`tests/test_company.py`, `tests/test_environment.py` (42 → 43 base dim references).
 
 ### Changed — Decoupled actor optimizers (auction and secondary stepped independently)
 
@@ -101,14 +103,18 @@ param groups independently of the actor decay.
 | `reward.gae_min_std` | 0.1 | 0.15 | Reduces over-confidence in low-variance regimes |
 | `exploration.epsilon_final` | 0.03 | 0.02 | Tighter exploitation at convergence |
 | `exploration.epsilon_decay_frac` | 0.40 | 0.45 | Slower exploration decay |
+| `ppo.lr` | 0.0003 | 0.0002 | Lower actor LR for more stable late-training updates |
 | `ppo.clip_eps` | 0.20 | 0.15 | Tighter trust region |
-| `ppo.mini_batch_size` | 128 | 64 | Smaller batches improve gradient diversity |
+| `ppo.entropy_coef_final` | 0.01 | 0.005 | Less residual entropy at convergence |
+| `ppo.entropy_decay_frac` | 0.90 | 0.70 | Faster entropy decay to encourage earlier exploitation |
+| `ppo.mini_batch_size` | 32 | 64 | Larger batches reduce gradient variance |
 | `ppo.episodes_per_update` | 16 | 32 | More on-policy data per update |
-| `ppo.log_std_min` | −4.0 | −3.5 | Prevents policy collapse to near-deterministic |
-| `ppo.critic_lr` | 0.0003 | 0.0005 | Higher critic LR to improve value accuracy |
+| `ppo.short_run_overrides.episodes_per_update` | 8 | 16 | Consistent 2× ratio with main setting |
+| `ppo.log_std_min` | −2.5 | −3.5 | Allow slightly more deterministic policies |
+| `ppo.critic_lr` | 0.001 | 0.0005 | Lower critic LR reduces value overfitting |
 | `ppo.target_kl` | 0.02 | 0.015 | Tighter KL constraint |
 | `ppo.critic_extra_epochs` | 4 | 6 | More critic epochs per update |
-| `ppo.critic_huber_delta` | 2.0 | 4.0 | Wider Huber region for large TD errors |
+| `ppo.critic_huber_delta` | 10.0 | 4.0 | Narrower Huber region, less tolerance for large TD errors |
 
 ---
 

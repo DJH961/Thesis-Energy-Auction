@@ -459,24 +459,24 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
 # ---------------------------------------------------------------------------
 
 def test_obs_phase1_shape(config):
-    """Phase 1 obs should be 42D base (no opponent modeling).
-    42 dims = 38 prior + 4 clip feedback dims [38]-[41]."""
+    """Phase 1 obs should be 43D base (no opponent modeling).
+    43 dims = 38 prior + 5 clip feedback dims [38]-[42]."""
     c = make_company(config, agent_id=0)
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, auction_gap=1.0)
-    assert obs.shape == (42,), f"Expected 42D, got {obs.shape}"
+    assert obs.shape == (43,), f"Expected 43D, got {obs.shape}"
     assert obs.dtype == np.float32
 
 def test_obs_phase1_with_opponents(config):
-    """With opponent modeling, obs should have 42 + 7*(N-1) dims."""
+    """With opponent modeling, obs should have 43 + 7*(N-1) dims."""
     config_opp = {**config, "opponent_modeling": {"enabled": True}}
     c = make_company(config_opp, agent_id=0)
     opponent_obs = np.zeros(7 * 3, dtype=np.float32)  # 3 opponents, 7D each
     obs = c.get_observation_phase1(
         year=0, cap_t=24.0, last_clearing_price=80.0,
         expected_price=80.0, opponent_obs=opponent_obs)
-    assert obs.shape == (42 + 21,)
+    assert obs.shape == (43 + 21,)
 
 def test_obs_phase2_extends_phase1(config):
     """Phase 2 obs = phase1 + 12 extra dims."""
@@ -486,9 +486,9 @@ def test_obs_phase2_extends_phase1(config):
     obs2 = c.get_observation_phase2(
         obs_phase1=obs1, allocation=2.0, clearing_price=80.0,
         emissions=3.0, banked=1.0, emission_shock=0.05, payment=160.0)
-    assert obs2.shape == (42 + 12,)
-    # First 42 dims should match phase1
-    np.testing.assert_array_equal(obs2[:42], obs1)
+    assert obs2.shape == (43 + 12,)
+    # First 43 dims should match phase1
+    np.testing.assert_array_equal(obs2[:43], obs1)
 
 def test_obs_values_finite(config):
     """All observation values should be finite."""
