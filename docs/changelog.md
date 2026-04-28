@@ -7,9 +7,68 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ## [8.4.2]
 
-Bug-fix release addressing four reward-shaping and action-gating defects identified in
-the under-bidding analysis. All four pushed the policy toward bidding less quantity than
-needed for compliance.
+Bug-fix release addressing defects identified in the under-bidding analysis
+(`docs/BUGS_AND_ISSUES.md`, sections 1–6).
+
+### PPO numerics (`src/agents/ppo_agent.py`)
+- **1.5** Advantage / return / HAPPO weighted-advantage normalization now uses
+  `torch.clamp(std, min=gae_min_std)` instead of `+ 1e-8` (the configured floor was
+  previously unused).
+- **1.6** Widened `log_ratio` pre-clamp from `[-2, 2]` to `[-20, 20]` so the PPO
+  clipped surrogate `clamp(ratio, 1±ε)` is solely responsible for the trust region.
+- **1.7** Phase-aware reward normalization in `compute_gae()` is now causal: two
+  per-phase running EMA `RewardNormalizer`s walk the trajectory in temporal order.
+- **1.16** `normalize_returns` code default aligned with YAML (`True` → `False`).
+- **6.7** Parenthesized `default_rng(seed if … else 0 + agent_id)` for readability.
+
+### Training loop (`scripts/train.py`)
+- **1.8** Removed the discarded `RewardNormalizer.normalize_reward()` call (1.7
+  makes it redundant).
+- **1.9** Seed Python `random` alongside `numpy` / `torch` in `train_one_seed`.
+- **1.10** Cosine LR decay moved out of the `is_update_episode` gate so it advances
+  every episode.
+- **2.9** Skip `agent_perf_ema` update for HPP-swapped agents (their rollout came
+  from a historical policy).
+
+### Cap schedule (`src/environment/cap_schedule.py`, `ets_environment.py`)
+- **2.5** Unified MSR effective-penalty calculation behind `_effective_penalty()`.
+  New optional `inflation_factor` parameter takes precedence over `(1+rate)**year`
+  compounding so MSR thresholds are correct under
+  `penalty.inflation_random_std` / `inflation_random_window`.
+
+### Environment (`src/environment/ets_environment.py`)
+- **3.10** One-shot warning when `auction.carry_forward_defaults=false` silently
+  drops defaulted volume from supply.
+
+### Config alignment
+- **1.11 / 3.9** Added `ets.reserve_discount`, `ets.reserve_initial`, and
+  `price.initial_expected` to `configs/default.yaml` with documented defaults.
+- **2.18** Corrected `+12%`→`+10%` cap-overhead comment.
+- **1.13** Stronger inline warning on bot-array length vs `n_bot_agents`.
+- **1.12** Synced every non-`tabula_rasa` key from `default.yaml` into
+  `configs/smoke_100.yaml` (treasury_reserve, banking_signal, opponent_obs, plus
+  PPO schedule keys).
+- **1.14 / 1.15 / 2.19 / 3.1 / 3.2 / 3.4 / 3.7** Re-aligned smoke with default for
+  `phantom_bidder.enabled`, `exploration.mode`, `ets.initial_bank_fraction`,
+  `auction.bid_change_limit.value`, `auction.suspension_length`,
+  `auction.budget_price_clip`, `budget.dynamic_budget_ceiling_multiplier`,
+  `ppo.critic_compliance_features`.
+
+### Tests (`tests/`)
+- **5.5 / 5.6 / 5.7** Tightened three assertions: under-subscribed
+  `alloc.sum() == 1.0`; invest action `executed ≤ requested`; `_make_env` default
+  `bcl_value` 50→75 to match production.
+
+### Confirmed false positives (no change)
+- **1.1 / 1.2** `settle_compliance_realized()` does not modify holdings; the env's
+  `holdings - total_obligation` is the single surrender step. CF growth is linear.
+- **1.3** `settle_auction()` zeros defaulter allocations, so
+  `auction_volume - allocations.sum() - defaulted` is correctly mutually exclusive
+  with `_defaulted_volume_pending`.
+- **1.4** `mac_cost` is in EUR/tCO2 (per its comparison to `carbon_price`); units
+  `MtCO2 × EUR/tCO2 = M€` ✓.
+
+---
 
 ### Fixed — `gap_penalty` denominator mismatch (auction-phase reward)
 

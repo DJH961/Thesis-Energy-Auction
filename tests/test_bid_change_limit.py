@@ -45,7 +45,7 @@ def _load_config(**overrides):
     return cfg
 
 
-def _make_env(seed=42, bcl_enabled=True, bcl_value=50.0, **overrides):
+def _make_env(seed=42, bcl_enabled=True, bcl_value=75.0, **overrides):
     cfg = _load_config(**overrides)
     cfg["auction"]["bid_change_limit"] = {"enabled": bcl_enabled, "value": bcl_value}
     env = ETSEnvironment(cfg, seed=seed)

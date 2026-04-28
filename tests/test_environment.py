@@ -96,6 +96,12 @@ def test_phase1_invest_action_direct_mapping():
     assert invest_mid > invest_low, (
         f"Expected monotonic increase in executed investment, got low={invest_low:.6f}, mid={invest_mid:.6f}"
     )
+    # Numeric tolerance: invest action 0.03 should map to ≤ requested fraction.
+    # The action is the requested invest fraction; budget gating may scale it
+    # down but never up, so executed_frac ∈ [0, 0.03 + small slack].
+    assert invest_mid <= 0.03 + 1e-6, (
+        f"Executed invest_frac {invest_mid:.6f} exceeded requested 0.03"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -153,7 +153,7 @@ class PPOAgent:
         self.config = config
         self.obs_dim_phase1 = obs_dim_phase1
         # Seeded RNG for reproducible mini-batch shuffling
-        self._rng = np.random.default_rng(seed if seed is not None else 0 + agent_id)
+        self._rng = np.random.default_rng((seed if seed is not None else 0) + agent_id)
         ppo = config["ppo"]
 
         self.gamma = ppo["gamma"]
@@ -266,7 +266,7 @@ class PPOAgent:
         self.critic_extra_epochs = ppo.get("critic_extra_epochs", 0)
         self.critic_huber = ppo.get("critic_huber", False)
         self.critic_huber_delta = ppo.get("critic_huber_delta", 10.0)
-        self.normalize_returns = ppo.get("normalize_returns", True)
+        self.normalize_returns = ppo.get("normalize_returns", False)
         self.clip_value = ppo.get("clip_value", False)
 
         # Initialize critic loss function
@@ -278,6 +278,13 @@ class PPOAgent:
         reward_cfg = config.get("reward", {})
         norm_alpha = reward_cfg.get("normalizer_alpha", 0.01)
         self._reward_normalizer = RewardNormalizer(alpha=norm_alpha)
+        # Per-phase causal reward normalizers (audit fix 1.7): replace the
+        # previous episode-wide phase-mean/std normalization (which used future
+        # rewards to normalize past ones, breaking GAE's Markov assumption).
+        # These are updated in temporal order inside compute_gae() so each
+        # reward is normalized using only stats from prior timesteps.
+        self._auc_reward_normalizer = RewardNormalizer(alpha=norm_alpha)
+        self._sec_reward_normalizer = RewardNormalizer(alpha=norm_alpha)
         self._reward_clip_min = reward_cfg.get("clip_min", -10.0)
         self._reward_clip_max = reward_cfg.get("clip_max", 10.0)
 
@@ -619,11 +626,11 @@ class PPOAgent:
         if self.normalize_returns and T > 1:
             ret_mean = ret_t.mean()
             ret_std = ret_t.std()
-            if ret_std > 1e-8:
-                ret_t = (ret_t - ret_mean) / (ret_std + 1e-8)
+            if ret_std > self.gae_min_std:
+                ret_t = (ret_t - ret_mean) / torch.clamp(ret_std, min=self.gae_min_std)
 
         if self.normalize_advantages and T > 1:
-            adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+            adv_t = (adv_t - adv_t.mean()) / torch.clamp(adv_t.std(), min=self.gae_min_std)
 
         adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
@@ -696,8 +703,10 @@ class PPOAgent:
                     if is_auc_mb.any():
                         auc_lp_new, auc_ent = self.auction_policy.evaluate(
                             obs1[mb][is_auc_mb], auc_raw[mb][is_auc_mb])
+                        # Wide clamp: NaN/Inf guard only. The PPO clipped surrogate
+                        # below is responsible for the trust-region constraint.
                         auc_log_ratio = torch.clamp(
-                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -2.0, 2.0)
+                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -20.0, 20.0)
                         auc_ratio = torch.exp(auc_log_ratio)
                         auc_adv = adv_t[mb][is_auc_mb]
                         auc_surr1 = auc_ratio * auc_adv
@@ -710,7 +719,7 @@ class PPOAgent:
                         sec_lp_new, sec_ent = self.secondary_policy.evaluate(
                             obs2[mb][sec_mb], sec_raw[mb][sec_mb])
                         sec_log_ratio = torch.clamp(
-                            sec_lp_new - old_sec_lp[mb][sec_mb], -2.0, 2.0)
+                            sec_lp_new - old_sec_lp[mb][sec_mb], -20.0, 20.0)
                         sec_ratio = torch.exp(sec_log_ratio)
                         sec_adv = adv_t[mb][sec_mb]
                         sec_surr1 = sec_ratio * sec_adv
@@ -868,24 +877,19 @@ class PPOAgent:
         values = np.nan_to_num(np.array(self.buffer.values, dtype=np.float32),
                                nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Phase-aware reward normalization for GAE computation.
-        # Auction and secondary rewards have different distributions; normalizing
-        # each phase separately preserves learning signal in both heads.
-        phase_is_auction = np.array([p == 'auction' for p in self.buffer.phases], dtype=bool)
-        phase_is_secondary = ~phase_is_auction
-        _EPS_STD = self.gae_min_std
-
-        if phase_is_auction.any():
-            auc_rewards = rewards[phase_is_auction]
-            auc_mu = auc_rewards.mean()
-            auc_std = max(auc_rewards.std(), _EPS_STD)
-            rewards[phase_is_auction] = np.clip((auc_rewards - auc_mu) / auc_std, -10.0, 10.0)
-
-        if phase_is_secondary.any():
-            sec_rewards = rewards[phase_is_secondary]
-            sec_mu = sec_rewards.mean()
-            sec_std = max(sec_rewards.std(), _EPS_STD)
-            rewards[phase_is_secondary] = np.clip((sec_rewards - sec_mu) / sec_std, -10.0, 10.0)
+        # Phase-aware CAUSAL reward normalization (audit fix 1.7).
+        # Walk forward in time; for each reward, use ONLY stats from prior
+        # timesteps (via the per-phase running RewardNormalizer EMAs that
+        # persist across episodes). This preserves the Markov assumption GAE
+        # relies on while still giving each phase its own scale.
+        phases_buf = self.buffer.phases
+        for t in range(len(rewards)):
+            r_raw = float(rewards[t])
+            if phases_buf[t] == 'auction':
+                r_norm = self._auc_reward_normalizer.update_and_normalize(r_raw)
+            else:
+                r_norm = self._sec_reward_normalizer.update_and_normalize(r_raw)
+            rewards[t] = float(np.clip(r_norm, -10.0, 10.0))
 
         # GAE
         T = len(rewards)
@@ -924,11 +928,11 @@ class PPOAgent:
         if self.normalize_returns and T > 1:
             ret_mean = ret_t.mean()
             ret_std = ret_t.std()
-            if ret_std > 1e-8:
-                ret_t = (ret_t - ret_mean) / (ret_std + 1e-8)
+            if ret_std > self.gae_min_std:
+                ret_t = (ret_t - ret_mean) / torch.clamp(ret_std, min=self.gae_min_std)
 
         if self.normalize_advantages and T > 1:
-            adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+            adv_t = (adv_t - adv_t.mean()) / torch.clamp(adv_t.std(), min=self.gae_min_std)
 
         adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
@@ -986,8 +990,8 @@ class PPOAgent:
             weighted_adv = adv_t * advantage_weights.to(self.device)
             # HAPPO weighted-advantage re-normalization
             w_std = weighted_adv.std()
-            if w_std > 1e-6:
-                weighted_adv = (weighted_adv - weighted_adv.mean()) / (w_std + 1e-8)
+            if w_std > self.gae_min_std:
+                weighted_adv = (weighted_adv - weighted_adv.mean()) / torch.clamp(w_std, min=self.gae_min_std)
         else:
             weighted_adv = adv_t
 
@@ -1030,8 +1034,10 @@ class PPOAgent:
                     if is_auc_mb.any():
                         auc_lp_new, auc_ent = self.auction_policy.evaluate(
                             obs1[mb][is_auc_mb], auc_raw[mb][is_auc_mb])
+                        # Wide clamp: NaN/Inf guard only. The PPO clipped surrogate
+                        # below is responsible for the trust-region constraint.
                         auc_log_ratio = torch.clamp(
-                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -2.0, 2.0)
+                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -20.0, 20.0)
                         auc_ratio = torch.exp(auc_log_ratio)
                         auc_adv = weighted_adv[mb][is_auc_mb]
                         auc_surr1 = auc_ratio * auc_adv
@@ -1044,7 +1050,7 @@ class PPOAgent:
                         sec_lp_new, sec_ent = self.secondary_policy.evaluate(
                             obs2[mb][sec_mb], sec_raw[mb][sec_mb])
                         sec_log_ratio = torch.clamp(
-                            sec_lp_new - old_sec_lp[mb][sec_mb], -2.0, 2.0)
+                            sec_lp_new - old_sec_lp[mb][sec_mb], -20.0, 20.0)
                         sec_ratio = torch.exp(sec_log_ratio)
                         sec_adv = weighted_adv[mb][sec_mb]
                         sec_surr1 = sec_ratio * sec_adv
