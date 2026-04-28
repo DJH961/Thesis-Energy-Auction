@@ -122,13 +122,19 @@ class AuctionPolicy(nn.Module):
         return log_prob, entropy
 
     def act_per_dim(self, obs, deterministic=False):
-        """Like ``act`` but returns per-dim log_prob (B, action_dim)."""
+        """Like ``act`` but returns per-dim log_prob (B, action_dim).
+
+        The stored "raw" representation is the clamped value (in [-1, 1])
+        so that log_prob and later ``evaluate_per_dim`` are computed at the
+        same point the environment actually executed. Without the clamp,
+        importance ratios would be evaluated at a sample the env never saw.
+        """
         dist = self.forward(obs)
         raw = dist.mean if deterministic else dist.rsample()
         squashed = torch.clamp(raw, -1.0, 1.0)
         action = squashed * self.action_scale + self.action_bias
-        log_prob = dist.log_prob(raw)  # (B, action_dim) — no sum
-        return action, raw, log_prob
+        log_prob = dist.log_prob(squashed)  # (B, action_dim) — no sum
+        return action, squashed, log_prob
 
     def _init_weights(self):
         for layer in [self.fc1, self.fc2]:

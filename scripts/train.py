@@ -1390,9 +1390,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         # Zero out swapped agents' contributions: their rewards came from
         # historical policies, not the current policies we are about to update.
         # v8.5: when ``happo_order_metric == "advantage"``, the EMA tracks the
-        # per-agent mean GAE advantage (raw, pre-normalization) so the update
-        # order is robust to different reward floors across mixed reward
-        # functions (compliance vs ESG-leaning agents).
+        # per-agent mean GAE advantage before advantage standardization
+        # (mean/std), after any per-phase reward normalization/clipping, so
+        # the update order is less sensitive to different reward floors across
+        # mixed reward functions (compliance vs ESG-leaning agents).
         if happo_dynamic_order:
             order_metric = str(config["ppo"].get("happo_order_metric", "reward"))
             if order_metric == "advantage":

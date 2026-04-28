@@ -1987,8 +1987,11 @@ class ETSEnvironment(gym.Env):
 
             auction_cost      = float(self._phase1_payments[i]) / infl
             invest_cost       = float(self._phase1_invest_costs[i]) / infl
-            opex_delta        = (company.compute_operational_cost(self.current_year)
-                                 - company.baseline_opex) / infl
+            # Real-terms OPEX delta vs initial-mix baseline. Deflate first,
+            # then subtract baseline_opex (already real, since infl(0)=1) so
+            # the delta is zero when the mix is unchanged regardless of year.
+            opex_delta        = (company.compute_operational_cost(self.current_year) / infl
+                                 - company.baseline_opex)
             mac_cost_i        = float(self._phase1_mac_costs[i]) / infl
             collateral_cost_i = (float(self._collateral_locked[i]) *
                                  float(self.config["auction"]["collateral"]
@@ -2689,7 +2692,11 @@ class ETSEnvironment(gym.Env):
             secondary_cost     = float(trade_costs[i])
             penalty_cost       = float(penalties[i])
             investment_cost    = float(invest_costs[i])
-            opex_delta         = company.compute_operational_cost(self.current_year) - company.baseline_opex
+            # Real-terms OPEX delta: deflate current-year nominal OPEX before
+            # subtracting baseline_opex (year-0 snapshot, already real).
+            # Avoids an inflation-driven cost term when the mix is unchanged.
+            opex_delta_real    = (company.compute_operational_cost(self.current_year) / infl
+                                  - company.baseline_opex)
             mac_cost_i         = float(mac_costs[i])
             collateral_cost_i  = float(collateral_costs[i])
             loan_interest_cost = company.compute_green_loan_cost()
@@ -2703,9 +2710,9 @@ class ETSEnvironment(gym.Env):
             budget_penalty = company.compute_budget_penalty()
             capex_penalty  = company.compute_capex_penalty()
 
-            # Three real cost buckets (all deflated by infl)
+            # Three real cost buckets (all in real terms)
             compliance_cost_real = (auction_cost + secondary_cost + mac_cost_i) / infl
-            capital_cost_real    = (investment_cost + opex_delta) / infl
+            capital_cost_real    = (investment_cost / infl) + opex_delta_real
             soft_penalty_real    = (budget_penalty + capex_penalty + loan_interest_cost) / infl
 
             anchor_real = anchor_t / infl

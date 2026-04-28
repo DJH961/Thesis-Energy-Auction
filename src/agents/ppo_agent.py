@@ -390,12 +390,16 @@ class PPOAgent:
                               epsilon: float = 0.0,
                               last_secondary_buy_price: float = 0.0,
                               current_year: int = 0):
-        """Phase 1: obs(18) → (action[6], raw[6], logp[1]).
+        """Phase 1: obs → (action[6], raw[6], logp[6]).
+
+        Returns per-dimension log-probabilities (one entry per action dim) so
+        the rollout buffer can route bid dims (0, 1) and investment dims
+        (2..5) to their own advantages in the split-head update.
 
         When ``epsilon > 0`` and not deterministic, with probability *epsilon*
         an epsilon-random action in physical space replaces the policy sample.
-        The raw action and log_prob are still computed under the current policy
-        so that the PPO importance ratio remains correct.
+        The raw action and per-dim log_prob are still computed under the
+        current policy so that the PPO importance ratio remains correct.
 
         ``last_secondary_buy_price``: price this agent paid per Mt on the
         secondary market last year. Shifts the WTP exploration anchor upward
@@ -993,8 +997,10 @@ class PPOAgent:
             adv_inv[t] = gae_i
         ret_inv = adv_inv + values_inv
 
-        # Track raw mean advantages for HAPPO advantage-based ordering (#15).
-        # Done before normalization so the EMA reflects the true scale.
+        # Track mean advantages for HAPPO advantage-based ordering (#15).
+        # Captured before advantage standardization (mean/std normalization),
+        # but after any per-phase reward normalization/clipping already
+        # applied to rewards / rewards_inv above.
         self._last_mean_adv = float(np.nanmean(advantages))
         self._last_mean_adv_invest = float(np.nanmean(adv_inv))
 
