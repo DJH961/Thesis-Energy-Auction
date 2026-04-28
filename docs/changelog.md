@@ -7,248 +7,66 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ## [8.4.2]
 
-Bug-fix release addressing four reward-shaping and action-gating defects identified in
-the under-bidding analysis. All four pushed the policy toward bidding less quantity than
-needed for compliance.
-
-### Fixed — Phase-aware reward normalization was non-causal (audit 1.7)
-
-`PPOAgent.compute_gae()` previously normalized auction- and secondary-phase rewards
-using the mean / std of the *entire* completed trajectory. The reward at year *t* was
-therefore divided by statistics that included rewards from years > *t*, leaking
-future information into the GAE recursion and breaking the Markov assumption GAE
-relies on.
-
-**Fix:** added two per-phase running EMA `RewardNormalizer` instances (sharing
-`reward.normalizer_alpha`) on each PPOAgent. `compute_gae()` now walks the trajectory
-in temporal order and normalizes each reward using only the EMAs accumulated from
-prior timesteps (and prior episodes), making the per-phase normalization strictly
-causal. Phase-specific scaling is preserved.
-
-**Files changed:** `src/agents/ppo_agent.py`.
-
-### Removed — Discarded `RewardNormalizer.normalize_reward()` call in train.py (audit 1.8)
-
-`scripts/train.py` called `agents[i].normalize_reward(rewards[i])` once per
-secondary-phase step but discarded the return value. The inline comment ("update
-stats for logging only") confirmed the value was decorative — yet the call still
-incurred per-step compute and gave a misleading impression that
-`reward.normalizer_alpha` affected training.
-
-**Fix:** removed the dead call. Per-phase causal normalization (1.7 above) now
-happens inside `PPOAgent.compute_gae()`, so no rollout-time normalizer update is
-needed. Raw rewards still enter the buffer exactly as before.
-
-**Files changed:** `scripts/train.py`.
-
-### Fixed — PPO advantage / return normalization NaN path (audit 1.5)
-
-Both `compute_gae()` and `update()` divided by `adv.std() + 1e-8` (and analogously for
-returns). When advantages are uniform (early training, strong shaping) `std ≈ 0` and the
-`1e-8` floor is too tight relative to the M€-denominated advantage scale, producing huge
-normalized advantages or NaNs that propagate into gradients. The configured
-`reward.gae_min_std` floor existed but was not applied.
-
-**Fix:** every advantage / return normalization site now uses
-`torch.clamp(std, min=self.gae_min_std)` (default `0.1`) as the divisor — including the
-HAPPO weighted-advantage re-normalization in `update_happo()`.
-
-**Files changed:** `src/agents/ppo_agent.py` (`update()`, `compute_gae()`,
-`update_happo()`).
-
-### Fixed — Pre-clamp of `log_ratio` corrupted PPO clipped surrogate (audit 1.6)
-
-`log_ratio = log_pi_new - log_pi_old` was clamped to `[-2, 2]` (so `ratio ∈ [0.135, 7.39]`)
-**before** the PPO clipped surrogate compared the ratio to `(1 - ε, 1 + ε)`. The
-inner clamp short-circuited the PPO clip and broke the importance-ratio semantics in
-both `update()` and `update_happo()`, for both the auction and secondary policies.
-
-**Fix:** widened the pre-clamp to `[-20, 20]` so it functions purely as a NaN/Inf
-guard. The PPO clipped surrogate `clamp(ratio, 1 - ε, 1 + ε)` is now solely responsible
-for the trust-region constraint, restoring standard PPO semantics.
-
-**Files changed:** `src/agents/ppo_agent.py` (auction + secondary log-ratio clamps in
-both `update()` and `update_happo()`).
-
-### Fixed — Cosine LR decay only advanced on PPO update episodes (audit 1.10)
-
-The cosine LR scheduler was nested inside the `if is_update_episode:` branch in
-`train_one_seed`. When `episodes_per_update > 1`, the LR therefore stepped in discrete
-jumps at update-episode boundaries instead of decaying smoothly per episode, which is
-not a true cosine schedule and could trigger optimizer oscillation near boundaries.
-
-**Fix:** moved both the actor and critic cosine-LR blocks out of the update gate so
-they advance every episode, regardless of whether the buffer was flushed.
-
-**Files changed:** `scripts/train.py` (`train_one_seed`).
-
-### Fixed — Python `random` module not seeded (audit 1.9)
-
-`train_one_seed` seeded `numpy.random` and `torch` but not the stdlib `random` module.
-Anything in the codebase using `random.choice` / `random.random` (HPP swaps, shuffles)
-was therefore not reproducible across seeds.
-
-**Fix:** added `random.seed(seed)` alongside the existing `np.random.seed(seed)` /
-`torch.manual_seed(seed)` calls.
-
-**Files changed:** `scripts/train.py` (added `import random`, `random.seed(seed)` in
-`train_one_seed`).
-
-### Fixed — `normalize_returns` code default contradicted YAML (audit 1.16)
-
-`PPOAgent.__init__` defaulted `normalize_returns` to `True`, while `configs/default.yaml`
-sets `ppo.normalize_returns: false`. If the YAML key were removed or renamed, behavior
-would silently flip, changing the critic value scale.
-
-**Fix:** aligned the code default with the production config (`False`).
-
-**Files changed:** `src/agents/ppo_agent.py`.
-
-### Fixed — Dynamic-reserve mode read undocumented config keys (audit 1.11)
-
-`_compute_dynamic_reserve()` reads `ets.reserve_discount` and `ets.reserve_initial`,
-neither of which was documented in `configs/default.yaml`. Static mode is the
-production default so the branch was dead — but enabling dynamic mode would
-silently fall back to in-code defaults.
-
-**Fix:** added both keys to `configs/default.yaml` under `ets:` with documented
-defaults (`reserve_discount: 0.80`, `reserve_initial: 50.0`) and a comment
-explaining when they are consulted.
-
-**Files changed:** `configs/default.yaml`.
-
-### Fixed — Smoke config diverged from production on phantom bidder and exploration (audit 1.14, 1.15)
-
-`configs/smoke_100.yaml` had `phantom_bidder.enabled: true` and
-`exploration.mode: "uniform"`, while `configs/default.yaml` has both disabled / set to
-`"anchored"`. Smoke and production therefore exercised different supply-demand regimes
-and different exploration modes — the production v8.4 anchored exploration had no smoke
-coverage, and any phantom-bidder regression in production would not surface in CI.
-
-**Fix:** smoke now matches default for both blocks (phantom disabled, anchored
-exploration with the same `epsilon_start`/`epsilon_final`/`epsilon_decay_frac`/
-`anchor_boost` values as default). Updated smoke header comment accordingly.
-
-**Files changed:** `configs/smoke_100.yaml`.
-
-### Fixed — MSR effective-penalty formula did not respect random per-year inflation (audit 2.5)
-
-`CapSchedule._apply_msr` and `preview_auction_volume` computed the inflation-adjusted
-penalty as `penalty_rate × (1 + inflation_rate)^year`, while `ETSEnvironment` already
-maintains a cumulative `_inflation_factor(year)` that supports per-year random shocks
-(`penalty.inflation_random_std` / `inflation_random_window`). When random rates were
-enabled, the cap-schedule formula compounded one shocked year's rate over `year` years
-and produced an incorrect threshold for MSR containment / emergency release.
-
-**Fix:** added `CapSchedule._effective_penalty(year, rate, factor=None)` helper used by
-both `_apply_msr` and `preview_auction_volume`. New optional `inflation_factor`
-parameter on `get_auction_volume` / `preview_auction_volume` takes precedence over the
-constant-rate compounding. `ETSEnvironment` now passes `_inflation_factor(year)` at all
-three call sites (burn-in, live `step_auction`, and Phase-1 obs preview).
-
-**Files changed:** `src/environment/cap_schedule.py`,
-`src/environment/ets_environment.py`.
-
-### Fixed — HPP swapped agents polluted HAPPO performance EMA (audit 2.9)
-
-When HPP swapped historical actors into the rollout, their buffers were correctly
-cleared before the PPO update, but their episode totals still drove
-`agent_perf_ema[i]` — meaning HAPPO dynamic ordering used a swapped policy's reward to
-rank a current policy.
-
-**Fix:** in `train_one_seed`, the EMA update now leaves `agent_perf_ema[i]` unchanged
-for any agent in `hpp_swapped` (its current policy contributed no rollout this episode).
-
-**Files changed:** `scripts/train.py`.
-
-### Fixed — `auction.carry_forward_defaults: false` silently dropped supply (audit 3.10)
-
-When the toggle was disabled, defaulted volume from the previous year was zeroed and
-removed from supply with no diagnostic — an easy footgun that would silently shift
-multi-year scarcity.
-
-**Fix:** added a one-shot per-episode warning when defaulted volume is dropped due to
-the toggle being off.
-
-**Files changed:** `src/environment/ets_environment.py`.
-
-### Fixed — Documented `price.initial_expected` and dynamic-reserve keys in default.yaml (audit 3.9, 1.11)
-
-`price.initial_expected` was set in scenario configs but read in `src/` with hardcoded
-fallbacks (70/80) — invisible to anyone reading `default.yaml`. Similarly,
-`ets.reserve_discount` / `ets.reserve_initial` were read by dynamic-reserve mode but
-not present in the config.
-
-**Fix:** added `price.initial_expected: 70.0`, `ets.reserve_discount: 0.80`, and
-`ets.reserve_initial: 50.0` to `configs/default.yaml` with explanatory comments.
-
-**Files changed:** `configs/default.yaml`.
-
-### Aligned — Smoke config with default for budget / auction / critic settings (audit 2.19, 3.1, 3.2, 3.4, 3.7)
-
-Following the project rule that *default.yaml is the source of truth*, smoke now uses
-the same values as default for:
-- `ets.initial_bank_fraction` (was `0.10`, now `0.5`)
-- `auction.bid_change_limit.value` (was `50.0`, now `75.0`)
-- `auction.suspension_length` (was `2`, now `0` — budget gate replaces suspension)
-- `auction.budget_price_clip` (added, `true`)
-- `budget.dynamic_budget_ceiling_multiplier` (added, `1.5`)
-- `ppo.critic_compliance_features` (added, `true`)
-
-**Files changed:** `configs/smoke_100.yaml`.
-
-### Aligned — Smoke config now mirrors every key in default.yaml (audit 1.12)
-
-`configs/smoke_100.yaml` was missing ~20 keys present in `default.yaml`, including
-entire blocks (`budget.treasury_reserve`, `reward.banking_signal`, `opponent_obs`)
-and several PPO schedule keys (`entropy_decay_frac`, `happo_dynamic_order`,
-`happo_perf_ema_alpha`, `critic_lr_decay`, `critic_lr_min`). When the production
-default is changed, the smoke harness silently kept old behaviour because the
-fallback default in code was used instead.
-
-**Fix:** synced every non-`tabula_rasa` key from `default.yaml` into
-`configs/smoke_100.yaml` with the same default values. The `tabula_rasa` block is
-deliberately not included — it is reference-only ablation in default.yaml and
-smoke does not need it.
-
-**Files changed:** `configs/smoke_100.yaml`.
-
-### Documentation — Stronger warning on bot-array length vs `n_bot_agents` (audit 1.13)
-
-`bot_initial_mix` / `bot_reward_weights` are length 8 even when `n_bot_agents=0`,
-so changing `n_bot_agents` to N silently activates the *first* N entries which
-might be stale. Preflight only enforces `len(arr) >= n_bot_agents`.
-
-**Fix:** expanded the inline comment in `default.yaml` to explicitly warn that
-the first N entries drive simulation behaviour and must be reviewed when
-`n_bot_agents` is changed.
-
-**Files changed:** `configs/default.yaml`.
-
-### Documentation — `default.yaml` cap-overhead comment corrected (audit 2.18)
-
-Comment said "+12% cap overhead" but the value was `0.10`. Comment updated to "+10%".
-
-**Files changed:** `configs/default.yaml`.
-
-### Cleanup — PPOAgent seed operator-precedence trap (audit 6.7)
-
-`np.random.default_rng(seed if seed is not None else 0 + agent_id)` was correct under
-Python operator precedence (parses as `... else (0 + agent_id)`) but read as if it
-might mean `(0 + agent_id)` with the `else 0` branch. Wrapped with explicit parens for
-readability.
-
-**Files changed:** `src/agents/ppo_agent.py`.
-
-### Tests — Tighter assertions and updated defaults
-
-- `tests/test_market_clearing.py`: under-subscribed reserve test now asserts
-  `alloc.sum() == 1.0` (not just per-agent zeros) (audit 5.6).
-- `tests/test_environment.py::test_phase1_invest_action_direct_mapping`: now asserts
-  the executed `invest_frac` does not exceed the requested action value, beyond the
-  pre-existing monotonicity check (audit 5.5).
-- `tests/test_bid_change_limit.py::_make_env`: default `bcl_value` updated from `50.0`
-  to `75.0` to match production `default.yaml` (audit 5.7).
+Bug-fix release addressing defects identified in the under-bidding analysis
+(`docs/BUGS_AND_ISSUES.md`, sections 1–6).
+
+### PPO numerics (`src/agents/ppo_agent.py`)
+- **1.5** Advantage / return / HAPPO weighted-advantage normalization now uses
+  `torch.clamp(std, min=gae_min_std)` instead of `+ 1e-8` (the configured floor was
+  previously unused).
+- **1.6** Widened `log_ratio` pre-clamp from `[-2, 2]` to `[-20, 20]` so the PPO
+  clipped surrogate `clamp(ratio, 1±ε)` is solely responsible for the trust region.
+- **1.7** Phase-aware reward normalization in `compute_gae()` is now causal: two
+  per-phase running EMA `RewardNormalizer`s walk the trajectory in temporal order.
+- **1.16** `normalize_returns` code default aligned with YAML (`True` → `False`).
+- **6.7** Parenthesized `default_rng(seed if … else 0 + agent_id)` for readability.
+
+### Training loop (`scripts/train.py`)
+- **1.8** Removed the discarded `RewardNormalizer.normalize_reward()` call (1.7
+  makes it redundant).
+- **1.9** Seed Python `random` alongside `numpy` / `torch` in `train_one_seed`.
+- **1.10** Cosine LR decay moved out of the `is_update_episode` gate so it advances
+  every episode.
+- **2.9** Skip `agent_perf_ema` update for HPP-swapped agents (their rollout came
+  from a historical policy).
+
+### Cap schedule (`src/environment/cap_schedule.py`, `ets_environment.py`)
+- **2.5** Unified MSR effective-penalty calculation behind `_effective_penalty()`.
+  New optional `inflation_factor` parameter takes precedence over `(1+rate)**year`
+  compounding so MSR thresholds are correct under
+  `penalty.inflation_random_std` / `inflation_random_window`.
+
+### Environment (`src/environment/ets_environment.py`)
+- **3.10** One-shot warning when `auction.carry_forward_defaults=false` silently
+  drops defaulted volume from supply.
+
+### Config alignment
+- **1.11 / 3.9** Added `ets.reserve_discount`, `ets.reserve_initial`, and
+  `price.initial_expected` to `configs/default.yaml` with documented defaults.
+- **2.18** Corrected `+12%`→`+10%` cap-overhead comment.
+- **1.13** Stronger inline warning on bot-array length vs `n_bot_agents`.
+- **1.12** Synced every non-`tabula_rasa` key from `default.yaml` into
+  `configs/smoke_100.yaml` (treasury_reserve, banking_signal, opponent_obs, plus
+  PPO schedule keys).
+- **1.14 / 1.15 / 2.19 / 3.1 / 3.2 / 3.4 / 3.7** Re-aligned smoke with default for
+  `phantom_bidder.enabled`, `exploration.mode`, `ets.initial_bank_fraction`,
+  `auction.bid_change_limit.value`, `auction.suspension_length`,
+  `auction.budget_price_clip`, `budget.dynamic_budget_ceiling_multiplier`,
+  `ppo.critic_compliance_features`.
+
+### Tests (`tests/`)
+- **5.5 / 5.6 / 5.7** Tightened three assertions: under-subscribed
+  `alloc.sum() == 1.0`; invest action `executed ≤ requested`; `_make_env` default
+  `bcl_value` 50→75 to match production.
+
+### Confirmed false positives (no change)
+- **1.1 / 1.2** `settle_compliance_realized()` does not modify holdings; the env's
+  `holdings - total_obligation` is the single surrender step. CF growth is linear.
+- **1.3** `settle_auction()` zeros defaulter allocations, so
+  `auction_volume - allocations.sum() - defaulted` is correctly mutually exclusive
+  with `_defaulted_volume_pending`.
+- **1.4** `mac_cost` is in EUR/tCO2 (per its comparison to `carbon_price`); units
+  `MtCO2 × EUR/tCO2 = M€` ✓.
 
 ---
 
