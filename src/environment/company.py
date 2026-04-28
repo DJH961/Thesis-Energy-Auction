@@ -128,6 +128,9 @@ class Company:
         self.capex_throughput = capex_tp[agent_id] if agent_id < len(capex_tp) else 1e9
         self.capex_overspend_coef = budget_cfg.get("capex_overspend_coef", 1.0)
         self.capex_spent_this_year = 0.0
+        # Revenue-linked capex throughput scaler (set via update_capex_revenue_factor)
+        self._baseline_revenue_for_capex = None
+        self._revenue_capex_factor = 1.0
 
         # Green finance (optional): annual loan headroom for green capex only.
         gf_cfg = config.get("green_finance", {})
@@ -142,7 +145,14 @@ class Company:
         self._jitter_enabled = jitter_cfg.get("enabled", False)
         poisson_lambdas = jitter_cfg.get("poisson_lambdas", [1.0, 1.0, 2.0, 3.0, 1.5])
         self._jitter_lambdas = np.array(poisson_lambdas, dtype=np.float64)
-        self._p_cancel = jitter_cfg.get("p_cancel", 0.03)
+        # Per-tech construction-phase cancellation. p_cancel_per_tech (length 5)
+        # takes precedence; the scalar p_cancel is used as a fallback default.
+        self._p_cancel = float(jitter_cfg.get("p_cancel", 0.03))
+        per_tech = jitter_cfg.get("p_cancel_per_tech", None)
+        if per_tech is not None and len(per_tech) >= 5:
+            self._p_cancel_per_tech = np.array(per_tech[:5], dtype=np.float64)
+        else:
+            self._p_cancel_per_tech = np.full(5, self._p_cancel, dtype=np.float64)
         self._recovery_rate = jitter_cfg.get("recovery_rate", 0.40)
         cf_sigma = jitter_cfg.get("cf_sigma", [0.0, 0.0, 0.08, 0.08, 0.05])
         self._cf_sigma = np.array(cf_sigma, dtype=np.float64)
@@ -391,6 +401,10 @@ class Company:
 
     @property
     def effective_capex_throughput(self) -> float:
+        """Capex throughput available this year, scaled by emergency-loan
+        squeeze and by realised electricity revenue (high revenue → more
+        construction capacity, low revenue → less)."""
+        base = self.capex_throughput
         if self._years_under_loan > 0 and self._loan_outstanding > 0:
             loan_burden = self._loan_outstanding / max(self.annual_budget, 1.0)
             squeeze = max(
@@ -398,8 +412,21 @@ class Company:
                       .get("capex_squeeze_floor", 0.50)),
                 1.0 - loan_burden
             )
-            return self.capex_throughput * squeeze
-        return self.capex_throughput
+            base = base * squeeze
+        return base * float(self._revenue_capex_factor)
+
+    def update_capex_revenue_factor(self, revenue: float) -> None:
+        """Update the revenue-based capex-throughput multiplier.
+
+        Factor = clip(0.7 + 0.3 × revenue / baseline_revenue, 0.5, 1.5).
+        Baseline revenue is captured the first time this method is called
+        (i.e. the year-0 revenue with the initial technology mix).
+        """
+        rev = float(revenue)
+        if self._baseline_revenue_for_capex is None or self._baseline_revenue_for_capex <= 0.0:
+            self._baseline_revenue_for_capex = max(rev, 1.0)
+        ratio = rev / max(self._baseline_revenue_for_capex, 1.0)
+        self._revenue_capex_factor = float(np.clip(0.7 + 0.3 * ratio, 0.5, 1.5))
 
     def settle_treasury_year_end(self) -> None:
         """Roll unspent budget into treasury. Call BEFORE apply_loan_repayment() and reset_budget()."""
@@ -548,20 +575,24 @@ class Company:
 
     def cancel_queued_projects(self, rng) -> float:
         """
-        Each queued project faces p_cancel chance of cancellation each year.
-        On cancellation, recovery_rate fraction of capex is returned.
+        Each queued project faces a per-year cancellation probability that
+        depends on its target technology (``p_cancel_per_tech``). On
+        cancellation, ``recovery_rate`` × spent capex is recovered.
         Returns recovered M€ (positive = money back).
         """
-        if not self._jitter_enabled or self._p_cancel <= 0:
+        if not self._jitter_enabled:
             return 0.0
 
         remaining = []
         recovered = 0.0
         for item in self._construction_queue:
-            if rng.random() < self._p_cancel:
-                # Project cancelled; partial capex recovery
+            tech_idx = int(item.get("tech_idx", -1))
+            if 0 <= tech_idx < len(self._p_cancel_per_tech):
+                p_c = float(self._p_cancel_per_tech[tech_idx])
+            else:
+                p_c = float(self._p_cancel)
+            if p_c > 0.0 and rng.random() < p_c:
                 recovered += item.get("capex_spent", 0.0) * self._recovery_rate
-                # frac_delta lost
             else:
                 remaining.append(item)
         self._construction_queue = remaining
@@ -886,8 +917,9 @@ class Company:
              1.0 = no cap applied; <1 = budget/capex gate reduced investment
 
         Opponent dims (if opponent_modeling enabled, 7D per opponent):
-        [43..] = (emissions/10, green_frac, fossil_frac, queue_noisy, bank_norm,
-                  net_secondary_norm, lagged_compliance_gap_norm) per opponent
+        [43..] = (emissions/10, green_frac, fossil_frac, queue_noisy,
+                  tnac_share_norm, net_secondary_norm,
+                  lagged_compliance_gap_norm) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
         queue = self.get_queue_capacity()
@@ -1080,3 +1112,7 @@ class Company:
         self._loan_drawn_this_step = 0.0
         self._treasury_reserve = 0.0
         self._treasury_drawn_this_year = 0.0
+        # Reset revenue-linked capex multiplier so the next episode's year-0
+        # revenue is what re-establishes the baseline.
+        self._baseline_revenue_for_capex = None
+        self._revenue_capex_factor = 1.0

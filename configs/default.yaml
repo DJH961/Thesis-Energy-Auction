@@ -1,12 +1,11 @@
 # ============================================================
-# ETS MARL — Configuration v8.4.2
-#   - 8 learning agents, 0 bots (pure MARL)
-#   - HAPPO sequential policy update, centralized critic
-#   - Fundamental price anchor (MAC-scarcity-penalty formula)
-#   - Coverage gap shaping unified (single mechanism)
-#   - MAC fuel-switching, electricity revenue, carry-forward
-#   - Warm-start, HPP, epsilon-greedy uniform exploration
-#   - 2026-indexed penalty with annual inflation, phantom bidder off
+# ETS MARL — Configuration v8.5
+#   8 learning agents, HAPPO sequential update, centralized critic.
+#   Phase 1 has split policy heads: bid sub-head (price, qty) and
+#   investment sub-head (invest_frac, tech logits) trained against
+#   their own value networks and reward channels.
+#   Auctions use uniform pricing with a fundamental MAC-scarcity-
+#   penalty anchor; secondary market is a double auction.
 # ============================================================
 
 simulation:
@@ -143,7 +142,8 @@ companies:
 investment:
   max_invest_frac: 0.20
   convexity_alpha: 0.20
-  discount_rate: 0.02
+  # 5%/yr WACC: standard utility-sector hurdle rate for thesis runs.
+  discount_rate: 0.05
 
 risk:
   p_fail_min: 0.08
@@ -199,16 +199,21 @@ secondary:
 # ----------------------------------------------------------
 budget:
   mode: "revenue_based"
-  debt_headrooms: [400.0, 400.0, 230.0, 230.0, 50.0, 50.0, -100.0, -100.0]
-  bot_debt_headrooms: [400.0, 400.0, 230.0, 230.0, 50.0, 50.0, -100.0, -100.0]
+  # debt_headrooms: per-agent cash buffer above electricity revenue. Sized so
+  # compliance-respecting agents don't need it; agents that miss compliance
+  # absorb the penalty (now charged through record_spending) before they
+  # exhaust their budget envelope.
+  debt_headrooms: [475.0, 475.0, 305.0, 305.0, 125.0, 125.0, -25.0, -25.0]
+  bot_debt_headrooms: [475.0, 475.0, 305.0, 305.0, 125.0, 125.0, -25.0, -25.0]
   budget_ema_alpha: 0.3
   annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   dynamic_budget_ceiling_multiplier: 1.5   # caps revenue-based budget to 1.5× annual_budget
   overspend_penalty_coef: 0.5
   contingency_zone: 0.10
-  hard_cap_multiplier: 1.20
   contingency_penalty_coef: 0.05
+  # Single hard cap for both step_auction's investment hard gate and
+  # compute_budget_penalty(): annual_budget × hard_cap_fraction.
   hard_cap_fraction: 1.15
   soft_zone_start: 1.00
   tiered_penalty_coef: 2.0
@@ -354,14 +359,18 @@ reward:
 
 # ----------------------------------------------------------
 # ESG signal — saved-carbon-years formula
-# esg = w_green × esg_scale × ef_ratio × time_ratio × compliance_gate
-# compliance_gate = coverage_frac^(1+blend): linear near full compliance, approaches quadratic under scarcity
+# esg = w_green × esg_scale × ((ef_ratio − ef_baseline_t) + speed_bonus) × compliance_gate
+# ef_baseline_t = year / n_years: do-nothing agents get zero-mean ESG;
+# only progress *ahead of* the linear decarbonization trajectory pays.
 # ----------------------------------------------------------
 esg:
   enabled: true
   scale: 2.0
-  speed_coef: 0.5       # speed bonus weight at year 0 (early investment)
-  speed_coef_late: 0.8  # speed bonus weight at final year (late investment still rewarded well)
+  # Speed bonus weight on Δgreen_frac. Front-loaded so early decarb gets the
+  # bigger kick; late-episode investments still pay back through the NPV
+  # terminal-queue value, so the late weight can be smaller.
+  speed_coef: 0.8
+  speed_coef_late: 0.4
 
 # ----------------------------------------------------------
 # Opponent modeling — public info per opponent
@@ -370,11 +379,15 @@ opponent_modeling:
   enabled: true
 
 # ----------------------------------------------------------
-# Opponent observation encoding (Change 7)
-# mode: "lagged" uses two-buffer 7D snapshots (default)
-#        "full_info" uses live get_public_info() (ablation)
+# Opponent observation encoding
+# mode: "lagged"    — two-buffer 7D snapshots (default)
+#        "full_info" — live get_public_info() (ablation)
 # 7D per opponent: emissions, green_frac, fossil_frac,
-#   queue_noisy, bank_norm, net_secondary_norm, lagged_compliance_gap_norm
+#   queue_noisy, tnac_share_norm (own_holdings / Σ holdings),
+#   net_secondary_norm, lagged_compliance_gap_norm
+# tnac_share_norm replaces the old per-firm bank_norm to better reflect
+# what is publicly inferable in the EU ETS (aggregate TNAC is reported,
+# per-firm holdings are not).
 # ----------------------------------------------------------
 opponent_obs:
   mode: "lagged"
@@ -418,9 +431,22 @@ ppo:
   log_std_min: -3.5
   log_std_max: 0.0
   centralized_critic: true
+  # Split-head investment critic. When true, Phase-1 trains:
+  #   bid sub-head    (dims 0,1: bid_price, qty_mult)  → main critic / advantage
+  #   invest sub-head (dims 2-5: invest_frac, tech logits) → invest critic / advantage
+  # Reward is decomposed into a "main" stream (compliance, penalty, secondary
+  # financials) and an "invest" stream (capital cost, ESG, terminal queue value),
+  # each with its own value network sharing no parameters.
+  split_invest_head: true
   happo: true
-  happo_dynamic_order: true      # sort update order worst-to-best by EMA reward each episode
-  happo_perf_ema_alpha: 0.1      # EMA decay for per-agent performance tracking
+  # HAPPO sequential update ordering: when "advantage", the per-agent EMA
+  # tracks raw (unnormalized) mean GAE advantage and the order is worst-to-best
+  # by that EMA — agents whose own value function under-predicts go first.
+  # Robust against ESG vs financial reward floors. "reward" keeps the prior
+  # behaviour (worst total-reward EMA goes first).
+  happo_dynamic_order: true
+  happo_order_metric: "advantage"
+  happo_perf_ema_alpha: 0.1
   critic_compliance_features: true  # append K=4 compliance features per agent to global state
   critic_lr: 0.0005
   critic_hidden_size: 512
@@ -461,7 +487,15 @@ uncertainty:
 construction_jitter:
   enabled: true
   poisson_lambdas: [1.0, 1.0, 2.0, 3.0, 1.5]
-  p_cancel: 0.03
+  # Per-tech construction-phase cancellation probability (per project per year).
+  # Fossil entries are ignored (only buildable green techs are queued).
+  # Calibrated to realistic utility-scale construction completion rates:
+  # offshore lower than onshore because permits are largely secured before
+  # construction begins; solar slightly higher because grid-connection is
+  # the dominant late-stage risk.
+  p_cancel_per_tech: [0.0, 0.0, 0.010, 0.006, 0.015]
+  # Backwards-compat scalar (used if p_cancel_per_tech is missing).
+  p_cancel: 0.010
   recovery_rate: 0.40
   cf_sigma: [0.0, 0.0, 0.08, 0.08, 0.05]
 

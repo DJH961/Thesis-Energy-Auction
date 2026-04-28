@@ -519,7 +519,7 @@ class ETSEnvironment(gym.Env):
                 c.green_frac,
                 c.fossil_frac,
                 float(sum(item["frac_delta"] for item in c._construction_queue)),
-                0.5,  # bank_norm: neutral prior
+                1.0 / max(self.n_total, 1),  # tnac_share_norm: equal-share neutral prior
                 0.0,  # net_secondary_norm: neutral prior
                 0.0,  # lagged_compliance_gap_norm: neutral prior
             ]
@@ -1218,6 +1218,9 @@ class ETSEnvironment(gym.Env):
             marginal_ef = self._compute_marginal_ef()
             # Update budgets for all companies (agents + bots)
             for c in active_companies:
+                rev_c = c.compute_revenue(marginal_ef, carbon_price_for_budget,
+                                          c.inflation_factor(self.current_year))
+                c.update_capex_revenue_factor(rev_c)
                 c.set_annual_budget(
                     c.compute_dynamic_budget(carbon_price_for_budget, marginal_ef, self.current_year)
                 )
@@ -1682,7 +1685,7 @@ class ETSEnvironment(gym.Env):
         invest_fracs = np.zeros(self.n_total)  # actual investment fractions used
         invest_tech_choices = np.zeros(self.n_total, dtype=int)
         budget_cfg = self.config.get("budget", {})
-        hard_cap_mult = float(budget_cfg.get("hard_cap_multiplier", 1.20))
+        hard_cap_frac_cfg = float(budget_cfg.get("hard_cap_fraction", 1.15))
 
         def _estimate_decommission_cost(company: Company, frac_delta: float) -> float:
             frac_to_retire = min(max(frac_delta, 0.0), company.fossil_frac)
@@ -1725,35 +1728,59 @@ class ETSEnvironment(gym.Env):
             invest_frac = float(auction_actions[i, 2])
             invest_frac = float(np.clip(invest_frac, 0.0, company.max_invest_frac))
             requested_invest_frac = invest_frac
-            tech_logits = auction_actions[i, 3:6]
-            tech_choice = int(np.argmax(tech_logits))
+            tech_logits = np.asarray(auction_actions[i, 3:6], dtype=np.float64)
+            # Softmax tech split: distribute invest_frac across the three
+            # buildable green technologies according to softmax(logits / T),
+            # so each year's investment can diversify across techs (mirrors
+            # how a real utility would allocate capex across a portfolio
+            # rather than picking one tech per year).
+            tech_temp = float(self.config.get("investment", {})
+                              .get("tech_softmax_temperature", 1.0))
+            tech_temp = max(tech_temp, 1e-6)
+            scaled_logits = tech_logits / tech_temp
+            scaled_logits -= np.max(scaled_logits)  # numeric stability
+            tech_weights = np.exp(scaled_logits)
+            tech_weights /= max(tech_weights.sum(), 1e-9)
+            # argmax kept for legacy diagnostic logging
+            tech_choice = int(np.argmax(tech_weights))
             invest_tech_choices[i] = tech_choice
 
-            tech_idx = tech_choice + 2  # 0/1/2 -> onshore/offshore/solar in company mix
+            tech_indices = [2, 3, 4]  # onshore, offshore, solar in mix index space
 
-            budget_ceiling = company.annual_budget * hard_cap_mult
+            def _capex_for(frac_total: float) -> float:
+                """Sum of per-tech capex at frac_total (split by tech_weights)."""
+                if frac_total <= 0.0:
+                    return 0.0
+                cost = 0.0
+                for ti, w in zip(tech_indices, tech_weights):
+                    sub = float(frac_total) * float(w)
+                    if sub > 1e-9:
+                        cost += company.compute_investment_cost(ti, sub, year)
+                return cost
+
+            budget_ceiling = company.annual_budget * hard_cap_frac_cfg
             budget_remaining = max(0.0, budget_ceiling - company.budget_spent_this_year)
-            capex_cost = company.compute_investment_cost(tech_idx, invest_frac, year)
+            capex_cost = _capex_for(invest_frac)
             total_proj_cost = capex_cost + _estimate_decommission_cost(company, invest_frac)
             budget_clipped = False
             capex_clipped = False
 
-            # Investment hard gate — block if would exceed hard cap
+            # Investment hard gate — block if would exceed hard cap (single
+            # source of truth: hard_cap_fraction).
             if budget_cfg.get("investment_hard_gate", True):
-                hard_cap_frac = float(budget_cfg.get("hard_cap_fraction", 1.15))
-                hard_cap_abs = hard_cap_frac * max(company.annual_budget, 1.0)
+                hard_cap_abs = hard_cap_frac_cfg * max(company.annual_budget, 1.0)
                 if company.budget_spent_this_year + total_proj_cost > hard_cap_abs:
                     available = max(0.0, hard_cap_abs - company.budget_spent_this_year)
                     if total_proj_cost > 1e-6:
                         scale = available / total_proj_cost
                         invest_frac *= scale
-                        capex_cost = company.compute_investment_cost(tech_idx, invest_frac, year)
+                        capex_cost = _capex_for(invest_frac)
                         total_proj_cost = capex_cost + _estimate_decommission_cost(company, invest_frac)
                         budget_clipped = True
 
             if total_proj_cost > budget_remaining and total_proj_cost > 1e-6:
                 invest_frac *= budget_remaining / total_proj_cost
-                capex_cost = company.compute_investment_cost(tech_idx, invest_frac, year)
+                capex_cost = _capex_for(invest_frac)
                 budget_clipped = True
 
             capex_remaining = max(0.0, company.effective_capex_throughput - company.capex_spent_this_year)
@@ -1762,19 +1789,24 @@ class ETSEnvironment(gym.Env):
                 capex_clipped = True
 
             # Optional green-finance boost can recover clipped investment.
+            # The boost solves a single-tech bisection on the dominant tech as
+            # a cheap proxy; the fine-grained per-tech split happens after.
             if (budget_clipped or capex_clipped) and company._gf_enabled and requested_invest_frac > invest_frac:
                 max_total_with_loan = budget_remaining + company.green_loan_headroom
                 max_capex_with_boost = capex_remaining + company.green_capex_headroom
+                # Use the dominant tech for the bisection; result then drives
+                # the per-tech split below proportionally.
+                dominant_tech_idx = tech_indices[tech_choice]
                 recovered_frac = _find_recovered_invest_frac(
                     company=company,
-                    tech_idx=tech_idx,
+                    tech_idx=dominant_tech_idx,
                     lo_frac=invest_frac,
                     hi_frac=requested_invest_frac,
                     max_total_cost=max_total_with_loan,
                     max_capex_cost=max_capex_with_boost,
                 )
                 if recovered_frac > invest_frac + 1e-9:
-                    recovered_total = company.compute_investment_cost(tech_idx, recovered_frac, year)
+                    recovered_total = _capex_for(recovered_frac)
                     recovered_total += _estimate_decommission_cost(company, recovered_frac)
                     extra_invest_cost = max(0.0, recovered_total - budget_remaining)
                     company.record_green_loan(extra_invest_cost)
@@ -1787,7 +1819,15 @@ class ETSEnvironment(gym.Env):
                 invest_frac / max(requested_invest_frac, 1e-6), 0.0, 1.0,
             )) if requested_invest_frac > 1e-6 else 1.0
 
-            invest_costs[i] = company.plan_investment(tech_choice, invest_frac, year)
+            # Issue one plan_investment per tech with non-trivial weight.
+            total_cost_i = 0.0
+            for tw_idx, w in enumerate(tech_weights):
+                sub_frac = invest_frac * float(w)
+                if sub_frac < 1e-9:
+                    continue
+                # plan_investment expects buildable index 0..2 (= tech_indices - 2)
+                total_cost_i += company.plan_investment(tw_idx, sub_frac, year)
+            invest_costs[i] = total_cost_i
             company.prev_invest_frac = invest_frac
             # Apply any cancellation recovery as a credit to invest_costs
             invest_costs[i] -= cancel_recoveries[i]
@@ -2365,11 +2405,15 @@ class ETSEnvironment(gym.Env):
         self._opponent_snapshots_prev = self._opponent_snapshots.copy()   # save year t-1
         opp_cfg = self.config.get("opponent_obs", {})
         queue_sigma = float(opp_cfg.get("queue_noise_sigma", 0.15))
+        # Total holdings across all participants (publicly inferable from
+        # aggregate TNAC reports). Used to convert per-firm holdings into a
+        # market-share signal that respects EU ETS confidentiality rules.
+        _total_holdings = float(self.holdings.sum())
         for _si, _sc in enumerate(self.companies):
             need_i = max(_sc.compute_estimate_need(), 1e-6)
             queue_raw = float(sum(item["frac_delta"] for item in _sc._construction_queue))
             queue_noisy = float(np.clip(queue_raw + self.rng.normal(0, queue_sigma), 0.0, 1.0))
-            bank_norm = float(np.clip(self.holdings[_si] / need_i, 0.0, 3.0)) / 3.0
+            tnac_share = float(np.clip(self.holdings[_si] / max(_total_holdings, 1e-6), 0.0, 1.0))
             net_sec = float(np.clip(
                 (self._sec_bought[_si] - self._sec_sold[_si]) / need_i, -1.0, 1.0
             ))
@@ -2377,7 +2421,7 @@ class ETSEnvironment(gym.Env):
             self._opponent_snapshots[_si] = [
                 _sc.compute_emissions() / 10.0,
                 _sc.green_frac, _sc.fossil_frac,
-                queue_noisy, bank_norm, net_sec, lag_gap,
+                queue_noisy, tnac_share, net_sec, lag_gap,
             ]
         # Reset per-year secondary counters for next year
         self._sec_bought[:] = 0.0
@@ -2650,6 +2694,7 @@ class ETSEnvironment(gym.Env):
             company.record_spending(
                 auction_cost + secondary_cost + investment_cost
                 + mac_cost_i + collateral_cost_i + loan_interest_cost
+                + penalty_cost
             )
             company.record_capex_spending(investment_cost)
             budget_penalty = company.compute_budget_penalty()
@@ -2775,11 +2820,15 @@ class ETSEnvironment(gym.Env):
                 green_delta = max(0.0, company.green_frac - company.prev_green_frac)
                 speed_bonus = esg_speed_coef * green_delta
 
-                # esg_scale alone calibrates the ESG magnitude — default 1.0
-                # yields esg_raw ≈ 1.0 for a fully decarbonized agent, matching
-                # the natural scale of (revenue_norm − cost_norm) so 50:50
-                # weights → 50:50 effect.
-                esg_raw = esg_scale * (ef_ratio + speed_bonus)
+                # Centered ESG: subtract a linear `year/n_years` baseline so a
+                # do-nothing agent receives zero-mean signal and an
+                # ahead-of-trajectory agent receives a positive one. This
+                # eliminates the positive-floor that previously biased HAPPO
+                # ordering against agents with `w_green > 0`.
+                ef_baseline = float(self.current_year) / max(float(self.n_years - 1), 1.0)
+                ef_baseline = float(np.clip(ef_baseline, 0.0, 1.0))
+                ef_centered = ef_ratio - ef_baseline
+                esg_raw = esg_scale * (ef_centered + speed_bonus)
                 esg_anchor_ratio = 1.0  # retained as a logged channel only
 
                 annual_need_i = max(company.compute_estimate_need(), 1e-6)
@@ -2792,7 +2841,12 @@ class ETSEnvironment(gym.Env):
                 gate_blend      = max(0.0, min(1.0, (gate_blend_threshold - coverage_frac) / gate_blend_width))
                 compliance_gate = coverage_frac ** (1.0 + gate_blend)
                 gate_activation = float(1.0 + gate_blend)
-                esg_signal      = esg_raw * compliance_gate
+                # Gate only attenuates positive ESG; do not flip the sign of a
+                # negative (behind-trajectory) signal under low coverage.
+                if esg_raw >= 0.0:
+                    esg_signal = esg_raw * compliance_gate
+                else:
+                    esg_signal = esg_raw
 
             if allocations is not None:
                 coverage_frac_auction = min(
@@ -2897,6 +2951,11 @@ class ETSEnvironment(gym.Env):
             pen_cfg     = self.config["penalty"]
             eff_penalty = pen_cfg["rate"] * self._inflation_factor(self.current_year)
             terminal_price = max(clearing_price, self.last_secondary_price, eff_penalty * 0.8)
+            # Asset operating life used to convert capacity additions into a
+            # discounted-cash-flow terminal value. Lifetime spans well beyond
+            # the simulated horizon, so late-episode investments still pay back.
+            asset_lifetime = float(reward_cfg.get("terminal_asset_lifetime_years", 20.0))
+            invest_rate = float(self.config.get("investment", {}).get("discount_rate", 0.05))
 
             for i, company in enumerate(self.companies):
                 if active_mask is not None and not bool(active_mask[i]):
@@ -2906,20 +2965,26 @@ class ETSEnvironment(gym.Env):
                 budget_real_t = max(company.annual_budget / infl_t, 1.0)
 
                 if terminal_bank:
-                    annual_need     = max(company.compute_estimate_need(), 0.1)
-                    capped_holdings = min(self.holdings[i], 2.0 * annual_need)
-                    ratio      = capped_holdings / annual_need
-                    # Linear below need (stronger bidding incentive under scarcity),
-                    # log above need (overbanking still not incentivized).
-                    if ratio < 1.0:
-                        bank_value = ratio * annual_need * terminal_price / budget_real_t
-                    else:
-                        bank_value = np.log1p(ratio) * annual_need * terminal_price / budget_real_t
+                    # Discounted hold value: holdings × terminal_price discounted
+                    # by the investment hurdle rate over the post-episode
+                    # operating horizon. No linear-below-need kicker, so the
+                    # incentive scales smoothly with bank size and never
+                    # dominates the late-year invest-vs-hold trade-off.
+                    capped_holdings = max(0.0, float(self.holdings[i]))
+                    discount = (1.0 + invest_rate) ** (-terminal_payoff_years)
+                    bank_value = capped_holdings * terminal_price * discount / budget_real_t
                     rewards[i]      += bank_value
                     base_rewards[i] += bank_value
                     terminal_bank_values[i] = bank_value
 
                 if terminal_queue:
+                    # NPV terminal value of pipeline projects: each queued
+                    # project contributes the present value of its annual
+                    # carbon savings over `asset_lifetime`, discounted from
+                    # the project's completion year. This values late-episode
+                    # investments at their economic worth (rather than zeroing
+                    # them) and so removes the structural incentive to stop
+                    # investing after the first few years.
                     queue_value = 0.0
                     for item in company._construction_queue:
                         tech_idx = int(item.get("tech_idx", -1))
@@ -2928,16 +2993,6 @@ class ETSEnvironment(gym.Env):
                         years_to_completion = max(
                             0, int(item.get("completion_year", self.current_year)) - self.current_year,
                         )
-                        tech_delay = max(float(company.deploy_delays[tech_idx]), 1.0)
-                        completion_fraction = float(
-                            np.clip(1.0 - (years_to_completion / tech_delay), 0.0, 1.0)
-                        )
-                        if completion_fraction <= 0.0:
-                            continue
-                        effective_remaining = max(0.0, terminal_payoff_years - float(years_to_completion))
-                        remaining_scale = min(1.0, effective_remaining / 2.0)
-                        if remaining_scale <= 0.0:
-                            continue
                         delta_ef = company.weighted_emission_factor - company.emission_factors[tech_idx]
                         if delta_ef <= 0:
                             continue
@@ -2945,13 +3000,15 @@ class ETSEnvironment(gym.Env):
                         if frac_delta <= 0.0:
                             continue
                         annual_saving_mt = (delta_ef * frac_delta * company.output_mwh) / 1e6
-                        discount    = gamma_discount ** years_to_completion
-                        queue_value += (
-                            annual_saving_mt * effective_remaining
-                            * discount * completion_fraction
-                            * terminal_price / budget_real_t
-                            * remaining_scale
-                        )
+                        annual_value = annual_saving_mt * terminal_price
+                        # Annuity factor over the operating lifetime
+                        if invest_rate > 1e-9:
+                            annuity = (1.0 - (1.0 + invest_rate) ** (-asset_lifetime)) / invest_rate
+                        else:
+                            annuity = float(asset_lifetime)
+                        # Discount from project completion back to year 0
+                        discount = (1.0 + invest_rate) ** (-years_to_completion)
+                        queue_value += annual_value * annuity * discount / budget_real_t
                     rewards[i]      += queue_value
                     base_rewards[i] += queue_value
                     terminal_queue_values[i] = queue_value

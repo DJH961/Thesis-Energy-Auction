@@ -282,7 +282,9 @@ def test_green_fraction_non_decreasing():
         auction_actions[:, 0] = 100.0  # bid price
         auction_actions[:, 1] = 2.0    # quantity
         auction_actions[:, 2] = 0.03   # invest_frac
-        auction_actions[:, 5] = 1.0    # solar logit highest
+        auction_actions[:, 3] = -10.0
+        auction_actions[:, 4] = -10.0
+        auction_actions[:, 5] = 10.0   # solar logit dominant (sharp softmax)
 
         obs2, _ = env.step_auction(auction_actions)
 

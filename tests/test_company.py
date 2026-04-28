@@ -383,12 +383,12 @@ def test_budget_utilization(config):
 
 
 def test_investment_scaled_to_budget_hard_cap():
-    """Overspend attempt above 20% should be clipped by hard_cap_multiplier."""
+    """Overspend attempt above hard_cap_fraction should be clipped."""
     cfg = load_env_config(seed=11)
     n_agents = cfg["companies"]["n_agents"]
     cfg["budget"]["mode"] = "fixed"
     cfg["budget"]["annual_budgets"] = [100.0] * n_agents
-    cfg["budget"]["hard_cap_multiplier"] = 1.20
+    cfg["budget"]["hard_cap_fraction"] = 1.20
     cfg["budget"]["capex_throughputs"] = [1e9] * n_agents
 
     env = ETSEnvironment(cfg, seed=11)
@@ -398,7 +398,10 @@ def test_investment_scaled_to_budget_hard_cap():
     actions[:, 0] = 120.0
     actions[:, 1] = 1.0
     actions[:, 2] = 0.20
-    actions[:, 3] = 1.0  # onshore
+    # Sharp tech logits → softmax concentrates on onshore.
+    actions[:, 3] = 10.0   # onshore
+    actions[:, 4] = -10.0
+    actions[:, 5] = -10.0
     env.step_auction(actions)
     sec = np.zeros((env.n_agents, 2), dtype=np.float32)
     sec[:, 0] = 80.0
@@ -416,7 +419,6 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
     n_agents = cfg["companies"]["n_agents"]
     cfg["budget"]["mode"] = "fixed"
     cfg["budget"]["annual_budgets"] = [5000.0] * n_agents
-    cfg["budget"]["hard_cap_multiplier"] = 10.0
     cfg["budget"]["hard_cap_fraction"] = 10.0  # disable hard gate for this test
     cfg["technologies"]["decommission_costs"] = [0, 0, 0, 0, 0]
 
@@ -437,7 +439,10 @@ def test_capex_throughput_exact_allowed_and_over_blocked():
     actions[:, 0] = 120.0
     actions[:, 1] = 1.0
     actions[:, 2] = action_value
-    actions[:, 3] = 1.0  # onshore
+    # Sharp logits force softmax onto onshore only.
+    actions[:, 3] = 10.0
+    actions[:, 4] = -10.0
+    actions[:, 5] = -10.0
     env.step_auction(actions)
     sec = np.zeros((env.n_agents, 2), dtype=np.float32)
     sec[:, 0] = 80.0
@@ -669,7 +674,9 @@ def test_investment_hard_gate_clips_spending():
     actions[:, 0] = 80.0
     actions[:, 1] = 0.3
     actions[:, 2] = 1.0  # max investment
-    actions[:, 5] = 1.0  # solar
+    actions[:, 3] = -10.0
+    actions[:, 4] = -10.0
+    actions[:, 5] = 10.0  # solar (sharp logit)
     env.step_auction(actions)
     sec = np.zeros((env.n_agents, 2), dtype=np.float32)
     sec[:, 0] = 80.0
