@@ -792,11 +792,15 @@ class Company:
                                own_last_secondary_buy_price: float = 0.0,
                                cumulative_coverage_ratio: float = 1.0,
                                cap_ahead_3y_ratio: float = 1.0,
-                               cap_ahead_6y_ratio: float = 1.0):
+                               cap_ahead_6y_ratio: float = 1.0,
+                               pcl_ceiling: float = 0.0,
+                               last_bid_price_clip: float = 0.0,
+                               last_bid_qty_clip_ratio: float = 1.0,
+                               last_invest_clip_ratio: float = 1.0):
         """
-        Phase 1 observation (pre-auction): 38D base + 7*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 42D base + 7*(N-1) opponent dims.
 
-        Base 38 dims:
+        Base 42 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
@@ -833,9 +837,17 @@ class Company:
         [35] treasury_norm: treasury_reserve / annual_budget (clipped [0,2], /2)
         [36] cap_ahead_3y_ratio: cap(t+3) / cap(t) clipped [0,1] — 3-year scarcity lookahead
         [37] cap_ahead_6y_ratio: cap(t+6) / cap(t) clipped [0,1] — 6-year scarcity lookahead
+        [38] pcl_headroom_norm: (pcl_ceiling - price_ma3) / price_max clipped [0,1]
+             Headroom to upper bid-change bound; 1.0 = unconstrained
+        [39] last_bid_price_clip: (actual - requested bid price) / price_max, signed [-1,1]
+             Negative if bid was clipped down; zero if unconstrained
+        [40] last_bid_qty_clip_ratio: actual_qty / requested_qty clipped [0,1]
+             1.0 = no qty gate fired; <1 = leverage/collateral/budget gate reduced qty
+        [41] last_invest_clip_ratio: actual_invest_frac / requested_invest_frac clipped [0,1]
+             1.0 = no cap applied; <1 = budget/capex gate reduced investment
 
         Opponent dims (if opponent_modeling enabled, 7D per opponent):
-        [38..] = (emissions/10, green_frac, fossil_frac, queue_noisy, bank_norm,
+        [42..] = (emissions/10, green_frac, fossil_frac, queue_noisy, bank_norm,
                   net_secondary_norm, lagged_compliance_gap_norm) per opponent
         """
         price_signal = (price_ma3 if price_ma3 is not None else last_clearing_price)
@@ -901,6 +913,10 @@ class Company:
             treasury_norm,                                         # [35] treasury reserve norm
             float(np.clip(cap_ahead_3y_ratio, 0.0, 1.0)),        # [36] 3-year cap scarcity lookahead
             float(np.clip(cap_ahead_6y_ratio, 0.0, 1.0)),        # [37] 6-year cap scarcity lookahead
+            float(np.clip((pcl_ceiling - price_signal) / pn, 0.0, 1.0)),   # [38] pcl headroom norm
+            float(np.clip(last_bid_price_clip / pn, -1.0, 1.0)),           # [39] bid price clip signal (signed)
+            float(np.clip(last_bid_qty_clip_ratio, 0.0, 1.0)),             # [40] bid qty clip ratio
+            float(np.clip(last_invest_clip_ratio, 0.0, 1.0)),              # [41] invest frac clip ratio
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -911,29 +927,34 @@ class Company:
                                 emission_shock=0.0, payment=0.0,
                                 collateral_locked_norm: float = 0.0,
                                 current_holdings: float = 0.0,
-                                current_year: int = 0):
+                                current_year: int = 0,
+                                last_sec_qty_clip_ratio: float = 1.0):
         """
-        Phase 2 observation (post-auction): obs_phase1 + 10 extra dims.
+        Phase 2 observation (post-auction): obs_phase1 + 12 extra dims.
         Appends auction results, emission shock, auction savings, coverage and compliance signals.
 
         Extra dims:
-        [base+0] allocation / 5
-        [base+1] clearing_price / price_max
-        [base+2] net compliance position: (banked + allocation - emissions - carry_forward) / 5
-                 <0 means the agent is still short after using all holdings
-        [base+3] emission_shock (realized deviation from base need)  -- P5
-        [base+4] auction_savings: (allocation × 100 - payment) / 1000
-                 penalty-value avoided minus cost paid; encodes deal quality
-        [base+5] coverage_ratio: (banked + allocation) / max(emissions + carry_forward, 1e-6)
-                 clipped to [0, 3], normalized by /3
-        [base+6] normalized carry_forward: carry_forward / max(estimated_need, 1e-6)
-                 clipped to [0, 3]; agents need to see their debt
-        [base+7] collateral_locked_norm: this year's collateral locked / annual_budget
-                 clipped to [0, 1]; immediate feedback on auction over-commitment risk
-        [base+8] budget_remaining_phase2_norm: (annual_budget - budget_spent) / annual_budget
-                 clipped to [-0.5, 1.0]; post-auction budget headroom
-        [base+9] compliance_liability_norm: unfunded compliance cost / annual_budget
-                 clipped to [0, 2.0]; signals penalty exposure
+        [base+0]  allocation / 5
+        [base+1]  clearing_price / price_max
+        [base+2]  net compliance position: (banked + allocation - emissions - carry_forward) / 5
+                  <0 means the agent is still short after using all holdings
+        [base+3]  emission_shock (realized deviation from base need)  -- P5
+        [base+4]  auction_savings: (allocation × 100 - payment) / 1000
+                  penalty-value avoided minus cost paid; encodes deal quality
+        [base+5]  coverage_ratio: (banked + allocation) / max(emissions + carry_forward, 1e-6)
+                  clipped to [0, 3], normalized by /3
+        [base+6]  normalized carry_forward: carry_forward / max(estimated_need, 1e-6)
+                  clipped to [0, 3]; agents need to see their debt
+        [base+7]  collateral_locked_norm: this year's collateral locked / annual_budget
+                  clipped to [0, 1]; immediate feedback on auction over-commitment risk
+        [base+8]  budget_remaining_phase2_norm: (annual_budget - budget_spent) / annual_budget
+                  clipped to [-0.5, 1.0]; post-auction budget headroom
+        [base+9]  compliance_liability_norm: unfunded compliance cost / annual_budget
+                  clipped to [0, 2.0]; signals penalty exposure
+        [base+10] compliance_gap_norm: (emissions + carry_forward - holdings) / estimated_need
+                  clipped to [-2, 2] /2; >0=short, <0=surplus
+        [base+11] last_sec_qty_clip_ratio: actual_sec_qty / requested_sec_qty (previous year)
+                  clipped to [-1, 1]; 1.0 = no constraint; <1 = buy clipped; negative = sell side
         """
         auction_savings = (allocation * 100.0 - payment) / 1000.0
 
@@ -975,21 +996,22 @@ class Company:
             budget_remaining_phase2_norm,                                           # [base+8]
             compliance_liability_norm,                                              # [base+9]
             compliance_gap_norm,                                                    # [base+10]
+            float(np.clip(last_sec_qty_clip_ratio, -1.0, 1.0)),                   # [base+11]
         ], dtype=np.float32)
         return np.concatenate([obs_phase1, extra])
 
     @property
     def obs_dim_phase1(self) -> int:
-        """38 base dims + 7*(N_total-1) opponent dims. See get_observation_phase1 for full layout."""
+        """42 base dims + 7*(N_total-1) opponent dims. See get_observation_phase1 for full layout."""
         opp_dims = self.config.get("opponent_obs", {}).get("dims_per_opponent", 7)
         if self._opponent_modeling and self._n_total > 1:
-            return 38 + opp_dims * (self._n_total - 1)
-        return 38
+            return 42 + opp_dims * (self._n_total - 1)
+        return 42
 
     @property
     def obs_dim_phase2(self) -> int:
-        """obs_dim_phase1 + 11 auction-result dims. See get_observation_phase2 for full layout."""
-        return self.obs_dim_phase1 + 11
+        """obs_dim_phase1 + 12 auction-result dims. See get_observation_phase2 for full layout."""
+        return self.obs_dim_phase1 + 12
 
     # ------------------------------------------------------------------
     # Reset

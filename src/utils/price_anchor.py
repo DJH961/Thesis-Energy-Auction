@@ -74,6 +74,7 @@ def compute_fundamental_anchor(
     year: int,
     config: dict,
     banking_premium_mult: float | None = None,
+    cap_t_actual: float | None = None,
 ) -> float:
     """
     Return the fundamental price anchor for the given simulation year.
@@ -87,6 +88,10 @@ def compute_fundamental_anchor(
     banking_premium_mult : float, optional
         Multiplier on MAC cost to account for banking premium.
         Defaults to config["price"]["banking_premium_mult"] (1.4).
+    cap_t_actual : float, optional
+        Actual cap for year ``year`` (e.g. from CapSchedule, which includes MSR
+        adjustments). If provided, bypasses the linear LRF approximation so
+        scarcity reflects the true post-MSR cap trajectory.
 
     Returns
     -------
@@ -97,16 +102,20 @@ def compute_fundamental_anchor(
     if mult is None:
         mult = float(config.get("price", {}).get("banking_premium_mult", 1.4))
 
-    penalty_base = float(config["penalty"]["rate"])
-    inflation    = float(config["penalty"]["inflation_rate"])
-    mac          = float(config["mac"]["coal_to_gas_cost"])
+    penalty_cfg  = config.get("penalty", {})
+    penalty_base = float(penalty_cfg.get("rate", 138.75))
+    inflation    = float(penalty_cfg.get("inflation_rate", 0.02))
+    mac          = float(config.get("mac", {}).get("coal_to_gas_cost", 48.0))
 
     ets_cfg = config.get("ets", {})
     lrf = float(ets_cfg.get("lrf_phase1", 0.043))
 
     cap_0 = _resolve_cap_year_0(config)
-    # Linear LRF approximation (matches EU ETS mandate, good enough for anchor)
-    cap_t = max(cap_0 * (1.0 - lrf * year), cap_0 * 0.01)
+    if cap_t_actual is not None:
+        cap_t = float(cap_t_actual)
+    else:
+        # Linear LRF approximation (matches EU ETS mandate, good enough for anchor)
+        cap_t = max(cap_0 * (1.0 - lrf * year), cap_0 * 0.01)
     scarcity = 1.0 - cap_t / max(cap_0, 1e-6)
     scarcity = float(max(0.0, min(1.0, scarcity)))
 

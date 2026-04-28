@@ -1098,7 +1098,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             for i in range(n_agents):
                 action, raw, logp = agents[i].select_auction_action(
                     obs1[i], epsilon=current_epsilon,
-                    last_secondary_buy_price=float(env._last_secondary_buy_price[i]))
+                    last_secondary_buy_price=float(env._last_secondary_buy_price[i]),
+                    current_year=year)
                 auction_actions[i] = action
                 auction_raws.append(raw)
                 auction_logps.append(logp)

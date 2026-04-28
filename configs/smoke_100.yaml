@@ -123,6 +123,9 @@ auction:
   price_max: 250.0
   price_min: 45.0
   quantity_max: 3.0
+  bid_change_limit:
+    enabled: true
+    value: 50.0
   qty_mult_low: 0.5
   qty_mult_high: 2.0
   max_agent_share: 1.0

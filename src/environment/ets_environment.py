@@ -236,6 +236,15 @@ class ETSEnvironment(gym.Env):
         self._last_collateral_load = np.zeros(self.n_total)
         # Per-agent bid affordability from PREVIOUS year
         self._bid_affordability = np.zeros(self.n_total)
+        # Bid price change limit config (read from YAML each step, not set externally).
+        self._bid_change_limit: float = 0.0  # cached value for obs dim
+        # Per-agent clip feedback signals (set during step_auction / step_secondary)
+        self._last_bid_price_clip = np.zeros(self.n_total)      # actual - requested (EUR/t), signed
+        self._last_bid_qty_clip_ratio = np.ones(self.n_total)   # actual / requested qty [0,1]
+        self._last_invest_clip_ratio = np.ones(self.n_total)    # actual / requested invest_frac [0,1]
+        self._last_sec_qty_clip_ratio = np.ones(self.n_total)   # actual / requested sec qty (signed)
+        # PCL ceiling for obs dim [38]: upper bid bound from bid_change_limit
+        self._pcl_ceiling: float = float(self.config["auction"]["price_max"])
         # Cumulative per-agent count of collateral warnings
         self._collateral_warning_count: np.ndarray = np.zeros(self.n_total, dtype=int)
         self._collateral_clip_events: dict[int, int] = {}
@@ -341,6 +350,10 @@ class ETSEnvironment(gym.Env):
             reward_cfg["shaping_decay_episode"] = decay_ep
         floor = reward_cfg.get("shaping_weight_floor", 0.0)
         self.shaping_weight = max(floor, 1.0 - episode / max(decay_ep, 1))
+
+    def set_bid_change_limit(self, limit: float):
+        """Deprecated: bid_change_limit is now read from config each step."""
+        pass
 
     @staticmethod
     def _apply_market_params_to_config(config: dict, params: dict):
@@ -512,6 +525,11 @@ class ETSEnvironment(gym.Env):
         self._bid_affordability = np.zeros(self.n_total)
         self._collateral_warning_count = np.zeros(self.n_total, dtype=int)
         self._collateral_clip_events = {i: 0 for i in range(self.n_total)}
+        self._last_bid_price_clip = np.zeros(self.n_total)
+        self._last_bid_qty_clip_ratio = np.ones(self.n_total)
+        self._last_invest_clip_ratio = np.ones(self.n_total)
+        self._last_sec_qty_clip_ratio = np.ones(self.n_total)
+        self._pcl_ceiling = float(self.config["auction"]["price_max"])
         self._current_marginal_ef = 0.0
         self._build_episode_inflation_path()
 
@@ -932,9 +950,18 @@ class ETSEnvironment(gym.Env):
         # not inflate the year-0 auction volume of the real episode.
         self.cap_schedule._unsold_rollover_pending = 0.0
 
+        # Seed MSR reserve to the configured fraction of cap_year_0.
+        # Burn-in never triggers MSR withholding (TNAC stays below tnac_upper),
+        # so without this seed the reserve is 0 for the first 2 real years.
+        msr_seed_frac = float(ws_cfg.get("msr_initial_reserve_frac", 0.0))
+        if msr_seed_frac > 0.0:
+            self.cap_schedule._msr_reserve = max(
+                self.cap_schedule._msr_reserve,
+                msr_seed_frac * self.cap_schedule.cap_year_0,
+            )
+
         # Reflect real 2026 EU ETS starting state: MSR reserve must not exceed
-        # tnac_lower. Burn-in can overfill the reserve; clamp it here before
-        # the calibration step adjusts agent holdings.
+        # tnac_lower. Clamp after seeding so we stay within the design band.
         self.cap_schedule._msr_reserve = min(
             self.cap_schedule._msr_reserve, self.cap_schedule.tnac_lower
         )
@@ -1312,6 +1339,33 @@ class ETSEnvironment(gym.Env):
 
         # Direct bid price: agent action[0] is the bid price in [price_min, price_max]
         bid_actions[:, 0] = np.clip(bid_actions[:, 0], price_min, price_max)
+
+        # Year-over-year bid price change limit for learning agents.
+        # Reads enabled/value from config each step; Year 0 always unconstrained.
+        _bcl_cfg = self.config["auction"].get("bid_change_limit", {})
+        _bcl_enabled = bool(_bcl_cfg.get("enabled", False))
+        _bcl_value = float(_bcl_cfg.get("value", 50.0))
+        self._bid_change_limit = _bcl_value if _bcl_enabled else 0.0
+        # Compute price_ma3 now so both the clipping reference and the pcl_ceiling
+        # obs dimension are consistent (price_ma3 is also re-used below).
+        price_ma3_early = self._compute_price_ma3()
+        if year > 0 and _bcl_enabled and _bcl_value > 0.0:
+            ref = price_ma3_early
+            lo = float(np.clip(ref - _bcl_value, price_min, price_max))
+            hi = float(np.clip(ref + _bcl_value, price_min, price_max))
+            self._pcl_ceiling = hi
+            for _i in range(self.n_agents):
+                orig = float(bid_actions[_i, 0])
+                clipped = float(np.clip(orig, lo, hi))
+                bid_actions[_i, 0] = clipped
+                self._last_bid_price_clip[_i] = clipped - orig  # negative if clipped down
+        else:
+            if _bcl_enabled and _bcl_value > 0.0:
+                self._pcl_ceiling = float(np.clip(price_ma3_early + _bcl_value, price_min, price_max))
+            else:
+                self._pcl_ceiling = float(price_max)
+            self._last_bid_price_clip[:self.n_agents] = 0.0
+
         # Quantity reparameterization: action[1] is a coverage MULTIPLIER on estimated need.
         # actual_qty = multiplier × compute_estimate_need()
         # This keeps the strategic decision centred on compliance coverage ratio rather
@@ -1322,6 +1376,7 @@ class ETSEnvironment(gym.Env):
         bid_qty_multipliers = np.zeros(self.n_total)
         estimate_needs = np.zeros(self.n_total)
         bid_coverages = np.zeros(self.n_total)
+        requested_qtys = np.zeros(self.n_total)  # before leverage/collateral/budget gates
         for i, company in enumerate(self.companies):
             if not self._is_agent_active(i):
                 bid_actions[i, 1] = 0.0
@@ -1341,6 +1396,7 @@ class ETSEnvironment(gym.Env):
             # EU lot-size discretization: round to nearest multiple of lot_size
             if lot_size > 0:
                 bid_actions[i, 1] = max(lot_size, round(bid_actions[i, 1] / lot_size) * lot_size)
+            requested_qtys[i] = bid_actions[i, 1]  # capture before any gates
 
         # Leverage gate — clip bid_quantity by leverage_multiplier × available_cash / bid_price.
         # Prevents agents from submitting notional bids far exceeding their cash.
@@ -1407,6 +1463,12 @@ class ETSEnvironment(gym.Env):
             bid_p = float(bid_actions[i, 0])
             if bid_p > 1e-6 and cash < bid_p * bid_actions[i, 1] * 0.10:
                 bid_actions[i, 1] = 0.0
+
+        # Record bid qty clip ratios (actual / requested after all gates)
+        for i in range(self.n_agents):
+            rq = requested_qtys[i]
+            aq = float(bid_actions[i, 1])
+            self._last_bid_qty_clip_ratio[i] = float(np.clip(aq / max(rq, 1e-6), 0.0, 1.0)) if rq > 1e-6 else 1.0
 
         # Budget price clip (Change 2): soft clip at 1.5x max affordable price.
         budget_price_clip = self.config["auction"].get("budget_price_clip", True)
@@ -1690,6 +1752,9 @@ class ETSEnvironment(gym.Env):
             invest_frac = float(np.clip(invest_frac, 0.0, company.max_invest_frac))
             invest_frac = min(invest_frac, company.fossil_frac)
             invest_fracs[i] = invest_frac
+            self._last_invest_clip_ratio[i] = float(np.clip(
+                invest_frac / max(requested_invest_frac, 1e-6), 0.0, 1.0,
+            )) if requested_invest_frac > 1e-6 else 1.0
 
             invest_costs[i] = company.plan_investment(tech_choice, invest_frac, year)
             company.prev_invest_frac = invest_frac
@@ -1747,6 +1812,7 @@ class ETSEnvironment(gym.Env):
                 )),
                 current_holdings=float(self.holdings[i] + allocations[i]),
                 current_year=year,
+                last_sec_qty_clip_ratio=float(self._last_sec_qty_clip_ratio[i]),
             )
             for i in range(self.n_agents)
         ]) if self.n_agents > 0 else np.zeros((0,), dtype=np.float32)
@@ -1834,7 +1900,8 @@ class ETSEnvironment(gym.Env):
             Auction-phase reward per learning agent (negative = cost).
         """
         r_auction = np.zeros(self.n_agents)
-        anchor_t  = compute_fundamental_anchor(self.current_year, self.config)
+        _cap_t_now = float(self.cap_schedule.get_cap(self.current_year))
+        anchor_t  = compute_fundamental_anchor(self.current_year, self.config, cap_t_actual=_cap_t_now)
 
         for i in range(self.n_agents):
             company = self.companies[i]
@@ -1949,6 +2016,17 @@ class ETSEnvironment(gym.Env):
 
         self.last_secondary_price = secondary_clearing
         self.last_secondary_volume = secondary_volume
+
+        # Record secondary qty clip ratio for learning agents' obs dim
+        for _i in range(self.n_agents):
+            requested_sq = float(secondary_qtys[_i])
+            actual_sq = float(trade_qtys[_i])
+            if abs(requested_sq) > 1e-6:
+                self._last_sec_qty_clip_ratio[_i] = float(np.clip(
+                    actual_sq / requested_sq, -1.0, 1.0,
+                ))
+            else:
+                self._last_sec_qty_clip_ratio[_i] = 1.0
 
         # Update bank cost basis for secondary purchases (buyers only).
         if secondary_clearing > 0.0:
@@ -2188,7 +2266,8 @@ class ETSEnvironment(gym.Env):
             self._price_history.append(secondary_clearing)
         rho = self.config["price"].get("ar1_persistence", 0.85)
         next_year = min(self.current_year + 1, self.n_years - 1)
-        price_floor = compute_fundamental_anchor(next_year, self.config)
+        _cap_next = float(self.cap_schedule.get_cap(next_year))
+        price_floor = compute_fundamental_anchor(next_year, self.config, cap_t_actual=_cap_next)
         vol_std = self.config["price"].get("volatility_std", 0.15)
 
         # Only update the AR(1) expected-price forecast from a meaningful (successful)
@@ -2486,7 +2565,10 @@ class ETSEnvironment(gym.Env):
         esg_cfg     = self.config.get("esg", {})
         esg_enabled = esg_cfg.get("enabled", False)
         esg_scale   = float(esg_cfg.get("scale", 2.0))
-        esg_speed_coef = float(esg_cfg.get("speed_coef", 0.5))
+        _speed_early = float(esg_cfg.get("speed_coef", 0.5))
+        _speed_late  = float(esg_cfg.get("speed_coef_late", _speed_early))
+        _year_frac   = self.current_year / max(self.n_years - 1, 1)
+        esg_speed_coef = _speed_early + _year_frac * (_speed_late - _speed_early)
 
         if mac_costs is None:
             mac_costs = np.zeros(self.n_total)
@@ -2502,10 +2584,11 @@ class ETSEnvironment(gym.Env):
         scarcity_t = max(0.0, 1.0 - cap_t / max(cap_0, 1e-9))
 
         # Cache anchor once — avoid redundant calls per agent
-        anchor_t        = compute_fundamental_anchor(self.current_year, self.config)
+        anchor_t        = compute_fundamental_anchor(self.current_year, self.config, cap_t_actual=cap_t)
         # Next-year anchor used by the forward-looking remediation term in penalty_norm.
         next_year       = min(self.current_year + 1, self.n_years - 1)
-        anchor_next_nom = compute_fundamental_anchor(next_year, self.config)
+        cap_t_next      = float(self.cap_schedule.get_cap(next_year))
+        anchor_next_nom = compute_fundamental_anchor(next_year, self.config, cap_t_actual=cap_t_next)
 
         # Banking timing signal config (read once outside agent loop)
         banking_cfg     = reward_cfg.get("banking_signal", {})
@@ -3033,6 +3116,10 @@ class ETSEnvironment(gym.Env):
                 ) if self._cumulative_emissions[i] > 0.01 else 1.0,
                 cap_ahead_3y_ratio=cap_ahead_3y_ratio,
                 cap_ahead_6y_ratio=cap_ahead_6y_ratio,
+                pcl_ceiling=self._pcl_ceiling,
+                last_bid_price_clip=float(self._last_bid_price_clip[i]),
+                last_bid_qty_clip_ratio=float(self._last_bid_qty_clip_ratio[i]),
+                last_invest_clip_ratio=float(self._last_invest_clip_ratio[i]),
             )
             obs_list.append(obs_i)
 

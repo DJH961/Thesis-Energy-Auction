@@ -138,6 +138,9 @@ auction:
   price_max: 250.0     # above penalty ceiling (~170 EUR/t at yr11 @ 2% inflation)
   price_min: 45.0      # matches ets.reserve_price
   quantity_max: 3.0
+  bid_change_limit:
+    enabled: true
+    value: 50.0        # max year-over-year bid price change (EUR/t); Year 0 always unconstrained
   qty_mult_low: 0.5
   qty_mult_high: 2.0
   max_agent_share: 1.0
@@ -338,7 +341,8 @@ reward:
 esg:
   enabled: true
   scale: 2.0
-  speed_coef: 0.5
+  speed_coef: 0.5       # speed bonus weight at year 0 (early investment)
+  speed_coef_late: 0.8  # speed bonus weight at final year (late investment still rewarded well)
 
 # ----------------------------------------------------------
 # Opponent modeling — public info per opponent
@@ -377,10 +381,10 @@ ppo:
   gae_lambda: 0.97
   clip_eps: 0.2
   entropy_coef: 0.08
-  entropy_coef_final: 0.025
+  entropy_coef_final: 0.01
   entropy_decay_start: -1          # -1 = auto (5% of n_episodes); 0 = start immediately
   entropy_decay_window: -1         # -1 = auto (entropy_decay_frac × n_episodes)
-  entropy_decay_frac: 0.60         # Fix 4: faster stabilization (was 0.90)
+  entropy_decay_frac: 0.9         # Fix 4: faster stabilization (was 0.90)
   value_coef: 0.5
   max_grad_norm: 0.5
   n_epochs: 5
@@ -454,6 +458,10 @@ warm_start:
   queue_mu_onshore: 1.5
   queue_mu_offshore: 0.5
   queue_mu_solar: 2.0
+  # Seed MSR reserve as a fraction of cap_year_0 (clamped to tnac_lower).
+  # Real EU ETS 2026: ~900 Mt reserve / ~3950 Mt cap_year_0 ≈ 0.23.
+  # Micro-ETS equivalent preserves the reserve-to-cap ratio.
+  msr_initial_reserve_frac: 0.23
 
 # ----------------------------------------------------------
 # Logging
@@ -517,7 +525,10 @@ exploration:
   epsilon_start: 0.25
   epsilon_final: 0.03               # Fix 3: lower mature noise floor (was 0.05)
   epsilon_decay_episodes: 0         # auto: epsilon_decay_frac × n_episodes, clamped to [1000, 100000]
-  epsilon_decay_frac: 0.30          # Fix 3: faster decay to exploitation (was 0.75)
+  epsilon_decay_frac: 0.40          # Fix 3: faster decay to exploitation (was 0.75)
+  # Boost factor applied to fundamental anchor for exploration WTP.
+  # fundamental_anchor(yr0)≈67, ×1.14≈76; (yr1)≈70, ×1.14≈80; grows with year.
+  anchor_boost: 1.14
   auction_anchors: null            # null = fundamental-anchor initialization (via inject_fundamental_anchor)
   secondary_anchors: null
 

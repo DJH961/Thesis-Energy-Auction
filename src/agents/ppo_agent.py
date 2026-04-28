@@ -347,7 +347,8 @@ class PPOAgent:
 
     def select_auction_action(self, obs1: np.ndarray, deterministic=False,
                               epsilon: float = 0.0,
-                              last_secondary_buy_price: float = 0.0):
+                              last_secondary_buy_price: float = 0.0,
+                              current_year: int = 0):
         """Phase 1: obs(18) → (action[6], raw[6], logp[1]).
 
         When ``epsilon > 0`` and not deterministic, with probability *epsilon*
@@ -384,8 +385,10 @@ class PPOAgent:
                     need_mt = max(need_mt, 0.01)
                     budget_headroom = float(obs1[OBS1_BUDGET_HEADROOM_IDX]) if len(obs1) > OBS1_BUDGET_HEADROOM_IDX else 0.5
                     available_budget = max(budget_headroom, 0.0) * self._wtp_annual_budget
-                    # WTP economic: MAC + half the gap to penalty (heuristic midpoint)
-                    wtp_economic = self._wtp_mac + 0.5 * max(0.0, self._wtp_penalty_rate - self._wtp_mac)
+                    # Year-adjusted fundamental anchor (yr1≈80, grows with year)
+                    from src.utils.price_anchor import compute_fundamental_anchor
+                    _boost = float(self.config.get("exploration", {}).get("anchor_boost", 1.14))
+                    wtp_economic = compute_fundamental_anchor(current_year, self.config) * _boost
                     # WTP budget: what can the agent afford per tonne
                     wtp_budget = available_budget / need_mt if need_mt > 0.01 else price_max
 
@@ -421,12 +424,14 @@ class PPOAgent:
                     price_max = high[0].item()
                     price_min = low[0].item()
 
-                    # [0] bid_price: Gaussian around WTP anchor (with C+D secondary feedback)
+                    # [0] bid_price: Gaussian around year-adjusted fundamental anchor
                     need_mt = float(obs1[OBS1_NEED_IDX]) * 10.0 if len(obs1) > OBS1_NEED_IDX else 1.0
                     need_mt = max(need_mt, 0.01)
                     bh = float(obs1[OBS1_BUDGET_HEADROOM_IDX]) if len(obs1) > OBS1_BUDGET_HEADROOM_IDX else 0.5
                     avail = max(bh, 0.0) * self._wtp_annual_budget
-                    wtp_e = self._wtp_mac + 0.5 * max(0.0, self._wtp_penalty_rate - self._wtp_mac)
+                    from src.utils.price_anchor import compute_fundamental_anchor
+                    _boost = float(self.config.get("exploration", {}).get("anchor_boost", 1.14))
+                    wtp_e = compute_fundamental_anchor(current_year, self.config) * _boost
                     wtp_b = avail / need_mt if need_mt > 0.01 else price_max
                     wtp_base = min(wtp_e, wtp_b)
                     # Approach C: shift anchor to secondary buy price if higher

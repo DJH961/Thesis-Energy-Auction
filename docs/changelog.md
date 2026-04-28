@@ -5,6 +5,183 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.4]
+
+### Added — Clip feedback signals in observation (4 new dims)
+
+Agents previously had no way to know whether their requested action was modified by
+internal gates (bid change limit, leverage cap, collateral budget, capex limit, secondary
+market depth). Four new dimensions are now exposed so agents receive direct gradient
+signal from constraint violations.
+
+**Phase 1 observation base: 40 → 42 dims**
+
+| Index | Name | Formula | Range |
+|---|---|---|---|
+| [38] | `pcl_headroom_norm` | `(pcl_ceiling − price_ma3) / price_max`, clipped [0,1] | [0, 1] |
+| [39] | `last_bid_price_clip` | `(actual_bid − requested_bid) / price_max`, signed | [−1, 1] |
+| [40] | `last_bid_qty_clip_ratio` | `actual_qty / requested_qty` | [0, 1] |
+| [41] | `last_invest_clip_ratio` | `actual_invest_frac / requested_invest_frac` | [0, 1] |
+
+The old dims [38]–[39] (`last_clearing_price_ref` and `bid_change_limit_norm`) are
+replaced by these four. `pcl_ceiling` = `min(price_ma3 + bcl_value, price_max)`.
+
+**Phase 2 observation: +11 → +12 extra dims**
+
+| Index | Name | Formula | Range |
+|---|---|---|---|
+| [base+11] | `last_sec_qty_clip_ratio` | `actual_sec_qty / requested_sec_qty`, previous year | [−1, 1] |
+
+All four clip arrays (`_last_bid_price_clip`, `_last_bid_qty_clip_ratio`,
+`_last_invest_clip_ratio`, `_last_sec_qty_clip_ratio`) are stored on `ETSEnvironment`
+(shape `n_total`) and reset to 0 / 1 at episode start.
+
+**Files changed:** `src/environment/company.py` (`get_observation_phase1()`, `get_observation_phase2()`,
+`obs_dim_phase1`, `obs_dim_phase2`), `src/environment/ets_environment.py` (`__init__`, `reset()`,
+`step_auction()`, `step_secondary()`, `_get_obs_phase1()`, `get_observation_phase2()` call sites),
+`tests/test_bid_change_limit.py` (26 new tests).
+
+### Changed — Bid change limit: fixed value, MA3 reference, config restructure
+
+The decaying-schedule BCL (two config keys `bid_change_limit_start` / `bid_change_limit_final`
+set via `set_bid_change_limit()` in `train.py`) is replaced by a simpler, more robust design:
+
+- **Fixed at 50 EUR/t** for the full run — no decay schedule.
+- **MA3 reference**: the clipping window is now centred on the 3-year moving average of
+  clearing prices (`price_ma3`) instead of `last_clearing_price`, making it more
+  outlier-resistant.
+- **Config restructure**: single nested key replaces the old pair.
+
+```yaml
+# Before (v8.3.2):
+auction:
+  bid_change_limit_start: 100.0
+  bid_change_limit_final: 50.0
+
+# After (v8.4):
+auction:
+  bid_change_limit:
+    enabled: true
+    value: 50.0      # fixed EUR/t; Year 0 always unconstrained
+```
+
+`set_bid_change_limit()` is now a no-op (kept for backwards compatibility).
+The per-episode BCL schedule code in `scripts/train.py` is removed.
+
+**Files changed:** `configs/default.yaml`, `configs/smoke_100.yaml`, `scripts/train.py`,
+`src/environment/ets_environment.py` (`set_bid_change_limit()`, `step_auction()` bid clipping
+block).
+
+### Changed — `compute_fundamental_anchor` accepts actual cap (bypasses LRF approximation)
+
+When the MSR is actively withholding, the effective cap falls below the linear-LRF
+approximation (`cap_0 × (1 − lrf × year)`), causing `compute_fundamental_anchor` to
+underestimate scarcity and the AR(1) price floor to drift low.
+
+**Fix:** New optional parameter `cap_t_actual: float | None = None`. When provided,
+it replaces the LRF linear estimate with the true MSR-adjusted cap from `CapSchedule`:
+
+```python
+def compute_fundamental_anchor(year, config, banking_premium_mult=None, cap_t_actual=None):
+    ...
+    if cap_t_actual is not None:
+        cap_t = float(cap_t_actual)
+    else:
+        cap_t = max(cap_0 * (1.0 - lrf * year), cap_0 * 0.01)
+```
+
+`ETSEnvironment` now passes `cap_t_actual` at all three call sites:
+`compute_auction_rewards()`, the AR(1) price floor update, and `_compute_rewards()`.
+
+**Files changed:** `src/utils/price_anchor.py`, `src/environment/ets_environment.py`
+(3 call sites).
+
+---
+
+## [8.3.2] (incorporated into 8.4)
+
+### Added — MSR warm-start (realistic reserve at episode start)
+
+During burn-in the Market Stability Reserve never triggers because TNAC stays well
+below `tnac_upper`, leaving `_msr_reserve = 0` at the start of every episode. This
+meant agents never encountered MSR withholding pressure during early years.
+
+**Fix:** New config key `warm_start.msr_initial_reserve_frac` (default `0.0`; set to
+`0.23` in `configs/default.yaml`). After burn-in completes, `_run_burnin()` seeds the
+reserve to `msr_initial_reserve_frac × cap_year_0`, then clamps to `tnac_lower` (the
+natural upper bound during normal operation).
+
+At the default setting this pre-loads ≈ 0.23 × cap_year_0 Mt into the reserve,
+matching realistic EU ETS reserve levels at the start of a 12-year window.
+
+**Files changed:** `src/environment/ets_environment.py` (`_run_burnin()`),
+`configs/default.yaml` (`warm_start.msr_initial_reserve_frac`).
+
+### Added — Bid price change limit (stabilised price discovery)
+
+Unconstrained bid jumps between years allow agents to escape any price-discovery
+regime instantly, preventing coordinated convergence. A per-episode hard limit on
+year-over-year bid price changes is now enforced in `step_auction()`.
+
+The limit decays linearly from `bid_change_limit_start` to `bid_change_limit_final`
+over the same episode window as epsilon decay:
+
+| Config key | Default | Meaning |
+|---|---|---|
+| `auction.bid_change_limit_start` | `100.0` | EUR/t cap early in training |
+| `auction.bid_change_limit_final` | `50.0` | EUR/t cap at convergence |
+
+Year 0 within an episode is always unconstrained (no prior clearing price).
+The current reference price and current limit are exposed to agents as two new
+observation dimensions:
+
+| Index | Name | Formula |
+|---|---|---|
+| [38] | `last_clearing_price_ref` | last clearing price / `price_max` |
+| [39] | `bid_change_limit_norm` | current limit / `price_max` |
+
+`obs_dim_phase1` updated from 38 to 40 base dims (total: 40 + 7×(N−1)).
+
+**Files changed:** `src/environment/ets_environment.py` (`__init__`, `step_auction()`,
+new `set_bid_change_limit()`), `src/environment/company.py` (`get_observation_phase1()`,
+`obs_dim_phase1`), `scripts/train.py` (limit schedule + `set_bid_change_limit()` call),
+`configs/default.yaml`.
+
+### Changed — ESG speed bonus interpolated by year
+
+The ESG signal `esg_raw = esg_scale × (ef_ratio + speed_coef × green_delta)` used a
+single fixed `speed_coef`. Because `ef_ratio` is front-loaded by construction (year-0
+investment earns 12 years of reward vs year-11 earning 1 year), late investors were
+systematically under-rewarded for speed.
+
+**Fix:** `speed_coef` is now linearly interpolated from `esg.speed_coef` at year 0 to
+`esg.speed_coef_late` at the final year. New config key `esg.speed_coef_late: 0.8`
+(up from the uniform `0.5`), compensating late investors with a higher speed bonus.
+
+**Files changed:** `src/environment/ets_environment.py` (`_compute_rewards()`),
+`configs/default.yaml` (`esg.speed_coef_late`).
+
+### Fixed — Exploration price anchor is now year-adjusted
+
+Epsilon-greedy exploration was centred on a static WTP estimate
+(`mac + 0.5 × (penalty − mac) ≈ 93 EUR/t`) that ignored year progression, causing
+over-exploration in early years and under-exploration in late years.
+
+**Fix:** Both the uniform and anchored exploration modes now centre on
+`compute_fundamental_anchor(current_year) × anchor_boost`, where `anchor_boost`
+is a new config key (`exploration.anchor_boost: 1.14`). This gives:
+
+| Year | Anchor | × 1.14 |
+|---|---|---|
+| 0 | ~67 EUR/t | ~76 EUR/t |
+| 1 | ~70 EUR/t | ~80 EUR/t |
+| 11 | ~101 EUR/t | ~115 EUR/t |
+
+**Files changed:** `src/agents/ppo_agent.py` (`select_auction_action()`),
+`configs/default.yaml` (`exploration.anchor_boost`).
+
+---
+
 ## [8.3.1]
 
 ### Added — Cap scarcity lookahead in observation (Fix 5)
