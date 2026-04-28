@@ -150,6 +150,14 @@ class Company:
         # State: technology mix vector [coal, gas, onshore, offshore, solar]
         self.mix = np.array(initial_mix, dtype=np.float64)
         assert abs(self.mix.sum() - 1.0) < 1e-6, f"Mix must sum to 1.0, got {self.mix.sum()}"
+        # Hot-method memoization (invalidated on mix / queue / carry_forward /
+        # consecutive_successes mutation via _invalidate_state_cache()).
+        # Eliminates repeated arithmetic across observation construction, reward
+        # computation, and heuristic policy calls.
+        self._cache_emissions = None
+        self._cache_estimate_need = None
+        self._cache_p_fail = None
+        self._cache_queue_capacity = None
         self.initial_ef = self.weighted_emission_factor  # snapshot for ESG signal
         self.baseline_opex = self.compute_operational_cost(current_year=0)  # snapshot of initial-mix OPEX
         self.prev_green_frac = self.green_frac
@@ -195,12 +203,27 @@ class Company:
         return float(np.dot(self.mix, self.emission_factors))
 
     # ------------------------------------------------------------------
+    # Cache invalidation
+    # ------------------------------------------------------------------
+
+    def _invalidate_state_cache(self):
+        """Clear memoized hot-method results. Call after any mutation of
+        self.mix, self._construction_queue, self._carry_forward, or
+        self._consecutive_successes."""
+        self._cache_emissions = None
+        self._cache_estimate_need = None
+        self._cache_p_fail = None
+        self._cache_queue_capacity = None
+
+    # ------------------------------------------------------------------
     # Emissions
     # ------------------------------------------------------------------
 
     def compute_emissions(self) -> float:
         """Annual emissions in Mt CO2 (deterministic from current mix)."""
-        return self.output_mwh * self.weighted_emission_factor / 1e6
+        if self._cache_emissions is None:
+            self._cache_emissions = self.output_mwh * self.weighted_emission_factor / 1e6
+        return self._cache_emissions
 
     def compute_emissions_with_cf_noise(self, cf_noise: np.ndarray) -> float:
         """
@@ -258,12 +281,16 @@ class Company:
         return emissions_reduction, cost
 
     def compute_risk_factor(self) -> float:
-        return self._compute_p_fail()
+        if self._cache_p_fail is None:
+            self._cache_p_fail = self._compute_p_fail()
+        return self._cache_p_fail
 
     def compute_estimate_need(self) -> float:
         # Intentionally unbuffered: expected emissions + compliance debt.
         # Coverage buffers are still learned through bid multipliers.
-        return self.compute_emissions() + self._carry_forward
+        if self._cache_estimate_need is None:
+            self._cache_estimate_need = self.compute_emissions() + self._carry_forward
+        return self._cache_estimate_need
 
     # ------------------------------------------------------------------
     # Operational costs
@@ -515,6 +542,7 @@ class Company:
             "success": success,
             "capex_spent": total_cost,
         })
+        self._invalidate_state_cache()
 
         return total_cost
 
@@ -537,6 +565,7 @@ class Company:
             else:
                 remaining.append(item)
         self._construction_queue = remaining
+        self._invalidate_state_cache()
         return recovered
 
     def apply_matured_investments(self, current_year: int):
@@ -575,6 +604,8 @@ class Company:
             self.mix = np.clip(self.mix, 0.0, 1.0)
             self.mix /= self.mix.sum()
 
+        self._invalidate_state_cache()
+
     # ------------------------------------------------------------------
     # Public info (for opponent modeling)
     # ------------------------------------------------------------------
@@ -597,6 +628,8 @@ class Company:
 
     def get_queue_capacity(self) -> np.ndarray:
         """MW under construction per green technology [onshore, offshore, solar]."""
+        if self._cache_queue_capacity is not None:
+            return self._cache_queue_capacity
         queue_frac = np.zeros(3)  # onshore, offshore, solar
         for item in self._construction_queue:
             tech_idx = item["tech_idx"]
@@ -606,6 +639,7 @@ class Company:
                 queue_frac[1] += item["frac_delta"]
             elif tech_idx == 4:
                 queue_frac[2] += item["frac_delta"]
+        self._cache_queue_capacity = queue_frac
         return queue_frac
 
     # ------------------------------------------------------------------
@@ -762,6 +796,7 @@ class Company:
                 self._carry_forward = min(shortfall, cap_mult * base_emiss)
             else:
                 self._carry_forward = shortfall
+            self._invalidate_state_cache()
         return shortfall * self.effective_penalty_rate(current_year)
 
     # ------------------------------------------------------------------
@@ -1024,6 +1059,7 @@ class Company:
 
     def reset(self, initial_mix: List[float]):
         self.mix = np.array(initial_mix, dtype=np.float64)
+        self._invalidate_state_cache()
         self.initial_ef = self.weighted_emission_factor
         self.prev_green_frac = self.green_frac
         self._construction_queue = []

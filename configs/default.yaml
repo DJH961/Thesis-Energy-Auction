@@ -14,6 +14,12 @@ simulation:
   n_episodes: 100000
   seeds: [42, 123, 456]
 
+# Device for PPO networks. "auto" picks CUDA if available, else CPU.
+# For these tiny MLPs (~123-D input, 2 FC layers) CPU is almost always faster
+# than GPU on multi-core machines (kernel-launch overhead > matmul cost).
+# Override to "cpu" or "cuda" to force.
+device: auto
+
 
 # ----------------------------------------------------------
 # Technology parameters (5 technologies)
