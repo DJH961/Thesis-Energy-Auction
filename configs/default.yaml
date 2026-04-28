@@ -1,105 +1,71 @@
-# ============================================================
 # ETS MARL — Configuration v8.5
-#   8 learning agents, HAPPO sequential update, centralized critic.
-#   Phase 1 has split policy heads: bid sub-head (price, qty) and
-#   investment sub-head (invest_frac, tech logits) trained against
-#   their own value networks and reward channels.
-#   Auctions use uniform pricing with a fundamental MAC-scarcity-
-#   penalty anchor; secondary market is a double auction.
-# ============================================================
+# 8 learning agents, HAPPO sequential update, split Phase-1 bid/invest heads.
 
 simulation:
   n_years: 12
   n_episodes: 120000
   seeds: [42, 123, 456]
 
-# Device for PPO networks. "auto" picks CUDA if available, else CPU.
-# For these tiny MLPs (~123-D input, 2 FC layers) CPU is almost always faster
-# than GPU on multi-core machines (kernel-launch overhead > matmul cost).
-# Override to "cpu" or "cuda" to force.
+# "auto" picks CUDA if available, else CPU.
 device: auto
 
 
-# ----------------------------------------------------------
-# Technology parameters (5 technologies)
-# Sources: IRENA 2024, IPCC AR5, IEA WEO 2024
-# ----------------------------------------------------------
 technologies:
   names: ["coal", "gas", "onshore_wind", "offshore_wind", "solar"]
   emission_factors: [0.820, 0.490, 0.011, 0.012, 0.048]  # tCO2/MWh
   capex: [3000, 1150, 1350, 3250, 750]                   # EUR/kW
   capacity_factors: [0.65, 0.60, 0.35, 0.47, 0.17]
-  # Deploy delays: solar 2yr (EU RED III), onshore 4yr, offshore 7yr.
-  # Sources: WindEurope Grid Access Report 2024, Aurora RESMOR 2026.
-  deploy_delays: [0, 0, 4, 7, 2]
+  deploy_delays: [0, 0, 4, 7, 2]                          # years; solar 2yr, onshore 4yr, offshore 7yr
   operational_costs: [72.0, 55.0, 17.0, 47.0, 10.0]      # EUR/MWh fuel+O&M
   decommission_costs: [200, 100, 0, 0, 0]                 # EUR/kW
   is_green: [false, false, true, true, true]
   is_buildable: [false, false, true, true, true]
 
-# ----------------------------------------------------------
-# ETS parameters
-# cap_year_0 and MSR thresholds are derived from participant
-# emissions at init. Use cap_year_0_override to fix manually.
-# ----------------------------------------------------------
 ets:
   cap_year_0_override: null     # null = emission-weighted calibration
-  # Calibration anchor: band_width / (LRF × cap_0) ≈ 10 years, matching EU ETS design intent.
-  # initial_bank_fraction set jointly so TNAC/tnac_upper = 1.05 at episode start
-  # (2026 observed: 1,148 Mt / 1,096 Mt = 1.05).
   initial_bank_fraction: 0.5
-  # +10% cap overhead: reflects real 2026 EU ETS ~15% overhead; slightly conservative
-  # for micro-ETS scale.
   cap_overhead_pct: 0.10
 
   lrf_phase1: 0.043
   lrf_phase2: 0.044
-  lrf_phase_switch: 2              # 2026–27 use 4.3%; 2028+ use 4.4% (EU ETS LRF)
+  lrf_phase_switch: 2
 
   msr:
     enabled: true
-    # tnac_upper_ratio: derived from 10 × LRF annual reduction / 0.635,
-    # matching real EU ETS band-to-annual-reduction ratio of ~14 years.
     tnac_upper_ratio: 0.68
-    tnac_mid_ratio: null            # null => derive from upper (preserves 400:833:1096 proportions)
-    tnac_lower_ratio: null          # null => derive from upper
+    tnac_mid_ratio: null
+    tnac_lower_ratio: null
     withhold_rate: 0.24
-    release_frac: 0.0638297872      # 3.0 Mt / 47.0 Mt
-    activation_year: 1              # 1-year TNAC lag (Decision 2015/1814 Art 1(5))
+    release_frac: 0.0638297872
+    activation_year: 1
     price_containment_absolute: 175
     price_release_absolute: 212
-    price_release_enabled: false    # disable procyclical emergency reserve injection
+    price_release_enabled: false
     emergency_release_frac: 0.064
     min_auction_frac: 0.10
 
   banking: true
-  reserve_price: 45.0              # auction bid floor (below MAC=48, prevents degenerate equilibrium)
+  reserve_price: 45.0
   reserve_price_mode: "static"
-  # Dynamic-reserve parameters (only consulted when reserve_price_mode: "dynamic").
-  # In dynamic mode: effective_reserve = max(reserve_price, reserve_discount × MA3_price);
-  # before any MA3 history exists, max(reserve_price, reserve_initial) is used.
   reserve_discount: 0.80
   reserve_initial: 50.0
   unsold_to_msr: false
   max_rollover_multiplier: 1.5
-  price_history_anchor: "auction"  # only successful auction clears enter MA3
+  price_history_anchor: "auction"
 
-# ----------------------------------------------------------
-# Companies — 8 learning agents (2x each of 4 archetypes)
-# Each agent produces 10 TWh/year.
-# ----------------------------------------------------------
+# 8 learning agents (2× each of 4 archetypes), 10 TWh/yr each.
 companies:
   n_agents: 8
   output_twh: 10.0
   initial_mix:                     # [coal, gas, onshore, offshore, solar]
-    - [0.25, 0.30, 0.20, 0.15, 0.10]   # A1: 45% green, ef≈0.355
-    - [0.25, 0.30, 0.20, 0.15, 0.10]   # A2: 45% green, ef≈0.355
-    - [0.15, 0.35, 0.25, 0.15, 0.10]   # A3: 50% green, ef≈0.299
-    - [0.15, 0.35, 0.25, 0.15, 0.10]   # A4: 50% green, ef≈0.299
-    - [0.10, 0.25, 0.30, 0.20, 0.15]   # A5: 65% green, ef≈0.210
-    - [0.10, 0.25, 0.30, 0.20, 0.15]   # A6: 65% green, ef≈0.210
-    - [0.05, 0.20, 0.30, 0.25, 0.20]   # A7: 75% green, ef≈0.143
-    - [0.05, 0.20, 0.30, 0.25, 0.20]   # A8: 75% green, ef≈0.143
+    - [0.25, 0.30, 0.20, 0.15, 0.10]   # A1: 45% green
+    - [0.25, 0.30, 0.20, 0.15, 0.10]   # A2: 45% green
+    - [0.15, 0.35, 0.25, 0.15, 0.10]   # A3: 50% green
+    - [0.15, 0.35, 0.25, 0.15, 0.10]   # A4: 50% green
+    - [0.10, 0.25, 0.30, 0.20, 0.15]   # A5: 65% green
+    - [0.10, 0.25, 0.30, 0.20, 0.15]   # A6: 65% green
+    - [0.05, 0.20, 0.30, 0.25, 0.20]   # A7: 75% green
+    - [0.05, 0.20, 0.30, 0.25, 0.20]   # A8: 75% green
   reward_weights:                  # [w_cost, w_green]
     - [1.0, 0.0]   # A1: pure financial
     - [0.5, 0.5]   # A2: balanced ESG
@@ -110,25 +76,16 @@ companies:
     - [1.0, 0.0]   # A7: pure financial
     - [0.5, 0.5]   # A8: balanced ESG
 
-  # Heuristic bot agents (indexed after learning agents).
-  # NOTE: bot_* arrays below have length 8 as a "configuration shelf" so they
-  # remain valid templates when n_bot_agents is increased. The first
-  # n_bot_agents entries are used; the rest are dead. WARNING — when changing
-  # n_bot_agents to N, REVIEW each bot_* array's first N entries: stale entries
-  # at index ≥ N continue to exist but become inactive only at runtime, while
-  # entries 0..N-1 still drive bot behaviour. Mismatched / outdated entries in
-  # the active prefix will silently change the simulation.
-  # preflight (src/utils/preflight.py) only enforces len(arr) >= n_bot_agents.
   n_bot_agents: 0
   bot_initial_mix:
-    - [0.40, 0.40, 0.10, 0.05, 0.05]   # B1: coal-heavy (id=8)
-    - [0.40, 0.40, 0.10, 0.05, 0.05]   # B2: coal-heavy (id=9)
-    - [0.15, 0.45, 0.20, 0.10, 0.10]   # B3: gas-dominant (id=10)
-    - [0.15, 0.45, 0.20, 0.10, 0.10]   # B4: gas-dominant (id=11)
-    - [0.05, 0.25, 0.35, 0.20, 0.15]   # B5: transitioner (id=12)
-    - [0.05, 0.25, 0.35, 0.20, 0.15]   # B6: transitioner (id=13)
-    - [0.00, 0.10, 0.30, 0.35, 0.25]   # B7: green-leader (id=14)
-    - [0.00, 0.10, 0.30, 0.35, 0.25]   # B8: green-leader (id=15)
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # B1: coal-heavy
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # B2: coal-heavy
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # B3: gas-dominant
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # B4: gas-dominant
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # B5: transitioner
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # B6: transitioner
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # B7: green-leader
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # B8: green-leader
   bot_reward_weights:
     - [1.0, 0.0]   # B1
     - [0.5, 0.5]   # B2
@@ -142,8 +99,7 @@ companies:
 investment:
   max_invest_frac: 0.20
   convexity_alpha: 0.20
-  # 5%/yr WACC: standard utility-sector hurdle rate for thesis runs.
-  discount_rate: 0.05
+  discount_rate: 0.05   # 5% WACC
 
 risk:
   p_fail_min: 0.08
@@ -153,19 +109,18 @@ risk:
   experience_threshold: 2
 
 auction:
-  price_max: 250.0     # above penalty ceiling (~170 EUR/t at yr11 @ 2% inflation)
-  price_min: 45.0      # matches ets.reserve_price
+  price_max: 250.0
+  price_min: 45.0
   quantity_max: 3.0
   bid_change_limit:
     enabled: true
-    value: 75.0        # max year-over-year bid price change (EUR/t); Year 0 always unconstrained
+    value: 75.0        # max year-over-year bid change (EUR/t)
   qty_mult_low: 0.5
   qty_mult_high: 2.0
   max_agent_share: 1.0
-  pricing_rule: "uniform"           # EU ETS uniform-price sealed-bid (Regulation 1031/2010)
+  pricing_rule: "uniform"
   cancel_under_subscribed: false
-  lot_size: 0.0005                  # 500 EUAs = 0.0005 Mt
-  # Bid collateral: 15% rate, 20% of notional. Models EU ECC/EEX margin requirements.
+  lot_size: 0.0005
   collateral:
     enabled: true
     collateral_rate: 0.15
@@ -174,13 +129,10 @@ auction:
     max_collateral_budget_share: 0.50
     min_qty_floor_frac: 0.5
   leverage_multiplier: 3.0
-  suspension_length: 0          # Change 1: budget gate replaces suspension
-  budget_price_clip: true       # Change 2: soft clip at 1.5× max_affordable_price
+  suspension_length: 0
+  budget_price_clip: true
   carry_forward_defaults: true
 
-# ----------------------------------------------------------
-# Secondary market (agent-to-agent double auction)
-# ----------------------------------------------------------
 trading:
   enabled: true
   transaction_cost: 0.5
@@ -193,28 +145,18 @@ secondary:
     enabled: false
     floor_fraction_of_penalty: 0.25
 
-# ----------------------------------------------------------
-# Budget envelope
-# Calibrated to revenue (~724 M€ for 10 TWh) × 60–70% retention.
-# ----------------------------------------------------------
 budget:
   mode: "revenue_based"
-  # debt_headrooms: per-agent cash buffer above electricity revenue. Sized so
-  # compliance-respecting agents don't need it; agents that miss compliance
-  # absorb the penalty (now charged through record_spending) before they
-  # exhaust their budget envelope.
   debt_headrooms: [475.0, 475.0, 305.0, 305.0, 125.0, 125.0, -25.0, -25.0]
   bot_debt_headrooms: [475.0, 475.0, 305.0, 305.0, 125.0, 125.0, -25.0, -25.0]
   budget_ema_alpha: 0.3
   annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
-  dynamic_budget_ceiling_multiplier: 1.5   # caps revenue-based budget to 1.5× annual_budget
+  dynamic_budget_ceiling_multiplier: 1.5
   overspend_penalty_coef: 0.5
   contingency_zone: 0.10
   contingency_penalty_coef: 0.05
-  # Single hard cap for both step_auction's investment hard gate and
-  # compute_budget_penalty(): annual_budget × hard_cap_fraction.
-  hard_cap_fraction: 1.15
+  hard_cap_fraction: 1.15   # drives both investment hard gate and compute_budget_penalty()
   soft_zone_start: 1.00
   tiered_penalty_coef: 2.0
   investment_hard_gate: true
@@ -226,16 +168,16 @@ budget:
     max_loan_fraction: 0.15
     interest_rate: 0.08
     repayment_years: 3
-    leverage_premium_coef: 0.25   # Change 3: rate += coef*(fraction^exp)
+    leverage_premium_coef: 0.25
     leverage_premium_exp: 1.5
-    capex_squeeze_floor: 0.50     # effective_capex_throughput floor when loan outstanding
-    origination_sting_coef: 0.07  # reward penalty on draw as fraction of annual_budget
-  treasury_reserve:               # Change 4: corporate treasury buffer
+    capex_squeeze_floor: 0.50
+    origination_sting_coef: 0.07
+  treasury_reserve:
     enabled: true
-    retention_fraction: 0.60      # fraction of year-end operating surplus retained
-    cap_multiple: 1.5             # treasury capped at cap_multiple × annual_budget
-    decay_rate: 0.05              # fraction lost to idle decay each year
-    terminal_value_rate: 0.30     # NPV rate applied at episode end
+    retention_fraction: 0.60
+    cap_multiple: 1.5
+    decay_rate: 0.05
+    terminal_value_rate: 0.30
   suspension_length: 1
 
 green_finance:
@@ -244,9 +186,6 @@ green_finance:
   loan_interest_rate: 0.05
   capex_throughput_boost: 80.0
 
-# ----------------------------------------------------------
-# Bot stochastic valuation & differentiation
-# ----------------------------------------------------------
 bots:
   valuation_noise_std: 5.0
   urgency_mult_low: 0.8
@@ -264,148 +203,91 @@ bots:
     enabled: false
     schedule: [[0, 8], [30000, 6], [60000, 4], [80000, 2]]
 
-# ----------------------------------------------------------
-# Non-compliance penalty & general inflation
-# inflation_rate applies to: penalty, CapEx, OpEx, MAC, electricity base.
-# ----------------------------------------------------------
 penalty:
-  rate: 138.75                     # EUR/tCO2 base in 2026 (132.06 in 2024 + 2.5%/yr × 2)
+  rate: 138.75                     # EUR/tCO2 base 2026
   inflation_rate: 0.020
   inflation_random_std: 0.015
   carry_forward: true
-  carry_forward_cap: 0.0           # 0.0 = no cap
+  carry_forward_cap: 0.0
 
-# ----------------------------------------------------------
-# AR(1) expected price model
-# Mean-reversion target is dynamically computed via
-# compute_fundamental_anchor(year, config) — MAC-scarcity-penalty formula.
-# banking_premium_mult: multiplier on MAC to account for banking option value.
-# ----------------------------------------------------------
 price:
-  initial_expected: 70.0           # Synthetic burn-in price seed; expected year-0 clearing target
-  banking_premium_mult: 1.4        # MAC × 1.4 = ~67 EUR/t at year 0
+  initial_expected: 70.0
+  banking_premium_mult: 1.4
   burnin_std: 10.0
   ar1_persistence: 0.85
   volatility_std: 0.15
 
-# ----------------------------------------------------------
-# MAC: Marginal Abatement Cost — fuel-switching
-# Automatic coal→gas dispatch when carbon_price > coal_to_gas_cost.
-# Also used as the base of the fundamental price anchor formula.
-# ----------------------------------------------------------
 mac:
   enabled: true
-  coal_to_gas_cost: 48.0           # EUR/tCO2 (ICIS 2020-2025 front-month switching cost)
+  coal_to_gas_cost: 48.0           # EUR/tCO2 fuel-switching cost
   max_switch_frac: 0.20
 
-# ----------------------------------------------------------
-# Electricity revenue
-# Revenue_i = output_TWh × (base_price + passthrough × carbon_price × marginal_ef)
-# ----------------------------------------------------------
 electricity:
   enabled: true
   base_price: 55.0
   carbon_passthrough: 0.90
 
-# ----------------------------------------------------------
-# Reward
-# R_i = -cost_norm + green_bonus + coverage_gap_shaping + terminal_values
-# ----------------------------------------------------------
 reward:
   normalizer_alpha: 0.02
   gae_min_std: 0.15
   opportunity_cost_rate: 0.0
   clip_min: -10.0
   clip_max: 10.0
-  shaping_beta: 7.0                # green_delta bonus weight
-  shaping_gamma: 1.0               # queue bonus weight
-  shaping_decay_episode: 0         # auto: shaping_decay_frac × n_episodes, clamped to [500, 80000]
-  shaping_decay_frac: 0.10         # Fix 4: frees plasticity early (was 0.40)
+  shaping_beta: 7.0
+  shaping_gamma: 1.0
+  shaping_decay_episode: 0         # auto: shaping_decay_frac × n_episodes
+  shaping_decay_frac: 0.10
   shaping_weight_floor: 0.0
   terminal_bank_value: true
   terminal_queue_value: true
   terminal_payoff_years: 5
-  treasury_terminal_value: true        # Change 4: treasury NPV added at episode end
-  anchor_normalize_cost_only: true     # Change 6: cost_norm = total_cost / (anchor_t × need)
-  budget_norm_anchor: "dynamic"        # "dynamic" uses annual_budget, "fixed" uses budget_norm_budget_0
-  budget_norm_budget_0: 1000.0         # reference budget for fixed normalisation mode
+  treasury_terminal_value: true
+  anchor_normalize_cost_only: true
+  budget_norm_anchor: "dynamic"
+  budget_norm_budget_0: 1000.0
 
-  # Opportunity cost shaping: per-Mt premium paid on secondary vs auction.
-  # Decays with shaping_weight so equilibrium reward is pure.
   opportunity_cost_shaping:
     enabled: true
     scale: 1.0
 
-  # Coverage gap shaping: immediate signal when bought < compliance need.
-  # Decays with shaping_weight so equilibrium reward is pure.
-  # This is the single coverage shaping mechanism in this codebase.
   coverage_gap_shaping:
     enabled: true
     scale: 0.5
 
-  # Banking timing signal: imputes bank drawdown at clearing price to eliminate
-  # the zero-bid free-compliance exploit, and rewards good intertemporal timing.
   banking_signal:
     enabled: true
-    w_banking: 0.3          # weight on timing P&L (clearing_price - cost_basis) × drawdown
-    w_imputed: 1.0          # weight on imputed bank drawdown added to compliance_norm
-    imputed_cap_factor: 5.0 # cap imputed norm at N × compliance_denom (v8.4.2: 2.0→5.0; old cap bound at clearing>2×anchor and made bank-draw cheaper than auction-buy in spikes)
-    initial_bank_cost_factor: 0.80  # pre-banked cost basis = fundamental_anchor(0) × factor
+    w_banking: 0.3
+    w_imputed: 1.0
+    imputed_cap_factor: 5.0
+    initial_bank_cost_factor: 0.80
 
-  # Blended compliance gate for ESG signal: linear above threshold, approaches
-  # quadratic below (threshold - width). Avoids hard penalty under scarcity.
   compliance_gate_blend_threshold: 0.90
   compliance_gate_blend_width: 0.30
 
-# ----------------------------------------------------------
-# ESG signal — saved-carbon-years formula
-# esg = w_green × esg_scale × ((ef_ratio − ef_baseline_t) + speed_bonus) × compliance_gate
-# ef_baseline_t = year / n_years: do-nothing agents get zero-mean ESG;
-# only progress *ahead of* the linear decarbonization trajectory pays.
-# ----------------------------------------------------------
+# ESG: esg = w_green × scale × ((ef_ratio − year/(n_years−1)) + speed_bonus) × compliance_gate
+# Do-nothing trajectory is zero-mean; ahead-of-trajectory agents receive positive signal.
 esg:
   enabled: true
   scale: 2.0
-  # Speed bonus weight on Δgreen_frac. Front-loaded so early decarb gets the
-  # bigger kick; late-episode investments still pay back through the NPV
-  # terminal-queue value, so the late weight can be smaller.
-  speed_coef: 0.8
+  speed_coef: 0.8       # front-loaded; early decarb gets the bigger kick
   speed_coef_late: 0.4
 
-# ----------------------------------------------------------
-# Opponent modeling — public info per opponent
-# ----------------------------------------------------------
 opponent_modeling:
   enabled: true
 
-# ----------------------------------------------------------
-# Opponent observation encoding
-# mode: "lagged"    — two-buffer 7D snapshots (default)
-#        "full_info" — live get_public_info() (ablation)
-# 7D per opponent: emissions, green_frac, fossil_frac,
-#   queue_noisy, tnac_share_norm (own_holdings / Σ holdings),
-#   net_secondary_norm, lagged_compliance_gap_norm
-# tnac_share_norm replaces the old per-firm bank_norm to better reflect
-# what is publicly inferable in the EU ETS (aggregate TNAC is reported,
-# per-firm holdings are not).
-# ----------------------------------------------------------
+# 7D per opponent: emissions, green_frac, fossil_frac, queue_noisy,
+# tnac_share_norm, net_secondary_norm, lagged_compliance_gap_norm
 opponent_obs:
   mode: "lagged"
   lag_years: 1
   queue_noise_sigma: 0.15
   dims_per_opponent: 7
 
-# ----------------------------------------------------------
-# Agent cycling (disabled — HAPPO handles coordination)
-# ----------------------------------------------------------
 agent_cycling:
   enabled: false
   soft: true
   soft_lr_scale: 0.3
 
-# ----------------------------------------------------------
-# PPO / HAPPO
-# ----------------------------------------------------------
 ppo:
   hidden_size: 256
   lr: 0.0002
@@ -414,9 +296,9 @@ ppo:
   clip_eps: 0.15
   entropy_coef: 0.08
   entropy_coef_final: 0.005
-  entropy_decay_start: -1          # -1 = auto (5% of n_episodes); 0 = start immediately
+  entropy_decay_start: -1          # -1 = auto (5% of n_episodes)
   entropy_decay_window: -1         # -1 = auto (entropy_decay_frac × n_episodes)
-  entropy_decay_frac: 0.70         # Fix 4: faster stabilization (was 0.90)
+  entropy_decay_frac: 0.70
   value_coef: 0.5
   max_grad_norm: 0.5
   n_epochs: 5
@@ -431,77 +313,47 @@ ppo:
   log_std_min: -3.5
   log_std_max: 0.0
   centralized_critic: true
-  # Split-head investment critic. When true, Phase-1 trains:
-  #   bid sub-head    (dims 0,1: bid_price, qty_mult)  → main critic / advantage
-  #   invest sub-head (dims 2-5: invest_frac, tech logits) → invest critic / advantage
-  # Reward is decomposed into a "main" stream (compliance, penalty, secondary
-  # financials) and an "invest" stream (capital cost, ESG, terminal queue value),
-  # each with its own value network sharing no parameters.
+  # Phase-1 split-head: bid (dims 0-1) → main critic; invest (dims 2-5) → invest critic.
   split_invest_head: true
   happo: true
-  # HAPPO sequential update ordering: when "advantage", the per-agent EMA
-  # tracks raw (unnormalized) mean GAE advantage and the order is worst-to-best
-  # by that EMA — agents whose own value function under-predicts go first.
-  # Robust against ESG vs financial reward floors. "reward" keeps the prior
-  # behaviour (worst total-reward EMA goes first).
   happo_dynamic_order: true
-  happo_order_metric: "advantage"
+  happo_order_metric: "advantage"   # "reward" uses prior EMA-reward ordering
   happo_perf_ema_alpha: 0.1
-  critic_compliance_features: true  # append K=4 compliance features per agent to global state
+  critic_compliance_features: true
   critic_lr: 0.0005
   critic_hidden_size: 512
-  critic_warmup_episodes: 0        # auto: 3% of n_episodes, clamped to [100, 5000]
+  critic_warmup_episodes: 0        # auto: 3% of n_episodes
   lr_decay: cosine
   lr_min: 0.00001
   critic_lr_decay: cosine
   critic_lr_min: 0.00005
   target_kl: 0.015
-  # Monitoring note: if approx_kl consistently hits target_kl on epoch 1-2, relax clip_eps to 0.175 or target_kl to 0.018
-  kl_anchor_beta: 0.0              # 0 = KL anchor disabled (pretrain is off by default)
-  kl_anchor_decay_episodes: 0      # auto: 50% of n_episodes, clamped to [500, 40000]
+  kl_anchor_beta: 0.0
+  kl_anchor_decay_episodes: 0      # auto: 50% of n_episodes
   critic_extra_epochs: 6
   critic_huber: true
   critic_huber_delta: 4.0
   clip_value: true
   normalize_returns: false
 
-# ----------------------------------------------------------
-# Curriculum learning
-# ----------------------------------------------------------
 curriculum:
   enabled: false
   start_years: 4
   ramp_episodes: 3000
 
-# ----------------------------------------------------------
-# Demand & emission uncertainty
-# ----------------------------------------------------------
 uncertainty:
   enabled: true
   sigma_demand: 0.07
   corr_rho: 0.40
 
-# ----------------------------------------------------------
-# Construction delay jitter & capacity uncertainty 
-# ----------------------------------------------------------
 construction_jitter:
   enabled: true
   poisson_lambdas: [1.0, 1.0, 2.0, 3.0, 1.5]
-  # Per-tech construction-phase cancellation probability (per project per year).
-  # Fossil entries are ignored (only buildable green techs are queued).
-  # Calibrated to realistic utility-scale construction completion rates:
-  # offshore lower than onshore because permits are largely secured before
-  # construction begins; solar slightly higher because grid-connection is
-  # the dominant late-stage risk.
-  p_cancel_per_tech: [0.0, 0.0, 0.010, 0.006, 0.015]
-  # Backwards-compat scalar (used if p_cancel_per_tech is missing).
-  p_cancel: 0.010
+  p_cancel_per_tech: [0.0, 0.0, 0.010, 0.006, 0.015]  # per project per year; fossil ignored
+  p_cancel: 0.010   # fallback scalar
   recovery_rate: 0.40
   cf_sigma: [0.0, 0.0, 0.08, 0.08, 0.05]
 
-# ----------------------------------------------------------
-# Warm-start pipeline
-# ----------------------------------------------------------
 warm_start:
   enabled: true
   burnin_enabled: true
@@ -514,14 +366,8 @@ warm_start:
   queue_mu_onshore: 1.5
   queue_mu_offshore: 0.5
   queue_mu_solar: 2.0
-  # Seed MSR reserve as a fraction of cap_year_0 (clamped to tnac_lower).
-  # Real EU ETS 2026: ~900 Mt reserve / ~3950 Mt cap_year_0 ≈ 0.23.
-  # Micro-ETS equivalent preserves the reserve-to-cap ratio.
   msr_initial_reserve_frac: 0.23
 
-# ----------------------------------------------------------
-# Logging
-# ----------------------------------------------------------
 logging:
   log_interval: 100
   save_interval: 500
@@ -533,20 +379,12 @@ logging:
     n_keep_milestones: 20
     n_keep_recent: 5
 
-# ----------------------------------------------------------
-# Behavioral cloning warm-start (disabled by default)
-# Enable for ablation studies comparing fundamental-anchor
-# initialization vs BC-pretrained initialization.
-# ----------------------------------------------------------
 pretrain:
   enabled: false
-  episodes: 0   # auto: 4% of n_episodes, clamped to [40, 2000]
-  epochs: 0     # auto: scales with n_episodes, clamped to [4, 12]
+  episodes: 0   # auto: 4% of n_episodes
+  epochs: 0     # auto: scales with n_episodes
   lr: 0.001
 
-# ----------------------------------------------------------
-# Training diagnostics / safety guardrails
-# ----------------------------------------------------------
 diagnostics:
   market_broken_window: 200
   market_broken_bid_threshold: 0.99
@@ -556,41 +394,25 @@ diagnostics:
   stuck_boost_coef: 0.04
   esg_over_penalty_warn_window: 50
 
-# ----------------------------------------------------------
-# Historical Policy Pool (HPP)
-# Anti-regression: random rollback to past actor snapshots.
-# seed_heuristic requires pretrain.enabled=true (BC must have run).
-# ----------------------------------------------------------
 hpp:
   enabled: true
   pool_size: 10
-  save_interval: 0      # auto: 3% of n_episodes, clamped to [50, 1000]
+  save_interval: 0      # auto: 3% of n_episodes
   swap_prob: 0.20
-  warmup_episodes: 0    # auto: 20% of n_episodes, clamped to [200, 30000]
-  seed_heuristic: false # requires pretrain.enabled=true
+  warmup_episodes: 0    # auto: 20% of n_episodes
+  seed_heuristic: false
   seed_count: 2
 
-# ----------------------------------------------------------
-# Epsilon-greedy exploration (physical-space, uniform mode)
-# Uniform: samples bid_price from uniform([price_min, price_max])
-# instead of from the policy distribution. Prevents floor-price
-# lock-in by ensuring early exploration covers the full range.
-# ----------------------------------------------------------
 exploration:
-  mode: "anchored"                  # Fix 3: Gaussian around WTP (was "uniform")
+  mode: "anchored"
   epsilon_start: 0.25
-  epsilon_final: 0.02               # Fix 3: lower mature noise floor (was 0.05)
-  epsilon_decay_episodes: 0         # auto: epsilon_decay_frac × n_episodes, clamped to [1000, 100000]
-  epsilon_decay_frac: 0.45          # Fix 3: faster decay to exploitation (was 0.75)
-  # Boost factor applied to fundamental anchor for exploration WTP.
-  # fundamental_anchor(yr0)≈67, ×1.14≈76; (yr1)≈70, ×1.14≈80; grows with year.
+  epsilon_final: 0.02
+  epsilon_decay_episodes: 0         # auto: epsilon_decay_frac × n_episodes
+  epsilon_decay_frac: 0.45
   anchor_boost: 1.14
-  auction_anchors: null            # null = fundamental-anchor initialization (via inject_fundamental_anchor)
+  auction_anchors: null
   secondary_anchors: null
 
-# ----------------------------------------------------------
-# Cap/budget curricula
-# ----------------------------------------------------------
 cap_curriculum:
   enabled: false
   cap_start: 1.3
@@ -603,10 +425,6 @@ budget_curriculum:
   budget_end: 1.0
   decay_frac: 0.30
 
-# ----------------------------------------------------------
-# Phantom Bidder: financial intermediary demand
-# Represents ~40% of EU ETS demand from banks/hedge funds.
-# ----------------------------------------------------------
 phantom_bidder:
   enabled: false
   qty_frac_lo: 0.15
@@ -617,24 +435,11 @@ phantom_bidder:
   price_max_frac_penalty: 0.65
   price_min_below_reserve_buffer: 5.0
 
-# ----------------------------------------------------------
-# Private per-episode urgency scalars
-# LogNormal(0, σ) multiplied into effective penalty per agent.
-# Creates private heterogeneity destroying symmetric floor equilibria.
-# ----------------------------------------------------------
 urgency_scalars:
   enabled: true
   lognormal_sigma: 0.30
 
-# ----------------------------------------------------------
-# ABLATION REFERENCE — tabula_rasa
-# DO NOT set enabled: true. Tabula-rasa is no longer a runtime
-# override; configure each schedule directly in its own section.
-# These values show the "blank slate" ablation baseline for reference:
-#   - No BC, no KL anchor, no action anchors
-#   - Wide uniform exploration (30% → 10%)
-#   - High entropy, fast shaping decay
-# ----------------------------------------------------------
+# ABLATION REFERENCE — tabula_rasa (enabled: true raises ValueError)
 tabula_rasa:
   enabled: false
   epsilon_start: 0.30
@@ -647,13 +452,3 @@ tabula_rasa:
   shaping_decay_frac: 0.60
   hpp_warmup_frac: 0.25
   exploration_mode: "uniform"
-
-# ----------------------------------------------------------
-# Pricing curriculum (disabled by default)
-# When enabled: PAB first → uniform pricing after pab_frac.
-# PAB creates direct bid-price gradients to bootstrap learning
-# before uniform pricing's zero-direct-gradient regime.
-# ----------------------------------------------------------
-pricing_curriculum:
-  enabled: false
-  pab_frac: 0.20
