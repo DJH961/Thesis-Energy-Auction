@@ -107,20 +107,26 @@ class RolloutBuffer:
         self.global_states = []  # MAPPO: centralized critic input
         self.auction_raw = []
         self.secondary_raw = []
-        self.auction_logp = []
+        self.auction_logp = []          # per-dim log_prob (6D) for split-head update
         self.secondary_logp = []
-        self.rewards = []
+        self.rewards = []               # main-stream reward (compliance, secondary financials, ...)
+        self.rewards_invest = []        # investment-stream reward (capital, ESG, terminal queue)
         self.dones = []
-        self.values = []
+        self.values = []                # V_main(s) from main critic at action time
+        self.values_invest = []         # V_invest(s) from invest critic at action time
         self.phases = []  # 'auction' or 'secondary' per transition (for phase-split gradients)
 
     def push(self, obs1, obs2, auc_raw, sec_raw, auc_lp, sec_lp, reward, done, value,
-             global_state=None, phase='secondary'):
+             global_state=None, phase='secondary',
+             reward_invest=0.0, value_invest=0.0):
         """
         phase : str, either 'auction' or 'secondary'
             Tags which phase produced this transition so update_happo() and
             compute_post_update_ratio() can route each policy loss to the
             correct observation space.
+        reward_invest, value_invest : float
+            Companion reward / value for the investment stream (split critic).
+            Default 0.0 keeps backwards compatibility for external callers.
         """
         self.obs1.append(obs1)
         self.obs2.append(obs2)
@@ -131,8 +137,10 @@ class RolloutBuffer:
         self.auction_logp.append(auc_lp)
         self.secondary_logp.append(sec_lp)
         self.rewards.append(reward)
+        self.rewards_invest.append(reward_invest)
         self.dones.append(done)
         self.values.append(value)
+        self.values_invest.append(value_invest)
         self.phases.append(phase)
 
     def __len__(self):
@@ -254,8 +262,15 @@ class PPOAgent:
 
         if self.centralized_critic and global_state_dim > 0:
             self.value_net = ValueNetwork(global_state_dim, critic_hidden).to(self.device)
+            self.value_net_invest = ValueNetwork(global_state_dim, critic_hidden).to(self.device)
         else:
             self.value_net = ValueNetwork(obs_dim_phase2, hidden).to(self.device)
+            self.value_net_invest = ValueNetwork(obs_dim_phase2, hidden).to(self.device)
+        # Split-head investment critic enabled? When False the invest critic
+        # is still constructed (for state_dict compatibility) but the second
+        # GAE stream is unused and dims (2..5) of the auction policy are
+        # trained against the main advantage like before.
+        self.split_invest_head = bool(ppo.get("split_invest_head", True))
 
         # Decoupled actor optimizers: auction and secondary trained independently
         # to prevent cross-gradient corruption during HAPPO sequential updates.
@@ -264,6 +279,8 @@ class PPOAgent:
         critic_params = list(self.value_net.parameters())
         critic_lr = ppo.get("critic_lr", ppo["lr"])
         self.critic_optimizer = optim.Adam(critic_params, lr=critic_lr)
+        self.critic_invest_optimizer = optim.Adam(
+            list(self.value_net_invest.parameters()), lr=critic_lr)
         # Backwards-compat aliases used by cycling code in train.py
         self.actor_optimizer = self.auction_optimizer
         self.optimizer = self.auction_optimizer
@@ -295,6 +312,12 @@ class PPOAgent:
         # reward is normalized using only stats from prior timesteps.
         self._auc_reward_normalizer = RewardNormalizer(alpha=norm_alpha)
         self._sec_reward_normalizer = RewardNormalizer(alpha=norm_alpha)
+        # Companion normalizers for the investment reward stream (split critic).
+        self._auc_reward_normalizer_invest = RewardNormalizer(alpha=norm_alpha)
+        self._sec_reward_normalizer_invest = RewardNormalizer(alpha=norm_alpha)
+        # Exposed mean-advantage trackers for HAPPO advantage-based ordering (#15).
+        self._last_mean_adv = 0.0
+        self._last_mean_adv_invest = 0.0
         self._reward_clip_min = reward_cfg.get("clip_min", -10.0)
         self._reward_clip_max = reward_cfg.get("clip_max", 10.0)
 
@@ -367,12 +390,16 @@ class PPOAgent:
                               epsilon: float = 0.0,
                               last_secondary_buy_price: float = 0.0,
                               current_year: int = 0):
-        """Phase 1: obs(18) → (action[6], raw[6], logp[1]).
+        """Phase 1: obs → (action[6], raw[6], logp[6]).
+
+        Returns per-dimension log-probabilities (one entry per action dim) so
+        the rollout buffer can route bid dims (0, 1) and investment dims
+        (2..5) to their own advantages in the split-head update.
 
         When ``epsilon > 0`` and not deterministic, with probability *epsilon*
         an epsilon-random action in physical space replaces the policy sample.
-        The raw action and log_prob are still computed under the current policy
-        so that the PPO importance ratio remains correct.
+        The raw action and per-dim log_prob are still computed under the
+        current policy so that the PPO importance ratio remains correct.
 
         ``last_secondary_buy_price``: price this agent paid per Mt on the
         secondary market last year. Shifts the WTP exploration anchor upward
@@ -382,7 +409,9 @@ class PPOAgent:
         obs_t = torch.from_numpy(np.ascontiguousarray(obs1, dtype=np.float32)
                                  ).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            action, raw, log_prob = self.auction_policy.act(obs_t, deterministic)
+            # Always sample per-dim log_prob so the buffer can route bid dims
+            # (0, 1) and investment dims (2..) to their own advantages later.
+            action, raw, log_prob = self.auction_policy.act_per_dim(obs_t, deterministic)
 
         if not deterministic and epsilon > 0.0 and np.random.random() < epsilon:
             with torch.no_grad():
@@ -485,9 +514,10 @@ class PPOAgent:
                 rand_raw = torch.clamp(
                     (rand_action - self.auction_policy.action_bias) /
                     (self.auction_policy.action_scale + 1e-8), -1.0, 1.0)
-                # Log-prob under current policy (for PPO importance ratio)
+                # Per-dim log-prob under the current policy (matches the
+                # 6-dim layout we always store).
                 dist = self.auction_policy.forward(obs_t)
-                rand_lp = dist.log_prob(rand_raw).sum(dim=-1, keepdim=True)
+                rand_lp = dist.log_prob(rand_raw)  # (1, 6)
             return (rand_action.cpu().numpy().squeeze(0),
                     rand_raw.cpu().numpy().squeeze(0),
                     rand_lp.cpu().numpy().squeeze(0))
@@ -552,11 +582,18 @@ class PPOAgent:
                 log_prob.cpu().numpy().squeeze(0))
 
     def estimate_value(self, obs: np.ndarray) -> float:
-        """V(s) — from local obs2 (IPPO) or global state (MAPPO)."""
+        """V_main(s) — main reward-stream critic (compliance, secondary, ...)."""
         with torch.no_grad():
             obs_t = torch.from_numpy(np.ascontiguousarray(obs, dtype=np.float32)
                                      ).unsqueeze(0).to(self.device)
             return self.value_net(obs_t).item()
+
+    def estimate_value_invest(self, obs: np.ndarray) -> float:
+        """V_invest(s) — investment reward-stream critic (capital, ESG, terminal queue)."""
+        with torch.no_grad():
+            obs_t = torch.from_numpy(np.ascontiguousarray(obs, dtype=np.float32)
+                                     ).unsqueeze(0).to(self.device)
+            return self.value_net_invest(obs_t).item()
 
     # ------------------------------------------------------------------
     # Storage
@@ -564,10 +601,12 @@ class PPOAgent:
 
     def store_transition(self, obs1, obs2, auc_raw, sec_raw,
                          auc_lp, sec_lp, reward, done, value,
-                         global_state=None, phase='secondary'):
+                         global_state=None, phase='secondary',
+                         reward_invest=0.0, value_invest=0.0):
         self.buffer.push(obs1, obs2, auc_raw, sec_raw,
                          auc_lp, sec_lp, reward, done, value,
-                         global_state=global_state, phase=phase)
+                         global_state=global_state, phase=phase,
+                         reward_invest=reward_invest, value_invest=value_invest)
 
     # ------------------------------------------------------------------
     # PPO Update (end of episode)
@@ -721,18 +760,22 @@ class PPOAgent:
 
                     # Auction policy: obs1-space, auction-phase rows only
                     if is_auc_mb.any():
-                        auc_lp_new, auc_ent = self.auction_policy.evaluate(
+                        # Per-dim log-prob (B, action_dim); sum to joint for non-HAPPO update.
+                        auc_lp_pd_new, auc_ent_pd = self.auction_policy.evaluate_per_dim(
                             obs1[mb][is_auc_mb], auc_raw[mb][is_auc_mb])
+                        auc_lp_new = auc_lp_pd_new.sum(dim=-1, keepdim=True)
+                        old_lp_sum = old_auc_lp[mb][is_auc_mb].sum(dim=-1, keepdim=True)
                         # Wide clamp: NaN/Inf guard only. The PPO clipped surrogate
                         # below is responsible for the trust-region constraint.
                         auc_log_ratio = torch.clamp(
-                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -20.0, 20.0)
+                            auc_lp_new - old_lp_sum, -20.0, 20.0)
                         auc_ratio = torch.exp(auc_log_ratio)
                         auc_adv = adv_t[mb][is_auc_mb]
                         auc_surr1 = auc_ratio * auc_adv
                         auc_surr2 = torch.clamp(
                             auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
                         auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
+                        auc_ent = auc_ent_pd.sum(dim=-1, keepdim=True)
 
                     # Secondary policy: obs2-space, secondary-phase rows only
                     if sec_mb.any():
@@ -849,18 +892,21 @@ class PPOAgent:
     # HAPPO: Sequential multi-agent update
     # ------------------------------------------------------------------
 
-    def compute_gae(self, last_value: float = 0.0):
+    def compute_gae(self, last_value: float = 0.0, last_value_invest: float = 0.0):
         """
         Extract GAE advantages and returns from the rollout buffer.
-        Rewards are normalized per-phase (auction vs secondary) before GAE
-        to account for their different reward distributions.
+
+        Two streams are computed in parallel:
+          • main:    `buffer.rewards` + `buffer.values`     → adv_t / ret_t
+          • invest:  `buffer.rewards_invest` + `buffer.values_invest`
+            → buf_tensors["adv_invest"] / buf_tensors["ret_invest"]
 
         Returns
         -------
         adv_t : Tensor [T, 1]
-            Normalised GAE advantages.
+            Normalised main-stream GAE advantages.
         ret_t : Tensor [T, 1]
-            GAE returns (advantages + values).
+            Main-stream GAE returns (advantages + values).
         buf_tensors : dict
             Pre-processed buffer tensors for reuse in update_happo / compute_post_update_ratio.
         """
@@ -884,6 +930,8 @@ class PPOAgent:
             np.asarray(self.buffer.auction_raw, dtype=np.float32)).to(self.device)
         sec_raw = torch.from_numpy(
             np.asarray(self.buffer.secondary_raw, dtype=np.float32)).to(self.device)
+        # Per-dim auction log-prob (T, action_dim). Old joint scalar callers
+        # pre-v8.5 are no longer supported.
         old_auc_lp = torch.from_numpy(
             np.asarray(self.buffer.auction_logp, dtype=np.float32)).to(self.device)
         old_sec_lp = torch.from_numpy(
@@ -898,10 +946,14 @@ class PPOAgent:
 
         rewards = np.nan_to_num(np.asarray(self.buffer.rewards, dtype=np.float32),
                                 nan=0.0, posinf=0.0, neginf=0.0)
+        rewards_inv = np.nan_to_num(np.asarray(self.buffer.rewards_invest, dtype=np.float32),
+                                    nan=0.0, posinf=0.0, neginf=0.0)
         dones = np.nan_to_num(np.asarray(self.buffer.dones, dtype=np.float32),
                               nan=1.0, posinf=1.0, neginf=1.0)
         values = np.nan_to_num(np.asarray(self.buffer.values, dtype=np.float32),
                                nan=0.0, posinf=0.0, neginf=0.0)
+        values_inv = np.nan_to_num(np.asarray(self.buffer.values_invest, dtype=np.float32),
+                                   nan=0.0, posinf=0.0, neginf=0.0)
 
         # Phase-aware CAUSAL reward normalization (audit fix 1.7).
         # Walk forward in time; for each reward, use ONLY stats from prior
@@ -916,8 +968,15 @@ class PPOAgent:
             else:
                 r_norm = self._sec_reward_normalizer.update_and_normalize(r_raw)
             rewards[t] = float(np.clip(r_norm, -10.0, 10.0))
+            # Invest stream uses its own normalizers
+            r_inv_raw = float(rewards_inv[t])
+            if phases_buf[t] == 'auction':
+                r_inv_norm = self._auc_reward_normalizer_invest.update_and_normalize(r_inv_raw)
+            else:
+                r_inv_norm = self._sec_reward_normalizer_invest.update_and_normalize(r_inv_raw)
+            rewards_inv[t] = float(np.clip(r_inv_norm, -10.0, 10.0))
 
-        # GAE
+        # GAE — main stream
         T = len(rewards)
         advantages = np.zeros(T, dtype=np.float32)
         gae = 0.0
@@ -926,10 +985,29 @@ class PPOAgent:
             delta = rewards[t] + self.gamma * (1 - dones[t]) * next_val - values[t]
             gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
             advantages[t] = gae
-
         returns = advantages + values
+
+        # GAE — invest stream (uses its own value bootstraps)
+        adv_inv = np.zeros(T, dtype=np.float32)
+        gae_i = 0.0
+        for t in reversed(range(T)):
+            next_v = last_value_invest if t == T - 1 else values_inv[t + 1]
+            delta_i = rewards_inv[t] + self.gamma * (1 - dones[t]) * next_v - values_inv[t]
+            gae_i = delta_i + self.gamma * self.gae_lambda * (1 - dones[t]) * gae_i
+            adv_inv[t] = gae_i
+        ret_inv = adv_inv + values_inv
+
+        # Track mean advantages for HAPPO advantage-based ordering (#15).
+        # Captured before advantage standardization (mean/std normalization),
+        # but after any per-phase reward normalization/clipping already
+        # applied to rewards / rewards_inv above.
+        self._last_mean_adv = float(np.nanmean(advantages))
+        self._last_mean_adv_invest = float(np.nanmean(adv_inv))
+
         advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
         returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+        adv_inv = np.nan_to_num(adv_inv, nan=0.0, posinf=0.0, neginf=0.0)
+        ret_inv = np.nan_to_num(ret_inv, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Year-1 advantage floor: year 1 structurally receives the most negative advantage
         # because the green transition trajectory starts at its worst. Without this floor,
@@ -949,6 +1027,8 @@ class PPOAgent:
 
         adv_t = torch.from_numpy(advantages).to(self.device).unsqueeze(1)
         ret_t = torch.from_numpy(returns).to(self.device).unsqueeze(1)
+        adv_inv_t = torch.from_numpy(adv_inv).to(self.device).unsqueeze(1)
+        ret_inv_t = torch.from_numpy(ret_inv).to(self.device).unsqueeze(1)
 
         # Return normalization
         if self.normalize_returns and T > 1:
@@ -956,21 +1036,34 @@ class PPOAgent:
             ret_std = ret_t.std()
             if ret_std > self.gae_min_std:
                 ret_t = (ret_t - ret_mean) / torch.clamp(ret_std, min=self.gae_min_std)
+            ret_inv_mean = ret_inv_t.mean()
+            ret_inv_std = ret_inv_t.std()
+            if ret_inv_std > self.gae_min_std:
+                ret_inv_t = (ret_inv_t - ret_inv_mean) / torch.clamp(ret_inv_std, min=self.gae_min_std)
 
         if self.normalize_advantages and T > 1:
             adv_t = (adv_t - adv_t.mean()) / torch.clamp(adv_t.std(), min=self.gae_min_std)
+            adv_inv_t = (adv_inv_t - adv_inv_t.mean()) / torch.clamp(
+                adv_inv_t.std(), min=self.gae_min_std)
 
         adv_t = torch.nan_to_num(adv_t, nan=0.0, posinf=0.0, neginf=0.0)
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
+        adv_inv_t = torch.nan_to_num(adv_inv_t, nan=0.0, posinf=0.0, neginf=0.0)
+        ret_inv_t = torch.nan_to_num(ret_inv_t, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Convert old values to tensor for value clipping
         old_values_t = torch.from_numpy(values).to(self.device).unsqueeze(1) if self.clip_value else None
+        old_values_inv_t = (torch.from_numpy(values_inv).to(self.device).unsqueeze(1)
+                            if self.clip_value else None)
 
         buf_tensors = {
             "obs1": obs1, "obs2": obs2, "critic_input": critic_input,
             "auc_raw": auc_raw, "sec_raw": sec_raw,
             "old_auc_lp": old_auc_lp, "old_sec_lp": old_sec_lp,
             "old_values": old_values_t,  # for value clipping in update_happo
+            "old_values_invest": old_values_inv_t,
+            "adv_invest": adv_inv_t,
+            "ret_invest": ret_inv_t,
             "T": T,
             "is_auction": is_auction_t,  # [T] bool: route policy losses to correct obs space
             "per_year_adv_mean": per_year_adv_mean,  # [n_years] diagnostic: mean adv per year
@@ -1005,9 +1098,12 @@ class PPOAgent:
         critic_input = buf_tensors["critic_input"]
         auc_raw = buf_tensors["auc_raw"]
         sec_raw = buf_tensors["sec_raw"]
-        old_auc_lp = buf_tensors["old_auc_lp"]
+        old_auc_lp = buf_tensors["old_auc_lp"]    # (T, action_dim) per-dim
         old_sec_lp = buf_tensors["old_sec_lp"]
         old_values_t = buf_tensors.get("old_values", None)  # for value clipping
+        old_values_inv_t = buf_tensors.get("old_values_invest", None)
+        adv_inv_t = buf_tensors.get("adv_invest", None)
+        ret_inv_t = buf_tensors.get("ret_invest", None)
         is_auction = buf_tensors["is_auction"]  # [T] bool: auction rows use obs1-space
         T = buf_tensors["T"]
 
@@ -1018,8 +1114,17 @@ class PPOAgent:
             w_std = weighted_adv.std()
             if w_std > self.gae_min_std:
                 weighted_adv = (weighted_adv - weighted_adv.mean()) / torch.clamp(w_std, min=self.gae_min_std)
+            if adv_inv_t is not None:
+                weighted_adv_inv = adv_inv_t * advantage_weights.to(self.device)
+                w_inv_std = weighted_adv_inv.std()
+                if w_inv_std > self.gae_min_std:
+                    weighted_adv_inv = (weighted_adv_inv - weighted_adv_inv.mean()) / torch.clamp(
+                        w_inv_std, min=self.gae_min_std)
+            else:
+                weighted_adv_inv = weighted_adv
         else:
             weighted_adv = adv_t
+            weighted_adv_inv = adv_inv_t if adv_inv_t is not None else adv_t
 
         total_a_loss = 0.0
         total_v_loss = 0.0
@@ -1041,6 +1146,15 @@ class PPOAgent:
                     v_pred, ret_t[mb],
                     old_values_t[mb] if self.clip_value else None
                 )
+                # Invest critic loss
+                v_inv_pred = self.value_net_invest(critic_input[mb])
+                if ret_inv_t is not None:
+                    invest_value_loss = self._critic_loss(
+                        v_inv_pred, ret_inv_t[mb],
+                        old_values_inv_t[mb] if (self.clip_value and old_values_inv_t is not None) else None
+                    )
+                else:
+                    invest_value_loss = torch.tensor(0.0, device=self.device)
 
                 if actor_update:
                     # Phase-split: auction policy only on auction rows, secondary only on secondary rows.
@@ -1058,18 +1172,52 @@ class PPOAgent:
 
                     # Auction policy: obs1-space, auction-phase rows only
                     if is_auc_mb.any():
-                        auc_lp_new, auc_ent = self.auction_policy.evaluate(
+                        # Per-dim log_prob (B, action_dim)
+                        auc_lp_pd_new, auc_ent_pd = self.auction_policy.evaluate_per_dim(
                             obs1[mb][is_auc_mb], auc_raw[mb][is_auc_mb])
-                        # Wide clamp: NaN/Inf guard only. The PPO clipped surrogate
-                        # below is responsible for the trust-region constraint.
-                        auc_log_ratio = torch.clamp(
-                            auc_lp_new - old_auc_lp[mb][is_auc_mb], -20.0, 20.0)
-                        auc_ratio = torch.exp(auc_log_ratio)
-                        auc_adv = weighted_adv[mb][is_auc_mb]
-                        auc_surr1 = auc_ratio * auc_adv
-                        auc_surr2 = torch.clamp(
-                            auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
-                        auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
+                        old_pd = old_auc_lp[mb][is_auc_mb]   # (B, action_dim)
+
+                        if self.split_invest_head and adv_inv_t is not None:
+                            # Bid block: dims 0, 1
+                            lp_bid_new = auc_lp_pd_new[:, :2].sum(dim=-1, keepdim=True)
+                            lp_bid_old = old_pd[:, :2].sum(dim=-1, keepdim=True)
+                            lr_bid = torch.clamp(lp_bid_new - lp_bid_old, -20.0, 20.0)
+                            r_bid = torch.exp(lr_bid)
+                            adv_bid = weighted_adv[mb][is_auc_mb]
+                            s1 = r_bid * adv_bid
+                            s2 = torch.clamp(r_bid, 1 - self.clip_eps, 1 + self.clip_eps) * adv_bid
+                            bid_loss = -torch.min(s1, s2).mean()
+
+                            # Investment block: dims 2..end
+                            lp_inv_new = auc_lp_pd_new[:, 2:].sum(dim=-1, keepdim=True)
+                            lp_inv_old = old_pd[:, 2:].sum(dim=-1, keepdim=True)
+                            lr_inv = torch.clamp(lp_inv_new - lp_inv_old, -20.0, 20.0)
+                            r_inv = torch.exp(lr_inv)
+                            adv_inv_mb = weighted_adv_inv[mb][is_auc_mb]
+                            si1 = r_inv * adv_inv_mb
+                            si2 = torch.clamp(r_inv, 1 - self.clip_eps, 1 + self.clip_eps) * adv_inv_mb
+                            inv_loss = -torch.min(si1, si2).mean()
+
+                            auc_policy_loss = bid_loss + inv_loss
+                            # Joint diagnostics for KL early stopping use the
+                            # full 6-dim ratio.
+                            auc_log_ratio = torch.clamp(
+                                auc_lp_pd_new.sum(dim=-1, keepdim=True)
+                                - old_pd.sum(dim=-1, keepdim=True), -20.0, 20.0)
+                            auc_ratio = torch.exp(auc_log_ratio)
+                        else:
+                            # Single-advantage path (split disabled): use joint ratio
+                            auc_lp_new = auc_lp_pd_new.sum(dim=-1, keepdim=True)
+                            old_lp_sum = old_pd.sum(dim=-1, keepdim=True)
+                            auc_log_ratio = torch.clamp(
+                                auc_lp_new - old_lp_sum, -20.0, 20.0)
+                            auc_ratio = torch.exp(auc_log_ratio)
+                            auc_adv = weighted_adv[mb][is_auc_mb]
+                            auc_surr1 = auc_ratio * auc_adv
+                            auc_surr2 = torch.clamp(
+                                auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
+                            auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
+                        auc_ent = auc_ent_pd.sum(dim=-1, keepdim=True)
 
                     # Secondary policy: obs2-space, secondary-phase rows only
                     if sec_mb.any():
@@ -1115,25 +1263,42 @@ class PPOAgent:
                                         - self.entropy_coef * entropy
                                         + kl_pen)
                     critic_loss_total = self.value_coef * value_loss
+                    invest_critic_loss_total = self.value_coef * invest_value_loss
                 else:
                     policy_loss = torch.tensor(0.0, device=self.device)
                     actor_loss_total = None
                     critic_loss_total = self.value_coef * value_loss
+                    invest_critic_loss_total = self.value_coef * invest_value_loss
 
-                # --- Critic step ---
+                # --- Main critic step ---
                 if not torch.isfinite(critic_loss_total):
-                    continue
-                self.critic_optimizer.zero_grad()
-                critic_loss_total.backward()
-                nn.utils.clip_grad_norm_(
-                    list(self.value_net.parameters()), self.max_grad_norm)
-                bad_crit = any(
-                    p.grad is not None and not torch.isfinite(p.grad).all()
-                    for p in self.value_net.parameters())
-                if bad_crit:
-                    self.critic_optimizer.zero_grad()
+                    pass
                 else:
-                    self.critic_optimizer.step()
+                    self.critic_optimizer.zero_grad()
+                    critic_loss_total.backward()
+                    nn.utils.clip_grad_norm_(
+                        list(self.value_net.parameters()), self.max_grad_norm)
+                    bad_crit = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in self.value_net.parameters())
+                    if bad_crit:
+                        self.critic_optimizer.zero_grad()
+                    else:
+                        self.critic_optimizer.step()
+
+                # --- Investment critic step ---
+                if torch.isfinite(invest_critic_loss_total) and self.split_invest_head:
+                    self.critic_invest_optimizer.zero_grad()
+                    invest_critic_loss_total.backward()
+                    nn.utils.clip_grad_norm_(
+                        list(self.value_net_invest.parameters()), self.max_grad_norm)
+                    bad_inv_crit = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in self.value_net_invest.parameters())
+                    if bad_inv_crit:
+                        self.critic_invest_optimizer.zero_grad()
+                    else:
+                        self.critic_invest_optimizer.step()
 
                 # --- Actor step (decoupled: auction and secondary stepped independently) ---
                 if actor_loss_total is not None:
@@ -1207,10 +1372,13 @@ class PPOAgent:
 
             # Auction rows: ratio from auction policy only (obs1-space)
             if is_auction.any():
-                new_auc_lp, _ = self.auction_policy.evaluate(
+                # Per-dim log-prob — joint ratio = sum across all dims.
+                new_auc_lp_pd, _ = self.auction_policy.evaluate_per_dim(
                     obs1[is_auction], auc_raw[is_auction])
+                new_auc_lp = new_auc_lp_pd.sum(dim=-1, keepdim=True)
+                old_auc_lp_sum = old_auc_lp[is_auction].sum(dim=-1, keepdim=True)
                 auc_lr = torch.clamp(
-                    new_auc_lp - old_auc_lp[is_auction], -2.0, 2.0)
+                    new_auc_lp - old_auc_lp_sum, -2.0, 2.0)
                 joint_log_ratio[is_auction] = auc_lr
 
             # Secondary rows: ratio from secondary policy only (obs2-space)
@@ -1235,9 +1403,11 @@ class PPOAgent:
             "auction_policy": self.auction_policy.state_dict(),
             "secondary_policy": self.secondary_policy.state_dict(),
             "value_net": self.value_net.state_dict(),
+            "value_net_invest": self.value_net_invest.state_dict(),
             "auction_optimizer": self.auction_optimizer.state_dict(),
             "secondary_optimizer": self.secondary_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
+            "critic_invest_optimizer": self.critic_invest_optimizer.state_dict(),
         }, path)
 
     def load(self, path):
@@ -1245,6 +1415,8 @@ class PPOAgent:
         self.auction_policy.load_state_dict(ckpt["auction_policy"])
         self.secondary_policy.load_state_dict(ckpt["secondary_policy"])
         self.value_net.load_state_dict(ckpt["value_net"])
+        if "value_net_invest" in ckpt:
+            self.value_net_invest.load_state_dict(ckpt["value_net_invest"])
         # Support both legacy "actor_optimizer" key and new split keys
         if "auction_optimizer" in ckpt:
             self.auction_optimizer.load_state_dict(ckpt["auction_optimizer"])
@@ -1254,3 +1426,5 @@ class PPOAgent:
             self.secondary_optimizer.load_state_dict(ckpt["secondary_optimizer"])
         if "critic_optimizer" in ckpt:
             self.critic_optimizer.load_state_dict(ckpt["critic_optimizer"])
+        if "critic_invest_optimizer" in ckpt:
+            self.critic_invest_optimizer.load_state_dict(ckpt["critic_invest_optimizer"])

@@ -1154,8 +1154,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
             obs2, auction_info = env.step_auction(auction_actions)
 
-            # Split rewards — compute auction-phase intermediate reward
-            r_auction = env.compute_auction_rewards()
+            # Split rewards — compute auction-phase intermediate reward.
+            # v8.5: returns the joint reward plus its decomposition into
+            # bid (compliance + gap) and invest (capital) sub-streams.
+            r_auction, r_auction_bid, r_auction_invest = env.compute_auction_rewards()
 
             # MAPPO: construct global states for each transition phase
             _centralized = config["ppo"].get("centralized_critic", False)
@@ -1175,13 +1177,17 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             for i in range(n_agents):
                 value_auc = agents[i].estimate_value(
                     global_state_auc if _centralized else critic_obs_auc[i])
+                value_auc_inv = agents[i].estimate_value_invest(
+                    global_state_auc if _centralized else critic_obs_auc[i])
                 agents[i].store_transition(
                     obs1=obs1[i], obs2=obs2[i],
                     auc_raw=auction_raws[i], sec_raw=np.zeros(2, dtype=np.float32),
                     auc_lp=auction_logps[i], sec_lp=np.zeros(1, dtype=np.float32),
-                    reward=float(r_auction[i]), done=False, value=value_auc,
+                    reward=float(r_auction_bid[i]), done=False, value=value_auc,
                     global_state=global_state_auc,
                     phase='auction',
+                    reward_invest=float(r_auction_invest[i]),
+                    value_invest=value_auc_inv,
                 )
 
             # === PHASE 2: Secondary Market ===
@@ -1201,6 +1207,12 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
             # Secondary reward = total reward - auction reward
             r_secondary = rewards - r_auction[:n_agents]
+            # Investment-stream reward at the secondary-phase timestep:
+            # ESG signal + (year-T) terminal-queue value. Reading the
+            # env-side cache populated inside _compute_rewards.
+            r_secondary_invest = np.array(
+                env._last_invest_reward_phase2[:n_agents], dtype=np.float32)
+            r_secondary_main = r_secondary - r_secondary_invest
 
             # Note (audit fix 1.8): the previous `normalize_reward()` call here
             # only updated EMA stats whose return value was discarded — i.e.
@@ -1213,13 +1225,17 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             for i in range(n_agents):
                 value_sec = agents[i].estimate_value(
                     global_state_sec if _centralized else obs2[i])
+                value_sec_inv = agents[i].estimate_value_invest(
+                    global_state_sec if _centralized else obs2[i])
                 agents[i].store_transition(
                     obs1=obs1[i], obs2=obs2[i],
                     auc_raw=auction_raws[i], sec_raw=secondary_raws[i],
                     auc_lp=auction_logps[i], sec_lp=secondary_logps[i],
-                    reward=float(r_secondary[i]), done=terminated, value=value_sec,
+                    reward=float(r_secondary_main[i]), done=terminated, value=value_sec,
                     global_state=global_state_sec,
                     phase='secondary',
+                    reward_invest=float(r_secondary_invest[i]),
+                    value_invest=value_sec_inv,
                 )
 
             total_rewards += rewards  # log RAW rewards for diagnostics
@@ -1373,13 +1389,24 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         # HAPPO dynamic order: update per-agent EMA of episode total reward.
         # Zero out swapped agents' contributions: their rewards came from
         # historical policies, not the current policies we are about to update.
+        # v8.5: when ``happo_order_metric == "advantage"``, the EMA tracks the
+        # per-agent mean GAE advantage before advantage standardization
+        # (mean/std), after any per-phase reward normalization/clipping, so
+        # the update order is less sensitive to different reward floors across
+        # mixed reward functions (compliance vs ESG-leaning agents).
         if happo_dynamic_order:
-            ema_rewards = total_rewards.copy()
+            order_metric = str(config["ppo"].get("happo_order_metric", "reward"))
+            if order_metric == "advantage":
+                # Pull the most recent mean advantage we cached on each agent.
+                ema_signal = np.array(
+                    [getattr(a, "_last_mean_adv", 0.0) for a in agents], dtype=np.float64)
+            else:
+                ema_signal = total_rewards.copy()
             if hpp_swapped:
                 for i in hpp_swapped:
-                    if 0 <= i < len(ema_rewards):
-                        ema_rewards[i] = agent_perf_ema[i]  # leave EMA unchanged for swapped agent
-            agent_perf_ema = (1.0 - happo_perf_ema_alpha) * agent_perf_ema + happo_perf_ema_alpha * ema_rewards
+                    if 0 <= i < len(ema_signal):
+                        ema_signal[i] = agent_perf_ema[i]  # leave EMA unchanged for swapped agent
+            agent_perf_ema = (1.0 - happo_perf_ema_alpha) * agent_perf_ema + happo_perf_ema_alpha * ema_signal
 
         # HPP: periodically snapshot current actors into the pool
         if hpp_enabled and episode > 0 and episode % hpp_save_interval == 0:
@@ -1416,7 +1443,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 # 1. Compute GAE advantages per agent (using their own centralized critics)
                 gae_data = []
                 for i in range(n_agents):
-                    adv, ret, buf = agents[i].compute_gae(last_value=0.0)
+                    adv, ret, buf = agents[i].compute_gae(
+                        last_value=0.0, last_value_invest=0.0)
                     gae_data.append((adv, ret, buf))
                 # Capture year-1 mean advantage from agent 0 for diagnostics
                 _buf0 = gae_data[0][2] if gae_data and gae_data[0][2] is not None else None

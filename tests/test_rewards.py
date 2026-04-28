@@ -227,8 +227,8 @@ def test_terminal_bank_uses_budget_divisor():
                 f"Terminal bank value too large — likely using /100 instead of /annual_budget")
 
 
-def test_terminal_bank_diminishing_returns():
-    """3x annual-need holdings should be worth less than 3x the 1x annual-need value."""
+def test_terminal_bank_scales_with_holdings():
+    """Discounted-hold terminal value scales linearly with holdings."""
     config = load_config()
     config["reward"]["terminal_bank_value"] = True
     config["reward"]["terminal_queue_value"] = False
@@ -263,8 +263,8 @@ def test_terminal_bank_diminishing_returns():
 
     v1 = env._last_terminal_bank_values[0]
     v3 = env._last_terminal_bank_values[1]
-    assert v3 > v1
-    assert v3 < 3.0 * v1
+    # v8.5: linear discounted-hold value (overbanking is checked elsewhere).
+    assert v3 == pytest.approx(3.0 * v1, rel=1e-6)
 
 
 def test_terminal_bank_zero_holdings():
@@ -934,10 +934,15 @@ class TestESGFinancialBalance:
                           / max(company.initial_ef, 1e-9))
             if ef_ratio > 0.001:
                 sig = ch.get("esg_signal", 0.0)
-                assert sig >= 0.0, f"ESG agent {i}: negative esg_signal={sig}"
+                # v8.5: signal is centered on a year/n_years baseline, so
+                # behind-trajectory progress can be negative. A non-zero
+                # signal of either sign confirms the channel is wired up.
+                assert sig != 0.0, f"ESG agent {i}: zero esg_signal despite progress"
                 if sig > 0.0:
                     any_positive = True
-        assert any_positive, "At least one ESG agent should have positive esg_signal after 3 years of solar investment"
+        # At least one ESG agent should be ahead of the linear baseline by
+        # year 3 (solar matures at deploy_delay=2 and increases green_frac).
+        assert any_positive, "Expected at least one ESG agent to outpace the linear decarb baseline"
 
     def test_esg_anchor_ratio_is_legacy_constant(self):
         """esg_anchor_ratio is retained as 1.0 in reward channels for log backward-compatibility."""
@@ -951,8 +956,11 @@ class TestESGFinancialBalance:
                 f"Agent {i}: esg_anchor_ratio={ratio} — expected 0.0 (non-ESG) or 1.0 (legacy constant)")
 
     def test_esg_financial_balance_ratio_in_bounds(self):
-        """ESG contribution (w_green*esg_signal) should be roughly 40–400% of cost_norm for
-        ESG agents after green investments have matured (solar delay=2yr, so run 5 years)."""
+        """|ESG contribution| / cost_norm should sit within a sensible band.
+
+        v8.5: signal is centered on a year/n_years baseline so it can be
+        either sign; we check magnitude only.
+        """
         env = self._make_env(esg_scale=2.0)
         # Run 5 years with steady green investment so solar (2yr delay) matures.
         for _ in range(5):
@@ -972,10 +980,10 @@ class TestESGFinancialBalance:
             cost_norm = ch.get("cost_norm", 1.0)
             if cost_norm <= 0.01:
                 continue
-            ratio = esg_contrib / cost_norm
-            assert 0.1 < ratio < 10.0, (
-                f"Agent {i}: ESG/cost ratio={ratio:.2f} (ef_ratio={ef_ratio:.3f}, gate={compliance_gate:.2f}) — "
-                f"expected 0.1–10.0 with esg_scale=2.0 after 5 years of greening")
+            mag_ratio = abs(esg_contrib) / cost_norm
+            assert 0.05 < mag_ratio < 10.0, (
+                f"Agent {i}: |ESG|/cost ratio={mag_ratio:.2f} (ef_ratio={ef_ratio:.3f}, gate={compliance_gate:.2f}) — "
+                f"expected 0.05–10.0 with esg_scale=2.0 after 5 years of greening")
             checked += 1
         assert checked > 0, (
             "No compliant ESG agents had ef_ratio > 0.05 after 5 years of invest_frac=0.15 — "
@@ -1175,8 +1183,8 @@ def test_split_rewards_sum_to_total():
 
     env.step_auction(auction_actions)
 
-    # Get auction intermediate reward
-    r_auction = env.compute_auction_rewards()
+    # v8.5: compute_auction_rewards now returns (joint, bid, invest)
+    r_auction, _r_bid, _r_invest = env.compute_auction_rewards()
 
     secondary_actions = np.zeros((n, 2), dtype=np.float32)
     secondary_actions[:, 0] = env._phase1_clearing_price
@@ -1267,7 +1275,7 @@ def test_underbid_gives_negative_auction_reward():
     auction_actions[:, 3:] = [0.0, 0.0, 1.0]  # solar logit highest
 
     env.step_auction(auction_actions)
-    r_auction = env.compute_auction_rewards()
+    r_auction, _, _ = env.compute_auction_rewards()
 
     for i in range(n):
         assert r_auction[i] < 0, (

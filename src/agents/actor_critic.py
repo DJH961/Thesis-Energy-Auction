@@ -107,6 +107,35 @@ class AuctionPolicy(nn.Module):
         entropy = dist.entropy().sum(dim=-1, keepdim=True)
         return log_prob, entropy
 
+    def evaluate_per_dim(self, obs, raw_actions):
+        """Like ``evaluate`` but returns per-dim log_prob (B, action_dim).
+
+        Used by the split-head update path so the surrogate can attribute
+        bid-related dims (0, 1) to the bid advantage and investment-related
+        dims (2..) to the investment advantage.
+        """
+        dist = self.forward(obs)
+        if raw_actions.device != self.action_scale.device:
+            raw_actions = raw_actions.to(self.action_scale.device)
+        log_prob = dist.log_prob(raw_actions)
+        entropy = dist.entropy()
+        return log_prob, entropy
+
+    def act_per_dim(self, obs, deterministic=False):
+        """Like ``act`` but returns per-dim log_prob (B, action_dim).
+
+        The stored "raw" representation is the clamped value (in [-1, 1])
+        so that log_prob and later ``evaluate_per_dim`` are computed at the
+        same point the environment actually executed. Without the clamp,
+        importance ratios would be evaluated at a sample the env never saw.
+        """
+        dist = self.forward(obs)
+        raw = dist.mean if deterministic else dist.rsample()
+        squashed = torch.clamp(raw, -1.0, 1.0)
+        action = squashed * self.action_scale + self.action_bias
+        log_prob = dist.log_prob(squashed)  # (B, action_dim) — no sum
+        return action, squashed, log_prob
+
     def _init_weights(self):
         for layer in [self.fc1, self.fc2]:
             nn.init.orthogonal_(layer.weight, gain=2**0.5)
