@@ -451,6 +451,8 @@ $$
   silently discarded and the agent has an incentive to manage operating
   margin in addition to compliance cost.
 
+- Treasury terminal value (`reward.treasury_terminal_value=true`): the corporate treasury reserve held at episode end is valued at `treasury_reserve.terminal_value_rate`, so retained surplus is not silently discarded and the agent has an incentive to manage operating margin in addition to compliance cost.
+
 Terminal price anchor uses `max(auction_clearing, secondary_clearing, 80% of inflation-adjusted penalty rate)`.
 
 ### 7.2 Shaping channels
