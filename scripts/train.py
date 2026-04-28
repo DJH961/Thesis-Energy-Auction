@@ -982,11 +982,11 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # year and amortizes file I/O. The buffer is also flushed at episode end
     # so partial-episode crashes never lose more than the in-flight episode.
     _yr_row_buffer: list = []
-    _YR_BUFFER_CAP = 256  # rows before mid-episode flush; ~one episode @12yr × ~20 episodes
+    _yr_buffer_cap = 256  # rows before mid-episode flush; ~one episode @12yr × ~20 episodes
 
     def _yr_write(row: dict) -> None:
         _yr_row_buffer.append(row)
-        if len(_yr_row_buffer) >= _YR_BUFFER_CAP:
+        if len(_yr_row_buffer) >= _yr_buffer_cap:
             yr_writer.writerows(_yr_row_buffer)
             _yr_row_buffer.clear()
 
@@ -1340,8 +1340,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     dtype=np.float64,
                 )
 
-                # Vectorized counter updates (in-place to keep array identity
-                # so per-episode reset via `[:] = 0` continues to work).
+                # Vectorized counter updates. Slice assignment (`[:] = ...`) is
+                # used so the array identity is preserved — the per-episode
+                # reset elsewhere does `_consec_shortfall[:] = 0` and depends
+                # on the same underlying buffer.
                 _has_sf = _sf_arr > 0.0
                 _consec_shortfall[:] = np.where(_has_sf, _consec_shortfall + 1, 0)
                 _ep_shortfall_count += _has_sf.astype(_ep_shortfall_count.dtype)
