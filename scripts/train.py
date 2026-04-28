@@ -47,6 +47,16 @@ from src.utils.preflight import run_preflight_checks
 import src.agents.heuristic_policy as heuristic_policy
 
 
+def _clone_state_dict(sd: dict) -> dict:
+    """Cheap snapshot of a torch state_dict for HPP pool storage.
+
+    `copy.deepcopy` recursively walks the dict and clones each tensor via the
+    pickling machinery — ~10–100x slower than directly calling `.clone()`.
+    For HPP we only need a value-detached copy of each leaf tensor on CPU.
+    """
+    return {k: v.detach().clone() for k, v in sd.items()}
+
+
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
@@ -814,8 +824,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         for i in range(n_agents):
             for _ in range(seed_count):
                 hpp_pools[i].append((
-                    copy.deepcopy(agents[i].auction_policy.state_dict()),
-                    copy.deepcopy(agents[i].secondary_policy.state_dict()),
+                    _clone_state_dict(agents[i].auction_policy.state_dict()),
+                    _clone_state_dict(agents[i].secondary_policy.state_dict()),
                 ))
             hpp_min_pool_sizes[i] = seed_count
         print(f"HPP heuristic seed: {seed_count} BC snapshots seeded into each of "
@@ -1093,8 +1103,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 if hpp_pools[i] and episode_rng.random() < hpp_swap_prob:
                     # Save current actor weights
                     hpp_swapped[i] = (
-                        copy.deepcopy(agents[i].auction_policy.state_dict()),
-                        copy.deepcopy(agents[i].secondary_policy.state_dict()),
+                        _clone_state_dict(agents[i].auction_policy.state_dict()),
+                        _clone_state_dict(agents[i].secondary_policy.state_dict()),
                     )
                     # Load random historical policy for action selection
                     hist_auc, hist_sec = hpp_pools[i][
@@ -1335,8 +1345,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         if hpp_enabled and episode > 0 and episode % hpp_save_interval == 0:
             for i in range(n_agents):
                 hpp_pools[i].append((
-                    copy.deepcopy(agents[i].auction_policy.state_dict()),
-                    copy.deepcopy(agents[i].secondary_policy.state_dict()),
+                    _clone_state_dict(agents[i].auction_policy.state_dict()),
+                    _clone_state_dict(agents[i].secondary_policy.state_dict()),
                 ))
 
         # === PPO Update (batched: every episodes_per_update episodes) ===
@@ -1383,7 +1393,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 # T = 2 × n_years because split rewards store auction + secondary transitions separately.
                 # Agents with mismatched T (e.g. HPP-cleared buffers) are excluded from the M-factor chain.
                 expected_T = episodes_per_update * n_years * 2
-                cumulative_ratio = torch.ones(expected_T, 1)
+                # Keep cumulative ratio on the agents' device so update_happo()
+                # doesn't pay a CPU↔GPU round-trip per agent in the chain.
+                _happo_device = agents[0].device if n_agents > 0 else torch.device("cpu")
+                cumulative_ratio = torch.ones(expected_T, 1, device=_happo_device)
 
                 for j in order:
                     adv_j, ret_j, buf_j = gae_data[j]
@@ -1419,9 +1432,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     if actor_update and T_j == expected_T:
                         ratio_j = agents[j].compute_post_update_ratio(buf_j)
                         clipped_j = torch.clamp(ratio_j, 1 - clip_eps, 1 + clip_eps)
-                        cumulative_ratio = (
-                            cumulative_ratio * clipped_j.detach().cpu()
-                        )
+                        # Stay on-device — advantage_weights.to(...) inside
+                        # update_happo is then a no-op for the next agent.
+                        cumulative_ratio = cumulative_ratio * clipped_j.detach()
 
                 # Reorder losses to match agent index (not update order)
                 ordered_losses = latest_losses

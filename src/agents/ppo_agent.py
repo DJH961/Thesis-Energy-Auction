@@ -369,7 +369,8 @@ class PPOAgent:
         so agents learn to bid above floor when the secondary market is
         expensive.
         """
-        obs_t = torch.FloatTensor(obs1).unsqueeze(0).to(self.device)
+        obs_t = torch.from_numpy(np.ascontiguousarray(obs1, dtype=np.float32)
+                                 ).unsqueeze(0).to(self.device)
         with torch.no_grad():
             action, raw, log_prob = self.auction_policy.act(obs_t, deterministic)
 
@@ -491,7 +492,8 @@ class PPOAgent:
 
         Epsilon-greedy in physical space (same approach as auction actions).
         """
-        obs_t = torch.FloatTensor(obs2).unsqueeze(0).to(self.device)
+        obs_t = torch.from_numpy(np.ascontiguousarray(obs2, dtype=np.float32)
+                                 ).unsqueeze(0).to(self.device)
         with torch.no_grad():
             action, raw, log_prob = self.secondary_policy.act(obs_t, deterministic)
 
@@ -541,9 +543,10 @@ class PPOAgent:
 
     def estimate_value(self, obs: np.ndarray) -> float:
         """V(s) — from local obs2 (IPPO) or global state (MAPPO)."""
-        obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            return self.value_net(obs_t).cpu().item()
+            obs_t = torch.from_numpy(np.ascontiguousarray(obs, dtype=np.float32)
+                                     ).unsqueeze(0).to(self.device)
+            return self.value_net(obs_t).item()
 
     # ------------------------------------------------------------------
     # Storage
@@ -575,36 +578,44 @@ class PPOAgent:
         if len(self.buffer) < 2:
             return None
 
-        obs1_np = np.nan_to_num(np.array(self.buffer.obs1), nan=0.0, posinf=1e6, neginf=-1e6)
-        obs2_np = np.nan_to_num(np.array(self.buffer.obs2), nan=0.0, posinf=1e6, neginf=-1e6)
-
-        obs1 = torch.FloatTensor(obs1_np).to(self.device)
-        obs2 = torch.FloatTensor(obs2_np).to(self.device)
+        # Single list→numpy→torch conversion path with on-tensor sanitisation.
+        # Avoids the previous double-pass (np.array → np.nan_to_num → torch.FloatTensor → .to).
+        obs1 = torch.nan_to_num(
+            torch.from_numpy(np.asarray(self.buffer.obs1, dtype=np.float32)).to(self.device),
+            nan=0.0, posinf=1e6, neginf=-1e6)
+        obs2 = torch.nan_to_num(
+            torch.from_numpy(np.asarray(self.buffer.obs2, dtype=np.float32)).to(self.device),
+            nan=0.0, posinf=1e6, neginf=-1e6)
 
         # MAPPO: use global states for centralized critic if available
         if self.centralized_critic and len(self.buffer.global_states) > 0:
-            critic_input = torch.FloatTensor(
-                np.array(self.buffer.global_states)).to(self.device)
+            critic_input = torch.from_numpy(
+                np.asarray(self.buffer.global_states, dtype=np.float32)).to(self.device)
         else:
             critic_input = obs2
 
-        auc_raw = torch.FloatTensor(np.array(self.buffer.auction_raw)).to(self.device)
-        sec_raw = torch.FloatTensor(np.array(self.buffer.secondary_raw)).to(self.device)
-        old_auc_lp = torch.FloatTensor(np.array(self.buffer.auction_logp)).to(self.device)
-        old_sec_lp = torch.FloatTensor(np.array(self.buffer.secondary_logp)).to(self.device)
+        auc_raw = torch.from_numpy(
+            np.asarray(self.buffer.auction_raw, dtype=np.float32)).to(self.device)
+        sec_raw = torch.from_numpy(
+            np.asarray(self.buffer.secondary_raw, dtype=np.float32)).to(self.device)
+        old_auc_lp = torch.from_numpy(
+            np.asarray(self.buffer.auction_logp, dtype=np.float32)).to(self.device)
+        old_sec_lp = torch.from_numpy(
+            np.asarray(self.buffer.secondary_logp, dtype=np.float32)).to(self.device)
 
         # Phase mask: True = auction transition (obs1-space), False = secondary (obs2-space).
         # Auction policy is trained only on auction rows; secondary only on secondary rows.
-        is_auction = torch.BoolTensor(
-            [p == 'auction' for p in self.buffer.phases]).to(self.device)
+        is_auction = torch.from_numpy(
+            np.fromiter((p == 'auction' for p in self.buffer.phases),
+                        dtype=np.bool_, count=len(self.buffer.phases))
+        ).to(self.device)
 
-        rewards = np.array(self.buffer.rewards, dtype=np.float32)
-        dones = np.array(self.buffer.dones, dtype=np.float32)
-        values = np.array(self.buffer.values, dtype=np.float32)
-
-        rewards = np.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
-        dones = np.nan_to_num(dones, nan=1.0, posinf=1.0, neginf=1.0)
-        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        rewards = np.nan_to_num(np.asarray(self.buffer.rewards, dtype=np.float32),
+                                nan=0.0, posinf=0.0, neginf=0.0)
+        dones = np.nan_to_num(np.asarray(self.buffer.dones, dtype=np.float32),
+                              nan=1.0, posinf=1.0, neginf=1.0)
+        values = np.nan_to_num(np.asarray(self.buffer.values, dtype=np.float32),
+                               nan=0.0, posinf=0.0, neginf=0.0)
 
         T = len(rewards)
         advantages = np.zeros(T, dtype=np.float32)
@@ -619,8 +630,8 @@ class PPOAgent:
         advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
         returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
 
-        adv_t = torch.FloatTensor(advantages).to(self.device).unsqueeze(1)
-        ret_t = torch.FloatTensor(returns).to(self.device).unsqueeze(1)
+        adv_t = torch.from_numpy(advantages).to(self.device).unsqueeze(1)
+        ret_t = torch.from_numpy(returns).to(self.device).unsqueeze(1)
 
         # Return normalization
         if self.normalize_returns and T > 1:
@@ -636,7 +647,7 @@ class PPOAgent:
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Convert old values to tensor for value clipping
-        old_values_t = torch.FloatTensor(values).to(self.device).unsqueeze(1) if self.clip_value else None
+        old_values_t = torch.from_numpy(values).to(self.device).unsqueeze(1) if self.clip_value else None
 
         # Critic extra epochs: warm up critic before main PPO loop
         if self.critic_extra_epochs > 0:
@@ -847,34 +858,41 @@ class PPOAgent:
         if len(self.buffer) < 2:
             return None, None, None
 
-        obs1_np = np.nan_to_num(np.array(self.buffer.obs1), nan=0.0, posinf=1e6, neginf=-1e6)
-        obs2_np = np.nan_to_num(np.array(self.buffer.obs2), nan=0.0, posinf=1e6, neginf=-1e6)
-
-        obs1 = torch.FloatTensor(obs1_np).to(self.device)
-        obs2 = torch.FloatTensor(obs2_np).to(self.device)
+        obs1 = torch.nan_to_num(
+            torch.from_numpy(np.asarray(self.buffer.obs1, dtype=np.float32)).to(self.device),
+            nan=0.0, posinf=1e6, neginf=-1e6)
+        obs2 = torch.nan_to_num(
+            torch.from_numpy(np.asarray(self.buffer.obs2, dtype=np.float32)).to(self.device),
+            nan=0.0, posinf=1e6, neginf=-1e6)
 
         if self.centralized_critic and len(self.buffer.global_states) > 0:
-            critic_input = torch.FloatTensor(
-                np.array(self.buffer.global_states)).to(self.device)
+            critic_input = torch.from_numpy(
+                np.asarray(self.buffer.global_states, dtype=np.float32)).to(self.device)
         else:
             critic_input = obs2
 
-        auc_raw = torch.FloatTensor(np.array(self.buffer.auction_raw)).to(self.device)
-        sec_raw = torch.FloatTensor(np.array(self.buffer.secondary_raw)).to(self.device)
-        old_auc_lp = torch.FloatTensor(np.array(self.buffer.auction_logp)).to(self.device)
-        old_sec_lp = torch.FloatTensor(np.array(self.buffer.secondary_logp)).to(self.device)
+        auc_raw = torch.from_numpy(
+            np.asarray(self.buffer.auction_raw, dtype=np.float32)).to(self.device)
+        sec_raw = torch.from_numpy(
+            np.asarray(self.buffer.secondary_raw, dtype=np.float32)).to(self.device)
+        old_auc_lp = torch.from_numpy(
+            np.asarray(self.buffer.auction_logp, dtype=np.float32)).to(self.device)
+        old_sec_lp = torch.from_numpy(
+            np.asarray(self.buffer.secondary_logp, dtype=np.float32)).to(self.device)
 
         # Phase mask: True = auction transition (obs1-space), False = secondary (obs2-space).
         # Exposed in buf_tensors so update_happo() can apply each policy loss to the
         # correct rows without cross-contaminating obs dimensions.
-        is_auction_t = torch.BoolTensor(
-            [p == 'auction' for p in self.buffer.phases]).to(self.device)
+        is_auction_t = torch.from_numpy(
+            np.fromiter((p == 'auction' for p in self.buffer.phases),
+                        dtype=np.bool_, count=len(self.buffer.phases))
+        ).to(self.device)
 
-        rewards = np.nan_to_num(np.array(self.buffer.rewards, dtype=np.float32),
+        rewards = np.nan_to_num(np.asarray(self.buffer.rewards, dtype=np.float32),
                                 nan=0.0, posinf=0.0, neginf=0.0)
-        dones = np.nan_to_num(np.array(self.buffer.dones, dtype=np.float32),
+        dones = np.nan_to_num(np.asarray(self.buffer.dones, dtype=np.float32),
                               nan=1.0, posinf=1.0, neginf=1.0)
-        values = np.nan_to_num(np.array(self.buffer.values, dtype=np.float32),
+        values = np.nan_to_num(np.asarray(self.buffer.values, dtype=np.float32),
                                nan=0.0, posinf=0.0, neginf=0.0)
 
         # Phase-aware CAUSAL reward normalization (audit fix 1.7).
@@ -921,8 +939,8 @@ class PPOAgent:
             for yr in range(n_years_buf)
         ], dtype=np.float32)
 
-        adv_t = torch.FloatTensor(advantages).to(self.device).unsqueeze(1)
-        ret_t = torch.FloatTensor(returns).to(self.device).unsqueeze(1)
+        adv_t = torch.from_numpy(advantages).to(self.device).unsqueeze(1)
+        ret_t = torch.from_numpy(returns).to(self.device).unsqueeze(1)
 
         # Return normalization
         if self.normalize_returns and T > 1:
@@ -938,7 +956,7 @@ class PPOAgent:
         ret_t = torch.nan_to_num(ret_t, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Convert old values to tensor for value clipping
-        old_values_t = torch.FloatTensor(values).to(self.device).unsqueeze(1) if self.clip_value else None
+        old_values_t = torch.from_numpy(values).to(self.device).unsqueeze(1) if self.clip_value else None
 
         buf_tensors = {
             "obs1": obs1, "obs2": obs2, "critic_input": critic_input,
