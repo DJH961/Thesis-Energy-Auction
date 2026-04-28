@@ -1,5 +1,5 @@
 # ============================================================
-# ETS MARL — Configuration v8.3.1
+# ETS MARL — Configuration v8.4.1
 #   - 8 learning agents, 0 bots (pure MARL)
 #   - HAPPO sequential policy update, centralized critic
 #   - Fundamental price anchor (MAC-scarcity-penalty formula)
@@ -140,7 +140,7 @@ auction:
   quantity_max: 3.0
   bid_change_limit:
     enabled: true
-    value: 50.0        # max year-over-year bid price change (EUR/t); Year 0 always unconstrained
+    value: 75.0        # max year-over-year bid price change (EUR/t); Year 0 always unconstrained
   qty_mult_low: 0.5
   qty_mult_high: 2.0
   max_agent_share: 1.0
@@ -288,8 +288,8 @@ electricity:
 # R_i = -cost_norm + green_bonus + coverage_gap_shaping + terminal_values
 # ----------------------------------------------------------
 reward:
-  normalizer_alpha: 0.01
-  gae_min_std: 0.1
+  normalizer_alpha: 0.02
+  gae_min_std: 0.15
   opportunity_cost_rate: 0.0
   clip_min: -10.0
   clip_max: 10.0
@@ -376,44 +376,47 @@ agent_cycling:
 # ----------------------------------------------------------
 ppo:
   hidden_size: 256
-  lr: 0.0003
+  lr: 0.0002
   gamma: 0.99
   gae_lambda: 0.97
-  clip_eps: 0.2
+  clip_eps: 0.15
   entropy_coef: 0.08
-  entropy_coef_final: 0.01
+  entropy_coef_final: 0.005
   entropy_decay_start: -1          # -1 = auto (5% of n_episodes); 0 = start immediately
   entropy_decay_window: -1         # -1 = auto (entropy_decay_frac × n_episodes)
-  entropy_decay_frac: 0.9         # Fix 4: faster stabilization (was 0.90)
+  entropy_decay_frac: 0.70         # Fix 4: faster stabilization (was 0.90)
   value_coef: 0.5
   max_grad_norm: 0.5
   n_epochs: 5
-  mini_batch_size: 32
-  episodes_per_update: 16
+  mini_batch_size: 64
+  episodes_per_update: 32
   long_run_episode_threshold: 20000
   short_run_overrides:
     lr: 0.0002
     entropy_coef_final: 0.03
-    episodes_per_update: 8
+    episodes_per_update: 16
   normalize_advantages: true
-  log_std_min: -2.5
+  log_std_min: -3.5
   log_std_max: 0.0
   centralized_critic: true
   happo: true
   happo_dynamic_order: true      # sort update order worst-to-best by EMA reward each episode
   happo_perf_ema_alpha: 0.1      # EMA decay for per-agent performance tracking
   critic_compliance_features: true  # append K=4 compliance features per agent to global state
-  critic_lr: 0.001
+  critic_lr: 0.0005
   critic_hidden_size: 512
   critic_warmup_episodes: 0        # auto: 3% of n_episodes, clamped to [100, 5000]
   lr_decay: cosine
   lr_min: 0.00001
-  target_kl: 0.02
+  critic_lr_decay: cosine
+  critic_lr_min: 0.00005
+  target_kl: 0.015
+  # Monitoring note: if approx_kl consistently hits target_kl on epoch 1-2, relax clip_eps to 0.175 or target_kl to 0.018
   kl_anchor_beta: 0.0              # 0 = KL anchor disabled (pretrain is off by default)
   kl_anchor_decay_episodes: 0      # auto: 50% of n_episodes, clamped to [500, 40000]
-  critic_extra_epochs: 5
+  critic_extra_epochs: 6
   critic_huber: true
-  critic_huber_delta: 10.0
+  critic_huber_delta: 4.0
   clip_value: true
   normalize_returns: false
 
@@ -523,9 +526,9 @@ hpp:
 exploration:
   mode: "anchored"                  # Fix 3: Gaussian around WTP (was "uniform")
   epsilon_start: 0.25
-  epsilon_final: 0.03               # Fix 3: lower mature noise floor (was 0.05)
+  epsilon_final: 0.02               # Fix 3: lower mature noise floor (was 0.05)
   epsilon_decay_episodes: 0         # auto: epsilon_decay_frac × n_episodes, clamped to [1000, 100000]
-  epsilon_decay_frac: 0.40          # Fix 3: faster decay to exploitation (was 0.75)
+  epsilon_decay_frac: 0.45          # Fix 3: faster decay to exploitation (was 0.75)
   # Boost factor applied to fundamental anchor for exploration WTP.
   # fundamental_anchor(yr0)≈67, ×1.14≈76; (yr1)≈70, ×1.14≈80; grows with year.
   anchor_boost: 1.14

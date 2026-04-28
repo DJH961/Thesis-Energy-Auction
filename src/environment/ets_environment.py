@@ -239,7 +239,8 @@ class ETSEnvironment(gym.Env):
         # Bid price change limit config (read from YAML each step, not set externally).
         self._bid_change_limit: float = 0.0  # cached value for obs dim
         # Per-agent clip feedback signals (set during step_auction / step_secondary)
-        self._last_bid_price_clip = np.zeros(self.n_total)      # actual - requested (EUR/t), signed
+        self._last_bid_price_clip = np.zeros(self.n_total)        # actual - requested (EUR/t), signed
+        self._last_budget_price_clip = np.zeros(self.n_total)     # budget clip delta (EUR/t), signed
         self._last_bid_qty_clip_ratio = np.ones(self.n_total)   # actual / requested qty [0,1]
         self._last_invest_clip_ratio = np.ones(self.n_total)    # actual / requested invest_frac [0,1]
         self._last_sec_qty_clip_ratio = np.ones(self.n_total)   # actual / requested sec qty (signed)
@@ -526,6 +527,7 @@ class ETSEnvironment(gym.Env):
         self._collateral_warning_count = np.zeros(self.n_total, dtype=int)
         self._collateral_clip_events = {i: 0 for i in range(self.n_total)}
         self._last_bid_price_clip = np.zeros(self.n_total)
+        self._last_budget_price_clip = np.zeros(self.n_total)
         self._last_bid_qty_clip_ratio = np.ones(self.n_total)
         self._last_invest_clip_ratio = np.ones(self.n_total)
         self._last_sec_qty_clip_ratio = np.ones(self.n_total)
@@ -903,6 +905,8 @@ class ETSEnvironment(gym.Env):
 
             if clearing_price > 0:
                 clipped_price = float(np.clip(clearing_price, price_min, price_max))
+                # Appending burnin prices seeds the MA3 warm-start so that year 0 of
+                # the real episode always has a meaningful price history reference.
                 self._price_history.append(clipped_price)
                 self.last_clearing_price = clipped_price
                 # Seed _prev_ma3 with the MA3 that now includes this clearing so
@@ -1350,7 +1354,7 @@ class ETSEnvironment(gym.Env):
         # obs dimension are consistent (price_ma3 is also re-used below).
         price_ma3_early = self._compute_price_ma3()
         if year > 0 and _bcl_enabled and _bcl_value > 0.0:
-            ref = price_ma3_early
+            ref = max(price_ma3_early, compute_fundamental_anchor(year, self.config, cap_t_actual=cap_t))
             lo = float(np.clip(ref - _bcl_value, price_min, price_max))
             hi = float(np.clip(ref + _bcl_value, price_min, price_max))
             self._pcl_ceiling = hi
@@ -1472,6 +1476,7 @@ class ETSEnvironment(gym.Env):
 
         # Budget price clip (Change 2): soft clip at 1.5x max affordable price.
         budget_price_clip = self.config["auction"].get("budget_price_clip", True)
+        self._last_budget_price_clip[:] = 0.0
         if budget_price_clip:
             for i, company in enumerate(self.companies):
                 if not self._is_agent_active(i):
@@ -1483,11 +1488,14 @@ class ETSEnvironment(gym.Env):
                 bid_q = max(float(bid_actions[i, 1]), 1e-6)
                 max_affordable_price = cash / bid_q
                 if bid_actions[i, 0] > 1.5 * max_affordable_price:
-                    bid_actions[i, 0] = float(np.clip(
+                    _orig_bid = float(bid_actions[i, 0])
+                    _clipped_price = float(np.clip(
                         max_affordable_price,
                         float(self.config["auction"]["price_min"]),
                         float(self.config["auction"]["price_max"]),
                     ))
+                    bid_actions[i, 0] = _clipped_price
+                    self._last_budget_price_clip[i] = _clipped_price - _orig_bid  # negative if clipped down
 
         # Pre-bid collateral locking — fraction of margin above reserve.
         # Reduces effective cash available when checking ability to settle payment.
@@ -3118,6 +3126,7 @@ class ETSEnvironment(gym.Env):
                 cap_ahead_6y_ratio=cap_ahead_6y_ratio,
                 pcl_ceiling=self._pcl_ceiling,
                 last_bid_price_clip=float(self._last_bid_price_clip[i]),
+                last_budget_price_clip=float(self._last_budget_price_clip[i]),
                 last_bid_qty_clip_ratio=float(self._last_bid_qty_clip_ratio[i]),
                 last_invest_clip_ratio=float(self._last_invest_clip_ratio[i]),
             )

@@ -5,6 +5,113 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.4.1]
+
+### Changed — PCL reference floored at fundamental anchor
+
+The bid price change limit (PCL) used `price_ma3` as its reference, which could drift
+below the fundamental equilibrium price during low-price regimes, compressing the
+allowed bidding range to an unrealistically narrow band.
+
+**Fix:** The PCL reference is now `max(price_ma3, compute_fundamental_anchor(year, config, cap_t_actual=cap_t))`.
+The actual MSR-adjusted cap (`cap_t`) is passed so the anchor reflects true scarcity,
+not the linear LRF approximation.
+
+**Files changed:** `src/environment/ets_environment.py` (`step_auction()` PCL block).
+
+### Added — Budget price clip tracked and merged into observation dim [39]
+
+The soft budget clip (bid price clamped to 1.5× max affordable price) was silently
+modifying actions with no gradient signal back to the agent.
+
+**Fix:** `_last_budget_price_clip` (shape `n_total`, reset to 0 each episode) stores
+`clipped_price − original_bid` (negative when clipped down). Dim [39] in the Phase 1
+observation is now the combined clip signal:
+
+```
+obs[39] = min(last_bid_price_clip, last_budget_price_clip) / price_max   # clipped [−1, 1]
+```
+
+This takes the most-negative of the PCL clip and the budget clip, giving the agent a
+single signed feedback signal that reflects whichever constraint was binding.
+
+**Files changed:** `src/environment/ets_environment.py` (`__init__`, `reset()`,
+`step_auction()`, `_get_obs_phase1()` call site), `src/environment/company.py`
+(`get_observation_phase1()` signature and dim [39] computation).
+
+### Changed — Decoupled actor optimizers (auction and secondary stepped independently)
+
+A single `actor_optimizer` covering both policy networks caused gradients from one
+policy head to bleed into the other during the shared backward pass, corrupting
+per-head gradient norms.
+
+**Fix:** Two separate optimizers replace the combined one:
+
+- `auction_optimizer` — tracks `auction_policy` parameters only
+- `secondary_optimizer` — tracks `secondary_policy` parameters only
+- `actor_optimizer` — backwards-compatibility alias for `auction_optimizer`
+
+Each optimizer zeroes, clips, and steps independently. `save()` / `load()` updated
+accordingly; `load()` falls back to the old `actor_optimizer` key for legacy checkpoints.
+
+**Files changed:** `src/agents/ppo_agent.py` (`__init__`, `update()`, `update_happo()`,
+`save()`, `load()`), `tests/test_mappo.py` (`test_separate_optimizers_step`).
+
+### Added — Year-1 advantage floor and per-year advantage diagnostics
+
+Year-1 transitions often receive large negative advantages early in training (insufficient
+banked allowances, no price history), causing excessively aggressive policy updates that
+destabilise year-0 learning.
+
+**Fix:** In `compute_gae()`, advantages at buffer indices 2 and 3 (year 1 auction and
+secondary) are clamped to a floor of −1.0 before normalisation. This is pre-normalisation
+so the floor is in the same units as the raw advantage distribution.
+
+`compute_gae()` also now returns `per_year_adv_mean` (shape `[n_years]`) in `buf_tensors`,
+computed pre-normalisation as `mean(adv[2*yr], adv[2*yr+1])` for each year.
+`train.py` logs `adv_yr1_mean_A1` (agent 0, year 1) to the episode CSV.
+
+**Files changed:** `src/agents/ppo_agent.py` (`compute_gae()`), `scripts/train.py`
+(capture + CSV field).
+
+### Changed — Separate critic LR decay schedule
+
+Previously the critic LR cosine decay used the same floor (`lr_min`) as the actor. A
+lower floor for the critic is needed to sustain value accuracy late in training without
+throttling actor exploration.
+
+**New config keys:**
+```yaml
+ppo:
+  critic_lr_decay: cosine     # independent decay mode for critic
+  critic_lr_min: 0.00005      # floor; actor lr_min unchanged
+```
+
+`scripts/train.py` reads these separately and applies them to `critic_optimizer`
+param groups independently of the actor decay.
+
+**Files changed:** `configs/default.yaml`, `scripts/train.py`.
+
+### Changed — Hyperparameter tuning (default.yaml)
+
+| Parameter | Before | After | Reason |
+|---|---|---|---|
+| `auction.bid_change_limit.value` | 50.0 | 75.0 | More headroom for price discovery |
+| `reward.normalizer_alpha` | 0.01 | 0.02 | Faster EMA response to reward scale shifts |
+| `reward.gae_min_std` | 0.1 | 0.15 | Reduces over-confidence in low-variance regimes |
+| `exploration.epsilon_final` | 0.03 | 0.02 | Tighter exploitation at convergence |
+| `exploration.epsilon_decay_frac` | 0.40 | 0.45 | Slower exploration decay |
+| `ppo.clip_eps` | 0.20 | 0.15 | Tighter trust region |
+| `ppo.mini_batch_size` | 128 | 64 | Smaller batches improve gradient diversity |
+| `ppo.episodes_per_update` | 16 | 32 | More on-policy data per update |
+| `ppo.log_std_min` | −4.0 | −3.5 | Prevents policy collapse to near-deterministic |
+| `ppo.critic_lr` | 0.0003 | 0.0005 | Higher critic LR to improve value accuracy |
+| `ppo.target_kl` | 0.02 | 0.015 | Tighter KL constraint |
+| `ppo.critic_extra_epochs` | 4 | 6 | More critic epochs per update |
+| `ppo.critic_huber_delta` | 2.0 | 4.0 | Wider Huber region for large TD errors |
+
+---
+
 ## [8.4]
 
 ### Added — Clip feedback signals in observation (4 new dims)

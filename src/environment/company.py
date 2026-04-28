@@ -795,6 +795,7 @@ class Company:
                                cap_ahead_6y_ratio: float = 1.0,
                                pcl_ceiling: float = 0.0,
                                last_bid_price_clip: float = 0.0,
+                               last_budget_price_clip: float = 0.0,
                                last_bid_qty_clip_ratio: float = 1.0,
                                last_invest_clip_ratio: float = 1.0):
         """
@@ -839,8 +840,8 @@ class Company:
         [37] cap_ahead_6y_ratio: cap(t+6) / cap(t) clipped [0,1] — 6-year scarcity lookahead
         [38] pcl_headroom_norm: (pcl_ceiling - price_ma3) / price_max clipped [0,1]
              Headroom to upper bid-change bound; 1.0 = unconstrained
-        [39] last_bid_price_clip: (actual - requested bid price) / price_max, signed [-1,1]
-             Negative if bid was clipped down; zero if unconstrained
+        [39] combined price clip signal: min(last_bid_price_clip, last_budget_price_clip) / price_max, signed [-1,1]
+             Most-negative of PCL clip and budget clip; negative if clipped down; zero if unconstrained
         [40] last_bid_qty_clip_ratio: actual_qty / requested_qty clipped [0,1]
              1.0 = no qty gate fired; <1 = leverage/collateral/budget gate reduced qty
         [41] last_invest_clip_ratio: actual_invest_frac / requested_invest_frac clipped [0,1]
@@ -914,7 +915,7 @@ class Company:
             float(np.clip(cap_ahead_3y_ratio, 0.0, 1.0)),        # [36] 3-year cap scarcity lookahead
             float(np.clip(cap_ahead_6y_ratio, 0.0, 1.0)),        # [37] 6-year cap scarcity lookahead
             float(np.clip((pcl_ceiling - price_signal) / pn, 0.0, 1.0)),   # [38] pcl headroom norm
-            float(np.clip(last_bid_price_clip / pn, -1.0, 1.0)),           # [39] bid price clip signal (signed)
+            float(np.clip(min(last_bid_price_clip, last_budget_price_clip) / pn, -1.0, 1.0)),  # [39] combined price clip (signed)
             float(np.clip(last_bid_qty_clip_ratio, 0.0, 1.0)),             # [40] bid qty clip ratio
             float(np.clip(last_invest_clip_ratio, 0.0, 1.0)),              # [41] invest frac clip ratio
         ], dtype=np.float32)

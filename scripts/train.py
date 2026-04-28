@@ -818,14 +818,16 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         print(f"Batch accumulation: {episodes_per_update} episodes per update "
               f"(~{episodes_per_update * n_years} transitions per batch).")
 
-    # Cosine LR decay setup
+    # Cosine LR decay setup (actor and critic can have separate schedules)
     lr_decay_mode = ppo_cfg.get("lr_decay", "none")
     lr_min = ppo_cfg.get("lr_min", 0.0)
     actor_lr_init = ppo_cfg["lr"]
     critic_lr_init = ppo_cfg.get("critic_lr", ppo_cfg["lr"])
+    critic_lr_decay_mode = ppo_cfg.get("critic_lr_decay", lr_decay_mode)
+    critic_lr_min_val = ppo_cfg.get("critic_lr_min", lr_min)
     if lr_decay_mode == "cosine":
         print(f"Cosine LR decay: actor {actor_lr_init}→{lr_min}, "
-              f"critic {critic_lr_init}→{lr_min} over {n_episodes} episodes.")
+              f"critic {critic_lr_init}→{critic_lr_min_val} over {n_episodes} episodes.")
 
     # Condition-based entropy tracker (auto-scales to n_episodes)
     entropy_tracker = EntropyConditionTracker(ppo_cfg, n_agents, n_episodes)
@@ -902,6 +904,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         "phantom_avg_bid_price",    # mean phantom bid price across years in episode
         "phantom_avg_bid_qty",      # mean phantom bid qty across years in episode
     ]
+    ep_fields += ["adv_yr1_mean_A1"]  # year-1 mean advantage for agent 0 (pre-normalization diagnostic)
     ep_csv = open(ep_path, "w", newline="")
     ep_writer = csv.DictWriter(ep_csv, fieldnames=ep_fields)
     ep_writer.writeheader()
@@ -974,6 +977,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # still show losses at coarse log intervals (e.g. every 50 episodes).
     last_available_losses = [None] * n_agents
     last_loss_episode = [None] * n_agents
+    _last_adv_yr1_mean_A1: float = 0.0  # year-1 mean advantage for agent 0 (updated on update episodes)
 
     train_t0 = time.time()
     recent_ep_durations = collections.deque(maxlen=200)
@@ -1345,6 +1349,10 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 for i in range(n_agents):
                     adv, ret, buf = agents[i].compute_gae(last_value=0.0)
                     gae_data.append((adv, ret, buf))
+                # Capture year-1 mean advantage from agent 0 for diagnostics
+                _buf0 = gae_data[0][2] if gae_data and gae_data[0][2] is not None else None
+                if _buf0 is not None and "per_year_adv_mean" in _buf0 and len(_buf0["per_year_adv_mean"]) > 1:
+                    _last_adv_yr1_mean_A1 = float(_buf0["per_year_adv_mean"][1])
 
                 # 2. Sequential update order: worst-to-best by EMA reward (dynamic) or
                 # by initial emission factor (static fallback).
@@ -1426,13 +1434,17 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     latest_losses.append(loss)
 
             # --- Cosine LR decay (applied after each PPO update batch) ---
+            frac = episode / max(n_episodes - 1, 1)
             if lr_decay_mode == "cosine":
-                frac = episode / max(n_episodes - 1, 1)
                 actor_lr_now = lr_min + 0.5 * (actor_lr_init - lr_min) * (1 + math.cos(math.pi * frac))
-                critic_lr_now = lr_min + 0.5 * (critic_lr_init - lr_min) * (1 + math.cos(math.pi * frac))
                 for agent in agents:
-                    for pg in agent.actor_optimizer.param_groups:
+                    for pg in agent.auction_optimizer.param_groups:
                         pg["lr"] = actor_lr_now
+                    for pg in agent.secondary_optimizer.param_groups:
+                        pg["lr"] = actor_lr_now
+            if critic_lr_decay_mode == "cosine":
+                critic_lr_now = critic_lr_min_val + 0.5 * (critic_lr_init - critic_lr_min_val) * (1 + math.cos(math.pi * frac))
+                for agent in agents:
                     for pg in agent.critic_optimizer.param_groups:
                         pg["lr"] = critic_lr_now
         else:
@@ -1930,6 +1942,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             ep_row[f"streak_floor_A{i+1}"] = int(_streak_floor[i])
             ep_row[f"streak_zeroqty_A{i+1}"] = int(_streak_qty[i])
 
+        ep_row["adv_yr1_mean_A1"] = round(_last_adv_yr1_mean_A1, 4)
         ep_writer.writerow(ep_row)
 
         # Aggregate MSR intervention frequencies for a single run-level summary.

@@ -297,24 +297,32 @@ def test_separate_optimizers_step():
 
     agent = agents[0]
 
-    # Check separate optimizers exist with correct param counts
-    actor_param_count = sum(p.numel() for p in agent.auction_policy.parameters()) + \
-                        sum(p.numel() for p in agent.secondary_policy.parameters())
+    # Check decoupled optimizers exist with correct param counts
+    auc_param_count = sum(p.numel() for p in agent.auction_policy.parameters())
+    sec_param_count = sum(p.numel() for p in agent.secondary_policy.parameters())
     critic_param_count = sum(p.numel() for p in agent.value_net.parameters())
 
-    actor_opt_params = sum(
+    auc_opt_params = sum(
         sum(p.numel() for p in group["params"])
-        for group in agent.actor_optimizer.param_groups
+        for group in agent.auction_optimizer.param_groups
+    )
+    sec_opt_params = sum(
+        sum(p.numel() for p in group["params"])
+        for group in agent.secondary_optimizer.param_groups
     )
     critic_opt_params = sum(
         sum(p.numel() for p in group["params"])
         for group in agent.critic_optimizer.param_groups
     )
 
-    assert actor_opt_params == actor_param_count, (
-        f"Actor optimizer param count mismatch: {actor_opt_params} vs {actor_param_count}")
+    assert auc_opt_params == auc_param_count, (
+        f"Auction optimizer param count mismatch: {auc_opt_params} vs {auc_param_count}")
+    assert sec_opt_params == sec_param_count, (
+        f"Secondary optimizer param count mismatch: {sec_opt_params} vs {sec_param_count}")
     assert critic_opt_params == critic_param_count, (
         f"Critic optimizer param count mismatch: {critic_opt_params} vs {critic_param_count}")
+    # Backwards-compat alias check
+    assert agent.actor_optimizer is agent.auction_optimizer
 
     # Verify different learning rates
     actor_lr = agent.actor_optimizer.param_groups[0]["lr"]

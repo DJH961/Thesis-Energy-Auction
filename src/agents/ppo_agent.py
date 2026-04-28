@@ -245,17 +245,16 @@ class PPOAgent:
         else:
             self.value_net = ValueNetwork(obs_dim_phase2, hidden).to(self.device)
 
-        # Separate actor/critic optimizers for independent learning rates
-        actor_params = (
-            list(self.auction_policy.parameters()) +
-            list(self.secondary_policy.parameters())
-        )
+        # Decoupled actor optimizers: auction and secondary trained independently
+        # to prevent cross-gradient corruption during HAPPO sequential updates.
+        self.auction_optimizer = optim.Adam(list(self.auction_policy.parameters()), lr=ppo["lr"])
+        self.secondary_optimizer = optim.Adam(list(self.secondary_policy.parameters()), lr=ppo["lr"])
         critic_params = list(self.value_net.parameters())
-        self.actor_optimizer = optim.Adam(actor_params, lr=ppo["lr"])
         critic_lr = ppo.get("critic_lr", ppo["lr"])
         self.critic_optimizer = optim.Adam(critic_params, lr=critic_lr)
-        # Backwards-compat alias used by cycling code in train.py
-        self.optimizer = self.actor_optimizer
+        # Backwards-compat aliases used by cycling code in train.py
+        self.actor_optimizer = self.auction_optimizer
+        self.optimizer = self.auction_optimizer
 
         self.buffer = RolloutBuffer()
         self.actor_loss_history = []
@@ -769,24 +768,33 @@ class PPOAgent:
                 else:
                     self.critic_optimizer.step()
 
-                # --- Actor step ---
+                # --- Actor step (decoupled: auction and secondary stepped independently) ---
                 if actor_loss_total is not None:
                     if not torch.isfinite(actor_loss_total):
                         total_v_loss += value_loss.item()
                         n_up += 1
                         continue
-                    self.actor_optimizer.zero_grad()
+                    self.auction_optimizer.zero_grad()
+                    self.secondary_optimizer.zero_grad()
                     actor_loss_total.backward()
-                    actor_params = (list(self.auction_policy.parameters()) +
-                                    list(self.secondary_policy.parameters()))
-                    nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
-                    bad_actor = any(
+                    auc_params = list(self.auction_policy.parameters())
+                    sec_params = list(self.secondary_policy.parameters())
+                    nn.utils.clip_grad_norm_(auc_params, self.max_grad_norm)
+                    nn.utils.clip_grad_norm_(sec_params, self.max_grad_norm)
+                    bad_auc = any(
                         p.grad is not None and not torch.isfinite(p.grad).all()
-                        for p in actor_params)
-                    if bad_actor:
-                        self.actor_optimizer.zero_grad()
+                        for p in auc_params)
+                    bad_sec = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in sec_params)
+                    if bad_auc:
+                        self.auction_optimizer.zero_grad()
                     else:
-                        self.actor_optimizer.step()
+                        self.auction_optimizer.step()
+                    if bad_sec:
+                        self.secondary_optimizer.zero_grad()
+                    else:
+                        self.secondary_optimizer.step()
 
                 total_a_loss += policy_loss.item()
                 total_v_loss += value_loss.item()
@@ -890,6 +898,22 @@ class PPOAgent:
         advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
         returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # Year-1 advantage floor: year 1 structurally receives the most negative advantage
+        # because the green transition trajectory starts at its worst. Without this floor,
+        # year-1 timesteps (buffer indices 2 and 3) drag normalization and suppress useful
+        # gradient signal from later years. Applied pre-normalization so it affects scaling.
+        _YR1_FLOOR = -1.0
+        if T > 3:
+            advantages[2] = max(advantages[2], _YR1_FLOOR)
+            advantages[3] = max(advantages[3], _YR1_FLOOR)
+
+        # Per-year advantage diagnostics (year = buffer_index // 2)
+        n_years_buf = T // 2
+        per_year_adv_mean = np.array([
+            float(np.mean(advantages[2 * yr: 2 * yr + 2]))
+            for yr in range(n_years_buf)
+        ], dtype=np.float32)
+
         adv_t = torch.FloatTensor(advantages).to(self.device).unsqueeze(1)
         ret_t = torch.FloatTensor(returns).to(self.device).unsqueeze(1)
 
@@ -916,6 +940,7 @@ class PPOAgent:
             "old_values": old_values_t,  # for value clipping in update_happo
             "T": T,
             "is_auction": is_auction_t,  # [T] bool: route policy losses to correct obs space
+            "per_year_adv_mean": per_year_adv_mean,  # [n_years] diagnostic: mean adv per year
         }
         return adv_t, ret_t, buf_tensors
 
@@ -1075,24 +1100,33 @@ class PPOAgent:
                 else:
                     self.critic_optimizer.step()
 
-                # --- Actor step ---
+                # --- Actor step (decoupled: auction and secondary stepped independently) ---
                 if actor_loss_total is not None:
                     if not torch.isfinite(actor_loss_total):
                         total_v_loss += value_loss.item()
                         n_up += 1
                         continue
-                    self.actor_optimizer.zero_grad()
+                    self.auction_optimizer.zero_grad()
+                    self.secondary_optimizer.zero_grad()
                     actor_loss_total.backward()
-                    actor_params = (list(self.auction_policy.parameters()) +
-                                    list(self.secondary_policy.parameters()))
-                    nn.utils.clip_grad_norm_(actor_params, self.max_grad_norm)
-                    bad_actor = any(
+                    auc_params = list(self.auction_policy.parameters())
+                    sec_params = list(self.secondary_policy.parameters())
+                    nn.utils.clip_grad_norm_(auc_params, self.max_grad_norm)
+                    nn.utils.clip_grad_norm_(sec_params, self.max_grad_norm)
+                    bad_auc = any(
                         p.grad is not None and not torch.isfinite(p.grad).all()
-                        for p in actor_params)
-                    if bad_actor:
-                        self.actor_optimizer.zero_grad()
+                        for p in auc_params)
+                    bad_sec = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in sec_params)
+                    if bad_auc:
+                        self.auction_optimizer.zero_grad()
                     else:
-                        self.actor_optimizer.step()
+                        self.auction_optimizer.step()
+                    if bad_sec:
+                        self.secondary_optimizer.zero_grad()
+                    else:
+                        self.secondary_optimizer.step()
 
                 total_a_loss += policy_loss.item()
                 total_v_loss += value_loss.item()
@@ -1166,7 +1200,8 @@ class PPOAgent:
             "auction_policy": self.auction_policy.state_dict(),
             "secondary_policy": self.secondary_policy.state_dict(),
             "value_net": self.value_net.state_dict(),
-            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "auction_optimizer": self.auction_optimizer.state_dict(),
+            "secondary_optimizer": self.secondary_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
         }, path)
 
@@ -1175,7 +1210,12 @@ class PPOAgent:
         self.auction_policy.load_state_dict(ckpt["auction_policy"])
         self.secondary_policy.load_state_dict(ckpt["secondary_policy"])
         self.value_net.load_state_dict(ckpt["value_net"])
-        if "actor_optimizer" in ckpt:
-            self.actor_optimizer.load_state_dict(ckpt["actor_optimizer"])
+        # Support both legacy "actor_optimizer" key and new split keys
+        if "auction_optimizer" in ckpt:
+            self.auction_optimizer.load_state_dict(ckpt["auction_optimizer"])
+        elif "actor_optimizer" in ckpt:
+            self.auction_optimizer.load_state_dict(ckpt["actor_optimizer"])
+        if "secondary_optimizer" in ckpt:
+            self.secondary_optimizer.load_state_dict(ckpt["secondary_optimizer"])
         if "critic_optimizer" in ckpt:
             self.critic_optimizer.load_state_dict(ckpt["critic_optimizer"])
