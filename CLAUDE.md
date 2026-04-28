@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Summary
 
-ETS MARL (v8.0.0) — a multi-agent reinforcement learning simulation of the EU Emissions Trading System. 8 learning agents (PPO/HAPPO) and up to 8 heuristic bots compete in a carbon allowance market over 12-year episodes. Agents bid in uniform-price auctions, trade on a secondary market, and invest in renewable energy capacity. This is a PhD thesis project.
+ETS MARL — a multi-agent reinforcement learning simulation of the EU Emissions Trading System. 8 learning agents (PPO/HAPPO) and up to 8 heuristic bots compete in a carbon allowance market over 12-year episodes. Agents bid in uniform-price auctions, trade on a secondary market, and invest in renewable energy capacity. This is a PhD thesis project.
 
 ## Commands
 
@@ -47,7 +47,7 @@ Each year within an episode has two decision phases, managed by `ETSEnvironment`
 - **`src/environment/company.py`** — `Company` class: per-agent state (energy mix, allowance bank, construction queue, budget, carry-forward obligations, emergency loans). Handles observation vector construction (`obs_dim_phase1`, `obs_dim_phase2`).
 - **`src/environment/cap_schedule.py`** — `CapSchedule` class: emission cap trajectory with linear reduction factor (LRF), Market Stability Reserve (MSR) with 1-year TNAC lag, cancellation mechanism, and emergency price containment.
 - **`src/auction/market_clearing_ets.py`** — Uniform-price sealed-bid auction clearing. `build_bids()` → `market_clearing_ets()` → `settle_auction()`.
-- **`src/agents/ppo_agent.py`** — `PPOAgent` with `RewardNormalizer`. Wraps two policy networks and a centralized critic. Handles HAPPO sequential updates, optional behavioral cloning pretraining (disabled by default in v8), and KL-anchored policy regularization. `inject_fundamental_anchor(year)` seeds the auction price head bias to the fundamental anchor each episode.
+- **`src/agents/ppo_agent.py`** — `PPOAgent` with `RewardNormalizer`. Wraps two policy networks and a centralized critic. Handles HAPPO sequential updates, optional behavioral cloning pretraining (disabled by default), and KL-anchored policy regularization. `inject_fundamental_anchor(year)` seeds the auction price head bias to the fundamental anchor each episode.
 - **`src/utils/price_anchor.py`** — `compute_fundamental_anchor(year, config)`: MAC-scarcity-penalty price anchor (no CapSchedule dependency). Drives AR(1) mean-reversion floor in `ETSEnvironment` and initial price-head bias in `PPOAgent`. Also `_resolve_cap_year_0(config)` with three-priority fallback.
 - **`src/agents/actor_critic.py`** — Neural network architectures: `AuctionPolicy` (6D, conditioned heads: qty depends on price), `SecondaryPolicy` (2D), `ValueNetwork` (centralized critic with global state input).
 - **`src/agents/heuristic_policy.py`** — Rule-based bot policy: fundamentals-based MAC→penalty bidding, NPV-gated investment, target-bank trajectory trading.
@@ -60,7 +60,7 @@ YAML-based (not Hydra in this repo). Config files in `configs/`:
 - `smoke_100.yaml` — 100-episode smoke test config (8 learning + 8 bots)
 - `scenarios/` — scenario variants (baseline_2024, low_price_2020)
 
-Many schedule parameters use `0` to mean "auto-scale relative to `n_episodes`" (e.g., `epsilon_decay_episodes: 0` → 35% of n_episodes). The `tabula_rasa` block is kept in config as an ablation reference but **`tabula_rasa.enabled=true` raises `ValueError`** in v8 — it is no longer a runtime override.
+Many schedule parameters use `0` to mean "auto-scale relative to `n_episodes`" (e.g., `epsilon_decay_episodes: 0` → fraction of n_episodes). The `tabula_rasa` block is kept in config as an ablation reference but **`tabula_rasa.enabled=true` raises `ValueError`** — it is no longer a runtime override.
 
 ### Observation Space
 
