@@ -1183,8 +1183,8 @@ def test_split_rewards_sum_to_total():
 
     env.step_auction(auction_actions)
 
-    # Get auction intermediate reward
-    r_auction = env.compute_auction_rewards()
+    # v8.5: compute_auction_rewards now returns (joint, bid, invest)
+    r_auction, _r_bid, _r_invest = env.compute_auction_rewards()
 
     secondary_actions = np.zeros((n, 2), dtype=np.float32)
     secondary_actions[:, 0] = env._phase1_clearing_price
@@ -1275,7 +1275,7 @@ def test_underbid_gives_negative_auction_reward():
     auction_actions[:, 3:] = [0.0, 0.0, 1.0]  # solar logit highest
 
     env.step_auction(auction_actions)
-    r_auction = env.compute_auction_rewards()
+    r_auction, _, _ = env.compute_auction_rewards()
 
     for i in range(n):
         assert r_auction[i] < 0, (

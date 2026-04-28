@@ -5,6 +5,101 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.5]
+
+Restructures Phase-1 credit assignment, refines the terminal/ESG reward
+shape, and tightens budget accounting. Highlights:
+
+### Reward / critic split (Phase 1)
+- **Split-head investment critic** (`ppo.split_invest_head`, default `true`).
+  The Phase-1 policy is now trained as two sub-heads sharing a trunk:
+  - bid sub-head (dims 0–1: bid price, qty multiplier) is trained against a
+    "main" advantage stream that sees compliance, secondary financials,
+    penalty, banking signal, and terminal-bank value;
+  - investment sub-head (dims 2–5: invest_frac, tech logits) is trained
+    against a separate "invest" advantage stream that sees capital cost,
+    centered ESG signal, and the discounted-NPV terminal-queue value.
+  Each stream has its own value network (`value_net` and
+  `value_net_invest`) and its own causal reward normalizer per phase.
+- `compute_auction_rewards()` now returns `(joint, bid, invest)` so the
+  train loop can route each sub-stream into the right buffer slot.
+  `_compute_rewards()` exposes `_last_invest_reward_phase2` for the same
+  purpose at the secondary-phase timestep.
+
+### Tech-portfolio investment
+- `auction_actions[i, 3:6]` are no longer routed through `argmax`: instead
+  a softmax over the three buildable green technologies splits
+  `invest_frac` proportionally, so each year's investment can diversify
+  across techs (`investment.tech_softmax_temperature`, default `1.0`).
+- Per-tech construction-phase cancellation rates
+  (`construction_jitter.p_cancel_per_tech`) replace the single
+  `p_cancel` scalar; defaults align with industry data
+  (~1.2 %/yr onshore, ~0.8 %/yr offshore, ~2.0 %/yr solar).
+
+### Capex throughput linked to revenue
+- `Company.effective_capex_throughput` is now scaled by
+  `clip(0.7 + 0.3 × revenue_t / baseline_revenue, 0.5, 1.5)`, where
+  `baseline_revenue` is captured the first time the env reports revenue
+  in an episode. High-revenue years gain construction headroom; low-
+  revenue years see it shrink.
+
+### Terminal-value reshape
+- **Terminal queue NPV (#3).** `terminal_queue_value` now computes a
+  proper discounted-cash-flow on each queued project: annual carbon
+  savings × terminal price, valued as an annuity over
+  `reward.terminal_asset_lifetime_years` (default 20 yr) at
+  `investment.discount_rate` and discounted from the project's
+  completion year. Late-episode investments are now valued at their
+  economic worth instead of decaying linearly to zero.
+- **Terminal bank discounted hold (#6).** The end-of-episode allowance-
+  bank kicker drops the linear-below-need / log-above-need split. The
+  value is now a single discounted hold:
+  `holdings × terminal_price × (1 + invest_rate)^(-terminal_payoff_years)
+  / budget_real`.
+
+### ESG signal centred on a linear baseline (#13)
+- ESG signal is now `esg_scale × ((ef_ratio − year/n_years) + speed_bonus)`,
+  so do-nothing decarbonization yields zero-mean signal across the
+  episode and only progress *ahead of* the linear trajectory pays. The
+  compliance gate is only applied to non-negative signals so a
+  behind-trajectory agent's negative signal isn't flipped under low
+  coverage.
+- `esg.speed_coef` is now front-loaded (`speed_coef` > `speed_coef_late`):
+  early decarbonization receives the bigger speed bonus, since late-
+  episode projects already pay back through the new terminal-queue NPV.
+
+### Opponent observations (#16)
+- `opponent_snapshots`/`opponent_obs` replaces the per-firm
+  `bank_norm` (own holdings ÷ own need) with `tnac_share_norm`
+  (own holdings ÷ Σ holdings). This signal is publicly inferable from
+  aggregate TNAC reports and respects EU ETS confidentiality rules
+  while still letting agents triangulate market share.
+
+### Budget envelope (#1, #2)
+- `penalty_cost` is now charged through `Company.record_spending`, so
+  the penalty also counts toward `budget_spent_this_year` and the
+  hard-cap penalty channel. Per-agent `budget.debt_headrooms` are sized
+  so compliance-respecting agents never need them; non-compliant agents
+  absorb the penalty before exhausting their cash buffer.
+- Single source of truth for the budget hard cap. `budget.hard_cap_multiplier`
+  is removed; `budget.hard_cap_fraction` (default 1.15) drives both
+  `step_auction()`'s investment hard gate and `compute_budget_penalty()`.
+
+### HAPPO ordering (#15)
+- `ppo.happo_order_metric` selects the EMA used for HAPPO sequential
+  ordering. The new default `"advantage"` tracks per-agent mean GAE
+  advantage so the update order is robust against different reward
+  floors across mixed reward functions; `"reward"` keeps the prior
+  behaviour.
+
+### Misc.
+- `investment.discount_rate` raised to `0.05` (5 % WACC, standard
+  utility-sector hurdle rate).
+- Tests covering ESG positivity, terminal-bank diminishing returns and
+  the auction-reward signature were updated to reflect the new shapes.
+
+---
+
 ## [8.4.2]
 
 Bug-fix release addressing defects identified in the under-bidding analysis

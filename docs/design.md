@@ -175,7 +175,14 @@ Important mechanics:
 | Offshore wind| 3.0                    | 0.08     |
 | Solar        | 1.5                    | 0.05     |
 
-Cancellation probability is `p_cancel=0.03` per year in the construction queue. If cancelled, the agent recovers `recovery_rate=0.40` (40%) of sunk capex. Capacity-factor noise (`cf_sigma`) applies each operating year, randomizing realized output and emissions.
+Cancellation probability is configurable per technology via
+`construction_jitter.p_cancel_per_tech` (one rate per `technologies.names` slot,
+defaulting to industry-aligned values: ~1.2 %/yr onshore, ~0.8 %/yr offshore,
+~2.0 %/yr solar; coal/gas defaults to zero). A scalar
+`construction_jitter.p_cancel` is honored as a backwards-compatible fallback.
+If cancelled, the agent recovers `recovery_rate=0.40` (40%) of sunk capex.
+Capacity-factor noise (`cf_sigma`) applies each operating year, randomizing
+realized output and emissions.
 
 ### 4.4 Demand and Emission Uncertainty
 
@@ -252,7 +259,17 @@ Action vector (6D):
 5. Offshore logit
 6. Solar logit
 
-Technology choice is `argmax(logits)`.
+Technology choice uses a softmax over the three logits, with the resulting
+weights splitting `invest_frac` proportionally across onshore, offshore and
+solar. The softmax temperature is `investment.tech_softmax_temperature`
+(default `1.0`); sharper logits → near-single-tech, softer logits →
+diversified portfolio. The Phase-1 policy is trained as two sub-heads
+sharing a trunk: the **bid sub-head** (dims 1–2) is updated against a
+"main" advantage stream (compliance, secondary financials, penalty,
+banking signal, terminal-bank value) and the **investment sub-head**
+(dims 3–6) is updated against a separate "invest" advantage stream
+(capital cost, ESG signal, terminal-queue NPV). Each stream has its own
+value network (`value_net` / `value_net_invest`).
 
 ### Phase 2: Secondary market
 
@@ -299,7 +316,7 @@ Each opponent contributes a **7D lagged tuple** (year t−1 snapshot, read from 
 | 1 | `green_frac` | raw [0,1] |
 | 2 | `fossil_frac` | raw [0,1] |
 | 3 | `queue_signal` + N(0,σ) | clipped [0,1] |
-| 4 | `bank_norm` = holdings / annual_need | clipped [0,3] / 3 |
+| 4 | `tnac_share_norm` = own_holdings / Σ holdings | clipped [0,1] |
 | 5 | `net_secondary_norm` = (sec_bought − sec_sold) / annual_need | clipped [−1,1] |
 | 6 | `lagged_compliance_gap_norm` = prior (emissions − surrendered) / annual_need | clipped [−1,1] |
 
@@ -374,40 +391,65 @@ Objective weight structure:
 - Financial agents (`w_cost=1.0`, `w_green=0.0`): optimize pure cost minimization.
 - ESG-balanced agents (`w_cost=0.5`, `w_green=0.5`): trade off cost and ESG signal.
 
-**ESG signal formula:**
+**ESG signal formula** (centred on a linear baseline):
 
 $$
-esg\_raw = esg\_scale \cdot \left(\frac{ef_{0,i} - ef_{t,i}}{ef_{0,i}} + speed\_coef \cdot \Delta green_i\right) \cdot compliance\_gate_i
+ef\_centered_t = \tfrac{ef_{0} - ef_{t}}{ef_{0}} - \tfrac{t}{n\_years - 1}
+$$
+
+$$
+esg\_raw_t = esg\_scale \cdot \left(ef\_centered_t + speed\_coef_t \cdot \Delta green_t\right)
 $$
 
 where:
-- `ef_ratio = (ef_0 - ef_t) / ef_0` is cumulative emission-factor improvement.
-- `speed_bonus = speed_coef × max(0, green_frac − prev_green_frac)` rewards current-year greening (default `speed_coef=0.5`).
-- `compliance_gate` is a smooth blend that approaches linear `coverage_frac` above
-  `compliance_gate_blend_threshold` and softens below — non-compliant agents receive a
-  proportionally suppressed ESG bonus without a hard cliff under late-year scarcity.
-  The earlier strict-quadratic gate was dropped because squaring eliminated the ESG
-  signal under scarcity in final years, exactly when it matters most.
-- `esg_anchor_ratio` is retained in `_last_reward_channels` as `1.0` for backward log compatibility but no longer multiplied into `esg_raw`.
-- There is **no** `time_ratio` decay; ESG improvement is equally valuable in early and late years.
-- `esg_signal = esg_raw × compliance_gate` (before applying `w_green`).
+
+- `ef_ratio = (ef_0 − ef_t) / ef_0` is cumulative emission-factor improvement.
+- The `t / (n_years − 1)` baseline subtracts the linear decarbonization
+  trajectory: a do-nothing agent earns zero-mean ESG signal across the
+  episode; only progress *ahead of* the linear trajectory is rewarded,
+  while progress *behind* it produces a negative signal.
+- `speed_bonus = speed_coef_t × max(0, green_frac − prev_green_frac)` rewards
+  current-year greening. The coefficient interpolates linearly from
+  `esg.speed_coef` at year 0 to `esg.speed_coef_late` at year n_years−1
+  so early decarbonization receives the bigger speed kick.
+- `compliance_gate` is a smooth blend that approaches linear `coverage_frac`
+  above `compliance_gate_blend_threshold` and softens below. It only
+  attenuates non-negative `esg_raw`: a behind-trajectory agent's negative
+  signal is not flipped under low coverage.
+- `esg_anchor_ratio` is retained in `_last_reward_channels` as `1.0` for
+  backward log compatibility but no longer multiplied into `esg_raw`.
+- There is **no** `time_ratio` decay; ESG improvement is equally valuable
+  in early and late years.
+- `esg_signal = esg_raw × compliance_gate` if `esg_raw ≥ 0`, else `esg_raw`.
 - Default `esg_scale = 2.0` is calibrated so that a mid-journey ESG agent (`ef_ratio ≈ 0.5`) contributes roughly equal ESG and financial weight — enabling positive net rewards for fully compliant, well-greened agents without re-introducing revenue.
 
 **Terminal values** in final year:
-- Bank terminal value — piecewise formula:
+
+- Bank terminal value — discounted hold:
 
 $$
-V^{bank}_i = \begin{cases}
-  r_i \cdot \hat{E}_i \cdot \dfrac{P_T}{budget\_real_i} & \text{if } r_i < 1 \\[6pt]
-  \log(1 + r_i) \cdot \hat{E}_i \cdot \dfrac{P_T}{budget\_real_i} & \text{if } r_i \geq 1
-\end{cases}
+V^{bank}_i = \frac{B_i \cdot P_T}{(1 + r_{inv})^{\,n_T} \cdot budget\_real_i}
 $$
 
-where $r_i = B_i / \max(\hat{E}_i, 0.1)$, $B_i$ is banked allowances, $\hat{E}_i$ is annual estimated need, $P_T$ is the terminal price anchor, and $budget\_real_i = annual\_budget_i / infl_T$. The linear branch (below annual need) provides a stronger bidding incentive under terminal scarcity; the log branch (above need) preserves diminishing returns for excess banking.
+  where $B_i$ is banked allowances, $P_T$ is the terminal price anchor,
+  $r_{inv}$ = `investment.discount_rate`, $n_T$ = `reward.terminal_payoff_years`,
+  and $budget\_real_i = annual\_budget_i / infl_T$. Holdings beyond the
+  current need still scale linearly; overbanking is checked elsewhere
+  through capex/budget gating, not through this terminal kicker.
 
-- Queue terminal value (discounted future emissions savings from queued projects) with a completion-fraction discount to prevent end-of-episode gaming of long-lead projects. A smooth `remaining_scale = min(1.0, effective_remaining / 2.0)` factor tapers credit for projects with less than two payoff years remaining rather than applying a hard cutoff.
+- Queue terminal value — present value of pipeline projects' carbon
+  savings as an annuity over `reward.terminal_asset_lifetime_years`
+  (default 20 yr) at `investment.discount_rate`, discounted from each
+  project's completion year back to the terminal year. Late-episode
+  investments are valued at their economic worth instead of decaying
+  linearly to zero, so the structural incentive to stop investing after
+  the first few years is removed.
 
-- Treasury terminal value (`reward.treasury_terminal_value=true`): the corporate treasury reserve held at episode end is valued at `treasury_reserve.terminal_value_rate`, so retained surplus is not silently discarded and the agent has an incentive to manage operating margin in addition to compliance cost.
+- Treasury terminal value (`reward.treasury_terminal_value=true`): the
+  corporate treasury reserve held at episode end is valued at
+  `treasury_reserve.terminal_value_rate`, so retained surplus is not
+  silently discarded and the agent has an incentive to manage operating
+  margin in addition to compliance cost.
 
 Terminal price anchor uses `max(auction_clearing, secondary_clearing, 80% of inflation-adjusted penalty rate)`.
 

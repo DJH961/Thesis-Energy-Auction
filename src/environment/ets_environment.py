@@ -294,6 +294,11 @@ class ETSEnvironment(gym.Env):
         self._last_terminal_liquidation_values = np.zeros(self.n_total)
         self._last_reward_base_values = np.zeros(self.n_total)
         self._last_reward_shaping_values = np.zeros(self.n_total)
+        # Phase-2 invest-stream reward (ESG + terminal-queue contribution),
+        # exposed so train.py can decompose the total reward into a "main"
+        # stream (compliance, secondary financials, terminal bank) and an
+        # "invest" stream that drives the split-head invest critic.
+        self._last_invest_reward_phase2 = np.zeros(self.n_total)
 
         # Price normalization constant
         self._price_norm = config["auction"]["price_max"]
@@ -499,6 +504,7 @@ class ETSEnvironment(gym.Env):
         self._last_terminal_liquidation_values = np.zeros(self.n_total)
         self._last_reward_base_values = np.zeros(self.n_total)
         self._last_reward_shaping_values = np.zeros(self.n_total)
+        self._last_invest_reward_phase2 = np.zeros(self.n_total)
         self._secondary_profit_ema = np.zeros(self.n_total)
         self._last_secondary_buy_price = np.zeros(self.n_total)
         self._cumulative_alloc = np.zeros(self.n_total)
@@ -1946,31 +1952,27 @@ class ETSEnvironment(gym.Env):
     # Split Rewards: Auction-phase intermediate reward
     # ------------------------------------------------------------------
 
-    def compute_auction_rewards(self) -> np.ndarray:
+    def compute_auction_rewards(self):
         """
         Compute per-agent intermediate reward for the auction phase.
-
-        Uses the SAME budget-relative, inflation-invariant normalization as
-        ``_compute_rewards`` (Phase 2). Each cost bucket is deflated by the
-        agent's cumulative inflation factor and divided by the natural
-        denominator for its kind (``anchor_real × need`` for compliance,
-        ``budget_real`` for capital and the coverage-gap penalty).
-
-        This guarantees that ``r_secondary = rewards − r_auction`` (computed
-        in ``train.py``) is dimensionally consistent: the auction-head and
-        secondary-head policy gradients live on the same scale, instead of
-        the previous mismatch (Phase 1 used a flat ``REWARD_SCALE = 1000``,
-        Phase 2 used ``budget_real ≈ 700`` → Phase-1 gradient was ~7× weaker
-        than Phase-2 for the same underlying error).
-
-        Must be called after ``step_auction()`` and before ``step_secondary()``.
 
         Returns
         -------
         r_auction : np.ndarray, shape (n_agents,)
-            Auction-phase reward per learning agent (negative = cost).
+            Total auction-phase reward (= bid + invest stream).
+        r_auction_bid : np.ndarray, shape (n_agents,)
+            Bid sub-head reward (compliance + coverage-gap penalty only).
+        r_auction_invest : np.ndarray, shape (n_agents,)
+            Investment sub-head reward (capital cost only).
+
+        ``r_auction = r_auction_bid + r_auction_invest`` so the ``r_auction``
+        return value is identical to the pre-v8.5 single-stream value, while
+        the split components let the train loop route the bid and investment
+        sub-heads to their own advantage streams.
         """
         r_auction = np.zeros(self.n_agents)
+        r_auction_bid = np.zeros(self.n_agents)
+        r_auction_invest = np.zeros(self.n_agents)
         _cap_t_now = float(self.cap_schedule.get_cap(self.current_year))
         anchor_t  = compute_fundamental_anchor(self.current_year, self.config, cap_t_actual=_cap_t_now)
 
@@ -1996,17 +1998,14 @@ class ETSEnvironment(gym.Env):
             capital_norm    = (invest_cost + opex_delta) / budget_real
 
             coverage_gap = max(0.0, need - float(self._phase1_allocations[i]))
-            # Use BASE penalty_rate (not effective) for inflation invariance:
-            # numerator stays in real terms, denominator carries the 1/infl.
-            # v8.4.2 bug fix: normalize by ``compliance_denom`` (= anchor_real × need),
-            # the same denominator as ``compliance_norm``. Previously this used
-            # ``budget_real`` (~10× larger), so a missed Mt saved ~1.0 of compliance_norm
-            # but cost only ~0.2 of gap_penalty — an explicit gradient toward leaving
-            # gaps. Matching denominators makes a missed Mt strictly more expensive
-            # than buying at the anchor (since penalty_rate > anchor_real).
             gap_penalty = (coverage_gap * company.penalty_rate) / compliance_denom
 
-            r_auction[i] = -(compliance_norm + capital_norm) - gap_penalty
+            # Bid sub-head: only sees compliance + coverage gap; investing
+            # decisions don't bias the bid policy gradient.
+            r_auction_bid[i] = -(compliance_norm) - gap_penalty
+            # Investment sub-head: only sees capital costs.
+            r_auction_invest[i] = -capital_norm
+            r_auction[i] = r_auction_bid[i] + r_auction_invest[i]
 
             self._last_auction_reward_channels[i] = {
                 "auction_cost":         float(auction_cost),
@@ -2017,8 +2016,10 @@ class ETSEnvironment(gym.Env):
                 "compliance_norm":      float(compliance_norm),
                 "capital_norm":         float(capital_norm),
                 "coverage_gap_penalty": float(gap_penalty),
+                "r_bid":                float(r_auction_bid[i]),
+                "r_invest":             float(r_auction_invest[i]),
             }
-        return r_auction
+        return r_auction, r_auction_bid, r_auction_invest
 
     # ------------------------------------------------------------------
     # Phase 2: Secondary Market + Compliance + Rewards
@@ -2638,6 +2639,8 @@ class ETSEnvironment(gym.Env):
         base_rewards = np.zeros(self.n_total)
         terminal_bank_values  = np.zeros(self.n_total)
         terminal_queue_values = np.zeros(self.n_total)
+        # Reset Phase-2 invest-stream contribution before this year's accumulation.
+        self._last_invest_reward_phase2 = np.zeros(self.n_total)
 
         reward_cfg  = self.config.get("reward", {})
         esg_cfg     = self.config.get("esg", {})
@@ -2874,6 +2877,10 @@ class ETSEnvironment(gym.Env):
             base_rewards[i] = base_reward
             rewards[i]      = base_reward
 
+            # Track invest-stream Phase-2 contribution (ESG only at this stage;
+            # the terminal_queue value is added in the year-T branch below).
+            self._last_invest_reward_phase2[i] = float(company.w_green * esg_signal)
+
             opp_cost_shaping = 0.0
             opp_cost_cfg = reward_cfg.get("opportunity_cost_shaping", {})
             if (opp_cost_cfg.get("enabled", False)
@@ -3012,6 +3019,7 @@ class ETSEnvironment(gym.Env):
                     rewards[i]      += queue_value
                     base_rewards[i] += queue_value
                     terminal_queue_values[i] = queue_value
+                    self._last_invest_reward_phase2[i] += float(queue_value)
 
                 if company._carry_forward > 0:
                     debt_penalty = (company._carry_forward * terminal_price * 1.5) / budget_real_t
