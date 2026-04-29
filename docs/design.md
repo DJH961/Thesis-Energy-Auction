@@ -12,7 +12,7 @@ This document describes the **ETS MARL** simulation: a stylised multi-agent rein
 
 **How an episode works:** Each episode simulates 12 years. Every year, participants bid in a sealed-bid uniform-price auction for CO2 allowances, then trade in a bilateral secondary market, and choose how much to invest in renewable capacity. Penalties fall on those without enough allowances to cover emissions. The government cap shrinks by ~4.3–4.4% annually, creating increasing scarcity that forces decarbonisation.
 
-**Learning objective:** Learning agents maximise a reward signal combining net financial cost (after compliance, trading, investment, and operations) with an optional ESG component (saved-carbon-years). Over 100,000 episodes, agents converge on market strategies.
+**Learning objective:** Learning agents maximise a reward signal combining net financial cost (after compliance, trading, investment, and operations) with an optional ESG component (saved-carbon-years). Over 120,000 episodes (the current default), agents converge on market strategies.
 
 ---
 
@@ -471,8 +471,6 @@ $$
   silently discarded and the agent has an incentive to manage operating
   margin in addition to compliance cost.
 
-- Treasury terminal value (`reward.treasury_terminal_value=true`): the corporate treasury reserve held at episode end is valued at `treasury_reserve.terminal_value_rate`, so retained surplus is not silently discarded and the agent has an incentive to manage operating margin in addition to compliance cost.
-
 Terminal price anchor uses `max(auction_clearing, secondary_clearing, 80% of inflation-adjusted penalty rate)`.
 
 ### 7.2 Shaping channels
@@ -547,9 +545,9 @@ This avoids cold-start artifacts where agents begin with zero banks and empty qu
 
 **Historical Policy Pool (HPP):** Anti-regression mechanism maintaining a pool of 10 past actor snapshots. Each episode, each agent is independently swapped to a historical snapshot with probability 0.20. This ensures agents always face a diverse opponent distribution, preventing coordination on degenerate equilibria. `seed_heuristic=false` — BC-seeding of the pool is disabled since behavioral cloning pretraining is off by default.
 
-**Entropy decay schedule:** Entropy coefficient decays from 0.08 to 0.025 over training to shift from exploration to exploitation.
+**Entropy decay schedule:** Entropy coefficient decays from `entropy_coef=0.08` to `entropy_coef_final=0.015` over training (`entropy_decay_frac=0.70` of `n_episodes`) to shift from exploration to exploitation while keeping a small floor that prevents late-training std collapse.
 
-**Reward normalization:** Per-agent EMA-based reward normalizer with `gae_min_std=0.1` prevents degenerate advantage estimates.
+**Reward normalization:** Per-agent EMA-based reward normalizer with `gae_min_std=0.15` prevents degenerate advantage estimates.
 
 ## 9. Economic and Financial Layers
 
