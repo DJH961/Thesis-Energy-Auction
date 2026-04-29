@@ -1,4 +1,4 @@
-# ETS MARL — Configuration v8.5
+# ETS MARL — Configuration v8.5.1
 # 8 learning agents, HAPPO sequential update, split Phase-1 bid/invest heads.
 
 simulation:
@@ -295,13 +295,14 @@ ppo:
   gae_lambda: 0.97
   clip_eps: 0.15
   entropy_coef: 0.08
-  entropy_coef_final: 0.005
+  entropy_coef_final: 0.015        # raised from 0.005 — prevents std collapse late in training
   entropy_decay_start: -1          # -1 = auto (5% of n_episodes)
   entropy_decay_window: -1         # -1 = auto (entropy_decay_frac × n_episodes)
   entropy_decay_frac: 0.70
   value_coef: 0.5
   max_grad_norm: 0.5
-  n_epochs: 5
+  n_epochs: 3                      # lowered from 5 — fewer epochs ⇒ less ratio drift
+                                   # per update; KL early-stop (target_kl) still bounds drift.
   mini_batch_size: 64
   episodes_per_update: 32
   long_run_episode_threshold: 20000
@@ -310,7 +311,9 @@ ppo:
     entropy_coef_final: 0.03
     episodes_per_update: 16
   normalize_advantages: true
-  log_std_min: -3.5
+  log_std_min: -3.0                # raised from -3.5 — keeps a small exploration floor
+                                   # (min raw σ ≈ 0.050 vs 0.030 before) without breaking
+                                   # convergence, which has been brittle in past runs.
   log_std_max: 0.0
   centralized_critic: true
   # Phase-1 split-head: bid (dims 0-1) → main critic; invest (dims 2-5) → invest critic.
@@ -328,6 +331,17 @@ ppo:
   critic_lr_decay: cosine
   critic_lr_min: 0.00005
   target_kl: 0.015
+  # Dual-clip PPO (Ye et al. 2020): caps the unbounded negative-advantage
+  # branch of the clipped surrogate when the importance ratio drifts.
+  # Without this, a single mini-batch sample with adv<0 and r=exp(log_ratio)
+  # large can drive policy_loss into the 1e6–1e8 range. c>1 (typical 3.0)
+  # bounds the loss as max(min(r·A, clip(r)·A), c·A) for adv<0; positive
+  # advantages are unaffected. Set to 0 to disable.
+  dual_clip_c: 3.0
+  # Numerical safety clamp on log(ratio_new/ratio_old) before exp(). The PPO
+  # clipped surrogate already enforces the trust region; this guard prevents
+  # ratio overflow and keeps the diagnostic actor-loss readout bounded.
+  log_ratio_clip: 10.0
   kl_anchor_beta: 0.0
   kl_anchor_decay_episodes: 0      # auto: 50% of n_episodes
   critic_extra_epochs: 6

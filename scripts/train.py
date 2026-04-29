@@ -371,6 +371,12 @@ def _print_training_legend():
     print("  │  Emiss      Mean annual emissions (Mt)")
     print("  │  Alloc      Mean annual allowances received from auction (Mt)")
     print("  │  Sf         Shortfall-years / total-years (compliance failures); e.g. ' 3/12'")
+    print("  │  Why(U/D/B/C) Per-episode compliance attribution year counts (mutually exclusive):")
+    print("  │               U = Under-bought, non-compliant   (obligation > alloc AND non-compliant)")
+    print("  │               D = Debt-cascade, non-compliant   (obligation ≤ alloc AND non-compliant — prior-year carry-forward debt)")
+    print("  │               B = Bank-covered                  (auction shortfall but compliance held via bank)")
+    print("  │               C = Sec-Covered                   (auction shortfall but compliance held via secondary buys)")
+    print("  │               Identity: U + D == Sf  (always)")
     print("  │  yr1€       Bid price (€/t) in year 1 of the episode")
     print("  │  yrN€       Bid price (€/t) in the final year of the episode")
     print("  │  avg€       Quantity-weighted mean bid price across all episode years")
@@ -1775,13 +1781,38 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         # Per-agent secondary buy/sell breakdown across the episode
         per_agent_sec_stats = []
+        # Per-agent compliance attribution. Mutually-exclusive year buckets
+        # so the column reads as a clean partition. Selling-into-shortfall
+        # is impossible by construction (see _settle_double_auction's
+        # max_sell = alloc + bank − emiss − carry_forward rule), so there
+        # is no "sold-into-short" bucket. Each year is classified by:
+        #   obligation_y    = realized_emissions[i] + old_carry_forward[i]
+        #   has_auction_gap = obligation_y > alloc[i]   (couldn't have
+        #                     been covered by this year's auction alone)
+        #   non_compliant   = shortfall[i] > 0          (after secondary)
+        #   net_sec_buy     = trade_qtys[i] > 0         (net secondary buyer)
+        # Buckets:
+        #   U (Under-bought, non-compliant)  : has_auction_gap AND non_compliant
+        #   D (Debt-cascade, non-compliant)  : (NOT has_auction_gap) AND non_compliant
+        #                                      ⇒ obligation_y ≤ alloc but bank
+        #                                        couldn't absorb prior-year
+        #                                        carry-forward debt
+        #   B (Bank-covered)                 : has_auction_gap AND compliant AND not net_sec_buy
+        #   C (Sec-Covered)                  : has_auction_gap AND compliant AND net_sec_buy
+        # Identity: U + D == Sf  for every agent, every episode.
+        per_agent_compliance_attr = []
         for i in range(n_total_agents):
             buy_vol = 0.0; sell_vol = 0.0
             buy_cost = 0.0; sell_rev = 0.0
             buy_years = 0; sell_years = 0
+            u_count = 0; d_count = 0; b_count = 0; c_count = 0
             for yl in env.episode_log:
                 tq = yl.get("trade_qtys", [0.0] * n_total_agents)
                 tc = yl.get("trade_costs", [0.0] * n_total_agents)
+                allocs_yl = yl.get("allocations", [0.0] * n_total_agents)
+                emiss_yl = yl.get("emissions", [0.0] * n_total_agents)
+                cf_yl = yl.get("old_carry_forward", [0.0] * n_total_agents)
+                shorts_yl = yl.get("shortfalls", [0.0] * n_total_agents)
                 if i < len(tq):
                     if tq[i] > 1e-6:
                         buy_vol += tq[i]
@@ -1791,12 +1822,37 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                         sell_vol += abs(tq[i])
                         sell_rev += abs(tc[i])
                         sell_years += 1
+                # Compliance attribution: examine this year for agent i.
+                if i < len(allocs_yl) and i < len(emiss_yl):
+                    cf_i = float(cf_yl[i]) if i < len(cf_yl) else 0.0
+                    obligation_y = float(emiss_yl[i]) + cf_i
+                    auction_gap = obligation_y - float(allocs_yl[i])
+                    sec_net_i = float(tq[i]) if i < len(tq) else 0.0
+                    short_i = float(shorts_yl[i]) if i < len(shorts_yl) else 0.0
+                    has_auction_gap = auction_gap > 1e-6
+                    non_compliant = short_i > 1e-6
+                    net_sec_buy = sec_net_i > 1e-6
+                    if non_compliant:
+                        if has_auction_gap:
+                            u_count += 1
+                        else:
+                            d_count += 1
+                    else:
+                        if has_auction_gap:
+                            if net_sec_buy:
+                                c_count += 1
+                            else:
+                                b_count += 1
+                        # else: no auction gap and compliant — quiet year
             buy_avg_px = buy_cost / buy_vol if buy_vol > 1e-6 else 0.0
             sell_avg_px = sell_rev / sell_vol if sell_vol > 1e-6 else 0.0
             per_agent_sec_stats.append({
                 "buy_vol": buy_vol, "sell_vol": sell_vol,
                 "buy_avg_px": buy_avg_px, "sell_avg_px": sell_avg_px,
                 "buy_years": buy_years, "sell_years": sell_years,
+            })
+            per_agent_compliance_attr.append({
+                "u": u_count, "d": d_count, "b": b_count, "c": c_count,
             })
 
         # Per-agent episode aggregates
@@ -2176,7 +2232,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             # ── Per-agent table ─────────────────────────────────────────
             print(thin)
             print(f"  {'':4}  {'Green':>16}  {'Emiss':>5} {'Alloc':>5}"
-                f" {'Sf':>5}  {'yr1€':>5} {'yrN€':>5} {'avg€':>5} {'lo€':>5} {'hi€':>5} {'BidMt':>6}"
+                f" {'Sf':>5} {'Why(U/D/B/C)':>13}  {'yr1€':>5} {'yrN€':>5} {'avg€':>5} {'lo€':>5} {'hi€':>5} {'BidMt':>6}"
                 f"  {'Rew':>8}  {'DiagPts(F/G/C)':>16}"
                   f"  {'ALoss':>7} {'CLoss':>7}"
                   f"  Secondary")
@@ -2188,6 +2244,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                 dg = g1 - g0
                 grn_str = f"{g0:3.0f}→{g1:3.0f}%({dg:+3.0f}pp)"
                 sf_str = f"{ep_shortfall_years[i]:2d}/{n_years_ep}"
+                attr_i = per_agent_compliance_attr[i]
+                why_str = f"{attr_i['u']:2d}/{attr_i['d']:2d}/{attr_i['b']:2d}/{attr_i['c']:2d}"
                 acc = ep_diag_accumulator[i]
                 nd = max(acc["count"], 1)
                 s_fin  = float(np.nan_to_num(acc["S_financial"] / nd, nan=0.0, posinf=1.0, neginf=0.0))
@@ -2214,7 +2272,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
                 print(f"  A{i+1}{act_mark}: {grn_str:>16}"
                                                 f"  {ep_mean_emiss[i]:5.2f} {ep_mean_alloc[i]:5.2f}"
-                                            f" {sf_str:>5}  {yr1_bid_per_agent[i]:5.0f} {yrN_bid_per_agent[i]:5.0f} {avg_bid_per_agent[i]:5.0f} {min_bid_per_agent[i]:5.0f} {max_bid_per_agent[i]:5.0f} {avg_bid_qty_per_agent[i]:6.2f}"
+                                            f" {sf_str:>5} {why_str:>13}  {yr1_bid_per_agent[i]:5.0f} {yrN_bid_per_agent[i]:5.0f} {avg_bid_per_agent[i]:5.0f} {min_bid_per_agent[i]:5.0f} {max_bid_per_agent[i]:5.0f} {avg_bid_qty_per_agent[i]:6.2f}"
                         f"  {ep_total_rewards_all[i]:8.1f}  {diag_str:>16}"
                       f"  {al_str:>7} {cl_str:>7}"
                       f"  {sec_str}")
@@ -2223,7 +2281,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             if n_bot_agents > 0:
                 print(thin)
                 print(f"  {'':4}  {'Green':>16}  {'Emiss':>5} {'Alloc':>5}"
-                    f" {'Sf':>5}  {'yr1€':>5} {'yrN€':>5} {'avg€':>5} {'lo€':>5} {'hi€':>5} {'BidMt':>6}"
+                    f" {'Sf':>5} {'Why(U/D/B/C)':>13}  {'yr1€':>5} {'yrN€':>5} {'avg€':>5} {'lo€':>5} {'hi€':>5} {'BidMt':>6}"
                     f"  {'Rew':>8}  Secondary")
                 for b in range(n_bot_agents):
                     j = n_agents + b
@@ -2232,6 +2290,8 @@ def train_one_seed(config: dict, seed: int, on_log=None):
                     dg = g1 - g0
                     grn_str = f"{g0:3.0f}→{g1:3.0f}%({dg:+3.0f}pp)"
                     sf_str = f"{ep_shortfall_years[j]:2d}/{n_years_ep}"
+                    attr_j = per_agent_compliance_attr[j]
+                    why_str_b = f"{attr_j['u']:2d}/{attr_j['d']:2d}/{attr_j['b']:2d}/{attr_j['c']:2d}"
 
                     # Secondary detail
                     ss_j = per_agent_sec_stats[j]
@@ -2244,7 +2304,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
                     print(f"  B{b+1} : {grn_str:>16}"
                           f"  {ep_mean_emiss[j]:5.2f} {ep_mean_alloc[j]:5.2f}"
-                          f" {sf_str:>5}  {yr1_bid_per_agent[j]:5.0f} {yrN_bid_per_agent[j]:5.0f} {avg_bid_per_agent[j]:5.0f} {min_bid_per_agent[j]:5.0f} {max_bid_per_agent[j]:5.0f} {avg_bid_qty_per_agent[j]:6.2f}"
+                          f" {sf_str:>5} {why_str_b:>13}  {yr1_bid_per_agent[j]:5.0f} {yrN_bid_per_agent[j]:5.0f} {avg_bid_per_agent[j]:5.0f} {min_bid_per_agent[j]:5.0f} {max_bid_per_agent[j]:5.0f} {avg_bid_qty_per_agent[j]:6.2f}"
                           f"  {ep_total_rewards_all[j]:8.1f}  {sec_str_b}")
 
             # ── Event board (separate visual block) ────────────────────
