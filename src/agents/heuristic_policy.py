@@ -168,10 +168,14 @@ def auction_action(
     qty_clipped = qty_mult_clipped * annual_need  # EUR-denominator for wtp_budget
 
     # --- Mid bid price — dual-ceiling WTP ---
-    # Economic ceiling: penalty + expected future price incentivises buying before penalty
-    expected_future_price = price_ma3
-    wtp_economic = market_anchor + urgency * max(0.0, penalty_rate + expected_future_price - market_anchor)
-    wtp_economic = min(wtp_economic, penalty_rate + expected_future_price - 1.0)
+    # Economic ceiling: linearly interpolate between current market price (urgency=0)
+    # and the inflation-adjusted penalty cap (urgency=1). Earlier formulations added
+    # `expected_future_price` (= price_ma3) on top of `penalty_rate`, which produced
+    # an unbounded MA3-feedback loop during burn-in: each clearing fed back into MA3
+    # and pushed WTP higher the next year, eventually pegging at price_max=250.
+    # The corrected formula keeps the penalty rate as the strict upper bound.
+    wtp_economic = market_anchor + urgency * max(0.0, penalty_rate - market_anchor)
+    wtp_economic = min(wtp_economic, penalty_rate - 1.0)
     # Budget ceiling: agent cannot commit more than max_compliance_share of available budget to compliance
     max_compliance_share = config.get("bots", {}).get("max_compliance_share", 0.70)
     wtp_budget = max_compliance_share * available / max(qty_clipped, 1e-6)
