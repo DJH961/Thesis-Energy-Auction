@@ -497,6 +497,8 @@ class _Heartbeat:
                 eta_str = ""
                 if last_ep is not None and last_ep > 0:
                     n_eps = meta.get("n_eps")
+                    first_t: float | None = None
+                    first_ep: int | None = None
                     with self._lock:
                         entry = self._jobs.get((variant, seed))
                         if entry is not None:
@@ -506,14 +508,18 @@ class _Heartbeat:
                             entry["last_ep"] = last_ep
                             first_t = entry["first_seen_t"]
                             first_ep = entry["first_seen_ep"]
-                    elapsed = now - first_t
-                    delta_eps = last_ep - first_ep
-                    if delta_eps > 0 and elapsed > 0 and n_eps:
-                        sec_per_ep = elapsed / delta_eps
-                        remaining = max(0, n_eps - last_ep) * sec_per_ep
-                        eta_running.append(remaining)
-                        full_job_estimates.append(n_eps * sec_per_ep)
-                        eta_str = f" | ETA {_format_eta(remaining)}"
+                    # ``entry`` may be None if the job was removed concurrently
+                    # by the launcher between the snapshot read and now; in
+                    # that case skip the ETA update (the job is already done).
+                    if first_t is not None and first_ep is not None:
+                        elapsed = now - first_t
+                        delta_eps = last_ep - first_ep
+                        if delta_eps > 0 and elapsed > 0 and n_eps:
+                            sec_per_ep = elapsed / delta_eps
+                            remaining = max(0, n_eps - last_ep) * sec_per_ep
+                            eta_running.append(remaining)
+                            full_job_estimates.append(n_eps * sec_per_ep)
+                            eta_str = f" | ETA {_format_eta(remaining)}"
 
                 if line:
                     line = line + eta_str
