@@ -47,13 +47,16 @@ def test_default_threads_per_process_policy(cores, expected):
     assert _default_threads_per_process(arch) == expected
 
 
-def test_configure_compute_explicit_num_threads_applied():
+def test_configure_compute_explicit_num_threads_applied(monkeypatch):
+    # Wipe so configure_compute writes fresh values rather than respecting
+    # a pre-existing user setting.
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "ETS_NUM_THREADS"):
+        monkeypatch.delenv(k, raising=False)
+
     summary = configure_compute(num_threads=2, quiet=True)
     assert summary["num_threads"] == 2
-    assert os.environ["OMP_NUM_THREADS"] == os.environ.get("OMP_NUM_THREADS")
-    # Either the call set it or a previous user value was respected; in either
-    # case the value must parse as a positive int.
-    assert int(os.environ["OMP_NUM_THREADS"]) >= 1
+    assert os.environ["OMP_NUM_THREADS"] == "2"
+    assert os.environ["MKL_NUM_THREADS"] == "2"
 
     import torch
     # set_num_threads is a global setting; just verify it took at least one
