@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.environment.ets_environment import ETSEnvironment
 from src.agents.ppo_agent import PPOAgent
 from src.utils.preflight import run_preflight_checks
+from src.utils.compute_setup import configure_compute, detect_architecture
 import src.agents.heuristic_policy as heuristic_policy
 
 
@@ -2435,11 +2436,90 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     print(f"\nDone — seed {seed}. Logs: {ep_path}, {yr_path}")
 
 
+def _run_seed_subprocess(config_path: str, seed: int, num_threads: int) -> int:
+    """Re-launch ``scripts/train.py`` for a single seed with a thread budget.
+
+    Used when ``--parallel-seeds N>1`` is requested. Each child runs the
+    standard ``train_one_seed`` path so per-seed RNG, logs, and checkpoints
+    are bit-identical to a sequential invocation; the only difference is that
+    ``ETS_NUM_THREADS`` is set so the child's BLAS pool uses
+    ``total_cores // N`` threads instead of the auto-detected default.
+    """
+    import subprocess
+
+    env = os.environ.copy()
+    env["ETS_NUM_THREADS"] = str(max(1, int(num_threads)))
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--config", config_path,
+        "--seed", str(seed),
+        "--parallel-seeds", "1",  # children must not re-fork
+    ]
+    return subprocess.call(cmd, env=env)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train ETS MARL (PPO, two-phase)")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--seed", type=int, nargs="+", default=[42])
+    parser.add_argument(
+        "--parallel-seeds", type=int, default=1,
+        help=(
+            "Run multiple seeds concurrently in independent subprocesses (default: 1). "
+            "Each seed remains numerically identical to a sequential run; only the "
+            "process layout changes. Use this on multi-core machines (e.g. Azure "
+            "Standard_D16ds_v5) to lift CPU utilisation. Ignored when only one seed "
+            "is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--num-threads", type=int, default=None,
+        help=(
+            "Override the per-process intra-op thread count. When omitted, an "
+            "architecture-aware default is chosen (see src/utils/compute_setup.py). "
+            "Equivalent to setting the ETS_NUM_THREADS env var."
+        ),
+    )
     args = parser.parse_args()
+
+    # Resolve compute layout *before* heavy tensor work begins. We do not
+    # apply the default per-process thread count yet when running multiple
+    # seeds in parallel — each child gets its share via ETS_NUM_THREADS.
+    n_seeds = len(args.seed)
+    parallel_seeds = max(1, int(args.parallel_seeds))
+    if parallel_seeds > 1 and n_seeds > 1:
+        arch = detect_architecture()
+        total = arch.get("physical_cores") or arch.get("logical_cores") or 1
+        # Don't try to spawn more workers than seeds; never exceed core count.
+        n_workers = min(parallel_seeds, n_seeds, max(1, total))
+        per_proc = max(1, total // n_workers)
+        # Apply a launcher-side thread budget for any incidental work the
+        # parent does (e.g. config parsing). Children get their own budget
+        # via ETS_NUM_THREADS — see _run_seed_subprocess.
+        configure_compute(num_threads=1, total_threads=total)
+        print(
+            f"[compute] launching {n_workers} parallel seeds "
+            f"({per_proc} thread(s) each, {total} cores total)",
+            file=sys.stderr,
+        )
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        rcs = []
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = [
+                pool.submit(_run_seed_subprocess, args.config, seed, per_proc)
+                for seed in args.seed
+            ]
+            for fut in as_completed(futures):
+                rcs.append(fut.result())
+        if any(rc != 0 for rc in rcs):
+            sys.exit(1)
+        return
+
+    # Single-process path (default): configure threads once, then run each
+    # seed sequentially as before.
+    configure_compute(num_threads=args.num_threads)
 
     config = load_config(args.config)
     for seed in args.seed:
