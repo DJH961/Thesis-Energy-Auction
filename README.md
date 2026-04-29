@@ -297,9 +297,17 @@ To keep the parent terminal readable while many jobs run concurrently,
 each subprocess's full stdout+stderr is captured to
 `<output_dir>/<variant>/run_<variant>_s<seed>.log`. The terminal only
 shows short progress lines (`[START]` / `[LIVE]` heartbeat / `[DONE]`).
-Heartbeats sample the last informative log line from each running job
-every `--heartbeat-interval` seconds (default 60); pass `--quiet` to
-disable them entirely.
+
+Each `[LIVE]` line is a one-line training summary per running job, parsed
+from the per-episode CSV — episode progress, clearing-price trajectory,
+mean reward, compliance rate, green-investment progress:
+
+```
+[sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | R̄ -3.2→-1.8 | comp 87% | green 31→44%
+```
+
+Heartbeats fire every `--heartbeat-interval` seconds (default 60); pass
+`--quiet` to disable them.
 
 Per-seed RNG and CSVs are bit-identical to a sequential
 `train.py --config <variant>.yaml --seed S --run-tag <variant>`

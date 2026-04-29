@@ -88,6 +88,141 @@ class TestTailLastMeaningfulLine:
         assert line == "[Ep 100/1000  reward=12.3]"
 
 
+class TestSummarizeCsv:
+    def _write_csv(self, path, rows, headers):
+        import csv as _csv
+        with open(path, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+
+    def test_returns_none_for_missing_file(self, sweep_module, tmp_path):
+        line, init = sweep_module._summarize_csv(str(tmp_path / "nope.csv"))
+        assert line is None
+        assert init is None
+
+    def test_returns_none_for_header_only(self, sweep_module, tmp_path):
+        p = tmp_path / "x.csv"
+        p.write_text("episode,clearing_price_last,reward_A1\n")
+        line, _ = sweep_module._summarize_csv(str(p))
+        assert line is None
+
+    def test_basic_summary_shape(self, sweep_module, tmp_path):
+        p = tmp_path / "x.csv"
+        headers = [
+            "episode", "clearing_price_last", "ep_mean_clearing_price",
+            "reward_A1", "reward_A2",
+            "green_frac_A1", "green_frac_A2",
+            "shortfall_A1", "shortfall_A2",
+        ]
+        rows = []
+        for ep in range(0, 1200, 100):
+            rows.append({
+                "episode": ep,
+                "clearing_price_last": 75 + ep * 0.05,
+                "ep_mean_clearing_price": 70 + ep * 0.04,
+                "reward_A1": -3.5 + ep * 0.001,
+                "reward_A2": -3.0 + ep * 0.001,
+                "green_frac_A1": 0.30 + ep * 0.0001,
+                "green_frac_A2": 0.32 + ep * 0.0001,
+                "shortfall_A1": 0.0 if ep > 200 else 0.5,
+                "shortfall_A2": 0.0,
+            })
+        self._write_csv(p, rows, headers)
+        line, init = sweep_module._summarize_csv(str(p), n_episodes=10000)
+        assert line is not None
+        assert "Ep 1100/10000" in line
+        assert "%" in line  # progress percent
+        assert "px 75→" in line  # initial→current arrow with rounded 75
+        assert "R̄" in line
+        assert "comp" in line  # compliance rate present
+        assert "green" in line
+        assert init is not None
+        assert init["episode"] == "0"
+
+    def test_handles_partial_trailing_line(self, sweep_module, tmp_path):
+        # Simulate a write race: last line is half-written.
+        p = tmp_path / "x.csv"
+        p.write_text(
+            "episode,clearing_price_last,reward_A1,green_frac_A1,shortfall_A1\n"
+            "0,75,-3.0,0.30,0.0\n"
+            "100,80,-2.5,0.35,0.0\n"
+            "200,85,"  # truncated mid-row
+        )
+        line, _ = sweep_module._summarize_csv(str(p))
+        assert line is not None
+        # Should fall back to the last *complete* row (episode 100).
+        assert "Ep 100" in line
+
+    def test_compliance_rate_zero_and_full(self, sweep_module, tmp_path):
+        headers = ["episode", "shortfall_A1", "shortfall_A2", "reward_A1", "reward_A2",
+                   "clearing_price_last", "green_frac_A1", "green_frac_A2"]
+        # All non-compliant.
+        p1 = tmp_path / "all_default.csv"
+        self._write_csv(p1, [
+            {"episode": i, "shortfall_A1": 5.0, "shortfall_A2": 5.0,
+             "reward_A1": -10.0, "reward_A2": -10.0,
+             "clearing_price_last": 100, "green_frac_A1": 0.5, "green_frac_A2": 0.5}
+            for i in range(50)
+        ], headers)
+        line1, _ = sweep_module._summarize_csv(str(p1))
+        assert "comp 0%" in line1
+
+        # All compliant.
+        p2 = tmp_path / "all_ok.csv"
+        self._write_csv(p2, [
+            {"episode": i, "shortfall_A1": 0.0, "shortfall_A2": 0.0,
+             "reward_A1": 1.0, "reward_A2": 1.0,
+             "clearing_price_last": 100, "green_frac_A1": 0.5, "green_frac_A2": 0.5}
+            for i in range(50)
+        ], headers)
+        line2, _ = sweep_module._summarize_csv(str(p2))
+        assert "comp 100%" in line2
+
+    def test_summary_under_200_chars(self, sweep_module, tmp_path):
+        # With 8 agents (largest realistic shape), the summary still fits.
+        n_agents = 8
+        headers = ["episode", "clearing_price_last", "ep_mean_clearing_price"]
+        for i in range(n_agents):
+            headers += [f"reward_A{i+1}", f"green_frac_A{i+1}", f"shortfall_A{i+1}"]
+        rows = []
+        for ep in range(0, 5000, 100):
+            row = {"episode": ep, "clearing_price_last": 100 + ep * 0.01,
+                   "ep_mean_clearing_price": 95 + ep * 0.01}
+            for i in range(n_agents):
+                row[f"reward_A{i+1}"] = -2.0 + ep * 0.0001
+                row[f"green_frac_A{i+1}"] = 0.40 + ep * 0.00005
+                row[f"shortfall_A{i+1}"] = 0.0
+            rows.append(row)
+        p = tmp_path / "big.csv"
+        self._write_csv(p, rows, headers)
+        line, _ = sweep_module._summarize_csv(str(p), n_episodes=100000)
+        assert line is not None
+        assert len(line) <= 200, f"summary too long: {len(line)} chars: {line}"
+
+    def test_initial_row_caching_anchors_arrow(self, sweep_module, tmp_path):
+        # Even if the tail window does not contain row 0, the cached initial_row
+        # should be respected to keep the "px X→Y" arrow stable across heartbeats.
+        headers = ["episode", "clearing_price_last", "reward_A1",
+                   "green_frac_A1", "shortfall_A1"]
+        p = tmp_path / "x.csv"
+        rows = [{"episode": i, "clearing_price_last": 50 + i * 0.5,
+                 "reward_A1": -5.0 + i * 0.01,
+                 "green_frac_A1": 0.20, "shortfall_A1": 0.0}
+                for i in range(0, 3000)]
+        self._write_csv(p, rows, headers)
+        # Provide a synthetic "first-ever" cached row that differs from
+        # whatever the tail window would pick.
+        cached = {"episode": "0", "clearing_price_last": "10",
+                  "reward_A1": "-99.0", "green_frac_A1": "0.05", "shortfall_A1": "0.0"}
+        line, init = sweep_module._summarize_csv(
+            str(p), n_episodes=10000, initial_row=cached, tail_bytes=1024,
+        )
+        assert "px 10→" in line  # uses the cached initial value, not the tail
+        assert init is cached  # returned unchanged for caller to keep caching
+
+
 class TestHeartbeat:
     def test_emits_tail_for_registered_jobs(self, sweep_module, tmp_path):
         import io
@@ -145,3 +280,62 @@ class TestHeartbeat:
         hb.start()
         hb.stop()
         hb.stop()  # must not raise
+
+    def test_prefers_csv_summary_over_log_tail(self, sweep_module, tmp_path):
+        """When a CSV is available, the heartbeat shows structured metrics."""
+        import io
+        import csv as _csv
+
+        log_path = tmp_path / "run_v_s1.log"
+        log_path.write_text("[some boring trainer line]\n")
+        csv_path = tmp_path / "training_log_v_s1.csv"
+        with open(csv_path, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=[
+                "episode", "clearing_price_last", "ep_mean_clearing_price",
+                "reward_A1", "green_frac_A1", "shortfall_A1",
+            ])
+            w.writeheader()
+            for ep in range(0, 500, 100):
+                w.writerow({
+                    "episode": ep, "clearing_price_last": 75 + ep * 0.1,
+                    "ep_mean_clearing_price": 70 + ep * 0.1,
+                    "reward_A1": -3.0 + ep * 0.001,
+                    "green_frac_A1": 0.30 + ep * 0.0001,
+                    "shortfall_A1": 0.0,
+                })
+
+        buf = io.StringIO()
+        hb = sweep_module._Heartbeat(interval=0.05, stream=buf)
+        hb.add("v", 1, str(log_path), csv_path=str(csv_path), n_episodes=1000)
+        hb.start()
+        try:
+            time.sleep(0.25)
+        finally:
+            hb.stop()
+
+        out = buf.getvalue()
+        # Structured fields, NOT the boring log tail.
+        assert "Ep 400/1000" in out
+        assert "px 75" in out
+        assert "comp" in out
+        assert "boring trainer line" not in out
+
+    def test_falls_back_to_log_when_csv_missing(self, sweep_module, tmp_path):
+        """If CSV does not exist yet (e.g. during BC pretrain), tail the log."""
+        import io
+        log_path = tmp_path / "run_v_s2.log"
+        log_path.write_text("[BC pretrain epoch 5/10  loss=0.23]\n")
+        buf = io.StringIO()
+        hb = sweep_module._Heartbeat(interval=0.05, stream=buf)
+        hb.add(
+            "v", 2, str(log_path),
+            csv_path=str(tmp_path / "does_not_exist.csv"),
+            n_episodes=1000,
+        )
+        hb.start()
+        try:
+            time.sleep(0.2)
+        finally:
+            hb.stop()
+        out = buf.getvalue()
+        assert "BC pretrain epoch 5/10" in out
