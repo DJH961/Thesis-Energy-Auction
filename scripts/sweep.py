@@ -18,22 +18,28 @@ subprocess via ``ProcessPoolExecutor``. Each subprocess:
 The parent terminal only shows short, structured progress lines:
 
     [sweep] [START 1/17] reference s=1  → results/.../reference/run_reference_s1.log
-    [sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | sec 60→78 (m41%) | comp 87% | green 31→44% | R̄ -3.2→-1.8 | ETA 4h12m
-    [sweep] [ETA total ≈ 18h33m] (3/17 done, 4 running, 10 queued)
+    [sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | und 2/12 | sec 60→78 (μ70, m41%) | comp 95% | green 31→44% | R̄ -1.8 | ETA 4h12m
+    [sweep] [ETA total ≈ 18h33m, elapsed 0h45m] (3/17 done, 4 running, 10 queued)
     [sweep] [DONE  1/17 OK ] reference s=1
 
 Heartbeats are printed every ``--heartbeat-interval`` seconds (default
-60s). Each heartbeat parses the per-episode CSV
-(``training_log_<variant>_s<seed>.csv``) to produce a single-line
-training summary per running job. Field order — episode, price,
-secondary market, compliance, greening, reward — is intentional:
+300s = 5 min). The very first tick fires early (~60s) so the user gets
+a quick confirmation things are running, then the loop settles into
+the configured interval. Each heartbeat parses the per-year CSV
+(``year_log_<variant>_s<seed>.csv``) to produce a single-line summary
+of the **last completed episode** — year-1 vs year-N (clearing price,
+secondary price, compliance, green share) plus that episode's
+across-years mean — followed by a last-50-episode mean reward read
+from ``training_log_<variant>_s<seed>.csv``. Field order — episode,
+price, secondary, compliance, greening, reward — is intentional:
 physical / market signals first, learning-quality reward last. A
 per-job ``ETA`` is appended once enough episodes have elapsed to
 estimate a rate; in multi-job sweeps an aggregate ``ETA total`` banner
-is printed once per tick combining the slowest running job with the
-queued backlog at the configured worker count. When the CSV does not
-exist yet (e.g. during behavioural-cloning pretraining), the heartbeat
-falls back to the last informative line of the captured log file.
+(with sweep-wide elapsed wall time) is printed once per tick combining
+the slowest running job with the queued backlog at the configured
+worker count. When the year CSV does not exist yet (e.g. during
+behavioural-cloning pretraining), the heartbeat falls back to the last
+informative line of the captured log file.
 
 Use ``--quiet`` to suppress heartbeats entirely.
 
@@ -151,103 +157,73 @@ def _tail_last_meaningful_line(path: str, max_bytes: int = 16384) -> str | None:
     return None
 
 
-def _summarize_csv(
-    csv_path: str,
-    *,
-    n_episodes: int | None = None,
-    initial_row: dict | None = None,
-    tail_bytes: int = 65536,
-    tail_rows: int = 50,
-) -> tuple[str | None, dict | None, int | None]:
-    """Build a one-line training-progress summary from a per-episode CSV.
+def _read_csv_tail(
+    csv_path: str, tail_bytes: int
+) -> tuple[list[str] | None, list[dict]]:
+    """Read header + tail of a CSV file.
 
-    Reads the CSV header + the last ``tail_bytes`` of the file (so we can
-    cheaply re-summarise even very long runs without re-parsing 100k rows
-    every heartbeat). Returns ``(line, initial_row, last_ep)``:
-
-    * ``line`` — the formatted summary string, e.g.::
-
-          Ep 1200/100000 (1.2%) | px 75→142 (μ128) | sec 60→78 (m41%) | comp 87% | green 31→44% | R̄ -3.2→-1.8
-
-      or ``None`` if the file is missing / has no data rows yet. The
-      field order — episode, price, secondary, compliance, green,
-      reward — is intentional: physical / market signals first,
-      learning-quality reward last.
-
-    * ``initial_row`` — the first complete data row (caller should cache
-      and pass back on later calls so initial-vs-current arrows stay
-      anchored to the *true* episode-0 values, not to whatever rows the
-      tail window happens to contain).
-
-    * ``last_ep`` — the most recent episode index seen in the CSV, or
-      ``None`` when no usable rows exist. Used by the heartbeat to
-      compute per-job and aggregate ETAs.
-
-    Robust to: missing file, header-only file, partial trailing line,
-    rows with empty/non-numeric cells.
+    Returns ``(header_columns, parsed_rows)``. Returns ``(None, [])`` when
+    the file is missing or empty. Skips partial trailing lines and any
+    row whose first cell is not a signed integer (the ``episode`` column
+    is always an int in our CSVs).
     """
     try:
         size = os.path.getsize(csv_path)
         if size == 0:
-            return None, initial_row, None
+            return None, []
         with open(csv_path, "rb") as f:
-            # Always read the header.
             header_line = f.readline()
             if not header_line:
-                return None, initial_row, None
+                return None, []
             header = header_line.decode("utf-8", errors="replace").rstrip("\r\n").split(",")
-            # If the file is small, just read the rest. Otherwise tail-read.
             if size <= len(header_line) + tail_bytes:
                 body = f.read()
             else:
                 f.seek(max(len(header_line), size - tail_bytes))
-                # Discard the (likely partial) first line of the window.
-                f.readline()
+                f.readline()  # discard partial first line of window
                 body = f.read()
         body_text = body.decode("utf-8", errors="replace")
     except OSError:
-        return None, initial_row, None
+        return None, []
 
-    # Parse rows.
     import csv as _csv
     import io as _io
 
-    reader = _csv.reader(_io.StringIO(body_text))
     rows: list[dict] = []
-    for raw in reader:
-        # Skip header echoes, partial trailing lines (fewer cells than the
-        # header), and any row whose first cell is not a digit (the
-        # ``episode`` column is always an int).
+    for raw in _csv.reader(_io.StringIO(body_text)):
         if len(raw) != len(header):
             continue
         ep_cell = raw[0] if raw else ""
         if not ep_cell or ep_cell == "episode" or not ep_cell.lstrip("-").isdigit():
             continue
         rows.append(dict(zip(header, raw)))
-    if not rows:
-        return None, initial_row, None
+    return header, rows
 
-    # If we don't yet have the very first row cached, try to recover it by
-    # reading the second line of the file (header-skipping).
-    if initial_row is None:
-        try:
-            with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
-                first_reader = _csv.DictReader(f)
-                for r in first_reader:
-                    if r.get("episode") not in (None, "", "episode"):
-                        initial_row = r
-                        break
-        except OSError:
-            initial_row = rows[0]
 
-    # Use the last ``tail_rows`` rows for "current" averages.
-    recent = rows[-tail_rows:]
+def _summarize_csv(
+    year_csv: str,
+    *,
+    training_csv: str | None = None,
+    n_episodes: int | None = None,
+    tail_bytes: int = 524288,
+    reward_window: int = 50,
+) -> tuple[str | None, int | None]:
+    """Build a one-line training-progress summary.
 
-    # Discover dynamic agent-count from columns present in the header.
-    n_total = sum(
-        1 for h in header
-        if h.startswith("reward_A") and h[len("reward_A"):].isdigit()
-    )
+    Year-level signals (price, secondary price, compliance, green) are
+    read from ``year_csv`` and report the **last completed episode**:
+    year-1 vs year-12 plus the episode-mean across years 1..12. Reward is
+    the mean across agents over the last ``reward_window`` episodes from
+    ``training_csv`` (no arrow — the comparison is against the previous
+    heartbeat line).
+
+    Returns ``(line, last_ep)``. ``line`` is ``None`` when the year CSV
+    has no usable rows yet; ``last_ep`` is the most recent episode index
+    seen, or ``None``.
+    """
+    header, yr_rows = _read_csv_tail(year_csv, tail_bytes)
+    if header is None or not yr_rows:
+        return None, None
 
     def _f(d: dict, key: str, default: float = float("nan")) -> float:
         v = d.get(key)
@@ -259,58 +235,122 @@ def _summarize_csv(
             return default
 
     def _mean(vals: list[float]) -> float:
-        clean = [v for v in vals if not (v != v)]  # drop NaN
+        clean = [v for v in vals if v == v]  # drop NaN
         return sum(clean) / len(clean) if clean else float("nan")
 
-    # Episode counter.
-    last_ep = int(_f(rows[-1], "episode", 0))
+    def _ok(x: float) -> bool:
+        return x == x  # not NaN
 
-    # --- Price: initial → recent-mean (and recent-mean across years). ---
-    price_init = _f(initial_row or rows[0], "clearing_price_last")
-    price_now = _mean([_f(r, "clearing_price_last") for r in recent])
-    price_mean_yr = _mean([_f(r, "ep_mean_clearing_price") for r in recent])
+    # Pick the most recent COMPLETE episode (one that has at least year 1
+    # and year max). Walk back from the last row, group by episode.
+    last_row_ep = int(_f(yr_rows[-1], "episode", -1))
+    if last_row_ep < 0:
+        return None, None
+    # Find the last episode whose final-year row is present. We define
+    # "final" as the maximum ``year`` value seen for that episode in the
+    # tail window, falling back to whatever years are available.
+    by_ep: dict[int, list[dict]] = {}
+    for r in yr_rows:
+        ep = int(_f(r, "episode", -1))
+        if ep < 0:
+            continue
+        by_ep.setdefault(ep, []).append(r)
+    if not by_ep:
+        return None, None
+    target_ep = max(by_ep.keys())
+    ep_rows = sorted(by_ep[target_ep], key=lambda r: int(_f(r, "year", 0)))
+    if not ep_rows:
+        return None, None
+    last_ep = target_ep
 
-    # --- Secondary market: avg price (initial → recent) + match rate. ---
-    sec_px_init = _f(initial_row or rows[0], "secondary_avg_price")
-    sec_px_now = _mean([_f(r, "secondary_avg_price") for r in recent])
-    sec_match = _mean([_f(r, "secondary_match_rate") for r in recent])
+    # Discover agent-count from the year_log header.
+    n_total = sum(
+        1 for h in header
+        if h.startswith("reward_A") and h[len("reward_A"):].isdigit()
+    )
 
-    # --- Per-agent metrics: average over agents and over the recent window. ---
-    if n_total > 0:
-        # Reward (initial single-episode mean across agents → recent mean).
-        r_init_per_agent = [_f(initial_row or rows[0], f"reward_A{i+1}") for i in range(n_total)]
-        r_init = _mean(r_init_per_agent)
-        r_now_vals: list[float] = []
-        for r in recent:
-            r_now_vals.append(_mean([_f(r, f"reward_A{i+1}") for i in range(n_total)]))
-        r_now = _mean(r_now_vals)
+    y1_row = ep_rows[0]
+    y12_row = ep_rows[-1]
 
-        # Greening (mean across agents, initial vs recent).
-        g_init = _mean([_f(initial_row or rows[0], f"green_frac_A{i+1}") for i in range(n_total)])
-        g_now_vals: list[float] = []
-        for r in recent:
-            g_now_vals.append(_mean([_f(r, f"green_frac_A{i+1}") for i in range(n_total)]))
-        g_now = _mean(g_now_vals)
+    def _row_green(r: dict) -> float:
+        if n_total == 0:
+            return float("nan")
+        return _mean([_f(r, f"green_frac_A{i+1}") for i in range(n_total)])
 
-        # Compliance rate over the recent window: fraction of (agent, episode)
-        # cells where shortfall ≈ 0. Tolerates tiny float dust.
+    def _row_comp(r: dict) -> float:
+        if n_total == 0:
+            return float("nan")
         compliant = 0
         total = 0
-        for r in recent:
-            for i in range(n_total):
-                v = _f(r, f"shortfall_A{i+1}", default=float("nan"))
-                if v != v:
-                    continue
-                total += 1
-                if v <= 1e-6:
-                    compliant += 1
-        comp_rate = (compliant / total) if total > 0 else float("nan")
-    else:
-        r_init = r_now = g_init = g_now = comp_rate = float("nan")
+        for i in range(n_total):
+            v = _f(r, f"shortfall_A{i+1}")
+            if not _ok(v):
+                continue
+            total += 1
+            if v <= 1e-6:
+                compliant += 1
+        return (compliant / total) if total > 0 else float("nan")
 
-    # --- Format pieces (skip cleanly when a number is NaN). ---
-    # Field order, by user preference: episode | price | secondary
-    # market | compliance | greening | reward.
+    # Year-1 / Year-N / episode-mean per metric.
+    px_y1 = _f(y1_row, "clearing_price")
+    px_yn = _f(y12_row, "clearing_price")
+    px_mu = _mean([_f(r, "clearing_price") for r in ep_rows])
+
+    sec_y1 = _f(y1_row, "secondary_price")
+    sec_yn = _f(y12_row, "secondary_price")
+    sec_mu = _mean([_f(r, "secondary_price") for r in ep_rows])
+
+    g_y1 = _row_green(y1_row)
+    g_yn = _row_green(y12_row)
+
+    c_mu = _mean([_row_comp(r) for r in ep_rows])
+
+    # Auction undersubscription count: years where total demand
+    # (Σ bid_qty_mult_i × estimate_need_i) is below the year's
+    # ``auction_volume`` supply. Reported as ``und K/N`` (K
+    # undersubscribed years out of N years in the episode).
+    und_count = 0
+    und_total = 0
+    for r in ep_rows:
+        supply = _f(r, "auction_volume")
+        if not _ok(supply) or supply <= 0:
+            continue
+        demand = 0.0
+        any_bid = False
+        for i in range(n_total):
+            mult = _f(r, f"bid_qty_mult_A{i+1}")
+            need = _f(r, f"estimate_need_A{i+1}")
+            if _ok(mult) and _ok(need):
+                demand += mult * need
+                any_bid = True
+        if not any_bid:
+            continue
+        und_total += 1
+        if demand < supply:
+            und_count += 1
+
+    # Reward: last-N episodes mean across agents (from training CSV).
+    r_now: float = float("nan")
+    sec_match: float = float("nan")
+    if training_csv is not None:
+        _ep_header, ep_rows_train = _read_csv_tail(training_csv, tail_bytes)
+        if _ep_header and ep_rows_train:
+            n_total_train = sum(
+                1 for h in _ep_header
+                if h.startswith("reward_A") and h[len("reward_A"):].isdigit()
+            )
+            recent = ep_rows_train[-reward_window:]
+            if n_total_train > 0:
+                r_now_vals: list[float] = []
+                for r in recent:
+                    r_now_vals.append(
+                        _mean([_f(r, f"reward_A{i+1}") for i in range(n_total_train)])
+                    )
+                r_now = _mean(r_now_vals)
+            # Match rate from the latest episode of the training CSV.
+            sec_match = _f(ep_rows_train[-1], "secondary_match_rate")
+
+    # Format. Field order: Ep | px | sec | comp | green | R̄.
     parts: list[str] = []
     if n_episodes and n_episodes > 0:
         pct = 100.0 * last_ep / n_episodes
@@ -318,34 +358,39 @@ def _summarize_csv(
     else:
         parts.append(f"Ep {last_ep}")
 
-    def _ok(x: float) -> bool:
-        return x == x  # not NaN
+    if _ok(px_y1) and _ok(px_yn):
+        s = f"px {px_y1:.0f}→{px_yn:.0f}"
+        if _ok(px_mu):
+            s += f" (μ{px_mu:.0f})"
+        parts.append(s)
 
-    if _ok(price_init) and _ok(price_now):
-        if _ok(price_mean_yr):
-            parts.append(f"px {price_init:.0f}→{price_now:.0f} (μ{price_mean_yr:.0f})")
+    if und_total > 0:
+        parts.append(f"und {und_count}/{und_total}")
+
+    if _ok(sec_y1) or _ok(sec_yn):
+        if _ok(sec_y1) and _ok(sec_yn):
+            s = f"sec {sec_y1:.0f}→{sec_yn:.0f}"
         else:
-            parts.append(f"px {price_init:.0f}→{price_now:.0f}")
-    # Secondary: prefer initial→recent arrow when both prices are defined,
-    # else fall back to whichever side is present; always append match rate
-    # if it's known. "m" = match rate (fraction of buy/sell volume that
-    # actually crossed in the double auction).
-    if _ok(sec_px_now):
-        if _ok(sec_px_init):
-            sec_str = f"sec {sec_px_init:.0f}→{sec_px_now:.0f}"
-        else:
-            sec_str = f"sec {sec_px_now:.0f}"
+            s = f"sec {sec_yn if _ok(sec_yn) else sec_y1:.0f}"
+        extra: list[str] = []
+        if _ok(sec_mu):
+            extra.append(f"μ{sec_mu:.0f}")
         if _ok(sec_match):
-            sec_str += f" (m{sec_match*100:.0f}%)"
-        parts.append(sec_str)
-    if _ok(comp_rate):
-        parts.append(f"comp {comp_rate*100:.0f}%")
-    if _ok(g_init) and _ok(g_now):
-        parts.append(f"green {g_init*100:.0f}→{g_now*100:.0f}%")
-    if _ok(r_init) and _ok(r_now):
-        parts.append(f"R̄ {r_init:+.1f}→{r_now:+.1f}")
+            extra.append(f"m{sec_match*100:.0f}%")
+        if extra:
+            s += f" ({', '.join(extra)})"
+        parts.append(s)
 
-    return " | ".join(parts), initial_row, last_ep
+    if _ok(c_mu):
+        parts.append(f"comp {c_mu*100:.0f}%")
+
+    if _ok(g_y1) and _ok(g_yn):
+        parts.append(f"green {g_y1*100:.0f}→{g_yn*100:.0f}%")
+
+    if _ok(r_now):
+        parts.append(f"R̄ {r_now:+.1f}")
+
+    return " | ".join(parts), last_ep
 
 
 def _format_eta(seconds: float) -> str:
@@ -389,13 +434,22 @@ class _Heartbeat:
         *,
         n_workers: int = 1,
         total_jobs: int | None = None,
+        first_interval: float | None = None,
     ):
         # Floor the interval to a small positive value to keep the loop sane
         # at near-zero settings (e.g. unit tests) without blocking forever.
         self.interval = max(0.05, float(interval))
+        # First-tick interval: a single early heartbeat so the user gets
+        # confirmation things are moving without flooding the terminal.
+        # Defaults to min(60s, interval); never larger than ``interval``.
+        if first_interval is None:
+            fi = min(60.0, self.interval)
+        else:
+            fi = max(0.05, float(first_interval))
+        self.first_interval = min(fi, self.interval)
         self._lock = threading.Lock()
-        # (variant, seed) -> {"log": str, "csv": str|None, "n_eps": int|None,
-        #                     "initial_row": dict|None,
+        # (variant, seed) -> {"log": str, "csv": str|None, "csv_year": str|None,
+        #                     "n_eps": int|None,
         #                     "first_seen_t": float|None, "first_seen_ep": int|None,
         #                     "last_ep": int|None}
         self._jobs: dict[tuple[str, int], dict] = {}
@@ -412,6 +466,10 @@ class _Heartbeat:
         self._n_workers = max(1, int(n_workers))
         self._total_jobs = int(total_jobs) if total_jobs is not None else None
         self._completed_jobs = 0
+        # Sweep wall-clock start; printed alongside the aggregate ETA banner
+        # as ``elapsed`` so the user always sees how long the sweep has been
+        # running, not just how much remains.
+        self._start_time = time.time()
 
     def set_completed(self, completed: int) -> None:
         """Record how many jobs the launcher has finished (for ETA math)."""
@@ -425,13 +483,14 @@ class _Heartbeat:
         log_path: str,
         csv_path: str | None = None,
         n_episodes: int | None = None,
+        csv_year: str | None = None,
     ) -> None:
         with self._lock:
             self._jobs[(variant, seed)] = {
                 "log": log_path,
                 "csv": csv_path,
+                "csv_year": csv_year,
                 "n_eps": n_episodes,
-                "initial_row": None,
                 "first_seen_t": None,
                 "first_seen_ep": None,
                 "last_ep": None,
@@ -451,12 +510,18 @@ class _Heartbeat:
             self._thread.join(timeout=2.0)
 
     def _loop(self) -> None:
-        while not self._stop.wait(self.interval):
+        # Use a short ``first_interval`` for the very first tick so the user
+        # gets a quick "things are running" confirmation, then settle into
+        # the (longer) ``interval`` for subsequent heartbeats.
+        wait = self.first_interval
+        while not self._stop.wait(wait):
+            wait = self.interval
             with self._lock:
                 snapshot = [(key, dict(meta)) for key, meta in self._jobs.items()]
                 completed = self._completed_jobs
                 total_jobs = self._total_jobs
                 n_workers = self._n_workers
+                start_time = self._start_time
             if not snapshot:
                 continue
 
@@ -471,20 +536,17 @@ class _Heartbeat:
                 line: str | None = None
                 last_ep: int | None = None
 
-                # 1) Preferred: structured summary from the per-episode CSV.
-                csv_path = meta.get("csv")
-                if csv_path and os.path.exists(csv_path):
-                    summary, init, last_ep = _summarize_csv(
-                        csv_path,
+                # 1) Preferred: structured summary from the year-level CSV
+                #    (last episode: year-1 vs year-N + episode mean) plus
+                #    a last-50-episode mean reward from the per-episode CSV.
+                year_csv = meta.get("csv_year")
+                train_csv = meta.get("csv")
+                if year_csv and os.path.exists(year_csv):
+                    summary, last_ep = _summarize_csv(
+                        year_csv,
+                        training_csv=train_csv if (train_csv and os.path.exists(train_csv)) else None,
                         n_episodes=meta.get("n_eps"),
-                        initial_row=meta.get("initial_row"),
                     )
-                    # Cache the resolved initial_row back for next tick.
-                    if init is not None:
-                        with self._lock:
-                            entry = self._jobs.get((variant, seed))
-                            if entry is not None:
-                                entry["initial_row"] = init
                     if summary:
                         line = summary
 
@@ -555,13 +617,15 @@ class _Heartbeat:
                 else:
                     queued_wall = 0.0
                 agg = slowest_running + queued_wall
+                elapsed_total = max(0.0, now - start_time)
                 done_msg = (
                     f"({completed}/{total_jobs} done, "
                     f"{running_count} running, {queued} queued)"
                 )
                 out = self._stream if self._stream is not None else sys.stderr
                 print(
-                    f"[sweep] [ETA total ≈ {_format_eta(agg)}] {done_msg}",
+                    f"[sweep] [ETA total ≈ {_format_eta(agg)}, "
+                    f"elapsed {_format_eta(elapsed_total)}] {done_msg}",
                     file=out,
                     flush=True,
                 )
@@ -590,13 +654,16 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--heartbeat-interval", type=float, default=60.0,
+        "--heartbeat-interval", type=float, default=300.0,
         help=(
             "Seconds between live-progress heartbeats printed to the terminal "
-            "(default: 60). Each heartbeat shows a one-line training summary "
-            "per running job (episode progress, clearing-price trajectory, "
-            "mean reward, compliance rate, green-investment progress) parsed "
-            "from the per-episode CSV. Use --quiet to disable."
+            "(default: 300, i.e. one heartbeat every 5 minutes). The very "
+            "first heartbeat fires earlier (after ~60s) so the user gets a "
+            "quick confirmation things are running. Each heartbeat shows a "
+            "one-line summary per running job: episode progress, year-1 vs "
+            "year-N (clearing price, secondary, compliance, green) of the "
+            "latest episode plus that episode's mean, and a last-50-episode "
+            "mean reward. Use --quiet to disable."
         ),
     )
     parser.add_argument(
@@ -660,7 +727,7 @@ def main() -> int:
     if not args.quiet:
         print(
             f"[sweep] heartbeat:    every {args.heartbeat_interval:.0f}s "
-            f"(per-job training summary: ep, px trajectory, R̄, compliance, green)",
+            f"(first tick early; per-job: ep, last-episode Y1→YN px/sec/comp/green, R̄ last-50)",
             file=sys.stderr,
         )
     print("[sweep] plan:", file=sys.stderr)
@@ -720,11 +787,15 @@ def main() -> int:
                     csv_path = os.path.join(
                         results_dir, f"training_log_{variant_name}_s{seed}.csv"
                     )
+                    csv_year = os.path.join(
+                        results_dir, f"year_log_{variant_name}_s{seed}.csv"
+                    )
                     heartbeat.add(
                         variant_name, seed,
                         _job_log_path(results_dir, variant_name, seed),
                         csv_path=csv_path,
                         n_episodes=_get_n_episodes(yaml_path),
+                        csv_year=csv_year,
                     )
                 print(
                     f"[sweep] [START {idx}/{n_jobs}] {variant_name} s={seed}  "
