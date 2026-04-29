@@ -336,6 +336,10 @@ ppo:
   critic_lr_decay: cosine             # match default.yaml
   critic_lr_min: 0.00005              # match default.yaml
   target_kl: 0.02
+  # Dual-clip PPO (Ye et al. 2020): bounds the negative-advantage loss
+  # branch (set to 0 to disable). See default.yaml for full explanation.
+  dual_clip_c: 3.0
+  log_ratio_clip: 10.0
   kl_anchor_beta: 0.0
   kl_anchor_decay_episodes: 0
   critic_extra_epochs: 5

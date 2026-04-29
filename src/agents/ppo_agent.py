@@ -176,6 +176,24 @@ class PPOAgent:
         reward_cfg = config.get("reward", {})
         self.gae_min_std = float(max(1e-8, reward_cfg.get("gae_min_std", 0.1)))
         self.target_kl = ppo.get("target_kl", 0.0)  # KL early stopping; 0 = disabled
+        # Dual-clip PPO (Ye et al. 2020, "Mastering Complex Control in MOBA
+        # Games with Deep Reinforcement Learning"). The standard PPO clipped
+        # surrogate is unbounded below for negative-advantage samples whenever
+        # the importance ratio drifts above (1+clip_eps): both surr1 = r·A
+        # and surr2 = clip(r)·A become large negative numbers, so
+        # -min(surr1, surr2) = -r·A grows without bound and can produce
+        # actor-loss values in the 1e6–1e8 range. Dual-clip caps this by
+        # taking max(min(surr1,surr2), c·A) for adv<0 with c>1. Set to 0
+        # (or any value <=1) to disable.
+        self.dual_clip_c = float(ppo.get("dual_clip_c", 3.0))
+        # Safety clamp on log-ratio (prevents exp overflow + bounds the
+        # diagnostic actor-loss display). The PPO clipped surrogate already
+        # provides the trust-region constraint; this is a numerical guard.
+        # Old default of 20 allowed ratios up to e^20≈4.85e8 to leak into
+        # the *displayed* policy_loss (gradient was clipped via grad-norm,
+        # but the printed scalar wasn't). 10 → ratio cap ≈ 22000, still well
+        # outside any reasonable trust region.
+        self.log_ratio_clip = float(ppo.get("log_ratio_clip", 10.0))
 
         # Device selection. Tiny MLPs (~123-dim input, two FC layers) are almost
         # always faster on CPU than GPU because kernel-launch overhead exceeds the
@@ -333,6 +351,29 @@ class PPOAgent:
     def set_kl_beta(self, beta: float):
         """Update KL anchor penalty weight (decayed by train.py)."""
         self.kl_beta = float(beta)
+
+    def _ppo_clipped_loss(self, ratio: torch.Tensor, adv: torch.Tensor) -> torch.Tensor:
+        """Clipped PPO surrogate with optional dual-clip for negative advantages.
+
+        Standard PPO loss:
+            L = -E[ min(r·A, clip(r, 1-ε, 1+ε)·A) ]
+        is unbounded below when A<0 and r >> 1+ε (both surr1 and surr2 are
+        large negatives, so min picks surr1). Dual-clip (Ye et al. 2020)
+        adds a hard floor for negative advantages:
+            L = -E[ A>=0 : min(r·A, clip(r)·A)
+                    A<0  : max(min(r·A, clip(r)·A), c·A) ]
+        with c>1 (typically 3). For positive advantages the behavior is
+        unchanged. Disabled when ``self.dual_clip_c <= 1.0``.
+        """
+        surr1 = ratio * adv
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
+        clipped_min = torch.min(surr1, surr2)
+        if self.dual_clip_c is not None and self.dual_clip_c > 1.0:
+            # Floor only on adv<0 rows; leave adv>=0 untouched.
+            neg_mask = (adv < 0).to(clipped_min.dtype)
+            floored = torch.max(clipped_min, self.dual_clip_c * adv)
+            clipped_min = neg_mask * floored + (1.0 - neg_mask) * clipped_min
+        return -clipped_min.mean()
 
     def inject_fundamental_anchor(self, year: int = 0) -> None:
         """Overwrite price_head.bias so the initial policy mean ≈ fundamental anchor.
@@ -766,15 +807,16 @@ class PPOAgent:
                         auc_lp_new = auc_lp_pd_new.sum(dim=-1, keepdim=True)
                         old_lp_sum = old_auc_lp[mb][is_auc_mb].sum(dim=-1, keepdim=True)
                         # Wide clamp: NaN/Inf guard only. The PPO clipped surrogate
-                        # below is responsible for the trust-region constraint.
+                        # below (with optional dual-clip) provides the trust-region
+                        # constraint. Tightened from ±20 to ±log_ratio_clip
+                        # (default 10) so a single outlier sample cannot blow
+                        # the displayed policy_loss into the 1e8 range.
                         auc_log_ratio = torch.clamp(
-                            auc_lp_new - old_lp_sum, -20.0, 20.0)
+                            auc_lp_new - old_lp_sum,
+                            -self.log_ratio_clip, self.log_ratio_clip)
                         auc_ratio = torch.exp(auc_log_ratio)
                         auc_adv = adv_t[mb][is_auc_mb]
-                        auc_surr1 = auc_ratio * auc_adv
-                        auc_surr2 = torch.clamp(
-                            auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
-                        auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
+                        auc_policy_loss = self._ppo_clipped_loss(auc_ratio, auc_adv)
                         auc_ent = auc_ent_pd.sum(dim=-1, keepdim=True)
 
                     # Secondary policy: obs2-space, secondary-phase rows only
@@ -782,13 +824,11 @@ class PPOAgent:
                         sec_lp_new, sec_ent = self.secondary_policy.evaluate(
                             obs2[mb][sec_mb], sec_raw[mb][sec_mb])
                         sec_log_ratio = torch.clamp(
-                            sec_lp_new - old_sec_lp[mb][sec_mb], -20.0, 20.0)
+                            sec_lp_new - old_sec_lp[mb][sec_mb],
+                            -self.log_ratio_clip, self.log_ratio_clip)
                         sec_ratio = torch.exp(sec_log_ratio)
                         sec_adv = adv_t[mb][sec_mb]
-                        sec_surr1 = sec_ratio * sec_adv
-                        sec_surr2 = torch.clamp(
-                            sec_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * sec_adv
-                        sec_policy_loss = -torch.min(sec_surr1, sec_surr2).mean()
+                        sec_policy_loss = self._ppo_clipped_loss(sec_ratio, sec_adv)
 
                     policy_loss = auc_policy_loss + sec_policy_loss
 
@@ -1181,42 +1221,41 @@ class PPOAgent:
                             # Bid block: dims 0, 1
                             lp_bid_new = auc_lp_pd_new[:, :2].sum(dim=-1, keepdim=True)
                             lp_bid_old = old_pd[:, :2].sum(dim=-1, keepdim=True)
-                            lr_bid = torch.clamp(lp_bid_new - lp_bid_old, -20.0, 20.0)
+                            lr_bid = torch.clamp(
+                                lp_bid_new - lp_bid_old,
+                                -self.log_ratio_clip, self.log_ratio_clip)
                             r_bid = torch.exp(lr_bid)
                             adv_bid = weighted_adv[mb][is_auc_mb]
-                            s1 = r_bid * adv_bid
-                            s2 = torch.clamp(r_bid, 1 - self.clip_eps, 1 + self.clip_eps) * adv_bid
-                            bid_loss = -torch.min(s1, s2).mean()
+                            bid_loss = self._ppo_clipped_loss(r_bid, adv_bid)
 
                             # Investment block: dims 2..end
                             lp_inv_new = auc_lp_pd_new[:, 2:].sum(dim=-1, keepdim=True)
                             lp_inv_old = old_pd[:, 2:].sum(dim=-1, keepdim=True)
-                            lr_inv = torch.clamp(lp_inv_new - lp_inv_old, -20.0, 20.0)
+                            lr_inv = torch.clamp(
+                                lp_inv_new - lp_inv_old,
+                                -self.log_ratio_clip, self.log_ratio_clip)
                             r_inv = torch.exp(lr_inv)
                             adv_inv_mb = weighted_adv_inv[mb][is_auc_mb]
-                            si1 = r_inv * adv_inv_mb
-                            si2 = torch.clamp(r_inv, 1 - self.clip_eps, 1 + self.clip_eps) * adv_inv_mb
-                            inv_loss = -torch.min(si1, si2).mean()
+                            inv_loss = self._ppo_clipped_loss(r_inv, adv_inv_mb)
 
                             auc_policy_loss = bid_loss + inv_loss
                             # Joint diagnostics for KL early stopping use the
                             # full 6-dim ratio.
                             auc_log_ratio = torch.clamp(
                                 auc_lp_pd_new.sum(dim=-1, keepdim=True)
-                                - old_pd.sum(dim=-1, keepdim=True), -20.0, 20.0)
+                                - old_pd.sum(dim=-1, keepdim=True),
+                                -self.log_ratio_clip, self.log_ratio_clip)
                             auc_ratio = torch.exp(auc_log_ratio)
                         else:
                             # Single-advantage path (split disabled): use joint ratio
                             auc_lp_new = auc_lp_pd_new.sum(dim=-1, keepdim=True)
                             old_lp_sum = old_pd.sum(dim=-1, keepdim=True)
                             auc_log_ratio = torch.clamp(
-                                auc_lp_new - old_lp_sum, -20.0, 20.0)
+                                auc_lp_new - old_lp_sum,
+                                -self.log_ratio_clip, self.log_ratio_clip)
                             auc_ratio = torch.exp(auc_log_ratio)
                             auc_adv = weighted_adv[mb][is_auc_mb]
-                            auc_surr1 = auc_ratio * auc_adv
-                            auc_surr2 = torch.clamp(
-                                auc_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * auc_adv
-                            auc_policy_loss = -torch.min(auc_surr1, auc_surr2).mean()
+                            auc_policy_loss = self._ppo_clipped_loss(auc_ratio, auc_adv)
                         auc_ent = auc_ent_pd.sum(dim=-1, keepdim=True)
 
                     # Secondary policy: obs2-space, secondary-phase rows only
@@ -1224,13 +1263,11 @@ class PPOAgent:
                         sec_lp_new, sec_ent = self.secondary_policy.evaluate(
                             obs2[mb][sec_mb], sec_raw[mb][sec_mb])
                         sec_log_ratio = torch.clamp(
-                            sec_lp_new - old_sec_lp[mb][sec_mb], -20.0, 20.0)
+                            sec_lp_new - old_sec_lp[mb][sec_mb],
+                            -self.log_ratio_clip, self.log_ratio_clip)
                         sec_ratio = torch.exp(sec_log_ratio)
                         sec_adv = weighted_adv[mb][sec_mb]
-                        sec_surr1 = sec_ratio * sec_adv
-                        sec_surr2 = torch.clamp(
-                            sec_ratio, 1 - self.clip_eps, 1 + self.clip_eps) * sec_adv
-                        sec_policy_loss = -torch.min(sec_surr1, sec_surr2).mean()
+                        sec_policy_loss = self._ppo_clipped_loss(sec_ratio, sec_adv)
 
                     policy_loss = auc_policy_loss + sec_policy_loss
 

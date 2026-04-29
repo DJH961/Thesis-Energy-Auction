@@ -328,6 +328,17 @@ ppo:
   critic_lr_decay: cosine
   critic_lr_min: 0.00005
   target_kl: 0.015
+  # Dual-clip PPO (Ye et al. 2020): caps the unbounded negative-advantage
+  # branch of the clipped surrogate when the importance ratio drifts.
+  # Without this, a single mini-batch sample with adv<0 and r=exp(log_ratio)
+  # large can drive policy_loss into the 1e6–1e8 range. c>1 (typical 3.0)
+  # bounds the loss as max(min(r·A, clip(r)·A), c·A) for adv<0; positive
+  # advantages are unaffected. Set to 0 to disable.
+  dual_clip_c: 3.0
+  # Numerical safety clamp on log(ratio_new/ratio_old) before exp(). The PPO
+  # clipped surrogate already enforces the trust region; this guard prevents
+  # ratio overflow and keeps the diagnostic actor-loss readout bounded.
+  log_ratio_clip: 10.0
   kl_anchor_beta: 0.0
   kl_anchor_decay_episodes: 0      # auto: 50% of n_episodes
   critic_extra_epochs: 6
