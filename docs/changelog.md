@@ -5,6 +5,71 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.5.1]
+
+Bug-fix release. Three areas:
+
+### PPO numerics — dual-clip surrogate (fix `actor_loss → 1e6–1e9`)
+- The standard PPO clipped surrogate is unbounded below for negative-
+  advantage rows once the importance ratio drifts above `1+ε`: both
+  `r·A` and `clip(r)·A` are large negatives, so `min` returns `r·A`
+  and the displayed `-min` grows without bound. Combined with the
+  v8.4.2 widening of the `log_ratio` clamp to `±20`, the actor loss
+  was reaching `1e8` in v8.5 training logs.
+- New `_ppo_clipped_loss(ratio, adv)` helper implements **dual-clip
+  PPO** (Ye et al. 2020). For `adv < 0` rows it adds a `c·adv` floor;
+  positive-advantage rows are unchanged. Wired into all five surrogate
+  sites in `update()` and `update_happo()` (auction joint, secondary,
+  bid head, invest head, single-adv joint auction).
+- `log_ratio` safety clamp tightened from `±20` → `±10` (still ratio
+  cap ≈ 22 000, well outside any reasonable trust region; bounds the
+  *displayed* loss too).
+- New config knobs:
+  - `ppo.dual_clip_c` (default `3.0`; `0` disables dual-clip)
+  - `ppo.log_ratio_clip` (default `10.0`)
+
+### Convergence-safe schedule tweaks (`configs/default.yaml`)
+- `ppo.entropy_coef_final` `0.005 → 0.015` — small lift to prevent
+  late-training std collapse without disturbing the existing decay
+  shape.
+- `ppo.log_std_min` `−3.5 → −3.0` — minimum raw σ rises from ≈0.030
+  to ≈0.050.
+- `ppo.n_epochs` `5 → 3` — combined with `target_kl=0.015` early-stop
+  and the new dual-clip, this materially reduces ratio drift per
+  update.
+
+### Per-agent compliance attribution diagnostic (`scripts/train.py`)
+- New `Why(U/D/B/C)` column on the per-agent and bot tables,
+  partitioning each year of the episode into mutually-exclusive
+  buckets:
+  - **U** Under-bought, non-compliant — `obligation > alloc` AND
+    non-compliant
+  - **D** Debt-cascade, non-compliant — `obligation ≤ alloc` AND
+    non-compliant (prior-year carry-forward exceeded auction
+    surplus + bank)
+  - **B** Bank-covered — `obligation > alloc` AND compliant AND no
+    net secondary buy
+  - **C** Sec-Covered — `obligation > alloc` AND compliant AND net
+    secondary buy
+  - Identity by construction: `U + D == Sf`.
+- Selling-into-shortfall is **impossible** by environment rules
+  (`_settle_double_auction` enforces
+  `max_sell = alloc + bank − emiss − carry_forward`), so no separate
+  "sold-into-short" bucket is reported.
+- Year log gains a new `old_carry_forward` field
+  (`ets_environment.py`) — the carry-forward debt at year start,
+  required to compute the obligation-aware `U/D` split. Used only
+  by the diagnostic; no behavioural impact.
+
+### Tests
+- New `tests/test_dual_clip_ppo.py` (5 tests) pins down the dual-clip
+  semantics: positive-adv unchanged, negative-adv bounded by
+  `c·|adv|`, vanilla recovered at `dual_clip_c=0`, mixed-sign batch
+  correctness, finite displayed loss under extreme ratios.
+- Full suite: 377 passed.
+
+---
+
 ## [8.5]
 
 Restructures Phase-1 credit assignment, refines the terminal/ESG reward
