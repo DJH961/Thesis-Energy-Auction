@@ -5,6 +5,233 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.5.3]
+
+Bug-fix release. Three targeted changes addressing the v8.5 floor-bidding
+regression head-on (Fix 1 was the missing structural piece) and refining
+v8.5.2's Fix 3 with the rolling/capped sec-price proxy the user
+correctly identified as needed.
+
+### Fix 1 (v8.5.3) — restore `baseline_cost` subtraction in `compute_auction_rewards()`
+
+**Background.** v8.4.2 subtracted a `baseline_cost = need × clearing_price`
+fair-price reference from the auction reward so the bid head saw
+*deviations* from the clearing price, not absolute spend. v8.5 removed
+this. The result: every euro of `auction_cost` became pure negative
+reward to the bid head, regardless of whether the agent bought exactly
+its compliance need at the prevailing clearing price (a *fair* purchase)
+or over-paid. The bid head's gradient unambiguously points to floor-
+bidding (which minimises `auction_cost`), even when supply is scarce.
+This is the structural cause of the v8.5 floor-bidding pathology.
+
+**Fix.** Restore the baseline:
+
+```python
+# src/environment/ets_environment.py — compute_auction_rewards()
+clearing_price_nom = float(self.last_clearing_price)
+baseline_cost = (need * clearing_price_nom) / max(infl, 1e-9)
+compliance_norm_excess = (
+    (auction_cost + mac_cost_i + collateral_cost_i - baseline_cost)
+    / compliance_denom
+)
+r_auction_bid[i] = -(compliance_norm_excess) - gap_penalty
+```
+
+Properties:
+- Bidding to win exactly `need` at the clearing price → `auction_cost ≈
+  baseline_cost` → bid-head reward ≈ 0 (neutral). The bid head no longer
+  has a structural preference for floor-bidding.
+- Over-buying → `auction_cost > baseline_cost` → small positive cost.
+- Under-buying → `auction_cost < baseline_cost` → small "saving" from
+  baseline, but the v8.5.3 `gap_penalty` (with rolling capped remediation
+  rate, see Fix 3 v2 below) dominates because the remediation rate
+  (≈ `eff_penalty` to `1.5·eff_penalty`) is several times the clearing
+  price. Net effect on under-buyers is still strongly negative.
+
+The `compliance_norm` legacy diagnostic (without baseline) is still
+written to `_last_auction_reward_channels` for backward compatibility;
+the new `compliance_norm_excess` field is the actual reward signal, and
+`baseline_cost` is exposed as its own diagnostic.
+
+### Fix 3 v2 (v8.5.3) — rolling, capped expected-remediation rate
+
+**Why v8.5.2 was too aggressive.** v8.5.2 used `max(eff_penalty,
+last_secondary_price, anchor)` per missing Mt. In normal markets,
+secondary clearings sit *persistently* above the penalty rate because
+carry-forward demand makes secondary buys preferable to default+
+penalty+carry-forward chain. As the user observed, `last_secondary_price
+> eff_penalty` is the typical case, not the price-spike edge case the
+v8.5.2 design assumed. Two failure modes:
+1. A single thin-liquidity year where sec clears at, e.g., 400 EUR/t
+   would set the next year's gap_penalty rate ≈ 400, multiplying that
+   reward channel by ~3× vs the legacy formula (`compliance_denom ≈
+   anchor·need ≈ 57·need` ⇒ amplification factor 400/57 ≈ 7).
+2. The bid head's effective coverage-gap penalty therefore had a
+   stochastic, year-to-year scale that destabilised training rather
+   than providing a clean trust-region signal.
+
+**Fix.**
+1. Maintain a per-episode EMA `_sec_price_ema` of secondary clearings,
+   updated only when `secondary_volume > 0` (no-trade years cannot
+   pollute the EMA with the stale auction clearing price). Default
+   `reward.sec_proxy.ema_alpha = 0.30` (≈ 2-3 year half-life).
+2. Cap the rate at `reward.sec_proxy.cap_mult × eff_penalty_rate`
+   (default 1.5×). The bid head sees a stable proxy in the
+   `[eff_penalty, 1.5·eff_penalty]` band regardless of sec dynamics.
+3. Floor still `max(eff_penalty, sec_ema, anchor)` to handle year 0
+   gracefully (sec_ema is `None` until the first sec clearing).
+
+```python
+sec_ema_nom              = self._sec_price_ema  # None until first sec clear
+sec_proxy_nom            = float(sec_ema_nom) if sec_ema_nom is not None else float(anchor_t)
+remediation_floor_nom    = max(eff_pen_rate_nom, sec_proxy_nom, anchor_t)
+remediation_cap_nom      = self._sec_proxy_cap_mult * eff_pen_rate_nom
+effective_remediation_nom = min(remediation_floor_nom, remediation_cap_nom)
+```
+
+New diagnostic `sec_price_ema` exposed in `_last_auction_reward_channels`.
+New config block:
+
+```yaml
+reward:
+  sec_proxy:
+    ema_alpha: 0.30
+    cap_mult: 1.5
+```
+
+### Year-0 bid-change-limit anchoring
+
+**Issue.** `bid_change_limit` (BCL) was only active for `year > 0`;
+year-0 bids were unconstrained, so policies that hadn't yet learned a
+sensible price routinely emitted `price_max = 250 EUR/t`. The first
+auction's clearing then polluted both the MA3 and the AR(1) expected-
+price forecast with an unrealistic anchor for the rest of the episode.
+
+**Fix.** The `year > 0` guard is removed in `step_auction()`. After
+`warm_start.burnin`, `_price_history` is seeded with synthetic +
+heuristic clearings (~70 EUR/t), so `price_ma3_early` is well-defined;
+if it isn't, `_compute_price_ma3()` falls back to `expected_price`
+(≈ `_price_initial`). The clipping reference is then
+`max(price_ma3_early, fundamental_anchor)` ± `value` (default ±75 EUR/t),
+matching the year > 0 path. With default config, year-0 bids land in
+roughly `[0, ~145]` instead of `[0, 250]`.
+
+### Verification of earlier fixes
+
+- **Fix 2 (v8.5.1, dual-clip PPO + log_ratio clamp ±10):** verified by
+  the 5 passing tests in `tests/test_dual_clip_ppo.py`. Actor loss is
+  bounded by `c·|adv|` (default `c = 3.0`) for any importance ratio.
+  No further change required.
+- **Fix 4 (v8.5.2, per-sub-head KL early stop):** verified correct.
+  When `split_invest_head=True`, `mb_kl = max(kl_bid, kl_inv, kl_sec)`
+  drives the early-stop signal; neither sub-head can dilute the other.
+  Joint-head fallback (`split_invest_head=False`) preserves legacy
+  averaging. No change required.
+
+### Version
+- `pyproject.toml`         8.5.2 → 8.5.3
+- `configs/default.yaml`   header banner v8.5.2 → v8.5.3
+
+---
+
+## [8.5.2]
+
+Bug-fix release targeting the v8.5 floor-bidding / two-faction failure mode
+observed in `archive/std_log.txt` (price stuck at €45 in the auction while
+the secondary clears at €280–€350, with `ALoss` saturating at 1e7–1e8 on
+ceiling-bidding agents and `comply` regressing from ~85% to ~70%).
+
+Two targeted fixes addressing the diagnostic items the user flagged as
+"buying in the market should truly make more sense than not buying" and
+the split-head invest critic interaction with KL early stopping.
+
+### Fix 3 — bid head now prices the cost of forced Phase-2 buying
+
+`compute_auction_rewards()` (`src/environment/ets_environment.py`) priced
+the coverage gap at `company.penalty_rate` only:
+
+```python
+gap_penalty = (coverage_gap * company.penalty_rate) / compliance_denom
+```
+
+In price-spike regimes where the secondary clears above the (inflation-
+adjusted) penalty rate, this systematically *under-states* the true cost
+of leaving an undercoverage gap — a rational agent will buy on secondary
+rather than default, paying `sec_price` per missing Mt. The bid head
+therefore developed a perverse preference for floor-bidding because the
+arbitrage profit from buying cheap allowances and re-selling on the
+secondary leaks into the value bootstrap (shared trunk + shared main
+critic) while the penalty-only `gap_penalty` provided no countervailing
+signal at auction time.
+
+**Fix.** The bid head now prices each missing Mt at the maximum of three
+nominal-EUR/t quantities, deflated to real terms:
+
+```python
+expected_remediation_rate_real = (
+    max(eff_pen_rate_nom, sec_proxy_nom, anchor_t) / infl
+)
+gap_penalty = (coverage_gap * expected_remediation_rate_real) / compliance_denom
+```
+
+- `eff_pen_rate_nom`  — `Company.effective_penalty_rate(year)`
+  (also fixes a pre-existing minor unit inconsistency: the old formula
+  used the *base* `penalty_rate` against a real-terms denominator, so
+  `gap_penalty` was slightly under-stated in late episodes).
+- `sec_proxy_nom`     — `self.last_secondary_price`, a 1-year-lagged
+  proxy for the secondary clearing the agent will face this year.
+  Initialised to `_price_initial`, so year 0 falls back to the anchor.
+- `anchor_t`          — fundamental anchor at the current cap;
+  conservative lower bound when sec history is uninformative.
+
+Behaviour in normal markets is essentially unchanged (the max picks
+`eff_pen_rate ≈ 138`, matching the legacy `penalty_rate` to floating-
+point precision). In price-spike regimes (sec > penalty), the bid head
+correctly internalises the secondary-buy cost.
+
+A new diagnostic field `expected_remediation_rate_real` is added to
+`_last_auction_reward_channels`. Existing `coverage_gap_penalty` keeps
+its name and downstream consumers.
+
+### Fix 4 — per-sub-head KL early stopping when `split_invest_head=True`
+
+`update_happo()` (`src/agents/ppo_agent.py`) computed a single
+**joint-6D** auction KL even when the bid head (dims 0–1) and the
+investment head (dims 2–5) were trained against separate advantage
+streams. Two failure modes:
+
+1. A runaway invest head could push joint KL well above `target_kl`
+   while the bid head was still happily inside its trust region —
+   early-stopping the *whole* update and freezing the bid head at a
+   suboptimal point.
+2. Conversely, a quiet invest head could average down a high bid-head
+   KL so target_kl never tripped, allowing the bid head to drift past
+   the intended trust region.
+
+**Fix.** When `split_invest_head=True`, per-sub-head KL is computed
+under `no_grad` from the *already-existing* `lr_bid`/`r_bid` and
+`lr_inv`/`r_inv` tensors (the same ones used to build the dual-clip
+losses), and the early-stop signal is
+
+```python
+kl_auc_eff = torch.max(kl_bid_mb, kl_inv_mb)
+mb_kl      = torch.max(kl_auc_eff, kl_sec)
+```
+
+Using `max` (not `mean`) ensures that *either* sub-head exceeding
+`target_kl` triggers early-stop, while neither sub-head can dilute the
+other's signal. The legacy averaging path (`0.5 * (kl_auc + kl_sec)`)
+is retained for `split_invest_head=False` to preserve back-compat.
+
+The synchronous `update()` path (no HAPPO weighting, no split-head
+support) is unchanged.
+
+### Version
+- `pyproject.toml`         8.5.1 → 8.5.2
+- `configs/default.yaml`   header banner v8.5.1 → v8.5.2
+
+---
+
 ## [8.5.1]
 
 Bug-fix release. Three areas:

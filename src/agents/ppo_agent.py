@@ -970,8 +970,8 @@ class PPOAgent:
             np.asarray(self.buffer.auction_raw, dtype=np.float32)).to(self.device)
         sec_raw = torch.from_numpy(
             np.asarray(self.buffer.secondary_raw, dtype=np.float32)).to(self.device)
-        # Per-dim auction log-prob (T, action_dim). Old joint scalar callers
-        # pre-v8.5 are no longer supported.
+        # Per-dim auction log-prob (T, action_dim). Joint scalar callers
+        # are no longer supported.
         old_auc_lp = torch.from_numpy(
             np.asarray(self.buffer.auction_logp, dtype=np.float32)).to(self.device)
         old_sec_lp = torch.from_numpy(
@@ -1210,6 +1210,16 @@ class PPOAgent:
                     auc_ratio = torch.ones(1, 1, device=self.device)
                     sec_ratio = torch.ones(1, 1, device=self.device)
 
+                    # Per-sub-head KL accumulators for split_invest_head=True.
+                    # When the bid and invest heads are trained against
+                    # separate advantage streams, a single joint-6D KL
+                    # could either let one head dilute the other below
+                    # target_kl or fire early on a noisy invest head and
+                    # freeze a still-learning bid head. We track each
+                    # sub-head separately and early-stop on the *max*.
+                    kl_bid_mb = None
+                    kl_inv_mb = None
+
                     # Auction policy: obs1-space, auction-phase rows only
                     if is_auc_mb.any():
                         # Per-dim log_prob (B, action_dim)
@@ -1246,6 +1256,10 @@ class PPOAgent:
                                 - old_pd.sum(dim=-1, keepdim=True),
                                 -self.log_ratio_clip, self.log_ratio_clip)
                             auc_ratio = torch.exp(auc_log_ratio)
+                            # Per-sub-head KL, computed under no_grad below.
+                            with torch.no_grad():
+                                kl_bid_mb = ((r_bid - 1.0) - lr_bid).mean()
+                                kl_inv_mb = ((r_inv - 1.0) - lr_inv).mean()
                         else:
                             # Single-advantage path (split disabled): use joint ratio
                             auc_lp_new = auc_lp_pd_new.sum(dim=-1, keepdim=True)
@@ -1272,9 +1286,18 @@ class PPOAgent:
                     policy_loss = auc_policy_loss + sec_policy_loss
 
                     with torch.no_grad():
-                        kl_auc = ((auc_ratio - 1.0) - auc_log_ratio).mean()
                         kl_sec = ((sec_ratio - 1.0) - sec_log_ratio).mean()
-                        mb_kl = 0.5 * (kl_auc + kl_sec)
+                        if kl_bid_mb is not None and kl_inv_mb is not None:
+                            # Split-head path: drive early-stop off the *max*
+                            # across {bid, invest, secondary} so that a single
+                            # runaway sub-head triggers the trust-region cut
+                            # without being averaged down by quiet heads.
+                            kl_auc_eff = torch.max(kl_bid_mb, kl_inv_mb)
+                            mb_kl = torch.max(kl_auc_eff, kl_sec)
+                        else:
+                            # Joint-head path (split disabled): legacy averaging.
+                            kl_auc = ((auc_ratio - 1.0) - auc_log_ratio).mean()
+                            mb_kl = 0.5 * (kl_auc + kl_sec)
                         epoch_kl_sum += mb_kl.item() * len(mb)
                         epoch_kl_count += len(mb)
 

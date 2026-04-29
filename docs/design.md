@@ -48,10 +48,10 @@ All winners pay the same clearing price (the marginal accepted bid).
   exceeds `max_collateral_budget_share × remaining_budget`.
 - The collateral clip is for training stability during exploration (not an economic mechanism);
   non-zero clip events indicate heuristic/environment mismatch.
-- A **bid change limit (PCL)** caps year-over-year price moves at `auction.bid_change_limit.value`
-  EUR/t (year 0 always unconstrained). The PCL reference is
+- A **bid change limit (BCL)** caps year-over-year price moves at `auction.bid_change_limit.value`
+  EUR/t and is active in year 0 too. The BCL reference is
   `max(price_ma3, fundamental_anchor(year))` so it does not drift below the equilibrium price
-  in low-price regimes. PCL clip signals are exposed as observation dimensions for gradient feedback.
+  in low-price regimes. BCL clip signals are exposed as observation dimensions for gradient feedback.
 - A soft budget price clip clamps a bid to ~1.5× the agent's max affordable price (kept as a
   separate observation dimension so the policy can still see when it was clipped).
 - If enabled, under-subscription can cancel the auction; default behavior is to clear partial demand.
@@ -383,6 +383,26 @@ per-agent in `per_agent_diag` for diagnostic purposes.
 
 `anchor_real = compute_fundamental_anchor(t) / infl`. `costNorm = compliance_norm + capital_norm + soft_norm + loan_sting`.
 
+**Phase-1 bid-head reward (fair-price baseline).** The bid sub-head is trained against `compliance_norm_excess`, not the absolute `compliance_norm`:
+
+$$
+\text{compliance\_norm\_excess} = \frac{\text{auction\_cost} + \text{mac\_cost} + \text{collateral\_cost} - \text{baseline\_cost}}{\text{compliance\_denom}}
+$$
+
+where `baseline_cost = need × last_clearing_price / infl`. Buying exactly the compliance need at the clearing price is therefore reward-neutral (≈0); over-buying is a small positive cost; under-buying is a small "saving" but is dominated by `gap_penalty` (priced at the remediation rate, see below). Without this baseline subtraction the bid head would see every euro of `auction_cost` as pure negative reward, biasing the policy toward floor-bidding regardless of scarcity. The legacy `compliance_norm` (without the baseline) is retained as a diagnostic.
+
+**Coverage-gap penalty.** Each missing Mt left after the primary auction is priced at the agent's expected remediation cost — secondary buy if cheaper, default + carry-forward + penalty otherwise:
+
+$$
+\text{rate} = \min\!\left(\max\!\left(\text{eff\_penalty}_t,\; \overline{P}^{\text{sec}}_t,\; \text{anchor}_t\right),\; c \cdot \text{eff\_penalty}_t\right) / \text{infl}
+$$
+
+$$
+\text{gap\_penalty} = \frac{\text{coverage\_gap} \cdot \text{rate}}{\text{compliance\_denom}}
+$$
+
+where `eff_penalty_t = company.effective_penalty_rate(t)` (penalty × private urgency scalar), $\overline{P}^{\text{sec}}_t$ is a per-episode EMA of secondary clearing (updated only on real volume; falls back to `anchor_t` before the first secondary trade), and `c = reward.sec_proxy.cap_mult` (default 1.5). The cap prevents a single secondary spike from amplifying `gap_penalty` arbitrarily; the EMA prevents thin-liquidity years from polluting the rate. Toggle via `reward.sec_proxy.enabled`.
+
 **Penalty normalization:** Uses `budget_real` as denominator. Two components:
 - **Prospective**: `shortfall × penalty_rate × (1 + scarcity_t) × urgency_scalar / budget_real` — scarcity-amplified expected future penalty, where `scarcity_t = max(0, 1 − cap_t / cap_0)`.
 - **Realized**: `penalty_cost × urgency_scalar / budget_real`.
@@ -484,18 +504,25 @@ Scores are logged to year-level CSV as `diag_S_*_Ai` and printed in training con
 ### 8.1 Policy/critic structure
 
 Each learning company has:
-- auction policy network
-- secondary policy network
-- value network
+- auction policy network (Phase 1 — bid + investment heads sharing a trunk)
+- secondary policy network (Phase 2)
+- two value networks (`value_net` and `value_net_invest`)
 
-Actors are decentralized; the critic is centralized (MAPPO mode) over concatenated multi-agent state with `critic_hidden_size=512`.
+Actors are decentralized; both critics are centralized (MAPPO mode) over the concatenated multi-agent state with `critic_hidden_size=512`.
+
+**Split bid/invest heads (`ppo.split_invest_head=true`).** The Phase-1 policy is trained as two sub-heads against separate advantage streams:
+
+- **Bid sub-head** (action dims 0–1: bid price, qty multiplier) is trained against an advantage stream that sees `compliance_norm_excess`, secondary financials, penalty, banking signal, and terminal-bank value.
+- **Investment sub-head** (action dims 2–5: invest fraction, tech logits) is trained against a separate advantage stream that sees `capital_norm`, the centred ESG signal, and the discounted-NPV terminal-queue value.
+
+Each stream has its own value network and its own causal reward normaliser per phase, so the bid head's gradient is not biased by capital/ESG signal and vice-versa. Per-sub-head KL is also tracked under `update_happo` so the early-stop on `target_kl` triggers on `max(KL_bid, KL_invest, KL_secondary)` rather than an averaged joint KL that could let one sub-head freeze the other.
 
 ### 8.2 HAPPO/PPO training
 
 - On-policy episode rollouts.
-- Sequential policy updates (HAPPO enabled).
-- GAE + clipped PPO objective.
-- KL early-stopping; KL anchor to frozen BC policy disabled by default (`kl_anchor_beta=0.0`).
+- Sequential policy updates (HAPPO enabled). Update order is set by an EMA of per-agent advantage (`ppo.happo_order_metric="advantage"`) rather than reward, so ordering is robust across reward functions with different floors.
+- GAE + dual-clip PPO objective: the standard clipped surrogate is augmented with a `c · adv` floor on negative-advantage rows (`ppo.dual_clip_c`, default 3.0) so the actor loss can't blow up when the importance ratio drifts above `1 + ε`. The `log_ratio` is also clamped to `±ppo.log_ratio_clip` (default 10) at every surrogate site.
+- KL early-stopping with `max(KL_bid, KL_invest, KL_secondary)` when split heads are enabled. KL anchor to a frozen BC policy is disabled by default (`kl_anchor_beta=0.0`).
 
 ### 8.3 Stabilization features
 

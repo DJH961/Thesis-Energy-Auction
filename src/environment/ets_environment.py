@@ -188,6 +188,16 @@ class ETSEnvironment(gym.Env):
         self._secondary_profit_ema = np.zeros(self.n_total)
         self._ema_alpha = 0.1
 
+        # Per-episode EMA of secondary clearing — used by the bid-head
+        # coverage-gap reward as a smooth proxy for expected remediation
+        # cost. None until the first secondary clearing in the episode
+        # (year 0 falls back to the fundamental anchor).
+        sec_proxy_cfg = config.get("reward", {}).get("sec_proxy", {})
+        self._sec_proxy_enabled    = bool(sec_proxy_cfg.get("enabled", True))
+        self._sec_proxy_ema_alpha = float(sec_proxy_cfg.get("ema_alpha", 0.30))
+        self._sec_proxy_cap_mult  = float(sec_proxy_cfg.get("cap_mult", 1.5))
+        self._sec_price_ema: Optional[float] = None
+
         # Per-agent last secondary buy price (feeds the WTP exploration anchor)
         self._last_secondary_buy_price = np.zeros(self.n_total)
         self._cumulative_alloc = np.zeros(self.n_total)
@@ -506,6 +516,8 @@ class ETSEnvironment(gym.Env):
         self._last_reward_shaping_values = np.zeros(self.n_total)
         self._last_invest_reward_phase2 = np.zeros(self.n_total)
         self._secondary_profit_ema = np.zeros(self.n_total)
+        # Reset per-episode secondary-price EMA.
+        self._sec_price_ema = None
         self._last_secondary_buy_price = np.zeros(self.n_total)
         self._cumulative_alloc = np.zeros(self.n_total)
         self._cumulative_emissions = np.zeros(self.n_total)
@@ -1367,8 +1379,10 @@ class ETSEnvironment(gym.Env):
         # Direct bid price: agent action[0] is the bid price in [price_min, price_max]
         bid_actions[:, 0] = np.clip(bid_actions[:, 0], price_min, price_max)
 
-        # Year-over-year bid price change limit for learning agents.
-        # Reads enabled/value from config each step; Year 0 always unconstrained.
+        # Year-over-year bid price change limit (BCL) for learning agents.
+        # Active in year 0 too (anchored on max(price_ma3_early, anchor)),
+        # so policies can't emit price_max bids that pollute the MA3/AR(1)
+        # forecast for the rest of the episode.
         _bcl_cfg = self.config["auction"].get("bid_change_limit", {})
         _bcl_enabled = bool(_bcl_cfg.get("enabled", False))
         _bcl_value = float(_bcl_cfg.get("value", 50.0))
@@ -1376,7 +1390,7 @@ class ETSEnvironment(gym.Env):
         # Compute price_ma3 now so both the clipping reference and the pcl_ceiling
         # obs dimension are consistent (price_ma3 is also re-used below).
         price_ma3_early = self._compute_price_ma3()
-        if year > 0 and _bcl_enabled and _bcl_value > 0.0:
+        if _bcl_enabled and _bcl_value > 0.0:
             ref = max(price_ma3_early, compute_fundamental_anchor(year, self.config, cap_t_actual=cap_t))
             lo = float(np.clip(ref - _bcl_value, price_min, price_max))
             hi = float(np.clip(ref + _bcl_value, price_min, price_max))
@@ -1387,10 +1401,7 @@ class ETSEnvironment(gym.Env):
                 bid_actions[_i, 0] = clipped
                 self._last_bid_price_clip[_i] = clipped - orig  # negative if clipped down
         else:
-            if _bcl_enabled and _bcl_value > 0.0:
-                self._pcl_ceiling = float(np.clip(price_ma3_early + _bcl_value, price_min, price_max))
-            else:
-                self._pcl_ceiling = float(price_max)
+            self._pcl_ceiling = float(price_max)
             self._last_bid_price_clip[:self.n_agents] = 0.0
 
         # Quantity reparameterization: action[1] is a coverage MULTIPLIER on estimated need.
@@ -2000,25 +2011,59 @@ class ETSEnvironment(gym.Env):
             compliance_norm = (auction_cost + mac_cost_i + collateral_cost_i) / compliance_denom
             capital_norm    = (invest_cost + opex_delta) / budget_real
 
-            coverage_gap = max(0.0, need - float(self._phase1_allocations[i]))
-            gap_penalty = (coverage_gap * company.penalty_rate) / compliance_denom
+            # baseline_cost — fair-price reference. Subtracting `need ×
+            # clearing_price` lets the bid head see a deviation-from-fair
+            # signal: buying exactly `need` at the clearing price → ≈0,
+            # over-buying → small positive cost, under-buying → small
+            # "saving" but `gap_penalty` (priced at the remediation rate,
+            # which is several times the clearing price) dominates.
+            clearing_price_nom = float(self.last_clearing_price)
+            baseline_cost = (need * clearing_price_nom) / max(infl, 1e-9)
+            compliance_norm_excess = (
+                (auction_cost + mac_cost_i + collateral_cost_i - baseline_cost)
+                / compliance_denom
+            )
 
-            # Bid sub-head: only sees compliance + coverage gap; investing
-            # decisions don't bias the bid policy gradient.
-            r_auction_bid[i] = -(compliance_norm) - gap_penalty
-            # Investment sub-head: only sees capital costs.
+            coverage_gap = max(0.0, need - float(self._phase1_allocations[i]))
+            # Coverage-gap rate = expected cost of remediation per missing Mt.
+            # Floor: max(eff_pen, sec_ema, anchor). Cap: cap_mult × eff_pen.
+            # When `sec_proxy.enabled=false`, fall back to bare eff_pen / infl
+            # (legacy v8.5.0 behaviour) — the rolling+capped proxy is the
+            # only place these knobs are read.
+            eff_pen_rate_nom = company.effective_penalty_rate(self.current_year)
+            if self._sec_proxy_enabled:
+                sec_ema_nom = self._sec_price_ema  # None until first sec clear
+                sec_proxy_nom = (
+                    float(sec_ema_nom) if sec_ema_nom is not None else float(anchor_t)
+                )
+                remediation_floor_nom = max(eff_pen_rate_nom, sec_proxy_nom, anchor_t)
+                remediation_cap_nom   = self._sec_proxy_cap_mult * eff_pen_rate_nom
+                effective_remediation_nom = min(remediation_floor_nom, remediation_cap_nom)
+            else:
+                sec_proxy_nom = float(anchor_t)
+                effective_remediation_nom = eff_pen_rate_nom
+            expected_remediation_rate_real = effective_remediation_nom / max(infl, 1e-9)
+            gap_penalty = (coverage_gap * expected_remediation_rate_real) / compliance_denom
+
+            # Bid sub-head: fair-price-adjusted compliance + coverage gap.
+            r_auction_bid[i] = -(compliance_norm_excess) - gap_penalty
+            # Investment sub-head: capital costs only.
             r_auction_invest[i] = -capital_norm
             r_auction[i] = r_auction_bid[i] + r_auction_invest[i]
 
             self._last_auction_reward_channels[i] = {
                 "auction_cost":         float(auction_cost),
+                "baseline_cost":        float(baseline_cost),
                 "collateral_cost":      float(collateral_cost_i),
                 "investment_cost":      float(invest_cost),
                 "opex_delta":           float(opex_delta),
                 "mac_cost":             float(mac_cost_i),
-                "compliance_norm":      float(compliance_norm),
+                "compliance_norm":      float(compliance_norm),         # legacy diag (full auction_cost)
+                "compliance_norm_excess": float(compliance_norm_excess), # actual reward signal
                 "capital_norm":         float(capital_norm),
                 "coverage_gap_penalty": float(gap_penalty),
+                "expected_remediation_rate_real": float(expected_remediation_rate_real),
+                "sec_price_ema":        float(sec_proxy_nom),
                 "r_bid":                float(r_auction_bid[i]),
                 "r_invest":             float(r_auction_invest[i]),
             }
@@ -2097,6 +2142,19 @@ class ETSEnvironment(gym.Env):
 
         self.last_secondary_price = secondary_clearing
         self.last_secondary_volume = secondary_volume
+
+        # Update per-episode EMA of secondary clearing (feeds the bid-head
+        # remediation-rate proxy). Only update on real volume so no-trade
+        # years (where secondary_clearing == auction clearing_price) don't
+        # contaminate the EMA with an unrealised auction price.
+        if self._sec_proxy_enabled and secondary_volume > 0.0 and secondary_clearing > 0.0:
+            if self._sec_price_ema is None:
+                self._sec_price_ema = float(secondary_clearing)
+            else:
+                a = self._sec_proxy_ema_alpha
+                self._sec_price_ema = (
+                    a * float(secondary_clearing) + (1.0 - a) * float(self._sec_price_ema)
+                )
 
         # Record secondary qty clip ratio for learning agents' obs dim
         for _i in range(self.n_agents):

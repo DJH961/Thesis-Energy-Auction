@@ -88,7 +88,7 @@ Every year, each AI agent makes **6 decisions** (Phase 1) plus **2 more** (Phase
 
 The agents use **HAPPO (Heterogeneous-Agent PPO)**, a multi-agent reinforcement learning algorithm with centralized critics.
 
-- Each agent has a centralized critic that sees the global state, enabling coordinated learning
+- Each agent has a centralized critic that sees the global state, enabling coordinated learning. The Phase-1 policy is split into a **bid sub-head** (price, qty multiplier) and an **investment sub-head** (invest fraction + tech logits) with separate advantage streams and separate value networks, so capital decisions don't bias the auction-bidding gradient.
 - **Fundamental price anchor** (`src/utils/price_anchor.py`): Each episode, the auction policy price head is seeded to an economically grounded anchor (~67 EUR/t at yr0, rising to ~101 EUR/t by yr11) derived from MAC cost, cap scarcity, and penalty rate. This replaces behavioral cloning as the initialization mechanism.
 - **WTP-anchored exploration** (`exploration.mode: "anchored"`): Epsilon-random auction prices are sampled from a Gaussian centered on the agent's willingness-to-pay anchor (~MAC + 0.5×(penalty − MAC)), keeping exploration economically grounded rather than flat-uniform across the full price range. A `"uniform"` mode (side-balanced around the WTP anchor) is also available as an ablation.
 - **Epsilon-greedy exploration** decays from 25% to 2% over training, preventing policy collapse
@@ -102,15 +102,16 @@ The reward signal is a pure cost+ESG+penalty formulation — electricity revenue
 
 `R = w_cost × (−cost_norm) + w_green × esg_signal − penalty_norm + shaping + terminal_values`
 
-- **cost_norm**: inflation-adjusted compliance + capital + soft-budget + loan costs, normalised by economic denominators (`anchor × need` for compliance, `annual_budget` for capital/soft buckets)
+- **cost_norm**: inflation-adjusted compliance + capital + soft-budget + loan costs, normalised by economic denominators (`anchor × need` for compliance, `annual_budget` for capital/soft buckets). The Phase-1 bid-head reward subtracts a fair-price baseline (`need × clearing_price`) so that buying exactly the compliance need at the clearing price is reward-neutral; over-buying is a small positive cost and under-buying is dominated by the coverage-gap penalty.
+- **Coverage-gap penalty**: missing Mt are priced at the expected cost of remediation — `max(effective_penalty_rate, secondary_price_ema, fundamental_anchor)` per Mt, capped at `cap_mult × effective_penalty_rate` (default 1.5×) so single-year secondary spikes can't dominate. See `reward.sec_proxy` (toggle via `enabled`).
 - **Banking signal**: imputes a cost basis on bank drawdowns at the clearing price, eliminating the zero-bid free-compliance exploit and rewarding good intertemporal timing (`reward.banking_signal`)
 - **ESG signal** — saved-carbon-years: `esg_scale × (ef_ratio + speed_coef × Δgreen) × compliance_gate` (compliance gate is a smooth blend that approaches linear above the threshold and softer below)
 - **penalty_norm**: non-compliance penalty normalised by `budget_real`, including a prospective scarcity-amplified expected-future-penalty term
 - **Coverage gap shaping**: optional per-agent reward bonus for closing the gap between auction allocation and compliance need (decays to zero)
 - **Opportunity cost shaping**: rewards agents in proportion to the cost premium paid on the secondary vs auction (decays to zero)
 - **Green investment shaping**: bonus for increasing green fraction (decays over training), scaled by `(0.2 + w_green)`
-- **Terminal bank value**: piecewise — linear below annual need (ratio < 1), log above (diminishing returns on overbanking)
-- **Terminal queue value**: in-construction projects valued by discounted future carbon savings with a smooth completion-fraction discount
+- **Terminal bank value**: discounted hold — banked allowances valued at the terminal price discounted at the investment rate over `terminal_payoff_years`, normalised by `budget_real`
+- **Terminal queue value**: in-construction projects valued as a present-value annuity over `terminal_asset_lifetime_years` (default 20 yr) at `investment.discount_rate`, discounted from each project's completion year
 - **Treasury terminal value**: corporate treasury reserve (year-end operating surplus retained at `retention_fraction`, decaying at `decay_rate`) is valued at episode end via `treasury_terminal_value`
 
 ### Key Mechanisms
@@ -126,7 +127,7 @@ The reward signal is a pure cost+ESG+penalty formulation — electricity revenue
 - **Private urgency scalars**: Per-episode LogNormal scalar multiplied into each agent's effective penalty, creating heterogeneous compliance pressure and breaking symmetric equilibria.
 - **Auction bid collateral**: overbids above clearing incur a real capital lock-up cost on awarded quantity (`auction.collateral.enabled`)
 - **Collateral affordability guardrail**: if collateral lock-up is unaffordable, bids are clipped in two steps (quantity first, then price if needed) to preserve feasible participation
-- **Bid change limit (PCL)**: Year-over-year bid price changes are capped at `auction.bid_change_limit.value` EUR/t (year 0 is unconstrained). The PCL reference is `max(price_ma3, fundamental_anchor(year))` so it doesn't drift below the equilibrium price during low-price regimes. Clip signals are exposed as observation dimensions for gradient feedback.
+- **Bid change limit (BCL)**: Year-over-year bid price changes are capped at `auction.bid_change_limit.value` EUR/t (active in year 0 too). The BCL reference is `max(price_ma3, fundamental_anchor(year))` so it doesn't drift below the equilibrium price during low-price regimes. Clip signals are exposed as observation dimensions for gradient feedback.
 - **Budget headroom observation**: Phase-1 observation reports current annual budget headroom (`1.0` fresh, `0.0` at limit, negative on overspend), plus separate dims for bid-price clip, soft-budget price clip, qty clip ratio, and invest-clip ratio.
 - **Emergency loan system**: When a company faces auction default, an emergency loan covers the shortfall (up to `max_loan_fraction × annual_budget`) instead of immediate suspension. Loans carry interest (default 8%) plus a leverage premium, with annual repayment deducted at year start. While a loan is outstanding the effective capex throughput is squeezed to a configurable floor.
 - **Corporate treasury reserve**: Year-end operating surplus is retained at `retention_fraction` (capped at `cap_multiple × annual_budget`, decaying at `decay_rate`) and provides a buffer that smooths year-to-year compliance shocks. Valued at episode end via `treasury_terminal_value`.

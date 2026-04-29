@@ -105,13 +105,13 @@ def test_phase1_invest_action_direct_mapping():
 
 
 # ---------------------------------------------------------------------------
-# Test 2c: Budget gate scales qty down for cash-poor agents (v8.4.2: soft scale, not hard zero)
+# Test 2c: Budget gate scales qty down for cash-poor agents (soft scale, not hard zero)
 # ---------------------------------------------------------------------------
 
 def test_budget_gate_scales_qty_for_cash_poor_agents():
     """Agents with cash < 10% of bid notional should have qty scaled down (not zeroed)
-    so that bid_p × bid_q × 0.10 ≤ cash. v8.4.2 replaced the hard zero with a soft scale
-    to avoid the gradient discontinuity that pushed policies to systematic under-bidding."""
+    so that bid_p × bid_q × 0.10 ≤ cash. The soft scale avoids the gradient
+    discontinuity that pushed policies to systematic under-bidding."""
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
     config["companies"]["n_bot_agents"] = 0
@@ -673,6 +673,10 @@ def test_defaulted_volume_not_double_counted_with_unsold_rollover():
     config["companies"]["n_bot_agents"] = 0
     config["auction"]["leverage_multiplier"] = 100.0
     config["budget"]["annual_budgets"] = [200.0] * 8  # well below price_max × per-agent alloc
+    # BCL clips year-0 bids to ≈[ma3-V, ma3+V]; this stress test relies on
+    # extreme 500 EUR/t bids to trigger affordability defaults, so disable
+    # BCL here. (BCL semantics are exercised by test_bid_change_limit.py.)
+    config["auction"]["bid_change_limit"] = {"enabled": False, "value": 75.0}
 
     env = ETSEnvironment(config, seed=42)
     env.reset(seed=42)
