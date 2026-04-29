@@ -1284,13 +1284,15 @@ def test_underbid_gives_negative_auction_reward():
         )
 
 
-def test_gap_penalty_uses_max_of_penalty_and_secondary_proxy():
-    """v8.5.2: gap_penalty rate = max(eff_penalty, last_secondary_price, anchor) / infl.
+def test_gap_penalty_uses_rolling_capped_remediation_rate():
+    """v8.5.3: gap_penalty rate uses max(eff_pen, sec_ema, anchor) capped at
+    cap_mult × eff_penalty (default 1.5×).
 
-    When the most recent secondary clearing exceeds the (inflation-adjusted)
-    penalty rate, the bid head's coverage-gap penalty must scale up
-    accordingly so the agent internalises the cost of being forced to buy
-    on the secondary at the elevated price.
+    Properties:
+      * sec_ema is None at year 0 → falls back to anchor → max picks
+        eff_penalty (anchor < eff_pen) → rate ≈ eff_penalty.
+      * Spiking the EMA above eff_penalty raises the rate, but only up
+        to cap_mult × eff_penalty regardless of how high the EMA is.
     """
     config = load_config()
     config["companies"]["n_bot_agents"] = 0
@@ -1306,42 +1308,48 @@ def test_gap_penalty_uses_max_of_penalty_and_secondary_proxy():
     auction_actions[:, 0] = 80.0
     auction_actions[:, 3:] = [0.0, 0.0, 1.0]
 
-    # Baseline sec proxy = _price_initial (~57 €/t at year 0). Expect max() to
-    # pick eff_penalty (~138.75 nominal). Capture the resulting gap_penalty.
+    eff_pen = env.companies[0].effective_penalty_rate(env.current_year)
+    cap_mult = env._sec_proxy_cap_mult
+
+    # Year 0, EMA = None → rate falls back to eff_penalty (anchor < eff_pen).
     env.step_auction(auction_actions)
     env.compute_auction_rewards()
-    base_pen_low = env._last_auction_reward_channels[0]["coverage_gap_penalty"]
-    base_rate_low = env._last_auction_reward_channels[0]["expected_remediation_rate_real"]
+    base_rate = env._last_auction_reward_channels[0]["expected_remediation_rate_real"]
+    assert abs(base_rate - eff_pen) < 1e-3, (
+        f"With no sec EMA, rate should fall back to eff_pen ({eff_pen:.2f}); got {base_rate:.2f}"
+    )
 
-    # Now spike last_secondary_price well above eff_penalty — gap_penalty must rise.
+    # Set EMA modestly above eff_pen → rate rises.
     env.reset(seed=42)
-    env.last_secondary_price = 400.0  # well above ~138 EUR/t penalty rate
+    env._sec_price_ema = eff_pen * 1.2
     env.step_auction(auction_actions)
     env.compute_auction_rewards()
-    spiked_pen = env._last_auction_reward_channels[0]["coverage_gap_penalty"]
-    spiked_rate = env._last_auction_reward_channels[0]["expected_remediation_rate_real"]
+    mid_rate = env._last_auction_reward_channels[0]["expected_remediation_rate_real"]
+    assert mid_rate > base_rate + 1.0, (
+        f"Rate should rise with sec EMA above eff_pen; base={base_rate:.2f}, mid={mid_rate:.2f}"
+    )
+    assert mid_rate == pytest.approx(eff_pen * 1.2, abs=1e-3), (
+        f"At sec EMA = 1.2 × eff_pen, rate should equal EMA (within cap); got {mid_rate:.2f}"
+    )
 
-    assert spiked_rate > base_rate_low, (
-        f"Spiking sec proxy should raise expected remediation rate; "
-        f"got base={base_rate_low:.2f}, spiked={spiked_rate:.2f}"
-    )
-    assert spiked_pen > base_pen_low, (
-        f"Spiking sec proxy should raise gap_penalty; "
-        f"got base={base_pen_low:.4f}, spiked={spiked_pen:.4f}"
-    )
-    # Sanity: the rate should now be ≈ 400/infl(year=0) = 400 (infl(0)=1).
-    assert 350.0 < spiked_rate < 450.0, (
-        f"Spiked rate should ≈ 400 EUR/t; got {spiked_rate:.2f}"
+    # Crazy spike (EMA = 5 × eff_pen) → rate should be capped at cap_mult × eff_pen.
+    env.reset(seed=42)
+    env._sec_price_ema = eff_pen * 5.0
+    env.step_auction(auction_actions)
+    env.compute_auction_rewards()
+    capped_rate = env._last_auction_reward_channels[0]["expected_remediation_rate_real"]
+    assert capped_rate == pytest.approx(cap_mult * eff_pen, abs=1e-3), (
+        f"Spiked sec EMA must be capped at {cap_mult}× eff_pen ({cap_mult * eff_pen:.2f}); "
+        f"got {capped_rate:.2f}"
     )
 
 
 def test_gap_penalty_unchanged_when_sec_proxy_below_penalty():
-    """Healthy regime (sec ≤ penalty): new gap_penalty matches v8.5 behaviour.
+    """Healthy regime (sec EMA ≤ penalty): rate equals eff_penalty.
 
-    The v8.5.2 generalisation must not perturb training in normal markets
-    where penalty_rate dominates the max(); the coverage_gap_penalty
-    channel should equal `coverage_gap * penalty_rate / compliance_denom`
-    to within float precision.
+    The v8.5.3 generalisation must not perturb training in normal markets
+    where penalty_rate dominates the max(); the rate should equal
+    eff_penalty to within float precision.
     """
     config = load_config()
     config["companies"]["n_bot_agents"] = 0
@@ -1352,8 +1360,8 @@ def test_gap_penalty_unchanged_when_sec_proxy_below_penalty():
     env = ETSEnvironment(config, seed=42)
     env.reset(seed=42)
 
-    # Force sec proxy well below the penalty rate so eff_penalty wins the max.
-    env.last_secondary_price = 30.0
+    # Force sec EMA well below the penalty rate so eff_penalty wins the max.
+    env._sec_price_ema = 30.0
 
     n = env.n_agents
     auction_actions = np.zeros((n, 6), dtype=np.float32)
@@ -1372,6 +1380,64 @@ def test_gap_penalty_unchanged_when_sec_proxy_below_penalty():
             f"Agent {i}: in healthy regime expected_remediation_rate should equal "
             f"effective penalty rate {eff_pen:.2f}; got {ch['expected_remediation_rate_real']:.2f}"
         )
+
+
+def test_baseline_cost_subtraction_neutralizes_fair_clearing_buy():
+    """v8.5.3: bid-head reward channels include baseline_cost.
+
+    `compliance_norm_excess = (auction_cost + mac + collat - baseline_cost) /
+    compliance_denom`. When `baseline_cost = need × clearing_price`, an
+    agent that won exactly its need at the clearing price has
+    `auction_cost ≈ baseline_cost`, so the bid-head signal is
+    near-neutral (apart from the small mac/collateral terms), removing
+    the structural floor-bidding bias of v8.5/v8.5.2.
+    """
+    config = load_config()
+    config["companies"]["n_bot_agents"] = 0
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset(seed=42)
+
+    n = env.n_agents
+    auction_actions = np.zeros((n, 6), dtype=np.float32)
+    auction_actions[:, 0] = 80.0   # well above floor
+    auction_actions[:, 1] = 1.0    # multiplier=1 → request exactly compute_estimate_need
+    auction_actions[:, 3:] = [0.0, 0.0, 1.0]
+
+    env.step_auction(auction_actions)
+    env.compute_auction_rewards()
+
+    for i in range(min(n, 3)):
+        ch = env._last_auction_reward_channels[i]
+        # Channel must be present.
+        assert "baseline_cost" in ch and "compliance_norm_excess" in ch
+        # baseline_cost must be positive in the typical case.
+        assert ch["baseline_cost"] >= 0.0, (
+            f"Agent {i}: baseline_cost should be non-negative, got {ch['baseline_cost']:.4f}"
+        )
+        # compliance_norm_excess (the actual reward signal) must be smaller in
+        # magnitude than compliance_norm (which still includes full auction_cost).
+        # Specifically, excess = (full_cost - baseline)/denom < full_cost/denom.
+        assert ch["compliance_norm_excess"] <= ch["compliance_norm"] + 1e-6, (
+            f"Agent {i}: compliance_norm_excess ({ch['compliance_norm_excess']:.4f}) should be ≤ "
+            f"compliance_norm ({ch['compliance_norm']:.4f})"
+        )
+
+
+def test_sec_price_ema_resets_each_episode():
+    """v8.5.3: _sec_price_ema must reset to None on env.reset()."""
+    config = load_config()
+    config["companies"]["n_bot_agents"] = 0
+    env = ETSEnvironment(config, seed=42)
+    env.reset(seed=42)
+    env._sec_price_ema = 300.0
+    env.reset(seed=43)
+    assert env._sec_price_ema is None, (
+        f"_sec_price_ema should be None after reset, got {env._sec_price_ema}"
+    )
 
 
 # ---------------------------------------------------------------------------

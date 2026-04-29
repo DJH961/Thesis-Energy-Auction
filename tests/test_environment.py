@@ -673,6 +673,10 @@ def test_defaulted_volume_not_double_counted_with_unsold_rollover():
     config["companies"]["n_bot_agents"] = 0
     config["auction"]["leverage_multiplier"] = 100.0
     config["budget"]["annual_budgets"] = [200.0] * 8  # well below price_max × per-agent alloc
+    # v8.5.3: BCL now clips year-0 bids to ≈[ma3-V, ma3+V]; this test relies on
+    # extreme 500 EUR/t bids to trigger affordability defaults, so disable BCL
+    # for this stress setup. (BCL semantics are exercised by test_bid_change_limit.py.)
+    config["auction"]["bid_change_limit"] = {"enabled": False, "value": 75.0}
 
     env = ETSEnvironment(config, seed=42)
     env.reset(seed=42)

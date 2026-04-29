@@ -1,4 +1,4 @@
-# ETS MARL — Configuration v8.5.2
+# ETS MARL — Configuration v8.5.3
 # 8 learning agents, HAPPO sequential update, split Phase-1 bid/invest heads.
 
 simulation:
@@ -258,6 +258,14 @@ reward:
     enabled: true
     w_banking: 0.3
     w_imputed: 1.0
+
+  # v8.5.3: rolling, capped expected-remediation-rate proxy for the
+  # bid-head's coverage-gap penalty. Smooths single-year secondary spikes
+  # and bounds the multiplier vs the penalty rate so a 3× sec spike
+  # cannot multiply gap_penalty by 3×.
+  sec_proxy:
+    ema_alpha: 0.30   # EMA smoothing of secondary clearing (per-episode)
+    cap_mult: 1.5     # rate ≤ cap_mult × effective_penalty_rate
     imputed_cap_factor: 5.0
     initial_bank_cost_factor: 0.80
 

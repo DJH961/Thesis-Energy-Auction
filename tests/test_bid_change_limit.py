@@ -107,17 +107,36 @@ class TestBCLDisabled:
 # Year 0: always unconstrained
 # ---------------------------------------------------------------------------
 
-class TestBCLYear0Unconstrained:
+class TestBCLYear0Anchored:
+    """v8.5.3: BCL is now active at year 0, anchored on
+    `max(price_ma3, fundamental_anchor) ± value`. Previously year 0 was
+    unconstrained and policies routinely emitted price_max (250 EUR/t),
+    polluting MA3/AR(1) for the rest of the episode."""
 
-    def test_year0_no_clip_even_with_extreme_bid(self):
-        """At year 0, BCL is never applied regardless of config."""
+    def test_year0_extreme_bid_is_clipped(self):
+        """An extreme year-0 bid (240 EUR/t) is clipped down to ma3+value."""
         env = _make_env(bcl_enabled=True, bcl_value=50.0)
-        # current_year is 0 after reset
         assert env.current_year == 0
         _run_auction_step(env, bid_price=240.0)
+        # With warm_start disabled and no prior history, _compute_price_ma3
+        # falls back to expected_price (= _price_initial = 70). Anchor is
+        # ~57. ref = max(70, 57) = 70. hi = 70 + 50 = 120. So a 240 bid
+        # is clipped down by ≈ 120.
+        for i in range(env.n_agents):
+            clip = float(env._last_bid_price_clip[i])
+            assert clip < -50.0, (
+                f"Agent {i}: BCL should clip extreme year-0 bid down by ≥50, "
+                f"got clip={clip:.4f}"
+            )
+
+    def test_year0_in_range_bid_is_not_clipped(self):
+        """A reasonable year-0 bid inside [ref-value, ref+value] is unchanged."""
+        env = _make_env(bcl_enabled=True, bcl_value=50.0)
+        assert env.current_year == 0
+        _run_auction_step(env, bid_price=80.0)  # well within [20, 120]
         for i in range(env.n_agents):
             assert env._last_bid_price_clip[i] == pytest.approx(0.0, abs=1e-6), (
-                f"Agent {i}: BCL should not apply at year 0, "
+                f"Agent {i}: in-range year-0 bid should not be clipped, "
                 f"got clip={env._last_bid_price_clip[i]:.4f}"
             )
 
