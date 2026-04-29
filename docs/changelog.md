@@ -5,6 +5,249 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.5.4]
+
+Bug-fix / infrastructure release. Pure efficiency change — **no
+training-quality, RNG, or numerical paths altered**. Two back-to-back
+runs of `--seed 42` produce byte-identical `training_log_s42.csv` and
+`year_log_s42.csv` before and after the change.
+
+### Fix 1 (v8.5.4) — architecture-aware CPU thread configuration
+
+**Background.** On a 16 vCPU / 64 GB Azure `Standard_D16ds_v5` the
+trainer was averaging ~24% CPU and ~3.4 GB RAM. The workload is a
+single Python process driving small MLPs (`hidden_size=256`,
+`mini_batch=64`); BLAS thread throughput plateaus around ~4 threads on
+matmuls of this size, after which OMP barrier sync dominates and extra
+cores sit idle. PyTorch's default of `torch.get_num_threads() ==
+n_physical_cores` therefore *under-utilises* large cloud VMs (the BLAS
+pool oversubscribes a single training process while 12 of 16 cores idle).
+
+**Fix.** New `src/utils/compute_setup.py`:
+
+* `detect_architecture()` — cross-platform detection of logical /
+  physical cores + RAM, via `psutil` with a `/proc/cpuinfo` fallback.
+* `configure_compute(num_threads=None, total_threads=None)` — sets
+  `torch.set_num_threads`, `torch.set_num_interop_threads(1)`, and the
+  `OMP_NUM_THREADS / MKL_NUM_THREADS / OPENBLAS_NUM_THREADS /
+  NUMEXPR_NUM_THREADS / VECLIB_MAXIMUM_THREADS` env vars plus
+  `KMP_BLOCKTIME=0` (prevents Intel OMP from spinning idle workers,
+  which is the failure mode that produces the "low CPU % but high
+  context-switch" pattern on large VMs).
+* Auto-policy calibrated to this codebase's matmul size:
+  ≤2 cores → use what we have; 3–4 → 2; 5–32 → 4; 33+ → 6.
+  Override with `ETS_NUM_THREADS` env var or `--num-threads` flag.
+
+`scripts/train.py` now calls `configure_compute()` once at the top of
+`main()`, before any tensor work.
+
+### Fix 2 (v8.5.4) — `--parallel-seeds N` launcher for multi-seed runs
+
+**Background.** The single-process bottleneck above is structural: even
+perfectly tuned BLAS can't parallelise the Python env loop. The right
+way to use a 16-core box is to run multiple seeds *in parallel
+processes*, each with its own ~4-thread BLAS budget.
+
+**Fix.** New `--parallel-seeds N` flag on `scripts/train.py`. When N>1
+and multiple seeds are supplied, the launcher uses
+`concurrent.futures.ProcessPoolExecutor` to spawn one subprocess per
+seed; each child re-executes `train.py --seed S --parallel-seeds 1`
+with `ETS_NUM_THREADS = total_cores // N`. Each child still runs the
+unchanged `train_one_seed` path, so per-seed RNG, optimizer order, and
+numerical results are bit-identical to a sequential invocation. Default
+is `--parallel-seeds 1` → existing behaviour exactly.
+
+Recommended invocation on `Standard_D16ds_v5`:
+
+```bash
+python scripts/train.py --config configs/default.yaml \
+       --seed 1 2 3 4 --parallel-seeds 4
+```
+
+→ 4 processes × 4 BLAS threads ≈ all 16 vCPUs doing useful work.
+Average CPU utilisation rises from ~24% to ~80–90% with no change to
+any seed's training trajectory.
+
+### Reproducibility note
+
+Within a fixed `--num-threads` setting, runs are byte-identical CSV-for-
+CSV. Switching between very different thread counts (e.g. 1 vs 8) on
+the same seed *can* surface ~1e-7 floating-point reordering in BLAS
+reductions; this does not affect training trajectories at any decimal
+that matters but may change the last printed digit in some logs. The
+default and `--parallel-seeds` paths both keep `num_threads` constant
+per process, so this caveat does not apply to standard usage.
+
+### Fix 3 (v8.5.4) — multi-variant × multi-seed sweep launcher
+
+**Background.** With `--parallel-seeds` it became easy to run many seeds
+of *one* config in parallel, but ablations across config variants
+(scarcity, MSR on/off, reserve price, reward weights, …) still needed
+hand-launched commands per variant, and per-variant outputs collided on
+filenames once they were copied into a single analysis folder. The
+unchanged trainer also dumps a *lot* of per-episode console output —
+fine for one process, but a mess when several variants are running
+concurrently in the same terminal.
+
+**Fix.** New `scripts/sweep.py` launcher that reads a sweep spec YAML
+and runs the cartesian product of variants × seeds in a process pool.
+
+* **Spec schema** (full schema + validation in `src/utils/sweep.py`):
+
+  ```yaml
+  base_config: configs/default.yaml
+  output_dir: results/sweeps/scarcity_msr
+  seeds: [1, 2, 3]                 # default; variants may override
+  parallel_workers: 4
+  threads_per_worker: null         # auto = total_cores / workers
+  variants:
+    - name: tight_cap
+      overrides: {ets.cap_overhead_pct: -0.02}
+    - name: msr_off
+      overrides: {ets.msr.enabled: false}
+    - name: tight_cap_msr_off
+      overrides:
+        ets.cap_overhead_pct: -0.02
+        ets.msr.enabled: false
+      seeds: [1, 2]                # per-variant seed override
+  ```
+
+  Each variant's overrides are deep-merged onto the base config (lists
+  *replace*, not concatenate, to avoid silent hyperparameter doubling).
+  Dotted-path keys (`ets.msr.enabled`) and nested mappings are both
+  accepted. Variant names are validated as filesystem-safe.
+
+* **Per-variant output isolation.** Each variant's resolved YAML is
+  written to `<output_dir>/_resolved/<variant>.yaml`. Its
+  `logging.results_dir` is forced to `<output_dir>/<variant>/`, and
+  `train.py` is invoked with a new `--run-tag <variant>` flag that
+  rewrites every output filename so they remain unique even when
+  copied into a single folder for analysis:
+
+  | Without tag (existing)              | With `--run-tag tight_cap`               |
+  |-------------------------------------|------------------------------------------|
+  | `training_log_s42.csv`              | `training_log_tight_cap_s42.csv`         |
+  | `year_log_s42.csv`                  | `year_log_tight_cap_s42.csv`             |
+  | `checkpoints_s42/`                  | `checkpoints_tight_cap_s42/`             |
+  | `snapshots/training_log_s42_ep*.csv`| `snapshots/training_log_tight_cap_s42_ep*.csv` |
+
+  `--run-tag` is a no-op when omitted, so existing single-config runs
+  produce byte-identical filenames to v8.5.3.
+
+* **Per-job log capture, terse parent terminal.** Each subprocess's
+  stdout+stderr is redirected to
+  `<output_dir>/<variant>/run_<variant>_s<seed>.log` instead of being
+  printed to the terminal where the launcher runs. The full per-episode
+  diagnostic output is preserved on disk for later inspection. The
+  parent terminal only prints structured progress lines:
+
+  ```
+  [sweep] [START 1/17] reference s=1  → results/.../reference/run_reference_s1.log
+  [sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | sec 60→78 (m41%) | comp 87% | green 31→44% | R̄ -3.2→-1.8 | ETA 4h12m
+  [sweep] [ETA total ≈ 18h33m] (3/17 done, 4 running, 10 queued)
+  [sweep] [DONE  1/17 OK ] reference s=1  (results/.../run_reference_s1.log)
+  ```
+
+  A background heartbeat thread fires every `--heartbeat-interval`
+  seconds (default 60) and emits **one structured summary line per
+  running job**, parsed directly from the per-episode CSV
+  (`training_log_<variant>_s<seed>.csv`). Field order — episode, price,
+  secondary, compliance, green, reward, ETA — is intentional:
+
+  | Field | Meaning |
+  |---|---|
+  | `Ep N/total (X.X%)` | Last episode logged, with progress through `simulation.n_episodes`. |
+  | `px init→recent (μy)` | Last-year auction clearing price: episode-0 value vs the mean over the most recent 50 logged episodes. `μ` is the within-episode year-mean over the same window. |
+  | `sec init→recent (mXX%)` | Secondary-market average price (initial→recent) with match rate (volume that crossed in the double auction). |
+  | `comp X%` | Compliance rate over the recent window: fraction of `(agent, episode)` cells where `shortfall_A* ≈ 0`. |
+  | `green init→recent%` | Mean `green_frac_A*` across all agents, episode-0 value vs recent mean. |
+  | `R̄ init→recent` | Mean of `reward_A*` across all agents, episode-0 value vs recent mean (tracks convergence). |
+  | `ETA Xh Ym` | Per-job remaining wall time, extrapolated from `(episodes_done / elapsed_since_first_heartbeat)`. |
+
+  Multi-job sweeps additionally emit a single aggregate banner per tick:
+
+  ```
+  [sweep] [ETA total ≈ 18h33m] (3/17 done, 4 running, 10 queued)
+  ```
+
+  computed as `max(running ETAs) + queued × mean_full_runtime / n_workers`.
+
+  When the CSV does not exist yet (e.g. during the behavioural-cloning
+  pretraining phase, before the trainer's CSV writer has emitted any
+  rows), the heartbeat falls back to the last informative line of the
+  captured log file. Pure-separator lines (`═══`, `───`, `=====`, …)
+  are filtered out of that fallback. Use `--quiet` to suppress
+  heartbeats entirely.
+
+  The summary is computed with a tail-window read (last 64 KB of the
+  CSV) and a cached "first-ever row" anchor, so re-summarising remains
+  cheap even at 100k+ episodes.
+
+* **Reproducibility.** Each `(variant, seed)` job runs the unchanged
+  `train_one_seed` path inside a fresh
+  `train.py --config <variant>.yaml --seed S --parallel-seeds 1
+  --run-tag <variant>` subprocess, so per-seed RNG, optimiser order,
+  and CSV outputs are bit-identical to a sequential, hand-launched
+  invocation; only the process layout (and on-disk filename infix)
+  differ.
+
+Usage:
+
+```bash
+# Validate spec and inspect the job plan without launching anything:
+python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml --dry-run
+
+# Run the full sweep:
+python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml
+```
+
+### Tests
+
+* `tests/test_compute_setup.py` — 14 cases covering `detect_architecture`,
+  the default-thread policy across core counts (incl. 16-core
+  `D16ds_v5`), explicit / env-var / `total_threads` overrides.
+* `tests/test_sweep.py` — 30 cases covering `deep_merge` (incl.
+  list-replace and no-mutate invariants), dotted-path expansion, spec
+  validation (missing fields, duplicate / unsafe variant names,
+  bool-vs-int seed types, per-variant seed override rules),
+  variant-config resolution, `build_jobs` cartesian expansion, and
+  YAML-on-disk round-trips.
+* `tests/test_sweep_launcher.py` — 28 cases covering the launcher's
+  `_job_log_path`, `_tail_last_meaningful_line` (incl. comment skip,
+  separator skip, large-file tail window), `_summarize_csv` (header-only
+  files, partial trailing lines, compliance-rate edges, ≤200-char output
+  guarantee, initial-row caching, secondary-market field, field
+  ordering, last-episode return), `_format_eta`, and the `_Heartbeat`
+  background thread (CSV-preferred summary, log-tail fallback, per-job
+  ETA, aggregate sweep ETA, emit / remove / truncate / idempotent stop).
+* End-to-end smoke: a one-variant one-seed sweep against
+  `configs/smoke_100.yaml` produces the renamed CSVs / checkpoint dir
+  and a `run_<variant>_s<seed>.log` capture, with the parent terminal
+  only emitting `[sweep] [START …]` / `[LIVE …]` / `[DONE …]` lines.
+* Full suite: 453 passed, 1 skipped (no regressions; +58 new tests
+  vs v8.5.3).
+
+### Files touched
+
+* `src/utils/compute_setup.py` (new)
+* `src/utils/sweep.py` (new) — spec schema, deep-merge, override
+  expansion, variant-config resolution, job materialisation.
+* `scripts/sweep.py` (new) — launcher: process pool, per-job log
+  capture, heartbeat thread, plan / dry-run output.
+* `configs/sweeps/example_sweep.yaml` (new) — worked example covering
+  scarcity, MSR on/off, reserve price.
+* `tests/test_compute_setup.py` (new)
+* `tests/test_sweep.py` (new)
+* `tests/test_sweep_launcher.py` (new)
+* `scripts/train.py` — `main()` calls `configure_compute()`; new
+  `--parallel-seeds`, `--num-threads`, `--run-tag` flags;
+  `_run_seed_subprocess` helper; output filenames / checkpoint dir /
+  snapshot filenames now carry the `--run-tag` infix when set.
+* `README.md` — new "Running Sweeps" subsection.
+* `configs/default.yaml`, `pyproject.toml` — version bump to 8.5.4.
+
+---
+
 ## [8.5.3]
 
 Bug-fix release. Three targeted changes addressing the v8.5 floor-bidding

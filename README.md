@@ -264,13 +264,59 @@ python scripts/train.py --config configs/smoke_100.yaml --seed 42
 # Full training run with default settings (100k episodes):
 python scripts/train.py --config configs/default.yaml --seed 42
 
-# Run with multiple seeds for statistical robustness:
-python scripts/train.py --config configs/default.yaml --seed 42
-python scripts/train.py --config configs/default.yaml --seed 123
-python scripts/train.py --config configs/default.yaml --seed 456
+# Run with multiple seeds for statistical robustness, in parallel processes
+# (each seed remains numerically identical to a sequential run):
+python scripts/train.py --config configs/default.yaml --seed 1 2 3 4 --parallel-seeds 4
 ```
 
 Training runs 120,000 episodes of 12-year simulations by default. Results are saved to a `results/` folder.
+
+### Running Sweeps (multiple configs × seeds)
+
+For ablations over multiple config variants (scarcity, MSR on/off, reserve
+price, etc.) use the sweep launcher. Define a *sweep spec* once, listing the
+overrides for each variant; the launcher resolves one full config per
+variant, then runs every (variant × seed) job as an independent `train.py`
+subprocess in a process pool.
+
+```bash
+# Validate the spec and inspect the job plan without launching anything:
+python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml --dry-run
+
+# Run the full sweep:
+python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml
+```
+
+Each variant writes to its own `<output_dir>/<variant>/` results directory,
+and **its CSV / checkpoint filenames are tagged with the variant name**
+(`training_log_<variant>_s<seed>.csv`, `year_log_<variant>_s<seed>.csv`,
+`checkpoints_<variant>_s<seed>/`) — so files stay unique even if you copy
+them all into one folder for analysis.
+
+To keep the parent terminal readable while many jobs run concurrently,
+each subprocess's full stdout+stderr is captured to
+`<output_dir>/<variant>/run_<variant>_s<seed>.log`. The terminal only
+shows short progress lines (`[START]` / `[LIVE]` heartbeat / `[DONE]`).
+
+Each `[LIVE]` line is a one-line training summary per running job, parsed
+from the per-episode CSV — episode progress, clearing-price trajectory,
+secondary-market price+match rate, compliance rate, green-investment
+progress, mean reward, and a per-job ETA. Multi-job sweeps additionally
+emit an aggregate `ETA total` banner once per tick:
+
+```
+[sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | sec 60→78 (m41%) | comp 87% | green 31→44% | R̄ -3.2→-1.8 | ETA 4h12m
+[sweep] [ETA total ≈ 18h33m] (3/17 done, 4 running, 10 queued)
+```
+
+Heartbeats fire every `--heartbeat-interval` seconds (default 60); pass
+`--quiet` to disable them.
+
+Per-seed RNG and CSVs are bit-identical to a sequential
+`train.py --config <variant>.yaml --seed S --run-tag <variant>`
+invocation; only the process layout differs. See
+`configs/sweeps/example_sweep.yaml` for the schema (also documented in
+`src/utils/sweep.py`).
 
 ### Running Tests
 
