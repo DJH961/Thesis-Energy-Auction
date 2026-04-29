@@ -1786,7 +1786,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
         #   U (Under-bought)        : alloc < emiss (auction shortfall) —
         #                             irrespective of secondary outcome.
         #   S (Sold-into-shortfall) : net seller (sec_net < 0) AND ended
-        #                             the year non-compliant (shortfall>0).
+        #                             the year non-compliant (shortfall > 0).
         #   C (Sec-Covered)         : auction shortfall (alloc < emiss)
         #                             but compliance held (shortfall == 0)
         #                             AND net secondary buyer (sec_net > 0).
