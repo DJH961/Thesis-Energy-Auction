@@ -731,6 +731,24 @@ class ETSEnvironment(gym.Env):
                 stacklevel=2,
             )
 
+        # Reseed price_history with the year-0 fundamental anchor so MA3 at year 0
+        # is grounded in fundamentals rather than burn-in noise. Year 1 MA3 then
+        # blends [anchor, year0_clearing], year 2 [anchor, year0, year1], year 3+
+        # rolls anchor out of the 3-year window. This prevents the BCL ratchet
+        # where a high burn-in MA3 expands the year-0 bid window upward, year-0
+        # then clears at price_max, and the year-1 BCL floor jumps accordingly.
+        # All other MA3 consumers (dynamic reserve, bot heuristic, MSR signal,
+        # collateral expected_clearing, obs) are no-worse off with an anchor seed
+        # than with a burn-in-noise seed.
+        _anchor_seed = compute_fundamental_anchor(
+            0, self.config, cap_t_actual=float(cap_year_0)
+        )
+        self._price_history = [float(_anchor_seed)]
+        self.last_clearing_price = float(_anchor_seed)
+        self.expected_price = float(_anchor_seed)
+        # Keep CapSchedule's smoothed-price spike check consistent with the seed.
+        self.cap_schedule._prev_ma3 = float(_anchor_seed)
+
         obs_phase1 = self._get_obs_phase1()   # shape (n_agents, obs_dim)
         return obs_phase1, {}
 

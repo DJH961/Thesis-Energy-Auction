@@ -490,12 +490,17 @@ def test_burnin_tnac_in_band():
 
 
 def test_burnin_price_history_realistic():
-    """After burn-in, price history should contain realistic values."""
+    """After reset (post burn-in), price history is reseeded with the year-0
+    fundamental anchor so MA3 is grounded in fundamentals rather than burn-in
+    noise. The single seed entry must be a realistic price."""
     env = load_env()
     env.reset(seed=42)
-    assert len(env._price_history) >= 2
+    assert len(env._price_history) == 1, (
+        "Expected exactly one (anchor) seed entry after reset; "
+        f"got {len(env._price_history)}"
+    )
     for p in env._price_history:
-        assert 5.0 < p < 300.0, f"Unrealistic burn-in price: {p}"
+        assert 5.0 < p < 300.0, f"Unrealistic anchor seed price: {p}"
 
 
 def test_burnin_msr_reserve():
