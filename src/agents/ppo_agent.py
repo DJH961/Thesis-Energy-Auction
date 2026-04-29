@@ -368,7 +368,7 @@ class PPOAgent:
         surr1 = ratio * adv
         surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
         clipped_min = torch.min(surr1, surr2)
-        if self.dual_clip_c is not None and self.dual_clip_c > 1.0:
+        if self.dual_clip_c > 1.0:
             # Floor only on adv<0 rows; leave adv>=0 untouched.
             neg_mask = (adv < 0).to(clipped_min.dtype)
             floored = torch.max(clipped_min, self.dual_clip_c * adv)

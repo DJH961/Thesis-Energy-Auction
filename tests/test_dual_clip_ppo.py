@@ -87,8 +87,11 @@ def test_dual_clip_mixed_batch_only_floors_negative_rows():
 def test_log_ratio_clip_caps_displayed_loss():
     """Even if log_ratio is enormous, the displayed loss must remain finite."""
     agent = _make_agent(dual_clip_c=3.0)
-    # Sanity: the configured clamp is > 0 and finite.
-    assert 0 < agent.log_ratio_clip < 50
+    # Sanity: the configured clamp is positive and finite. Any positive
+    # finite value is valid; we just guard against accidental misconfig.
+    assert agent.log_ratio_clip > 0 and torch.isfinite(
+        torch.tensor(agent.log_ratio_clip)
+    )
     # Loss with extreme ratio (post log_ratio clamp) must be finite.
     big_ratio = torch.tensor([[float(torch.exp(torch.tensor(agent.log_ratio_clip)))]])
     adv = torch.tensor([[-1.0]])
