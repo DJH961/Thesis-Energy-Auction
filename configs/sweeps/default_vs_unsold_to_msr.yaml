@@ -1,0 +1,28 @@
+# =============================================================================
+# Sweep: default vs. unsold_to_msr ablation
+# =============================================================================
+# 4 experiments total:
+#   - default (base_config) at seeds 23 and 41
+#   - default + ets.unsold_to_msr=true at seeds 23 and 53
+#
+# Seed 23 is shared across both variants for a paired comparison; seeds 41
+# and 53 give an additional independent draw per variant.
+#
+# Run with:
+#     python scripts/sweep.py --spec configs/sweeps/default_vs_unsold_to_msr.yaml
+# =============================================================================
+
+base_config: configs/default.yaml
+output_dir: results/sweeps/default_vs_unsold_to_msr
+
+parallel_workers: 4
+threads_per_worker: null
+
+variants:
+  - name: default
+    seeds: [23, 41]
+
+  - name: unsold_to_msr_on
+    overrides:
+      ets.unsold_to_msr: true
+    seeds: [23, 53]
