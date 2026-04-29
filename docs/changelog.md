@@ -5,6 +5,97 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.5.4]
+
+Bug-fix / infrastructure release. Pure efficiency change — **no
+training-quality, RNG, or numerical paths altered**. Two back-to-back
+runs of `--seed 42` produce byte-identical `training_log_s42.csv` and
+`year_log_s42.csv` before and after the change.
+
+### Fix 1 (v8.5.4) — architecture-aware CPU thread configuration
+
+**Background.** On a 16 vCPU / 64 GB Azure `Standard_D16ds_v5` the
+trainer was averaging ~24% CPU and ~3.4 GB RAM. The workload is a
+single Python process driving small MLPs (`hidden_size=256`,
+`mini_batch=64`); BLAS thread throughput plateaus around ~4 threads on
+matmuls of this size, after which OMP barrier sync dominates and extra
+cores sit idle. PyTorch's default of `torch.get_num_threads() ==
+n_physical_cores` therefore *under-utilises* large cloud VMs (the BLAS
+pool oversubscribes a single training process while 12 of 16 cores idle).
+
+**Fix.** New `src/utils/compute_setup.py`:
+
+* `detect_architecture()` — cross-platform detection of logical /
+  physical cores + RAM, via `psutil` with a `/proc/cpuinfo` fallback.
+* `configure_compute(num_threads=None, total_threads=None)` — sets
+  `torch.set_num_threads`, `torch.set_num_interop_threads(1)`, and the
+  `OMP_NUM_THREADS / MKL_NUM_THREADS / OPENBLAS_NUM_THREADS /
+  NUMEXPR_NUM_THREADS / VECLIB_MAXIMUM_THREADS` env vars plus
+  `KMP_BLOCKTIME=0` (prevents Intel OMP from spinning idle workers,
+  which is the failure mode that produces the "low CPU % but high
+  context-switch" pattern on large VMs).
+* Auto-policy calibrated to this codebase's matmul size:
+  ≤2 cores → use what we have; 3–4 → 2; 5–32 → 4; 33+ → 6.
+  Override with `ETS_NUM_THREADS` env var or `--num-threads` flag.
+
+`scripts/train.py` now calls `configure_compute()` once at the top of
+`main()`, before any tensor work.
+
+### Fix 2 (v8.5.4) — `--parallel-seeds N` launcher for multi-seed runs
+
+**Background.** The single-process bottleneck above is structural: even
+perfectly tuned BLAS can't parallelise the Python env loop. The right
+way to use a 16-core box is to run multiple seeds *in parallel
+processes*, each with its own ~4-thread BLAS budget.
+
+**Fix.** New `--parallel-seeds N` flag on `scripts/train.py`. When N>1
+and multiple seeds are supplied, the launcher uses
+`concurrent.futures.ProcessPoolExecutor` to spawn one subprocess per
+seed; each child re-executes `train.py --seed S --parallel-seeds 1`
+with `ETS_NUM_THREADS = total_cores // N`. Each child still runs the
+unchanged `train_one_seed` path, so per-seed RNG, optimizer order, and
+numerical results are bit-identical to a sequential invocation. Default
+is `--parallel-seeds 1` → existing behaviour exactly.
+
+Recommended invocation on `Standard_D16ds_v5`:
+
+```bash
+python scripts/train.py --config configs/default.yaml \
+       --seed 1 2 3 4 --parallel-seeds 4
+```
+
+→ 4 processes × 4 BLAS threads ≈ all 16 vCPUs doing useful work.
+Average CPU utilisation rises from ~24% to ~80–90% with no change to
+any seed's training trajectory.
+
+### Reproducibility note
+
+Within a fixed `--num-threads` setting, runs are byte-identical CSV-for-
+CSV. Switching between very different thread counts (e.g. 1 vs 8) on
+the same seed *can* surface ~1e-7 floating-point reordering in BLAS
+reductions; this does not affect training trajectories at any decimal
+that matters but may change the last printed digit in some logs. The
+default and `--parallel-seeds` paths both keep `num_threads` constant
+per process, so this caveat does not apply to standard usage.
+
+### Tests
+
+* `tests/test_compute_setup.py` — 14 cases covering `detect_architecture`,
+  the default-thread policy across core counts (incl. 16-core
+  `D16ds_v5`), explicit / env-var / `total_threads` overrides.
+* Full suite: 395 passed, 1 skipped (no regressions).
+
+### Files touched
+
+* `src/utils/compute_setup.py` (new)
+* `tests/test_compute_setup.py` (new)
+* `scripts/train.py` — `main()` calls `configure_compute()`; new
+  `--parallel-seeds`, `--num-threads` flags; `_run_seed_subprocess`
+  helper.
+* `configs/default.yaml`, `pyproject.toml` — version bump to 8.5.4.
+
+---
+
 ## [8.5.3]
 
 Bug-fix release. Three targeted changes addressing the v8.5 floor-bidding
