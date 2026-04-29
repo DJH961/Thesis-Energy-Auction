@@ -143,22 +143,34 @@ and runs the cartesian product of variants × seeds in a process pool.
 
   ```
   [sweep] [START 1/17] reference s=1  → results/.../reference/run_reference_s1.log
-  [sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | R̄ -3.2→-1.8 | comp 87% | green 31→44%
+  [sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | sec 60→78 (m41%) | comp 87% | green 31→44% | R̄ -3.2→-1.8 | ETA 4h12m
+  [sweep] [ETA total ≈ 18h33m] (3/17 done, 4 running, 10 queued)
   [sweep] [DONE  1/17 OK ] reference s=1  (results/.../run_reference_s1.log)
   ```
 
   A background heartbeat thread fires every `--heartbeat-interval`
   seconds (default 60) and emits **one structured summary line per
   running job**, parsed directly from the per-episode CSV
-  (`training_log_<variant>_s<seed>.csv`):
+  (`training_log_<variant>_s<seed>.csv`). Field order — episode, price,
+  secondary, compliance, green, reward, ETA — is intentional:
 
   | Field | Meaning |
   |---|---|
   | `Ep N/total (X.X%)` | Last episode logged, with progress through `simulation.n_episodes`. |
   | `px init→recent (μy)` | Last-year auction clearing price: episode-0 value vs the mean over the most recent 50 logged episodes. `μ` is the within-episode year-mean over the same window. |
-  | `R̄ init→recent` | Mean of `reward_A*` across all agents, episode-0 value vs recent mean (tracks convergence). |
+  | `sec init→recent (mXX%)` | Secondary-market average price (initial→recent) with match rate (volume that crossed in the double auction). |
   | `comp X%` | Compliance rate over the recent window: fraction of `(agent, episode)` cells where `shortfall_A* ≈ 0`. |
   | `green init→recent%` | Mean `green_frac_A*` across all agents, episode-0 value vs recent mean. |
+  | `R̄ init→recent` | Mean of `reward_A*` across all agents, episode-0 value vs recent mean (tracks convergence). |
+  | `ETA Xh Ym` | Per-job remaining wall time, extrapolated from `(episodes_done / elapsed_since_first_heartbeat)`. |
+
+  Multi-job sweeps additionally emit a single aggregate banner per tick:
+
+  ```
+  [sweep] [ETA total ≈ 18h33m] (3/17 done, 4 running, 10 queued)
+  ```
+
+  computed as `max(running ETAs) + queued × mean_full_runtime / n_workers`.
 
   When the CSV does not exist yet (e.g. during the behavioural-cloning
   pretraining phase, before the trainer's CSV writer has emitted any
@@ -200,18 +212,19 @@ python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml
   bool-vs-int seed types, per-variant seed override rules),
   variant-config resolution, `build_jobs` cartesian expansion, and
   YAML-on-disk round-trips.
-* `tests/test_sweep_launcher.py` — 20 cases covering the launcher's
+* `tests/test_sweep_launcher.py` — 28 cases covering the launcher's
   `_job_log_path`, `_tail_last_meaningful_line` (incl. comment skip,
   separator skip, large-file tail window), `_summarize_csv` (header-only
   files, partial trailing lines, compliance-rate edges, ≤200-char output
-  guarantee, initial-row caching), and the `_Heartbeat` background
-  thread (CSV-preferred summary, log-tail fallback, emit / remove /
-  truncate / idempotent stop).
+  guarantee, initial-row caching, secondary-market field, field
+  ordering, last-episode return), `_format_eta`, and the `_Heartbeat`
+  background thread (CSV-preferred summary, log-tail fallback, per-job
+  ETA, aggregate sweep ETA, emit / remove / truncate / idempotent stop).
 * End-to-end smoke: a one-variant one-seed sweep against
   `configs/smoke_100.yaml` produces the renamed CSVs / checkpoint dir
   and a `run_<variant>_s<seed>.log` capture, with the parent terminal
   only emitting `[sweep] [START …]` / `[LIVE …]` / `[DONE …]` lines.
-* Full suite: 445 passed, 1 skipped (no regressions; +50 new tests
+* Full suite: 453 passed, 1 skipped (no regressions; +58 new tests
   vs v8.5.3).
 
 ### Files touched

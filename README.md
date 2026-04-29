@@ -300,10 +300,13 @@ shows short progress lines (`[START]` / `[LIVE]` heartbeat / `[DONE]`).
 
 Each `[LIVE]` line is a one-line training summary per running job, parsed
 from the per-episode CSV — episode progress, clearing-price trajectory,
-mean reward, compliance rate, green-investment progress:
+secondary-market price+match rate, compliance rate, green-investment
+progress, mean reward, and a per-job ETA. Multi-job sweeps additionally
+emit an aggregate `ETA total` banner once per tick:
 
 ```
-[sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | R̄ -3.2→-1.8 | comp 87% | green 31→44%
+[sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | sec 60→78 (m41%) | comp 87% | green 31→44% | R̄ -3.2→-1.8 | ETA 4h12m
+[sweep] [ETA total ≈ 18h33m] (3/17 done, 4 running, 10 queued)
 ```
 
 Heartbeats fire every `--heartbeat-interval` seconds (default 60); pass

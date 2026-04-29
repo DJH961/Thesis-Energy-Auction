@@ -98,14 +98,14 @@ class TestSummarizeCsv:
                 w.writerow(r)
 
     def test_returns_none_for_missing_file(self, sweep_module, tmp_path):
-        line, init = sweep_module._summarize_csv(str(tmp_path / "nope.csv"))
+        line, init, _last = sweep_module._summarize_csv(str(tmp_path / "nope.csv"))
         assert line is None
         assert init is None
 
     def test_returns_none_for_header_only(self, sweep_module, tmp_path):
         p = tmp_path / "x.csv"
         p.write_text("episode,clearing_price_last,reward_A1\n")
-        line, _ = sweep_module._summarize_csv(str(p))
+        line, _, _last = sweep_module._summarize_csv(str(p))
         assert line is None
 
     def test_basic_summary_shape(self, sweep_module, tmp_path):
@@ -130,7 +130,7 @@ class TestSummarizeCsv:
                 "shortfall_A2": 0.0,
             })
         self._write_csv(p, rows, headers)
-        line, init = sweep_module._summarize_csv(str(p), n_episodes=10000)
+        line, init, _last = sweep_module._summarize_csv(str(p), n_episodes=10000)
         assert line is not None
         assert "Ep 1100/10000" in line
         assert "%" in line  # progress percent
@@ -150,7 +150,7 @@ class TestSummarizeCsv:
             "100,80,-2.5,0.35,0.0\n"
             "200,85,"  # truncated mid-row
         )
-        line, _ = sweep_module._summarize_csv(str(p))
+        line, _, _last = sweep_module._summarize_csv(str(p))
         assert line is not None
         # Should fall back to the last *complete* row (episode 100).
         assert "Ep 100" in line
@@ -166,7 +166,7 @@ class TestSummarizeCsv:
              "clearing_price_last": 100, "green_frac_A1": 0.5, "green_frac_A2": 0.5}
             for i in range(50)
         ], headers)
-        line1, _ = sweep_module._summarize_csv(str(p1))
+        line1, _, _last = sweep_module._summarize_csv(str(p1))
         assert "comp 0%" in line1
 
         # All compliant.
@@ -177,7 +177,7 @@ class TestSummarizeCsv:
              "clearing_price_last": 100, "green_frac_A1": 0.5, "green_frac_A2": 0.5}
             for i in range(50)
         ], headers)
-        line2, _ = sweep_module._summarize_csv(str(p2))
+        line2, _, _last = sweep_module._summarize_csv(str(p2))
         assert "comp 100%" in line2
 
     def test_summary_under_200_chars(self, sweep_module, tmp_path):
@@ -197,7 +197,7 @@ class TestSummarizeCsv:
             rows.append(row)
         p = tmp_path / "big.csv"
         self._write_csv(p, rows, headers)
-        line, _ = sweep_module._summarize_csv(str(p), n_episodes=100000)
+        line, _, _last = sweep_module._summarize_csv(str(p), n_episodes=100000)
         assert line is not None
         assert len(line) <= 200, f"summary too long: {len(line)} chars: {line}"
 
@@ -216,11 +216,88 @@ class TestSummarizeCsv:
         # whatever the tail window would pick.
         cached = {"episode": "0", "clearing_price_last": "10",
                   "reward_A1": "-99.0", "green_frac_A1": "0.05", "shortfall_A1": "0.0"}
-        line, init = sweep_module._summarize_csv(
+        line, init, _last = sweep_module._summarize_csv(
             str(p), n_episodes=10000, initial_row=cached, tail_bytes=1024,
         )
         assert "px 10→" in line  # uses the cached initial value, not the tail
         assert init is cached  # returned unchanged for caller to keep caching
+
+    def test_field_order_and_secondary_market(self, sweep_module, tmp_path):
+        """Fields must appear in order: episode | px | sec | comp | green | R̄.
+
+        Secondary-market columns (avg_price + match_rate) must be summarised
+        when present, with format ``sec INIT→NOW (mXX%)``.
+        """
+        import csv as _csv
+        p = tmp_path / "x.csv"
+        headers = [
+            "episode", "clearing_price_last", "ep_mean_clearing_price",
+            "secondary_avg_price", "secondary_match_rate",
+            "reward_A1", "green_frac_A1", "shortfall_A1",
+        ]
+        with open(p, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            for ep in range(0, 500, 100):
+                w.writerow({
+                    "episode": ep,
+                    "clearing_price_last": 75 + ep * 0.05,
+                    "ep_mean_clearing_price": 70 + ep * 0.04,
+                    "secondary_avg_price": 60 + ep * 0.03,
+                    "secondary_match_rate": 0.40 + ep * 0.0001,
+                    "reward_A1": -3.0 + ep * 0.001,
+                    "green_frac_A1": 0.30 + ep * 0.0001,
+                    "shortfall_A1": 0.0,
+                })
+        line, _, last_ep = sweep_module._summarize_csv(str(p), n_episodes=1000)
+        assert line is not None
+        assert last_ep == 400
+        # Secondary market field present with both arrow and match-rate.
+        assert "sec 60→" in line
+        assert "(m" in line and "%)" in line
+        # Required ordering: Ep < px < sec < comp < green < R̄.
+        order_keys = ["Ep ", "| px ", "| sec ", "| comp ", "| green ", "| R̄ "]
+        positions = [line.find(k) for k in order_keys]
+        assert all(p >= 0 for p in positions), f"missing field in: {line}"
+        assert positions == sorted(positions), f"wrong order: {line}"
+
+    def test_returns_last_ep(self, sweep_module, tmp_path):
+        import csv as _csv
+        p = tmp_path / "x.csv"
+        with open(p, "w", newline="") as f:
+            w = _csv.DictWriter(
+                f, fieldnames=["episode", "clearing_price_last", "reward_A1",
+                               "green_frac_A1", "shortfall_A1"],
+            )
+            w.writeheader()
+            for ep in (0, 50, 137):
+                w.writerow({"episode": ep, "clearing_price_last": 80,
+                            "reward_A1": -1.0, "green_frac_A1": 0.3,
+                            "shortfall_A1": 0.0})
+        _line, _init, last_ep = sweep_module._summarize_csv(str(p))
+        assert last_ep == 137
+
+
+class TestFormatEta:
+    def test_subhour(self, sweep_module):
+        assert sweep_module._format_eta(45) == "0m"
+        assert sweep_module._format_eta(60) == "1m"
+        assert sweep_module._format_eta(125) == "2m"
+        assert sweep_module._format_eta(59 * 60) == "59m"
+
+    def test_hours(self, sweep_module):
+        assert sweep_module._format_eta(60 * 60) == "1h00m"
+        assert sweep_module._format_eta(2 * 3600 + 35 * 60) == "2h35m"
+
+    def test_days(self, sweep_module):
+        assert sweep_module._format_eta(86400) == "1d00h"
+        assert sweep_module._format_eta(2 * 86400 + 5 * 3600) == "2d05h"
+
+    def test_unknown_for_invalid(self, sweep_module):
+        assert sweep_module._format_eta(0) == "?"
+        assert sweep_module._format_eta(-1) == "?"
+        assert sweep_module._format_eta(float("nan")) == "?"
+        assert sweep_module._format_eta(float("inf")) == "?"
 
 
 class TestHeartbeat:
@@ -339,3 +416,93 @@ class TestHeartbeat:
             hb.stop()
         out = buf.getvalue()
         assert "BC pretrain epoch 5/10" in out
+
+    def test_emits_per_job_eta_when_episode_progresses(
+        self, sweep_module, tmp_path
+    ):
+        """Per-job ETA appears once enough episodes have been observed."""
+        import csv as _csv
+        import io
+
+        log_path = tmp_path / "run_v_s1.log"
+        log_path.write_text("\n")
+        csv_path = tmp_path / "training_log_v_s1.csv"
+        headers = ["episode", "clearing_price_last", "reward_A1",
+                   "green_frac_A1", "shortfall_A1"]
+
+        def _write(rows):
+            with open(csv_path, "w", newline="") as f:
+                w = _csv.DictWriter(f, fieldnames=headers)
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+
+        # First snapshot: episode 100.
+        _write([{"episode": 100, "clearing_price_last": 80, "reward_A1": -3,
+                 "green_frac_A1": 0.3, "shortfall_A1": 0.0}])
+
+        buf = io.StringIO()
+        hb = sweep_module._Heartbeat(
+            interval=0.05, stream=buf, n_workers=1, total_jobs=1,
+        )
+        hb.add("v", 1, str(log_path), csv_path=str(csv_path), n_episodes=1000)
+        hb.start()
+        try:
+            time.sleep(0.2)
+            # Advance episode count so the heartbeat can compute a rate.
+            _write([{"episode": 200, "clearing_price_last": 85, "reward_A1": -2,
+                     "green_frac_A1": 0.32, "shortfall_A1": 0.0}])
+            time.sleep(0.4)
+        finally:
+            hb.stop()
+
+        out = buf.getvalue()
+        # ETA should be emitted on the per-job line once a non-zero delta is
+        # observed. We cannot assert the exact value (timing-dependent in
+        # CI), only that an ETA token is appended.
+        assert "ETA " in out
+        # Single-job sweep: aggregate ETA banner is suppressed.
+        assert "ETA total" not in out
+
+    def test_emits_aggregate_eta_for_multi_job_sweep(
+        self, sweep_module, tmp_path
+    ):
+        """Multi-job sweeps print an aggregate ``ETA total`` banner per tick."""
+        import csv as _csv
+        import io
+
+        # Two jobs sharing one worker → queued > 0 for whichever isn't running.
+        headers = ["episode", "clearing_price_last", "reward_A1",
+                   "green_frac_A1", "shortfall_A1"]
+        csv_path = tmp_path / "training_log_v_s1.csv"
+        log_path = tmp_path / "run_v_s1.log"
+        log_path.write_text("\n")
+
+        def _write(rows):
+            with open(csv_path, "w", newline="") as f:
+                w = _csv.DictWriter(f, fieldnames=headers)
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+
+        _write([{"episode": 100, "clearing_price_last": 80, "reward_A1": -3,
+                 "green_frac_A1": 0.3, "shortfall_A1": 0.0}])
+
+        buf = io.StringIO()
+        hb = sweep_module._Heartbeat(
+            interval=0.05, stream=buf, n_workers=1, total_jobs=4,
+        )
+        hb.add("v", 1, str(log_path), csv_path=str(csv_path), n_episodes=1000)
+        hb.start()
+        try:
+            time.sleep(0.2)
+            _write([{"episode": 200, "clearing_price_last": 85, "reward_A1": -2,
+                     "green_frac_A1": 0.32, "shortfall_A1": 0.0}])
+            time.sleep(0.4)
+        finally:
+            hb.stop()
+
+        out = buf.getvalue()
+        assert "ETA total" in out
+        # The done/running/queued breakdown must reflect set_completed=0.
+        assert "running" in out and "queued" in out

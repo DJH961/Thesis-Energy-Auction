@@ -18,18 +18,22 @@ subprocess via ``ProcessPoolExecutor``. Each subprocess:
 The parent terminal only shows short, structured progress lines:
 
     [sweep] [START 1/17] reference s=1  → results/.../reference/run_reference_s1.log
-    [sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | R̄ -3.2→-1.8 | comp 87% | green 31→44%
+    [sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | sec 60→78 (m41%) | comp 87% | green 31→44% | R̄ -3.2→-1.8 | ETA 4h12m
+    [sweep] [ETA total ≈ 18h33m] (3/17 done, 4 running, 10 queued)
     [sweep] [DONE  1/17 OK ] reference s=1
 
 Heartbeats are printed every ``--heartbeat-interval`` seconds (default
 60s). Each heartbeat parses the per-episode CSV
 (``training_log_<variant>_s<seed>.csv``) to produce a single-line
-training summary per running job: episode progress, clearing-price
-trajectory (initial→recent, with episode-mean), mean reward
-(initial→recent, to track convergence), compliance rate, and
-green-investment trajectory. When the CSV does not exist yet (e.g.
-during behavioural-cloning pretraining), the heartbeat falls back to
-the last informative line of the captured log file.
+training summary per running job. Field order — episode, price,
+secondary market, compliance, greening, reward — is intentional:
+physical / market signals first, learning-quality reward last. A
+per-job ``ETA`` is appended once enough episodes have elapsed to
+estimate a rate; in multi-job sweeps an aggregate ``ETA total`` banner
+is printed once per tick combining the slowest running job with the
+queued backlog at the configured worker count. When the CSV does not
+exist yet (e.g. during behavioural-cloning pretraining), the heartbeat
+falls back to the last informative line of the captured log file.
 
 Use ``--quiet`` to suppress heartbeats entirely.
 
@@ -154,23 +158,30 @@ def _summarize_csv(
     initial_row: dict | None = None,
     tail_bytes: int = 65536,
     tail_rows: int = 50,
-) -> tuple[str | None, dict | None]:
+) -> tuple[str | None, dict | None, int | None]:
     """Build a one-line training-progress summary from a per-episode CSV.
 
     Reads the CSV header + the last ``tail_bytes`` of the file (so we can
     cheaply re-summarise even very long runs without re-parsing 100k rows
-    every heartbeat). Returns ``(line, initial_row)``:
+    every heartbeat). Returns ``(line, initial_row, last_ep)``:
 
     * ``line`` — the formatted summary string, e.g.::
 
-          Ep 1200/100000 (1.2%) | px 75→142 (μ128) | R̄ -3.2→-1.8 | comp 87% | green 31→44%
+          Ep 1200/100000 (1.2%) | px 75→142 (μ128) | sec 60→78 (m41%) | comp 87% | green 31→44% | R̄ -3.2→-1.8
 
-      or ``None`` if the file is missing / has no data rows yet.
+      or ``None`` if the file is missing / has no data rows yet. The
+      field order — episode, price, secondary, compliance, green,
+      reward — is intentional: physical / market signals first,
+      learning-quality reward last.
 
-    * ``initial_row`` — the first complete data row (caller should cache and
-      pass back on later calls so initial-vs-current arrows stay anchored
-      to the *true* episode-0 values, not to whatever rows the tail window
-      happens to contain).
+    * ``initial_row`` — the first complete data row (caller should cache
+      and pass back on later calls so initial-vs-current arrows stay
+      anchored to the *true* episode-0 values, not to whatever rows the
+      tail window happens to contain).
+
+    * ``last_ep`` — the most recent episode index seen in the CSV, or
+      ``None`` when no usable rows exist. Used by the heartbeat to
+      compute per-job and aggregate ETAs.
 
     Robust to: missing file, header-only file, partial trailing line,
     rows with empty/non-numeric cells.
@@ -178,12 +189,12 @@ def _summarize_csv(
     try:
         size = os.path.getsize(csv_path)
         if size == 0:
-            return None, initial_row
+            return None, initial_row, None
         with open(csv_path, "rb") as f:
             # Always read the header.
             header_line = f.readline()
             if not header_line:
-                return None, initial_row
+                return None, initial_row, None
             header = header_line.decode("utf-8", errors="replace").rstrip("\r\n").split(",")
             # If the file is small, just read the rest. Otherwise tail-read.
             if size <= len(header_line) + tail_bytes:
@@ -195,7 +206,7 @@ def _summarize_csv(
                 body = f.read()
         body_text = body.decode("utf-8", errors="replace")
     except OSError:
-        return None, initial_row
+        return None, initial_row, None
 
     # Parse rows.
     import csv as _csv
@@ -214,7 +225,7 @@ def _summarize_csv(
             continue
         rows.append(dict(zip(header, raw)))
     if not rows:
-        return None, initial_row
+        return None, initial_row, None
 
     # If we don't yet have the very first row cached, try to recover it by
     # reading the second line of the file (header-skipping).
@@ -259,6 +270,11 @@ def _summarize_csv(
     price_now = _mean([_f(r, "clearing_price_last") for r in recent])
     price_mean_yr = _mean([_f(r, "ep_mean_clearing_price") for r in recent])
 
+    # --- Secondary market: avg price (initial → recent) + match rate. ---
+    sec_px_init = _f(initial_row or rows[0], "secondary_avg_price")
+    sec_px_now = _mean([_f(r, "secondary_avg_price") for r in recent])
+    sec_match = _mean([_f(r, "secondary_match_rate") for r in recent])
+
     # --- Per-agent metrics: average over agents and over the recent window. ---
     if n_total > 0:
         # Reward (initial single-episode mean across agents → recent mean).
@@ -293,6 +309,8 @@ def _summarize_csv(
         r_init = r_now = g_init = g_now = comp_rate = float("nan")
 
     # --- Format pieces (skip cleanly when a number is NaN). ---
+    # Field order, by user preference: episode | price | secondary
+    # market | compliance | greening | reward.
     parts: list[str] = []
     if n_episodes and n_episodes > 0:
         pct = 100.0 * last_ep / n_episodes
@@ -308,14 +326,45 @@ def _summarize_csv(
             parts.append(f"px {price_init:.0f}→{price_now:.0f} (μ{price_mean_yr:.0f})")
         else:
             parts.append(f"px {price_init:.0f}→{price_now:.0f}")
-    if _ok(r_init) and _ok(r_now):
-        parts.append(f"R̄ {r_init:+.1f}→{r_now:+.1f}")
+    # Secondary: prefer initial→recent arrow when both prices are defined,
+    # else fall back to whichever side is present; always append match rate
+    # if it's known. "m" = match rate (fraction of buy/sell volume that
+    # actually crossed in the double auction).
+    if _ok(sec_px_now):
+        if _ok(sec_px_init):
+            sec_str = f"sec {sec_px_init:.0f}→{sec_px_now:.0f}"
+        else:
+            sec_str = f"sec {sec_px_now:.0f}"
+        if _ok(sec_match):
+            sec_str += f" (m{sec_match*100:.0f}%)"
+        parts.append(sec_str)
     if _ok(comp_rate):
         parts.append(f"comp {comp_rate*100:.0f}%")
     if _ok(g_init) and _ok(g_now):
         parts.append(f"green {g_init*100:.0f}→{g_now*100:.0f}%")
+    if _ok(r_init) and _ok(r_now):
+        parts.append(f"R̄ {r_init:+.1f}→{r_now:+.1f}")
 
-    return " | ".join(parts), initial_row
+    return " | ".join(parts), initial_row, last_ep
+
+
+def _format_eta(seconds: float) -> str:
+    """Format a duration in seconds as a short ETA string.
+
+    Returns ``"?"`` for non-positive / non-finite values (covers the early
+    period of a job before any episode delta is observable).
+    """
+    if not (seconds == seconds) or seconds <= 0 or seconds == float("inf"):
+        return "?"
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d{hours:02d}h"
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m"
 
 
 class _Heartbeat:
@@ -333,19 +382,41 @@ class _Heartbeat:
     stdout/stderr log.
     """
 
-    def __init__(self, interval: float, stream=None):
+    def __init__(
+        self,
+        interval: float,
+        stream=None,
+        *,
+        n_workers: int = 1,
+        total_jobs: int | None = None,
+    ):
         # Floor the interval to a small positive value to keep the loop sane
         # at near-zero settings (e.g. unit tests) without blocking forever.
         self.interval = max(0.05, float(interval))
         self._lock = threading.Lock()
         # (variant, seed) -> {"log": str, "csv": str|None, "n_eps": int|None,
-        #                     "initial_row": dict|None}
+        #                     "initial_row": dict|None,
+        #                     "first_seen_t": float|None, "first_seen_ep": int|None,
+        #                     "last_ep": int|None}
         self._jobs: dict[tuple[str, int], dict] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # Allow tests to inject a writable stream; default to current stderr
         # at print-time (so output still respects redirections).
         self._stream = stream
+        # Sweep-wide context for aggregate ETA. ``total_jobs`` is the number
+        # of (variant × seed) jobs the launcher submitted; it is used together
+        # with the count of jobs that have already completed to estimate the
+        # wall-clock remaining for the *whole* sweep, not just the running
+        # jobs. ``n_workers`` is the parallel-worker count.
+        self._n_workers = max(1, int(n_workers))
+        self._total_jobs = int(total_jobs) if total_jobs is not None else None
+        self._completed_jobs = 0
+
+    def set_completed(self, completed: int) -> None:
+        """Record how many jobs the launcher has finished (for ETA math)."""
+        with self._lock:
+            self._completed_jobs = int(completed)
 
     def add(
         self,
@@ -361,6 +432,9 @@ class _Heartbeat:
                 "csv": csv_path,
                 "n_eps": n_episodes,
                 "initial_row": None,
+                "first_seen_t": None,
+                "first_seen_ep": None,
+                "last_ep": None,
             }
 
     def remove(self, variant: str, seed: int) -> None:
@@ -380,15 +454,27 @@ class _Heartbeat:
         while not self._stop.wait(self.interval):
             with self._lock:
                 snapshot = [(key, dict(meta)) for key, meta in self._jobs.items()]
+                completed = self._completed_jobs
+                total_jobs = self._total_jobs
+                n_workers = self._n_workers
             if not snapshot:
                 continue
+
+            # Per-job ETA accumulator: list of (remaining_seconds_for_job,
+            # estimated_full_job_seconds). We use these to estimate the
+            # aggregate sweep ETA below.
+            eta_running: list[float] = []
+            full_job_estimates: list[float] = []
+
+            now = time.time()
             for (variant, seed), meta in snapshot:
                 line: str | None = None
+                last_ep: int | None = None
 
                 # 1) Preferred: structured summary from the per-episode CSV.
                 csv_path = meta.get("csv")
                 if csv_path and os.path.exists(csv_path):
-                    summary, init = _summarize_csv(
+                    summary, init, last_ep = _summarize_csv(
                         csv_path,
                         n_episodes=meta.get("n_eps"),
                         initial_row=meta.get("initial_row"),
@@ -406,16 +492,73 @@ class _Heartbeat:
                 if line is None:
                     line = _tail_last_meaningful_line(meta["log"])
 
+                # Update per-job ETA tracking (only when we have a structured
+                # episode count from the CSV — log-tail mode can't time-budget).
+                eta_str = ""
+                if last_ep is not None and last_ep > 0:
+                    n_eps = meta.get("n_eps")
+                    with self._lock:
+                        entry = self._jobs.get((variant, seed))
+                        if entry is not None:
+                            if entry.get("first_seen_t") is None:
+                                entry["first_seen_t"] = now
+                                entry["first_seen_ep"] = last_ep
+                            entry["last_ep"] = last_ep
+                            first_t = entry["first_seen_t"]
+                            first_ep = entry["first_seen_ep"]
+                    elapsed = now - first_t
+                    delta_eps = last_ep - first_ep
+                    if delta_eps > 0 and elapsed > 0 and n_eps:
+                        sec_per_ep = elapsed / delta_eps
+                        remaining = max(0, n_eps - last_ep) * sec_per_ep
+                        eta_running.append(remaining)
+                        full_job_estimates.append(n_eps * sec_per_ep)
+                        eta_str = f" | ETA {_format_eta(remaining)}"
+
                 if line:
+                    line = line + eta_str
                     # Truncate very long lines so the terminal stays readable.
-                    if len(line) > 200:
-                        line = line[:197] + "..."
+                    if len(line) > 220:
+                        line = line[:217] + "..."
                     out = self._stream if self._stream is not None else sys.stderr
                     print(
                         f"[sweep] [LIVE  {variant} s={seed}] {line}",
                         file=out,
                         flush=True,
                     )
+
+            # Aggregate sweep-wide ETA. Two contributions:
+            #   (a) finishing the currently-running jobs — bounded below by
+            #       the slowest running job (they execute in parallel).
+            #   (b) clearing the queue of not-yet-started jobs at
+            #       ``n_workers`` jobs in flight using the mean per-job
+            #       runtime estimate.
+            # We only print the aggregate ETA when there is more than one
+            # job in the sweep so that single-job invocations stay quiet.
+            if (
+                eta_running
+                and total_jobs is not None
+                and total_jobs > 1
+            ):
+                running_count = len(eta_running)
+                queued = max(0, total_jobs - completed - running_count)
+                slowest_running = max(eta_running)
+                if queued > 0 and full_job_estimates:
+                    mean_full = sum(full_job_estimates) / len(full_job_estimates)
+                    queued_wall = (queued * mean_full) / max(1, n_workers)
+                else:
+                    queued_wall = 0.0
+                agg = slowest_running + queued_wall
+                done_msg = (
+                    f"({completed}/{total_jobs} done, "
+                    f"{running_count} running, {queued} queued)"
+                )
+                out = self._stream if self._stream is not None else sys.stderr
+                print(
+                    f"[sweep] [ETA total ≈ {_format_eta(agg)}] {done_msg}",
+                    file=out,
+                    flush=True,
+                )
 
 
 def main() -> int:
@@ -530,7 +673,11 @@ def main() -> int:
     # Launch.
     heartbeat = None
     if not args.quiet:
-        heartbeat = _Heartbeat(args.heartbeat_interval)
+        heartbeat = _Heartbeat(
+            args.heartbeat_interval,
+            n_workers=n_workers,
+            total_jobs=n_jobs,
+        )
         heartbeat.start()
 
     # Cache n_episodes per resolved variant YAML (one read per variant) so
@@ -586,6 +733,7 @@ def main() -> int:
                 completed += 1
                 if heartbeat is not None:
                     heartbeat.remove(variant_name, seed)
+                    heartbeat.set_completed(completed)
                 tag = "OK " if rc == 0 else f"FAIL({rc})"
                 print(
                     f"[sweep] [DONE  {completed}/{n_jobs} {tag}] {variant_name} s={seed}  "
