@@ -2294,6 +2294,7 @@ class ETSEnvironment(gym.Env):
                 for i in range(self.n_total)
             ],
             "investment_costs": invest_costs.tolist(),
+            "old_carry_forward": old_carry_forward.tolist(),  # carry-forward debt at year start (pre-compliance)
         })
 
         # ── Per-agent per-year diagnostics ───────────────────────────────────
