@@ -287,12 +287,25 @@ python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml --dry-run
 python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml
 ```
 
-See `configs/sweeps/example_sweep.yaml` for the schema (also documented in
-`src/utils/sweep.py`). Each variant writes to its own
-`<output_dir>/<variant_name>/` results directory, so logs never collide.
+Each variant writes to its own `<output_dir>/<variant>/` results directory,
+and **its CSV / checkpoint filenames are tagged with the variant name**
+(`training_log_<variant>_s<seed>.csv`, `year_log_<variant>_s<seed>.csv`,
+`checkpoints_<variant>_s<seed>/`) — so files stay unique even if you copy
+them all into one folder for analysis.
+
+To keep the parent terminal readable while many jobs run concurrently,
+each subprocess's full stdout+stderr is captured to
+`<output_dir>/<variant>/run_<variant>_s<seed>.log`. The terminal only
+shows short progress lines (`[START]` / `[LIVE]` heartbeat / `[DONE]`).
+Heartbeats sample the last informative log line from each running job
+every `--heartbeat-interval` seconds (default 60); pass `--quiet` to
+disable them entirely.
+
 Per-seed RNG and CSVs are bit-identical to a sequential
-`train.py --config <variant>.yaml --seed S` invocation; only the process
-layout differs.
+`train.py --config <variant>.yaml --seed S --run-tag <variant>`
+invocation; only the process layout differs. See
+`configs/sweeps/example_sweep.yaml` for the schema (also documented in
+`src/utils/sweep.py`).
 
 ### Running Tests
 

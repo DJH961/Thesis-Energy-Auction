@@ -78,20 +78,138 @@ that matters but may change the last printed digit in some logs. The
 default and `--parallel-seeds` paths both keep `num_threads` constant
 per process, so this caveat does not apply to standard usage.
 
+### Fix 3 (v8.5.4) — multi-variant × multi-seed sweep launcher
+
+**Background.** With `--parallel-seeds` it became easy to run many seeds
+of *one* config in parallel, but ablations across config variants
+(scarcity, MSR on/off, reserve price, reward weights, …) still needed
+hand-launched commands per variant, and per-variant outputs collided on
+filenames once they were copied into a single analysis folder. The
+unchanged trainer also dumps a *lot* of per-episode console output —
+fine for one process, but a mess when several variants are running
+concurrently in the same terminal.
+
+**Fix.** New `scripts/sweep.py` launcher that reads a sweep spec YAML
+and runs the cartesian product of variants × seeds in a process pool.
+
+* **Spec schema** (full schema + validation in `src/utils/sweep.py`):
+
+  ```yaml
+  base_config: configs/default.yaml
+  output_dir: results/sweeps/scarcity_msr
+  seeds: [1, 2, 3]                 # default; variants may override
+  parallel_workers: 4
+  threads_per_worker: null         # auto = total_cores / workers
+  variants:
+    - name: tight_cap
+      overrides: {ets.cap_overhead_pct: -0.02}
+    - name: msr_off
+      overrides: {ets.msr.enabled: false}
+    - name: tight_cap_msr_off
+      overrides:
+        ets.cap_overhead_pct: -0.02
+        ets.msr.enabled: false
+      seeds: [1, 2]                # per-variant seed override
+  ```
+
+  Each variant's overrides are deep-merged onto the base config (lists
+  *replace*, not concatenate, to avoid silent hyperparameter doubling).
+  Dotted-path keys (`ets.msr.enabled`) and nested mappings are both
+  accepted. Variant names are validated as filesystem-safe.
+
+* **Per-variant output isolation.** Each variant's resolved YAML is
+  written to `<output_dir>/_resolved/<variant>.yaml`. Its
+  `logging.results_dir` is forced to `<output_dir>/<variant>/`, and
+  `train.py` is invoked with a new `--run-tag <variant>` flag that
+  rewrites every output filename so they remain unique even when
+  copied into a single folder for analysis:
+
+  | Without tag (existing)              | With `--run-tag tight_cap`               |
+  |-------------------------------------|------------------------------------------|
+  | `training_log_s42.csv`              | `training_log_tight_cap_s42.csv`         |
+  | `year_log_s42.csv`                  | `year_log_tight_cap_s42.csv`             |
+  | `checkpoints_s42/`                  | `checkpoints_tight_cap_s42/`             |
+  | `snapshots/training_log_s42_ep*.csv`| `snapshots/training_log_tight_cap_s42_ep*.csv` |
+
+  `--run-tag` is a no-op when omitted, so existing single-config runs
+  produce byte-identical filenames to v8.5.3.
+
+* **Per-job log capture, terse parent terminal.** Each subprocess's
+  stdout+stderr is redirected to
+  `<output_dir>/<variant>/run_<variant>_s<seed>.log` instead of being
+  printed to the terminal where the launcher runs. The full per-episode
+  diagnostic output is preserved on disk for later inspection. The
+  parent terminal only prints structured progress lines:
+
+  ```
+  [sweep] [START 1/17] reference s=1  → results/.../reference/run_reference_s1.log
+  [sweep] [LIVE  reference s=1] Warnings (year-step counts): priceFloor=2 ...
+  [sweep] [DONE  1/17 OK ] reference s=1  (results/.../run_reference_s1.log)
+  ```
+
+  A background heartbeat thread samples the last informative line from
+  each running job's log file every `--heartbeat-interval` seconds
+  (default 60). Pure-separator lines (`═══`, `───`, `=====`, …) are
+  filtered out so the heartbeat shows real per-episode content. Use
+  `--quiet` to suppress heartbeats entirely.
+
+* **Reproducibility.** Each `(variant, seed)` job runs the unchanged
+  `train_one_seed` path inside a fresh
+  `train.py --config <variant>.yaml --seed S --parallel-seeds 1
+  --run-tag <variant>` subprocess, so per-seed RNG, optimiser order,
+  and CSV outputs are bit-identical to a sequential, hand-launched
+  invocation; only the process layout (and on-disk filename infix)
+  differ.
+
+Usage:
+
+```bash
+# Validate spec and inspect the job plan without launching anything:
+python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml --dry-run
+
+# Run the full sweep:
+python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml
+```
+
 ### Tests
 
 * `tests/test_compute_setup.py` — 14 cases covering `detect_architecture`,
   the default-thread policy across core counts (incl. 16-core
   `D16ds_v5`), explicit / env-var / `total_threads` overrides.
-* Full suite: 395 passed, 1 skipped (no regressions).
+* `tests/test_sweep.py` — 30 cases covering `deep_merge` (incl.
+  list-replace and no-mutate invariants), dotted-path expansion, spec
+  validation (missing fields, duplicate / unsafe variant names,
+  bool-vs-int seed types, per-variant seed override rules),
+  variant-config resolution, `build_jobs` cartesian expansion, and
+  YAML-on-disk round-trips.
+* `tests/test_sweep_launcher.py` — 11 cases covering the launcher's
+  `_job_log_path`, `_tail_last_meaningful_line` (incl. comment skip,
+  separator skip, large-file tail window), and the `_Heartbeat`
+  background thread (emit / remove / truncate / idempotent stop).
+* End-to-end smoke: a one-variant one-seed sweep against
+  `configs/smoke_100.yaml` produces the renamed CSVs / checkpoint dir
+  and a `run_<variant>_s<seed>.log` capture, with the parent terminal
+  only emitting `[sweep] [START …]` / `[LIVE …]` / `[DONE …]` lines.
+* Full suite: 436 passed, 1 skipped (no regressions; +41 new tests
+  vs v8.5.3).
 
 ### Files touched
 
 * `src/utils/compute_setup.py` (new)
+* `src/utils/sweep.py` (new) — spec schema, deep-merge, override
+  expansion, variant-config resolution, job materialisation.
+* `scripts/sweep.py` (new) — launcher: process pool, per-job log
+  capture, heartbeat thread, plan / dry-run output.
+* `configs/sweeps/example_sweep.yaml` (new) — worked example covering
+  scarcity, MSR on/off, reserve price.
 * `tests/test_compute_setup.py` (new)
+* `tests/test_sweep.py` (new)
+* `tests/test_sweep_launcher.py` (new)
 * `scripts/train.py` — `main()` calls `configure_compute()`; new
-  `--parallel-seeds`, `--num-threads` flags; `_run_seed_subprocess`
-  helper.
+  `--parallel-seeds`, `--num-threads`, `--run-tag` flags;
+  `_run_seed_subprocess` helper; output filenames / checkpoint dir /
+  snapshot filenames now carry the `--run-tag` infix when set.
+* `README.md` — new "Running Sweeps" subsection.
 * `configs/default.yaml`, `pyproject.toml` — version bump to 8.5.4.
 
 ---

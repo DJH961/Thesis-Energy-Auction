@@ -621,10 +621,17 @@ def prune_checkpoints(
     )
 
 
-def train_one_seed(config: dict, seed: int, on_log=None):
+def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = None):
     # Isolate per-run auto-resolved schedule values (e.g. shaping decay)
     # so earlier short runs do not mutate config used by later long runs.
     config = copy.deepcopy(config)
+
+    # Filename infix used to disambiguate outputs across config variants
+    # in a sweep. ``run_tag=None`` (default) preserves the original
+    # ``..._s{seed}`` filenames so existing single-config runs are
+    # bit-identical on disk; ``run_tag="foo"`` switches to
+    # ``..._foo_s{seed}`` everywhere.
+    _tag_part = f"_{run_tag}" if run_tag else ""
 
     # Reproducibility: seed all RNGs before any stochastic operation
     np.random.seed(seed)
@@ -877,7 +884,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     os.makedirs(results_dir, exist_ok=True)
 
     # Episode-level
-    ep_path = os.path.join(results_dir, f"training_log_s{seed}.csv")
+    ep_path = os.path.join(results_dir, f"training_log{_tag_part}_s{seed}.csv")
     ep_fields = ["episode", "clearing_price_last", "cap_last", "entropy_coef",
                  "shaping_weight", "entropy_decay_triggered", "active_agent",
                  "epsilon"]
@@ -938,7 +945,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     ep_writer.writeheader()
 
     # Year-level
-    yr_path = os.path.join(results_dir, f"year_log_s{seed}.csv")
+    yr_path = os.path.join(results_dir, f"year_log{_tag_part}_s{seed}.csv")
     yr_fields = ["episode", "year", "cap", "auction_volume", "tnac",
                  "clearing_price", "secondary_price", "msr_reserve",
                  "msr_total_cancelled", "msr_withhold_this_year", "msr_release_this_year",
@@ -2385,7 +2392,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
 
         # Checkpointing
         if episode % save_interval == 0:
-            ckpt_dir = os.path.join(results_dir, f"checkpoints_s{seed}")
+            ckpt_dir = os.path.join(results_dir, f"checkpoints{_tag_part}_s{seed}")
             os.makedirs(ckpt_dir, exist_ok=True)
             for i, agent in enumerate(agents):
                 agent.save(os.path.join(ckpt_dir, f"agent_{i}_ep{episode}.pt"))
@@ -2398,15 +2405,15 @@ def train_one_seed(config: dict, seed: int, on_log=None):
             snap_dir = os.path.join(results_dir, "snapshots")
             os.makedirs(snap_dir, exist_ok=True)
             _flush_csv_logs(episode, force=True)
-            snap_ep = os.path.join(snap_dir, f"training_log_s{seed}_ep{episode}.csv")
-            snap_yr = os.path.join(snap_dir, f"year_log_s{seed}_ep{episode}.csv")
+            snap_ep = os.path.join(snap_dir, f"training_log{_tag_part}_s{seed}_ep{episode}.csv")
+            snap_yr = os.path.join(snap_dir, f"year_log{_tag_part}_s{seed}_ep{episode}.csv")
             shutil.copy2(ep_path, snap_ep)
             shutil.copy2(yr_path, snap_yr)
 
         ep_total = total_rewards.sum()
         if ep_total > best_total_reward:
             best_total_reward = ep_total
-            ckpt_dir = os.path.join(results_dir, f"checkpoints_s{seed}")
+            ckpt_dir = os.path.join(results_dir, f"checkpoints{_tag_part}_s{seed}")
             os.makedirs(ckpt_dir, exist_ok=True)
             for i, agent in enumerate(agents):
                 agent.save(os.path.join(ckpt_dir, f"agent_{i}_best.pt"))
@@ -2422,7 +2429,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     # always retain every checkpoint written up to the point of failure.
     prune_cfg = config.get("logging", {}).get("checkpoint_pruning", {})
     if prune_cfg.get("enabled", True):
-        ckpt_dir = os.path.join(results_dir, f"checkpoints_s{seed}")
+        ckpt_dir = os.path.join(results_dir, f"checkpoints{_tag_part}_s{seed}")
         prune_checkpoints(
             ckpt_dir=ckpt_dir,
             n_agents=n_agents,
@@ -2436,7 +2443,7 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     print(f"\nDone — seed {seed}. Logs: {ep_path}, {yr_path}")
 
 
-def _run_seed_subprocess(config_path: str, seed: int, num_threads: int) -> int:
+def _run_seed_subprocess(config_path: str, seed: int, num_threads: int, run_tag: str | None = None) -> int:
     """Re-launch ``scripts/train.py`` for a single seed with a thread budget.
 
     Used when ``--parallel-seeds N>1`` is requested. Each child runs the
@@ -2456,6 +2463,8 @@ def _run_seed_subprocess(config_path: str, seed: int, num_threads: int) -> int:
         "--seed", str(seed),
         "--parallel-seeds", "1",  # children must not re-fork
     ]
+    if run_tag:
+        cmd += ["--run-tag", str(run_tag)]
     return subprocess.call(cmd, env=env)
 
 
@@ -2479,6 +2488,16 @@ def main():
             "Override the per-process intra-op thread count. When omitted, an "
             "architecture-aware default is chosen (see src/utils/compute_setup.py). "
             "Equivalent to setting the ETS_NUM_THREADS env var."
+        ),
+    )
+    parser.add_argument(
+        "--run-tag", type=str, default=None,
+        help=(
+            "Optional filename infix used to disambiguate outputs across config "
+            "variants (e.g. when running a sweep via scripts/sweep.py). Output "
+            "files become 'training_log_<tag>_s<seed>.csv', "
+            "'year_log_<tag>_s<seed>.csv', 'checkpoints_<tag>_s<seed>/' etc. "
+            "Omit to keep the original 'training_log_s<seed>.csv' naming."
         ),
     )
     args = parser.parse_args()
@@ -2508,7 +2527,7 @@ def main():
         rcs = []
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             futures = [
-                pool.submit(_run_seed_subprocess, args.config, seed, per_proc)
+                pool.submit(_run_seed_subprocess, args.config, seed, per_proc, args.run_tag)
                 for seed in args.seed
             ]
             for fut in as_completed(futures):
@@ -2523,7 +2542,7 @@ def main():
 
     config = load_config(args.config)
     for seed in args.seed:
-        train_one_seed(config, seed)
+        train_one_seed(config, seed, run_tag=args.run_tag)
 
 
 if __name__ == "__main__":
