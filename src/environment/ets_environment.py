@@ -2001,7 +2001,27 @@ class ETSEnvironment(gym.Env):
             capital_norm    = (invest_cost + opex_delta) / budget_real
 
             coverage_gap = max(0.0, need - float(self._phase1_allocations[i]))
-            gap_penalty = (coverage_gap * company.penalty_rate) / compliance_denom
+            # v8.5.2: price the coverage gap at the agent's *expected cost of
+            # remediation*, not just the raw penalty rate. A rational agent
+            # left short after the auction will buy on secondary if that is
+            # cheaper than defaulting + carry-forward; in price-spike regimes
+            # the secondary clearing can exceed the (inflation-adjusted)
+            # penalty rate, in which case the old `coverage_gap * penalty_rate`
+            # formulation under-states the true cost of leaving a gap and the
+            # bid head develops a perverse preference for floor-bidding. We
+            # take max() over (a) the inflation-adjusted penalty rate, (b) the
+            # most recent secondary clearing (1-year-lagged proxy for the
+            # secondary the agent will actually face), and (c) the fundamental
+            # anchor (lower bound when sec history is uninformative, e.g.
+            # year 0). All three are nominal EUR/t at the current year, so
+            # we deflate by `infl` to keep units consistent with the
+            # (real-terms) compliance_denom.
+            eff_pen_rate_nom = company.effective_penalty_rate(self.current_year)
+            sec_proxy_nom    = float(getattr(self, "last_secondary_price", anchor_t))
+            expected_remediation_rate_real = (
+                max(eff_pen_rate_nom, sec_proxy_nom, anchor_t) / max(infl, 1e-9)
+            )
+            gap_penalty = (coverage_gap * expected_remediation_rate_real) / compliance_denom
 
             # Bid sub-head: only sees compliance + coverage gap; investing
             # decisions don't bias the bid policy gradient.
@@ -2019,6 +2039,7 @@ class ETSEnvironment(gym.Env):
                 "compliance_norm":      float(compliance_norm),
                 "capital_norm":         float(capital_norm),
                 "coverage_gap_penalty": float(gap_penalty),
+                "expected_remediation_rate_real": float(expected_remediation_rate_real),
                 "r_bid":                float(r_auction_bid[i]),
                 "r_invest":             float(r_auction_invest[i]),
             }

@@ -5,6 +5,104 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.5.2]
+
+Bug-fix release targeting the v8.5 floor-bidding / two-faction failure mode
+observed in `archive/std_log.txt` (price stuck at €45 in the auction while
+the secondary clears at €280–€350, with `ALoss` saturating at 1e7–1e8 on
+ceiling-bidding agents and `comply` regressing from ~85% to ~70%).
+
+Two targeted fixes addressing the diagnostic items the user flagged as
+"buying in the market should truly make more sense than not buying" and
+the split-head invest critic interaction with KL early stopping.
+
+### Fix 3 — bid head now prices the cost of forced Phase-2 buying
+
+`compute_auction_rewards()` (`src/environment/ets_environment.py`) priced
+the coverage gap at `company.penalty_rate` only:
+
+```python
+gap_penalty = (coverage_gap * company.penalty_rate) / compliance_denom
+```
+
+In price-spike regimes where the secondary clears above the (inflation-
+adjusted) penalty rate, this systematically *under-states* the true cost
+of leaving an undercoverage gap — a rational agent will buy on secondary
+rather than default, paying `sec_price` per missing Mt. The bid head
+therefore developed a perverse preference for floor-bidding because the
+arbitrage profit from buying cheap allowances and re-selling on the
+secondary leaks into the value bootstrap (shared trunk + shared main
+critic) while the penalty-only `gap_penalty` provided no countervailing
+signal at auction time.
+
+**Fix.** The bid head now prices each missing Mt at the maximum of three
+nominal-EUR/t quantities, deflated to real terms:
+
+```python
+expected_remediation_rate_real = (
+    max(eff_pen_rate_nom, sec_proxy_nom, anchor_t) / infl
+)
+gap_penalty = (coverage_gap * expected_remediation_rate_real) / compliance_denom
+```
+
+- `eff_pen_rate_nom`  — `Company.effective_penalty_rate(year)`
+  (also fixes a pre-existing minor unit inconsistency: the old formula
+  used the *base* `penalty_rate` against a real-terms denominator, so
+  `gap_penalty` was slightly under-stated in late episodes).
+- `sec_proxy_nom`     — `self.last_secondary_price`, a 1-year-lagged
+  proxy for the secondary clearing the agent will face this year.
+  Initialised to `_price_initial`, so year 0 falls back to the anchor.
+- `anchor_t`          — fundamental anchor at the current cap;
+  conservative lower bound when sec history is uninformative.
+
+Behaviour in normal markets is essentially unchanged (the max picks
+`eff_pen_rate ≈ 138`, matching the legacy `penalty_rate` to floating-
+point precision). In price-spike regimes (sec > penalty), the bid head
+correctly internalises the secondary-buy cost.
+
+A new diagnostic field `expected_remediation_rate_real` is added to
+`_last_auction_reward_channels`. Existing `coverage_gap_penalty` keeps
+its name and downstream consumers.
+
+### Fix 4 — per-sub-head KL early stopping when `split_invest_head=True`
+
+`update_happo()` (`src/agents/ppo_agent.py`) computed a single
+**joint-6D** auction KL even when the bid head (dims 0–1) and the
+investment head (dims 2–5) were trained against separate advantage
+streams. Two failure modes:
+
+1. A runaway invest head could push joint KL well above `target_kl`
+   while the bid head was still happily inside its trust region —
+   early-stopping the *whole* update and freezing the bid head at a
+   suboptimal point.
+2. Conversely, a quiet invest head could average down a high bid-head
+   KL so target_kl never tripped, allowing the bid head to drift past
+   the intended trust region.
+
+**Fix.** When `split_invest_head=True`, per-sub-head KL is computed
+under `no_grad` from the *already-existing* `lr_bid`/`r_bid` and
+`lr_inv`/`r_inv` tensors (the same ones used to build the dual-clip
+losses), and the early-stop signal is
+
+```python
+kl_auc_eff = torch.max(kl_bid_mb, kl_inv_mb)
+mb_kl      = torch.max(kl_auc_eff, kl_sec)
+```
+
+Using `max` (not `mean`) ensures that *either* sub-head exceeding
+`target_kl` triggers early-stop, while neither sub-head can dilute the
+other's signal. The legacy averaging path (`0.5 * (kl_auc + kl_sec)`)
+is retained for `split_invest_head=False` to preserve back-compat.
+
+The synchronous `update()` path (no HAPPO weighting, no split-head
+support) is unchanged.
+
+### Version
+- `pyproject.toml`         8.5.1 → 8.5.2
+- `configs/default.yaml`   header banner v8.5.1 → v8.5.2
+
+---
+
 ## [8.5.1]
 
 Bug-fix release. Three areas:

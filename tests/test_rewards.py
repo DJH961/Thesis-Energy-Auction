@@ -1284,6 +1284,96 @@ def test_underbid_gives_negative_auction_reward():
         )
 
 
+def test_gap_penalty_uses_max_of_penalty_and_secondary_proxy():
+    """v8.5.2: gap_penalty rate = max(eff_penalty, last_secondary_price, anchor) / infl.
+
+    When the most recent secondary clearing exceeds the (inflation-adjusted)
+    penalty rate, the bid head's coverage-gap penalty must scale up
+    accordingly so the agent internalises the cost of being forced to buy
+    on the secondary at the elevated price.
+    """
+    config = load_config()
+    config["companies"]["n_bot_agents"] = 0
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset(seed=42)
+
+    n = env.n_agents
+    auction_actions = np.zeros((n, 6), dtype=np.float32)
+    auction_actions[:, 0] = 80.0
+    auction_actions[:, 3:] = [0.0, 0.0, 1.0]
+
+    # Baseline sec proxy = _price_initial (~57 €/t at year 0). Expect max() to
+    # pick eff_penalty (~138.75 nominal). Capture the resulting gap_penalty.
+    env.step_auction(auction_actions)
+    env.compute_auction_rewards()
+    base_pen_low = env._last_auction_reward_channels[0]["coverage_gap_penalty"]
+    base_rate_low = env._last_auction_reward_channels[0]["expected_remediation_rate_real"]
+
+    # Now spike last_secondary_price well above eff_penalty — gap_penalty must rise.
+    env.reset(seed=42)
+    env.last_secondary_price = 400.0  # well above ~138 EUR/t penalty rate
+    env.step_auction(auction_actions)
+    env.compute_auction_rewards()
+    spiked_pen = env._last_auction_reward_channels[0]["coverage_gap_penalty"]
+    spiked_rate = env._last_auction_reward_channels[0]["expected_remediation_rate_real"]
+
+    assert spiked_rate > base_rate_low, (
+        f"Spiking sec proxy should raise expected remediation rate; "
+        f"got base={base_rate_low:.2f}, spiked={spiked_rate:.2f}"
+    )
+    assert spiked_pen > base_pen_low, (
+        f"Spiking sec proxy should raise gap_penalty; "
+        f"got base={base_pen_low:.4f}, spiked={spiked_pen:.4f}"
+    )
+    # Sanity: the rate should now be ≈ 400/infl(year=0) = 400 (infl(0)=1).
+    assert 350.0 < spiked_rate < 450.0, (
+        f"Spiked rate should ≈ 400 EUR/t; got {spiked_rate:.2f}"
+    )
+
+
+def test_gap_penalty_unchanged_when_sec_proxy_below_penalty():
+    """Healthy regime (sec ≤ penalty): new gap_penalty matches v8.5 behaviour.
+
+    The v8.5.2 generalisation must not perturb training in normal markets
+    where penalty_rate dominates the max(); the coverage_gap_penalty
+    channel should equal `coverage_gap * penalty_rate / compliance_denom`
+    to within float precision.
+    """
+    config = load_config()
+    config["companies"]["n_bot_agents"] = 0
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset(seed=42)
+
+    # Force sec proxy well below the penalty rate so eff_penalty wins the max.
+    env.last_secondary_price = 30.0
+
+    n = env.n_agents
+    auction_actions = np.zeros((n, 6), dtype=np.float32)
+    auction_actions[:, 0] = 80.0
+    auction_actions[:, 3:] = [0.0, 0.0, 1.0]
+    env.step_auction(auction_actions)
+    env.compute_auction_rewards()
+
+    for i in range(n):
+        ch = env._last_auction_reward_channels[i]
+        # At year 0 the inflation factor is 1, so effective penalty == base penalty.
+        company = env.companies[i]
+        eff_pen = company.effective_penalty_rate(env.current_year)
+        # Rate stored in channels is real-terms (= eff_pen / infl(year=0) = base penalty).
+        assert abs(ch["expected_remediation_rate_real"] - eff_pen) < 1e-3, (
+            f"Agent {i}: in healthy regime expected_remediation_rate should equal "
+            f"effective penalty rate {eff_pen:.2f}; got {ch['expected_remediation_rate_real']:.2f}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Change 6: anchor-normalised cost reward
 # ---------------------------------------------------------------------------
