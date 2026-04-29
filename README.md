@@ -96,7 +96,7 @@ The agents use **HAPPO (Heterogeneous-Agent PPO)**, a multi-agent reinforcement 
 - **Auto-scaled schedules**: warmup, exploration decay, and HPP timing scale automatically with `n_episodes`
 - Hidden burn-in warm-start initializes banks, MSR reserve, and price history before visible year 0
 - Behavioral cloning pretraining and KL-anchor regularization are **disabled by default** (config: `pretrain.enabled: false`, `ppo.kl_anchor_beta: 0.0`)
-- Over 100,000 episodes, agents converge on sophisticated market strategies
+- Over 120,000 episodes (the current default), agents converge on sophisticated market strategies
 
 The reward signal is a pure cost+ESG+penalty formulation — electricity revenue is **not** included in the reward gradient (it is logged separately but cannot be influenced by bidding strategy):
 
@@ -270,7 +270,7 @@ python scripts/train.py --config configs/default.yaml --seed 123
 python scripts/train.py --config configs/default.yaml --seed 456
 ```
 
-Training runs 100,000 episodes of 12-year simulations by default. Results are saved to a `results/` folder.
+Training runs 120,000 episodes of 12-year simulations by default. Results are saved to a `results/` folder.
 
 ### Running Tests
 
@@ -291,7 +291,7 @@ The most important settings you might want to change:
 
 | Setting | Default | What It Controls |
 |---------|---------|-----------------|
-| `simulation.n_episodes` | 100,000 | How many episodes to train for (more = better but slower) |
+| `simulation.n_episodes` | 120,000 | How many episodes to train for (more = better but slower) |
 | `simulation.n_years` | 12 | How many years each episode simulates |
 | `companies.n_agents` | 8 | Number of learning agents (PPO) |
 | `companies.n_bot_agents` | 0 | Number of heuristic bot agents (0 = pure MARL; `smoke_100.yaml` uses 8) |
@@ -299,7 +299,7 @@ The most important settings you might want to change:
 | `ets.cap_year_0_override` | `null` | Optional hard override for year-0 cap |
 | `ets.msr.tnac_upper_ratio` | 0.68 | TNAC upper-band threshold as fraction of cap_year_0; mid/lower derived to preserve 400:833:1096 |
 | `auction.price_max` | 250 | Maximum bid price (€/tonne) |
-| `auction.bid_change_limit.value` | 75 | Max year-over-year bid price change (€/t); year 0 unconstrained |
+| `auction.bid_change_limit.value` | 75 | Max year-over-year bid price change (€/t); active in year 0 too, anchored on `max(price_ma3, fundamental_anchor)` |
 | `penalty.rate` | 138.75 | Fine per excess tonne of CO2 (€), base level at simulation year-0 (2026) |
 | `pretrain.enabled` | false | Behavioral cloning warm-start from heuristic policy (disabled by default) |
 | `ppo.kl_anchor_beta` | 0.0 | KL-anchor regularization toward BC policy (disabled by default) |
