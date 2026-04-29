@@ -1,0 +1,60 @@
+# =============================================================================
+# Example sweep spec — scarcity × MSR ablation
+# =============================================================================
+# Run with:
+#     python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml
+#
+# Each (variant, seed) pair runs as an independent train.py subprocess.
+# Each variant writes its results under <output_dir>/<variant_name>/, so logs
+# never collide between variants. Within a variant, seeds keep their normal
+# training_log_s{seed}.csv / year_log_s{seed}.csv layout.
+#
+# Per-seed RNG and numerical results are bit-identical to a sequential
+# `train.py --config <variant>.yaml --seed S` invocation; only the process
+# layout differs.
+# =============================================================================
+
+base_config: configs/default.yaml
+output_dir: results/sweeps/scarcity_msr
+
+# Default seed list — applied to every variant that does not set its own.
+seeds: [1, 2, 3]
+
+# How many training subprocesses to run concurrently. Each gets its own
+# BLAS thread budget via threads_per_worker.
+parallel_workers: 4
+
+# Per-process intra-op thread count. ``null`` => auto = total_cores // workers,
+# computed at launch from the host architecture (see src/utils/compute_setup.py).
+threads_per_worker: null
+
+variants:
+  # -- Reference: defaults straight from base_config. ------------------------
+  - name: reference
+
+  # -- Scarcity ablation: tighter / looser cap. ------------------------------
+  - name: tight_cap
+    overrides:
+      ets.cap_overhead_pct: -0.02         # ~2% structural deficit in year 0
+
+  - name: loose_cap
+    overrides:
+      ets.cap_overhead_pct: 0.20          # comfortable surplus
+
+  # -- MSR ablation: switch the Market Stability Reserve off entirely. -------
+  - name: msr_off
+    overrides:
+      ets.msr.enabled: false
+
+  # -- MSR + scarcity interaction: tight cap with no MSR cushion. ------------
+  - name: tight_cap_msr_off
+    overrides:
+      ets.cap_overhead_pct: -0.02
+      ets.msr.enabled: false
+    seeds: [1, 2]                         # cheaper variant: only 2 seeds
+
+  # -- Reserve price ablation: higher floor, harder for low bids to clear. ---
+  - name: high_reserve_price
+    overrides:
+      ets.reserve_price: 65.0
+      ets.reserve_initial: 70.0

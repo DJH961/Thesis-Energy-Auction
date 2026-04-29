@@ -264,13 +264,35 @@ python scripts/train.py --config configs/smoke_100.yaml --seed 42
 # Full training run with default settings (100k episodes):
 python scripts/train.py --config configs/default.yaml --seed 42
 
-# Run with multiple seeds for statistical robustness:
-python scripts/train.py --config configs/default.yaml --seed 42
-python scripts/train.py --config configs/default.yaml --seed 123
-python scripts/train.py --config configs/default.yaml --seed 456
+# Run with multiple seeds for statistical robustness, in parallel processes
+# (each seed remains numerically identical to a sequential run):
+python scripts/train.py --config configs/default.yaml --seed 1 2 3 4 --parallel-seeds 4
 ```
 
 Training runs 100,000 episodes of 12-year simulations by default. Results are saved to a `results/` folder.
+
+### Running Sweeps (multiple configs × seeds)
+
+For ablations over multiple config variants (scarcity, MSR on/off, reserve
+price, etc.) use the sweep launcher. Define a *sweep spec* once, listing the
+overrides for each variant; the launcher resolves one full config per
+variant, then runs every (variant × seed) job as an independent `train.py`
+subprocess in a process pool.
+
+```bash
+# Validate the spec and inspect the job plan without launching anything:
+python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml --dry-run
+
+# Run the full sweep:
+python scripts/sweep.py --spec configs/sweeps/example_sweep.yaml
+```
+
+See `configs/sweeps/example_sweep.yaml` for the schema (also documented in
+`src/utils/sweep.py`). Each variant writes to its own
+`<output_dir>/<variant_name>/` results directory, so logs never collide.
+Per-seed RNG and CSVs are bit-identical to a sequential
+`train.py --config <variant>.yaml --seed S` invocation; only the process
+layout differs.
 
 ### Running Tests
 
