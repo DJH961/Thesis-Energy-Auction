@@ -970,8 +970,8 @@ class PPOAgent:
             np.asarray(self.buffer.auction_raw, dtype=np.float32)).to(self.device)
         sec_raw = torch.from_numpy(
             np.asarray(self.buffer.secondary_raw, dtype=np.float32)).to(self.device)
-        # Per-dim auction log-prob (T, action_dim). Old joint scalar callers
-        # pre-v8.5 are no longer supported.
+        # Per-dim auction log-prob (T, action_dim). Joint scalar callers
+        # are no longer supported.
         old_auc_lp = torch.from_numpy(
             np.asarray(self.buffer.auction_logp, dtype=np.float32)).to(self.device)
         old_sec_lp = torch.from_numpy(
@@ -1211,14 +1211,12 @@ class PPOAgent:
                     sec_ratio = torch.ones(1, 1, device=self.device)
 
                     # Per-sub-head KL accumulators for split_invest_head=True.
-                    # When the bid head and the investment head are trained
-                    # against different advantage streams (v8.5), a runaway
-                    # invest head could previously average down a small bid-
-                    # head KL into a "joint" KL that never tripped target_kl,
-                    # OR conversely the joint KL could fire early and freeze
-                    # a still-learning bid head.  v8.5.2: track each sub-head
-                    # separately and early-stop on the *max* across sub-heads
-                    # so neither head dominates the early-stop decision.
+                    # When the bid and invest heads are trained against
+                    # separate advantage streams, a single joint-6D KL
+                    # could either let one head dilute the other below
+                    # target_kl or fire early on a noisy invest head and
+                    # freeze a still-learning bid head. We track each
+                    # sub-head separately and early-stop on the *max*.
                     kl_bid_mb = None
                     kl_inv_mb = None
 

@@ -696,7 +696,9 @@ def train_one_seed(config: dict, seed: int, on_log=None):
     n_bot_agents = config["companies"].get("n_bot_agents", 0)
     bot_str = f" + {n_bot_agents} bots" if n_bot_agents > 0 else ""
 
+    cfg_version = config.get("version", "unknown")
     print(f"\n{'='*60}")
+    print(f"ETS MARL — config version {cfg_version}")
     print(f"Training — seed {seed}, {n_agents} learning agents{bot_str}, {algo}, two-phase")
     print(f"Carry-forward: {cf_str} | Clipped Gaussian{curric_str}{eps_str}")
     print(
