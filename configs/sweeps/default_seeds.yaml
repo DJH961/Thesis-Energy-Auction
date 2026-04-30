@@ -17,7 +17,7 @@ output_dir: results/sweeps/default_seeds
 
 # Four seeds chosen to be unrelated — no powers of two, no anniversaries,
 # no single-digit favourites. Drawn from primes / large composites.
-seeds: [73849, 219073, 581629, 904357]
+seeds: [738, 219, 581, 904]
 
 parallel_workers: 4
 threads_per_worker: null
