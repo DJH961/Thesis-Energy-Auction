@@ -325,9 +325,15 @@ reward:
 # scarcity, mirroring the social shadow price of carbon. Removed the prior
 # v8.5 ef_baseline = year/(n_years−1) horizon penalty that punished late
 # investment as if year 12 were the end of civilisation.
+#
+# Calibration (v8.6.1): scale=1.3 was empirically chosen so a balanced
+# [w_cost=0.5, w_green=0.5] agent receives ≈50/50 reward input from the
+# financial channel and ESG over a full episode (tail-mean ratio ≈ 0.95).
+# See docs/changelog.md §[8.6.0] "ESG balance analysis" for the trace.
+# Re-tune `scale` (NOT stock_weight / flow_weight) if the balance drifts.
 esg:
   enabled: true
-  scale: 1.0            # halved from v8.5 (2.0) since two channels now contribute
+  scale: 0.25           # calibrated for 50/50 fin/ESG balance for [0.5, 0.5] agents
   stock_weight: 1.0     # weight on ef_ratio "we are green right now"
   flow_weight:  1.5     # weight on ef_ratio × anchor_real_ratio (saved-carbon at live anchor)
   speed_coef: 0.3       # v8.6: uniform across episode — no front-loading

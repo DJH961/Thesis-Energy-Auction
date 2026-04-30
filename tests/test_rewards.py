@@ -1726,3 +1726,73 @@ def test_joint_gate_inflation_aware_ma3():
     # Sanity: simulation ran without exception. The detailed expected_clearing
     # math is exercised by the protect_need test above.
     assert env._last_effective_reserve > 0.0
+
+
+def test_esg_balance_with_financial_50_50():
+    """v8.6.1: For balanced [w_cost=0.5, w_green=0.5] agents, the ESG and
+    financial channels should each contribute ~50% of the absolute reward
+    signal (per user direction in PR #N).
+
+    The test runs a deterministic compliant rollout (anchor-priced bids,
+    moderate green investment) and checks that |Σ w_g·esg| / (|fin| + |esg|)
+    falls in [0.35, 0.65] across the episode tail. The default scale=0.25
+    was empirically calibrated for this target — if the test fails, either
+    the scale needs re-tuning or the reward composition has drifted.
+    """
+    # Load WITHOUT the test-helper's lrf overrides, which inflate scarcity
+    # and break the compliance gate. Use the default 12-year trajectory.
+    with open(CONFIG_PATH) as f:
+        config = yaml.safe_load(f)
+    config["companies"]["n_bot_agents"] = 0
+    config["simulation"]["n_years"] = 12
+    config["warm_start"]["enabled"] = False
+    config["uncertainty"]["enabled"] = False
+    config["construction_jitter"]["enabled"] = False
+
+    env = ETSEnvironment(config, seed=42)
+    env.reset(seed=42)
+
+    # Deterministic compliant rollout using the test helper. Auction at 80 EUR/t
+    # (above year-0 reserve), qty_mult=1.0×need; green agents do a small
+    # solar investment each year, financial agents skip investment.
+    for yr_idx in range(env.n_years):
+        n = env.n_agents
+        a = np.zeros((n, 6), dtype=np.float32)
+        a[:, 0] = 80.0  # bid at 80 EUR/t (above reserve, near anchor in early years)
+        a[:, 1] = 1.0   # qty_mult ≈ 1.0×need
+        for i in range(n):
+            if env.companies[i].w_green > 0.4:
+                a[i, 2] = 0.05  # invest_frac ≈ 5%/yr
+            else:
+                a[i, 2] = 0.0
+        a[:, 3:] = [0.0, 0.0, 1.0]  # solar logits
+        env.step_auction(a)
+        sec = np.zeros((n, 2), dtype=np.float32)
+        sec[:, 0] = env._phase1_clearing_price
+        env.step_secondary(sec)
+
+    # Measure tail-window (last 6 years) ESG vs financial for green agents
+    balanced = [i for i in range(env.n_agents) if env.companies[i].w_green > 0.4]
+    assert balanced, "No balanced (green) agents in fixture; check archetype config"
+
+    total_esg, total_fin = 0.0, 0.0
+    for yl in env.episode_log[-6:]:
+        rc = yl.get("reward_channels", {})
+        for i in balanced:
+            c = rc.get(i, {})
+            comp = env.companies[i]
+            cn = (c.get("compliance_norm", 0.0)
+                  + c.get("capital_norm", 0.0)
+                  + c.get("soft_norm", 0.0))
+            total_fin += comp.w_cost * (-(cn - 1.0))
+            total_esg += comp.w_green * c.get("esg_signal", 0.0)
+
+    abs_total = abs(total_esg) + abs(total_fin)
+    assert abs_total > 1e-6, f"Both channels are zero — degenerate rollout"
+    pct_esg = abs(total_esg) / abs_total
+    assert 0.35 <= pct_esg <= 0.65, (
+        f"ESG/Financial balance out of [35%, 65%] window. "
+        f"Got |ESG|={abs(total_esg):.3f}, |FIN|={abs(total_fin):.3f}, "
+        f"%ESG={100*pct_esg:.1f}%. Re-tune `esg.scale` if the user goal "
+        f"of ~50/50 still applies."
+    )

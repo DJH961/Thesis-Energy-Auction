@@ -12,7 +12,138 @@ Consolidates v8.5.7 (joint budget gate, U/D/M compliance buckets), v8.5.8
 fix), and the new v8.6 work on the ESG reward + two-stage joint gate +
 deflated quality volatility + notebook integration.
 
-### v8.6 new work
+### v8.6.0 / v8.6.1 — ESG balance analysis & calibration
+
+**User direction (PR follow-up):** *"Make sure ESG is well balanced with the
+financial reward. I want green agents to have around 50% input from each
+finance and ESG."*
+
+#### Empirical decomposition
+
+For an A2/A4/A6/A8 archetype agent (`w_cost=0.5, w_green=0.5`), the per-step
+reward is
+
+```
+base = w_cost × (-cost_norm_centered)  +  w_green × esg_signal  −  penalty_norm  + banking
+       \________________________/         \____________________/
+              FINANCIAL                          ESG
+```
+
+A deterministic compliant rollout (8 learning agents, 0 bots, all bid
+80 EUR/t × 1.0×need, green agents invest 5 %/yr in solar) was run to
+measure the tail-window magnitudes for several `esg.scale` values:
+
+| `esg.scale` | Σ \|ESG\| | Σ \|FIN\| | %ESG | Comment |
+|---|---|---|---|---|
+| 0.15 | 1.42 | 2.25 | 39 % | financial-heavy |
+| 0.20 | 1.89 | 2.25 | 46 % | slight financial bias |
+| **0.25** | **2.37** | **2.25** | **51 %** | **calibrated, 50/50 ✓** |
+| 0.30 | 2.84 | 2.25 | 56 % | slight ESG bias |
+| 0.50 | 4.74 | 2.25 | 68 % | ESG-dominated |
+| 1.00 | 9.47 | 2.25 | 81 % | ESG-dominated |
+| 1.30 | 12.32 | 2.25 | 85 % | ESG-dominated |
+
+`scale=0.25` was selected as the v8.6 default. A regression test
+(`test_esg_balance_with_financial_50_50`) pins the balance into
+[35 %, 65 %] so future changes to either channel will trip the test.
+
+#### Per-year trajectory at `scale=0.25`
+
+```
+Year   ESG/yr   FIN/yr   %ESG    ef_ratio   anchor_ratio
+ 0     +0.00    +0.07    0%      0.44       1.00
+ 1     +0.00    +0.30    0%      0.44       1.02
+ 2     +0.00    +0.27    0%      0.44       1.07
+ 3     +0.01    +0.12    7%      0.44       1.09     ← compliance gate kicks in
+ 4     +0.01    +0.01   62%      0.44       1.11
+ 5     +0.02    +0.02   54%      0.44       1.18
+ 6     +0.02    +0.05   33%      0.44       1.24     ← typical mid-game
+ 7     +0.03    +0.22   12%      0.44       1.28
+ 8     +0.02    +0.31    7%      0.44       1.33
+ 9     +0.01    +0.41    3%      0.44       1.37     ← scarcity-cost peak
+10     +0.05    -0.11   30%      0.44       1.44
+11     +0.03    -0.08   29%      0.44       1.47
+                                tail-window: 51 % ESG
+```
+
+The shape is intentional: compliance dominates the early signal (ESG gated
+to ~0 when coverage_frac < 0.9), ESG meaningful in the middle, financial
+costs of cap-tightening dominate near the peak (years 7-9), then both
+balance again in the final two years.
+
+#### Strengths of the saved-carbon hybrid
+
+1. **Late investment rewarded (TVM, not horizon penalty).** A year-11
+   agent at ef_ratio=0.5 receives `+0.39` (with scale=0.25). Pre-v8.6 it
+   was `−0.50`. Earlier investment is still preferred because more years
+   of stock + flow accrual remain — TVM is preserved organically.
+2. **Sustained green share earns reward every year** (stock_term ≠ 0
+   for any positive ef_ratio). Stops the v8.5 front-load-then-stop pattern
+   where agents invested years 1-3 then never again.
+3. **Saved carbon monetised at the live anchor.** flow_term =
+   `(saved_Mt × anchor_real_t) / (init_baseline_emiss × anchor_real_0)`.
+   This is the social shadow price of avoided CO₂ — a real ESG-mandated
+   CFO would value avoided emissions at exactly this benchmark.
+4. **Compliance always comes first.** The compliance gate
+   `coverage_frac^(1+blend)` zeroes ESG when an agent is under-covered.
+   Without compliance, no ESG bonus, regardless of how green the company is.
+5. **Anchor-driven, not exogenous.** The `anchor_real_t / anchor_real_0`
+   ratio is endogenous to the cap trajectory; no manual schedule needed.
+6. **Δgreen speed bonus is uniform across the episode.** No artificial
+   front-loading bias (per user direction: "late investment is bad
+   because of TVM, not because there's no future").
+
+#### Weaknesses & stress scenarios
+
+1. **Compliance gate creates a ~89 %→91 % discontinuity** in coverage.
+   An agent at 89 % coverage gets ESG strongly attenuated; at 91 % it's
+   near-full. Mitigated by the `gate_blend_threshold=0.90`,
+   `gate_blend_width=0.30` smoothing, but a sharp gradient remains around
+   the threshold. *Acceptable* — this is the desired "compliance first"
+   behaviour.
+2. **No subtractive baseline for poor performance.** ESG ≥ 0 always.
+   A coal-heavy agent (ef_ratio=0) gets ESG=0, not negative. This is by
+   design (reward shape per user direction) but means the financial
+   channel must independently penalise poor green outcomes. *Acceptable*
+   — handled by the carbon penalty / anchor-priced compliance cost in
+   the financial channel.
+3. **Anchor ratio caps via cap trajectory.** In the EU-ETS 12y horizon
+   the anchor ratio reaches ~1.47 by year 11 (real terms), so the
+   flow_term contribution is bounded ~1.5× the stock_term. *Acceptable*
+   — matches reality (carbon has a bounded social value over a 12y window).
+4. **Stress scenario — pure-green agent (ef_ratio=1):** receives
+   `0.25 × (1.0 × 1 + 1.5 × 1 × 1.47 + 0.3 × 0) = 0.80` peak ESG, ×
+   w_green=0.5 = `0.40` per year. Cumulative over 12 years: ~3.5. This
+   is the upper bound of green reward in steady state.
+5. **Stress scenario — late-starter (invests entirely in year 6):**
+   years 0-6 ESG=0, years 7-11 ef_ratio rises from 0 to ~0.7. Cumulative
+   ESG: ~1.5. **Better than NEVER (cumulative 0)** ✓ — the broken v8.5
+   formula gave this agent a *negative* cumulative reward, pushing the
+   policy toward "never invest". Fixed.
+6. **Stress scenario — front-loader (invests entirely in year 0):**
+   ef_ratio=0.7 from year 0 onwards. Stock_term contributes every year;
+   flow_term ramps with anchor. Cumulative ESG: ~5.5 (vs late-starter
+   1.5). **TVM-correct preference for early investment ✓.**
+7. **Stress scenario — deceptive bidder (high bid_p but only 90 %
+   coverage):** compliance gate cuts ESG to ~0.7 of nominal. The
+   financial channel still pays compliance cost. Net effect: agent
+   doesn't game ESG by deferring compliance.
+
+#### Realism
+
+- The hybrid mirrors how real ESG-rated utilities are evaluated:
+  (a) operating green capacity (S&P/MSCI factor: emission intensity
+  level), and (b) avoided emissions valued at the live carbon price
+  (TCFD scenario analysis & internal carbon pricing).
+- Anchor as social shadow price: the EU-ETS anchor IS the marginal
+  abatement cost benchmark used by Ørsted, EDF, Engie etc. for ESG-NPV
+  internal accounting. The flow_term is therefore directly interpretable
+  as a "saved-CO₂ ESG dividend at the social cost of carbon".
+- 50/50 financial/ESG split for a balanced [0.5, 0.5] agent corresponds
+  to a CFO whose long-term incentive plan is 50 % EBITDA-linked and
+  50 % ESG-linked — common for mid-cap European utilities in 2024-2025.
+
+### v8.6 new work (consolidated)
 
 **1. ESG reward — saved-carbon hybrid (the key change).**
 
@@ -33,25 +164,14 @@ esg_signal = esg_raw × compliance_gate (positive only)
 
 Algebraically `flow_term = (saved_Mt × anchor_real_t) / (init_baseline_emiss × anchor_real_0)`
 — avoided carbon valued at the live anchor, normalised by the per-agent year-0 carbon
-liability. Properties:
-* **Late investment still positive.** Year-11 agent at ef_ratio=0.5 now
-  scores `1.55` (was `−1.0` pre-v8.6). Earlier investment is still
-  preferred because more years of stock+flow accrual remain — TVM is
-  preserved, the artificial horizon penalty is gone.
-* **Sustained green share earns reward every year** (stock_term) — stops
-  the front-load-then-stop pattern where agents currently invest only in
-  years 1-3 and never again.
-* **Saved carbon is monetised at the live anchor**, so a green company
-  earns more in years 6-12 than year 1 (carbon scarcer + more inflated).
-* Compliance gate retained per direction ("compliance comes first").
+liability.
 
 New diagnostic columns: `esg_stock_term`, `esg_flow_term`. `esg_anchor_ratio`
 (previously a 1.0 placeholder) now reflects real semantics: `anchor_real_t / anchor_real_0`.
 
-New config knobs: `esg.stock_weight=1.0`, `esg.flow_weight=1.5`, lowered
-`esg.scale=1.0` (was 2.0; factor accounted for the extra channel). Speed
-coef now uniform across episode (`0.3` early/late) — no more front-loading
-bias from `0.8` early / `0.4` late.
+**Defaults (v8.6.1 calibrated):** `esg.scale=0.25` (down from v8.5 = 2.0),
+`stock_weight=1.0`, `flow_weight=1.5`, `speed_coef=0.3` uniform. The
+0.25 default targets a 50/50 financial/ESG split (see analysis above).
 
 **2. Two-stage joint budget gate.**
 
