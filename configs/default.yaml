@@ -1,4 +1,4 @@
-# ETS MARL — Configuration v8.5.7
+# ETS MARL — Configuration v8.5.8
 # 8 learning agents, HAPPO sequential update, split Phase-1 bid/invest heads.
 
 # Run version banner — printed at the top of training output so the version
@@ -108,7 +108,11 @@ investment:
 
 risk:
   p_fail_min: 0.08
-  p_fail_max: 0.65
+  # v8.5.8: reduced from 0.65 → 0.40 to align with policy-supported industry
+  # FID risk for offshore wind / solar (10-15% with PPA, ~30% under merchant
+  # exposure). 0.65 was punitively high and combined with the experience-
+  # discount loop to produce 10× inter-agent invest variance.
+  p_fail_max: 0.40
   p_fail_alpha: 0.7
   experience_discount: 0.10
   experience_threshold: 2
@@ -162,12 +166,25 @@ secondary:
 
 budget:
   mode: "revenue_based"
-  debt_headrooms: [475.0, 475.0, 305.0, 305.0, 125.0, 125.0, -25.0, -25.0]
-  bot_debt_headrooms: [475.0, 475.0, 305.0, 305.0, 125.0, 125.0, -25.0, -25.0]
+  # v8.5.8: debt_headrooms halved (and rebalanced from coal-heavy bias).
+  # Anchor trajectory is 70 EUR/t (year 1) → 150 EUR/t (year 12); revenue
+  # passthrough makes coal-heavy agents earn far more than greens at high
+  # carbon prices. The previous [475, 305, 125, -25] schedule plus a 1.5×
+  # cap meant coal-heavy agents had 56% more cash than greens in low-price
+  # regimes (cap doesn't bind) AND ~13% more in high-price regimes (cap
+  # binds for both). Halving the schedule preserves the transition-finance
+  # signal but stops over-subsidising fossil incumbents.
+  debt_headrooms: [240.0, 240.0, 155.0, 155.0, 65.0, 65.0, -25.0, -25.0]
+  bot_debt_headrooms: [240.0, 240.0, 155.0, 155.0, 65.0, 65.0, -25.0, -25.0]
   budget_ema_alpha: 0.3
   annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
-  dynamic_budget_ceiling_multiplier: 1.5
+  # v8.5.8: raised from 1.5 → 2.5. With anchor trajectory 70 → 150 EUR/t
+  # (≈2.14×), the prior 1.5× cap discarded ~40% of the high-year carbon-
+  # passthrough revenue, freezing budgets in years 6+ even as the system
+  # value of every Mt rose. 2.5× lets the high-price years actually translate
+  # into investable cash so the green transition is fundable when it matters.
+  dynamic_budget_ceiling_multiplier: 2.5
   overspend_penalty_coef: 0.5
   contingency_zone: 0.10
   contingency_penalty_coef: 0.05

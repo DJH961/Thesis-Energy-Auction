@@ -552,8 +552,14 @@ class Company:
 
         if success:
             self._consecutive_successes += 1
-        else:
-            self._consecutive_successes = 0
+        # v8.5.8: do NOT reset _consecutive_successes on a single failure.
+        # The previous reset created a positive-feedback loop where lucky
+        # agents (who hit 2 successes in a row early) unlocked the experience
+        # discount permanently, while agents with one early failure had to
+        # restart the streak from zero — driving 10× inter-agent invest
+        # variance from tiny seed-luck differences. The streak now monotonic-
+        # ally accumulates, so accumulated experience is no longer wiped out
+        # by one failed project.
 
         if self._jitter_enabled:
             lam = float(self._jitter_lambdas[tech_idx])
@@ -831,7 +837,7 @@ class Company:
         return shortfall * self.effective_penalty_rate(current_year)
 
     # ------------------------------------------------------------------
-    # Observations — Phase 1: 43D base (+7*(N-1) opponent) | Phase 2: +12
+    # Observations — Phase 1: 44D base (+7*(N-1) opponent) | Phase 2: +12
     # See get_observation_phase1 / get_observation_phase2 for the full layout.
     # ------------------------------------------------------------------
 
@@ -864,11 +870,12 @@ class Company:
                                last_bid_price_clip: float = 0.0,
                                last_budget_price_clip: float = 0.0,
                                last_bid_qty_clip_ratio: float = 1.0,
-                               last_invest_clip_ratio: float = 1.0):
+                               last_invest_clip_ratio: float = 1.0,
+                               compliance_affordability: float = 0.0):
         """
-        Phase 1 observation (pre-auction): 43D base + 7*(N-1) opponent dims.
+        Phase 1 observation (pre-auction): 44D base + 7*(N-1) opponent dims.
 
-        Base 43 dims:
+        Base 44 dims:
         [0]  time (normalized)
         [1]  cap (normalized)
         [2]  3-year moving average of clearing price (normalized)
@@ -915,9 +922,17 @@ class Company:
              1.0 = no qty gate fired; <1 = leverage/collateral/budget gate reduced qty
         [42] last_invest_clip_ratio: actual_invest_frac / requested_invest_frac clipped [0,1]
              1.0 = no cap applied; <1 = budget/capex gate reduced investment
+        [43] compliance_affordability: forward-looking budget signal (v8.5.8).
+             = (estimate_need × expected_clearing) / max(cash, 1), clipped [0, 3], normalized /3.
+             Tells the agent how much of its remaining cash a need-covering bid at the
+             expected clearing price would consume. 0 ≈ trivially affordable; 0.33 (raw 1.0)
+             = entire cash needed for compliance; 1.0 (raw 3.0) = compliance unaffordable
+             from cash alone. Replaces purely lagged clip-feedback with a forward-looking
+             budget anchor so agents don't need to learn affordability through repeated
+             clip events.
 
         Opponent dims (if opponent_modeling enabled, 7D per opponent):
-        [43..] = (emissions/10, green_frac, fossil_frac, queue_noisy,
+        [44..] = (emissions/10, green_frac, fossil_frac, queue_noisy,
                   tnac_share_norm, net_secondary_norm,
                   lagged_compliance_gap_norm) per opponent
         """
@@ -989,6 +1004,7 @@ class Company:
             float(np.clip(last_budget_price_clip / pn, -1.0, 1.0)),       # [40] budget price clip (signed)
             float(np.clip(last_bid_qty_clip_ratio, 0.0, 1.0)),            # [41] bid qty clip ratio
             float(np.clip(last_invest_clip_ratio, 0.0, 1.0)),             # [42] invest frac clip ratio
+            float(np.clip(compliance_affordability, 0.0, 3.0)) / 3.0,    # [43] forward-looking compliance affordability
         ], dtype=np.float32)
         if opponent_obs is not None and len(opponent_obs) > 0:
             return np.concatenate([base, opponent_obs])
@@ -1074,11 +1090,11 @@ class Company:
 
     @property
     def obs_dim_phase1(self) -> int:
-        """43 base dims + 7*(N_total-1) opponent dims. See get_observation_phase1 for full layout."""
+        """44 base dims + 7*(N_total-1) opponent dims. See get_observation_phase1 for full layout."""
         opp_dims = self.config.get("opponent_obs", {}).get("dims_per_opponent", 7)
         if self._opponent_modeling and self._n_total > 1:
-            return 43 + opp_dims * (self._n_total - 1)
-        return 43
+            return 44 + opp_dims * (self._n_total - 1)
+        return 44
 
     @property
     def obs_dim_phase2(self) -> int:

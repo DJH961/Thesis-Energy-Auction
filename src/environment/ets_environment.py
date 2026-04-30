@@ -3266,6 +3266,18 @@ class ETSEnvironment(gym.Env):
             / max(cap_t, 1e-6), 0.0, 1.0
         ))
 
+        # Forward-looking expected clearing for compliance affordability obs[43].
+        # Same formula the joint budget gate uses, so the obs reflects the same
+        # cost basis the gate will actually apply at auction time.
+        _anchor_for_obs = compute_fundamental_anchor(
+            self.current_year, self.config, cap_t_actual=float(cap_t)
+        )
+        _expected_clearing_for_obs = max(
+            float(self._last_effective_reserve),
+            float(price_ma3),
+            float(_anchor_for_obs),
+        )
+
         obs_list = []
         for i in range(self.n_agents):  # only learning agents get observations
             c = self.companies[i]
@@ -3321,6 +3333,16 @@ class ETSEnvironment(gym.Env):
                 last_budget_price_clip=float(self._last_budget_price_clip[i]),
                 last_bid_qty_clip_ratio=float(self._last_bid_qty_clip_ratio[i]),
                 last_invest_clip_ratio=float(self._last_invest_clip_ratio[i]),
+                compliance_affordability=(
+                    # forward-looking signal: how much of remaining cash a need-
+                    # covering bid at expected clearing would consume
+                    (max(c.compute_estimate_need(), 0.0) * _expected_clearing_for_obs)
+                    / max(
+                        float(c.annual_budget - c.budget_spent_this_year)
+                        + c.get_treasury_available(),
+                        1.0,
+                    )
+                ),
             )
             obs_list.append(obs_i)
 

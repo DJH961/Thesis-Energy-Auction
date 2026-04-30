@@ -45,6 +45,7 @@ from src.environment.ets_environment import ETSEnvironment
 from src.agents.ppo_agent import PPOAgent
 from src.utils.preflight import run_preflight_checks
 from src.utils.compute_setup import configure_compute, detect_architecture
+from src.utils.price_anchor import compute_fundamental_anchor
 import src.agents.heuristic_policy as heuristic_policy
 
 
@@ -981,6 +982,9 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
         "ep_default_count",
         "ep_mean_bid_qty_mult",
         "ep_mean_coal_budget_headroom",
+        # v8.5.8 anchor-invariant quality metric (analysis-only, mirrors notebook §5.8)
+        "quality_score", "Q_compliance", "Q_price_realism",
+        "Q_saved_carbon", "Q_cost_eff", "Q_volatility",
     ]
     for i in range(n_total_agents):
         ep_fields += [f"sec_buy_vol_A{i+1}", f"sec_sell_vol_A{i+1}",
@@ -2142,6 +2146,150 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                 )
         ep_mean_coal_budget_headroom = float(np.mean(coal_headrooms)) if coal_headrooms else float("nan")
 
+        # ──────────────────────────────────────────────────────────────────
+        # v8.5.8 — Convergence Quality Metric (per-episode, written to CSV
+        # and printed in console). Mirrors notebook §5.8 logic. Anchor-
+        # invariant composite of compliance, price-realism, saved-carbon
+        # at anchor, cost efficiency vs counterfactual, and volatility.
+        # Analysis-only — never feeds back into training/PPO.
+        #
+        # Q = 0.30·compliance + 0.25·price_realism + 0.25·saved_carbon
+        #   + 0.10·cost_eff   − 0.10·volatility
+        # Any single missing component is reweighted out so the score
+        # remains comparable.
+        # ──────────────────────────────────────────────────────────────────
+        try:
+            # Anchor cache (per year-of-episode)
+            n_years_ep = max(len(env.episode_log), 1)
+            _anchors_per_year = {}
+            for yl_idx, yl in enumerate(env.episode_log):
+                yr = int(yl.get("year", yl_idx))
+                if yr not in _anchors_per_year:
+                    cap_t_a = float(env.cap_schedule.get_cap(min(yr, env.n_years - 1)))
+                    _anchors_per_year[yr] = float(compute_fundamental_anchor(
+                        yr, config, cap_t_actual=cap_t_a
+                    ))
+
+            # 1. Compliance (1 − non-compliance year share, agent-year average)
+            _comp_total_years = 0
+            _comp_compliant   = 0
+            for yl in env.episode_log:
+                shorts = yl.get("shortfalls", [0.0] * n_total_agents)
+                for i in range(n_total_agents):
+                    _comp_total_years += 1
+                    if shorts[i] <= 1e-6:
+                        _comp_compliant += 1
+            Q_compliance = (_comp_compliant / max(_comp_total_years, 1)) if _comp_total_years else float("nan")
+
+            # 2. Price realism (1 − mean(|clearing − anchor|/anchor), clipped)
+            _rel_errs = []
+            for yl in env.episode_log:
+                cp = float(yl.get("clearing_price", 0.0))
+                yr = int(yl.get("year", 0))
+                anc = float(_anchors_per_year.get(yr, 0.0))
+                if anc > 1e-6 and cp > 1e-6:
+                    _rel_errs.append(min(5.0, abs(cp - anc) / anc))
+            Q_price_realism = (
+                float(np.clip(1.0 - float(np.mean(_rel_errs)), 0.0, 1.0))
+                if _rel_errs else float("nan")
+            )
+
+            # 3. Saved-carbon (system value at anchor / counterfactual at anchor).
+            # Baseline: per-agent year-0 emissions as do-nothing reference.
+            yr0_emiss = None
+            for yl in env.episode_log:
+                if int(yl.get("year", 0)) == 0:
+                    yr0_emiss = list(yl.get("emissions", [0.0] * n_total_agents))
+                    break
+            if yr0_emiss is not None and len(yr0_emiss) >= n_total_agents:
+                _saved_value = 0.0
+                _ctrf_value  = 0.0
+                for yl in env.episode_log:
+                    yr = int(yl.get("year", 0))
+                    anc = float(_anchors_per_year.get(yr, 0.0))
+                    if anc <= 1e-6:
+                        continue
+                    emiss_y = yl.get("emissions", [0.0] * n_total_agents)
+                    for i in range(n_total_agents):
+                        base_i = max(0.0, float(yr0_emiss[i]))
+                        real_i = max(0.0, float(emiss_y[i]))
+                        saved  = max(0.0, base_i - real_i)
+                        _saved_value += saved * anc
+                        _ctrf_value  += base_i * anc
+                Q_saved_carbon = (
+                    float(np.clip(_saved_value / _ctrf_value, 0.0, 1.0))
+                    if _ctrf_value > 1e-6 else float("nan")
+                )
+            else:
+                _ctrf_value = 0.0
+                Q_saved_carbon = float("nan")
+
+            # 4. Cost efficiency: 1 − total_real_cost / counterfactual_cost mapped
+            #    from [-1, 1] to [0, 1] (negative means cost > counterfactual).
+            if _ctrf_value > 1e-6:
+                _total_cost = 0.0
+                for yl in env.episode_log:
+                    for prefix in ("auction_cost", "trade_cost", "invest_cost",
+                                   "penalty", "collateral_cost", "mac_cost"):
+                        key_list = [f"{prefix}_A{i+1}" for i in range(n_total_agents)]
+                        # year-log dicts use top-level keys; fall back to per-agent lists
+                        for k in key_list:
+                            if k in yl:
+                                _total_cost += float(yl.get(k, 0.0) or 0.0)
+                # Cost lists may also be in the per-agent log fields (auction_cost array).
+                # Fallback: if total_cost ended near zero, use a simpler invest+trade+penalty estimate.
+                if _total_cost <= 1e-6:
+                    inv_costs = [
+                        sum(float((yl.get("invest_cost_A%d" % (i + 1)) or 0.0)) for yl in env.episode_log)
+                        for i in range(n_total_agents)
+                    ]
+                    pen_total = sum(float(p) for p in ep_total_penalties)
+                    _total_cost = float(sum(inv_costs)) + pen_total
+                _cost_eff_raw = float(np.clip(1.0 - _total_cost / _ctrf_value, -1.0, 1.0))
+                Q_cost_eff = float(np.clip(0.5 * (_cost_eff_raw + 1.0), 0.0, 1.0))
+            else:
+                Q_cost_eff = float("nan")
+
+            # 5. Volatility penalty (std/mean of clearing across the episode)
+            if len(prices_ep) > 1:
+                p_mu = float(np.mean(prices_ep))
+                p_sd = float(np.std(prices_ep))
+                Q_volatility = (
+                    float(np.clip(p_sd / p_mu, 0.0, 1.0)) if p_mu > 1e-6 else float("nan")
+                )
+            else:
+                Q_volatility = float("nan")
+
+            _Q_W = {
+                "compliance": 0.30, "price_realism": 0.25, "saved_carbon": 0.25,
+                "cost_eff": 0.10, "volatility": 0.10,
+            }
+            _parts = {
+                "compliance": Q_compliance, "price_realism": Q_price_realism,
+                "saved_carbon": Q_saved_carbon, "cost_eff": Q_cost_eff,
+                "volatility": Q_volatility,
+            }
+            _composite = 0.0
+            _w_pos_used = 0.0
+            for _k, _v in _parts.items():
+                if _v is None or (isinstance(_v, float) and np.isnan(_v)):
+                    continue
+                _w = _Q_W[_k]
+                if _k == "volatility":
+                    _composite -= _w * _v
+                else:
+                    _composite += _w * _v
+                    _w_pos_used += _w
+            if _w_pos_used > 0:
+                _w_pos_total = sum(w for k, w in _Q_W.items() if k != "volatility")
+                _composite = _composite / _w_pos_used * _w_pos_total
+            quality_score = float(_composite)
+        except Exception:
+            # Defensive: never crash training on a metric calc failure.
+            Q_compliance = Q_price_realism = Q_saved_carbon = float("nan")
+            Q_cost_eff = Q_volatility = float("nan")
+            quality_score = float("nan")
+
         ep_row = {
             "episode": episode,
             "clearing_price_last": last_log.get("clearing_price", 0),
@@ -2163,6 +2311,13 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             "ep_default_count": ep_default_count,
             "ep_mean_bid_qty_mult": round(ep_mean_bid_qty_mult, 4) if not np.isnan(ep_mean_bid_qty_mult) else None,
             "ep_mean_coal_budget_headroom": round(ep_mean_coal_budget_headroom, 2) if not np.isnan(ep_mean_coal_budget_headroom) else None,
+            # v8.5.8 anchor-invariant convergence quality (analysis-only).
+            "quality_score":      round(quality_score, 4) if not np.isnan(quality_score) else None,
+            "Q_compliance":       round(Q_compliance, 4) if not np.isnan(Q_compliance) else None,
+            "Q_price_realism":    round(Q_price_realism, 4) if not np.isnan(Q_price_realism) else None,
+            "Q_saved_carbon":     round(Q_saved_carbon, 4) if not np.isnan(Q_saved_carbon) else None,
+            "Q_cost_eff":         round(Q_cost_eff, 4) if not np.isnan(Q_cost_eff) else None,
+            "Q_volatility":       round(Q_volatility, 4) if not np.isnan(Q_volatility) else None,
         }
         for i in range(n_total_agents):
             # Post-warmstart initial bank for "Holdings by Year" plot
@@ -2366,11 +2521,21 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             print(sep)
 
             # ── Control plane ──────────────────────────────────────────
+            _q_str = ""
+            if not (isinstance(quality_score, float) and np.isnan(quality_score)):
+                # Compact quality readout: composite + each component (cmp/prc/sav/eff/vol)
+                def _qf(x):
+                    return "  -- " if (x is None or (isinstance(x, float) and np.isnan(x))) else f"{x:.2f}"
+                _q_str = (
+                    f" │ Q={quality_score:.3f}"
+                    f" (c{_qf(Q_compliance)}/p{_qf(Q_price_realism)}"
+                    f"/s{_qf(Q_saved_carbon)}/e{_qf(Q_cost_eff)}/v{_qf(Q_volatility)})"
+                )
             print(f"  Ep {episode:5d} │ {_format_hms(elapsed_s)} elapsed  ETA {_format_hms(eta_s)}"
                   f"  ({avg_ep_s:.2f} s/ep)"
                   f" │ ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"
                   f"  ε={current_epsilon:.3f}"
-                  f"{decay_str}{cyc_str}{warmup_str}")
+                  f"{decay_str}{cyc_str}{warmup_str}{_q_str}")
 
             # ── Market trajectories ────────────────────────────────────
             price_traj = " ".join(f"{p:5.0f}" for p in prices_ep)

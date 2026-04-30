@@ -15,7 +15,7 @@ Covers:
   - Obs dim [41] = bid qty clip ratio in [0, 1]
   - Obs dim [42] = invest frac clip ratio in [0, 1]
   - Phase 2 obs dim [base+11] = sec qty clip ratio
-  - obs_dim_phase1 = 43 (no opp modeling) or 43 + 7*(N-1)
+  - obs_dim_phase1 = 44 (no opp modeling) or 44 + 7*(N-1)
   - obs_dim_phase2 = obs_dim_phase1 + 12
 """
 
@@ -310,15 +310,15 @@ class TestBCLClipSignalMagnitude:
 
 class TestObsDimensions:
 
-    def test_obs_dim_phase1_base_43(self):
-        """obs_dim_phase1 == 43 when opponent modeling is disabled."""
+    def test_obs_dim_phase1_base_44(self):
+        """obs_dim_phase1 == 44 when opponent modeling is disabled (v8.5.8)."""
         env = _make_env()
-        assert env.companies[0].obs_dim_phase1 == 43, (
-            f"Expected obs_dim_phase1=43, got {env.companies[0].obs_dim_phase1}"
+        assert env.companies[0].obs_dim_phase1 == 44, (
+            f"Expected obs_dim_phase1=44, got {env.companies[0].obs_dim_phase1}"
         )
 
     def test_obs_dim_phase1_with_opp_modeling(self):
-        """obs_dim_phase1 == 43 + 7*(n_total-1) with opponent modeling enabled."""
+        """obs_dim_phase1 == 44 + 7*(n_total-1) with opponent modeling enabled (v8.5.8)."""
         cfg = _load_config()
         cfg["opponent_modeling"]["enabled"] = True
         cfg["auction"]["bid_change_limit"] = {"enabled": True, "value": 50.0}
@@ -326,7 +326,7 @@ class TestObsDimensions:
         env.reset(seed=42)
         n = env.n_total
         opp_dims = cfg.get("opponent_obs", {}).get("dims_per_opponent", 7)
-        expected = 43 + opp_dims * (n - 1)
+        expected = 44 + opp_dims * (n - 1)
         assert env.companies[0].obs_dim_phase1 == expected, (
             f"Expected obs_dim_phase1={expected}, got {env.companies[0].obs_dim_phase1}"
         )

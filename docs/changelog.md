@@ -5,6 +5,115 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.5.8]
+
+Six narrowly-scoped changes following the v8.5.7 review:
+
+**1. Quality metric promoted to training-log + console.** The anchor-
+invariant convergence quality metric introduced in v8.5.7 (notebook §5.8)
+is now also computed every episode by `scripts/train.py` and written to
+`training_log_*.csv` as six columns: `quality_score`, `Q_compliance`,
+`Q_price_realism`, `Q_saved_carbon`, `Q_cost_eff`, `Q_volatility`. A
+compact readout `Q=0.532 (c0.84/p0.69/s0.22/e0.91/v0.37)` is appended
+to the per-episode console block next to entropy/epsilon, mirroring the
+notebook composite (0.30·comp + 0.25·realism + 0.25·saved-carbon +
+0.10·cost-eff − 0.10·volatility) so sweeps surface the score in real
+time. Saved-carbon is monetised at the per-year fundamental anchor;
+cost-eff uses `total_real_cost / counterfactual_cost` (counterfactual =
+year-0 emissions × anchor) mapped from [-1, 1] to [0, 1]; price-realism
+is `1 − mean(|clearing − anchor|/anchor)` clipped to [0, 1]. Defensive
+exception handling prevents a metric calculation failure from crashing
+training — a NaN is logged and printed as `--`.
+
+**2. Forward-looking compliance affordability obs (obs[43]).**
+Previously the policy only saw *lagged* clip feedback (obs[40]/[41])
+about whether budget gates fired *last* year — an indirect, low-bandwidth
+channel. The new obs[43] reports
+`(estimate_need × expected_clearing) / max(cash, 1)` clipped to [0, 3]
+and normalised by /3, where `expected_clearing = max(reserve, MA3,
+anchor)` (the same forward-looking price the joint budget gate uses).
+Reads directly as "fraction of cash a need-covering bid would consume
+at the realistic clearing price". 0 ≈ trivially affordable; 0.33 (raw
+1.0) = entire cash needed for compliance; 1.0 (raw 3.0) = compliance
+unaffordable from cash alone. `obs_dim_phase1` rises from 43 → 44 (+
+the existing 7×(N−1) opponent dims). Three test files updated.
+
+**3. Investment streak no longer resets on a single failure.** The
+`_consecutive_successes = 0` reset on `plan_investment` failure has
+been removed. The previous reset combined with `experience_threshold=2`
+created a hard positive-feedback loop where lucky agents (2 successes
+in a row early) unlocked the experience discount permanently while
+unlucky agents reset to zero on each failure — a documented driver of
+~10× inter-agent invest variance from tiny seed-luck differentials.
+The streak now monotonically accumulates, so accumulated experience is
+preserved across occasional failures.
+
+**4. `risk.p_fail_max`: 0.65 → 0.40.** The previous `p_fail_max=0.65`
+made offshore-wind / solar investments NPV-negative even for ESG agents
+with `w_green=0.5` (per the v8.5.7 NPV walkthrough). 0.40 aligns with
+real-world FID risk for policy-supported renewables (10-15% with PPAs,
+≤30% under merchant exposure), letting the green NPV math break-even.
+Combined with change #3, removes most of the structural "why doesn't
+the green agent invest more?" answer.
+
+**5. Budget calibration for the 70 → 150 EUR/t anchor trajectory.**
+Two re-tunes that go together:
+* `dynamic_budget_ceiling_multiplier`: 1.5 → 2.5. Anchor goes from 70
+  (year 1) to 150 (year 12), a 2.14× scaling. The old 1.5× cap
+  discarded ~40% of the high-year carbon-passthrough revenue, freezing
+  budgets in years 6+ and starving the green transition of investable
+  cash exactly when it's most expensive.
+* `debt_headrooms`: `[475,475,305,305,125,125,-25,-25]` →
+  `[240,240,155,155,65,65,-25,-25]` (halved on the positive entries,
+  zero kept at the green end). The old schedule gave coal-heavy agents
+  ~56% more cash than greens in low-price regimes (cap doesn't bind).
+  Halving preserves the transition-finance signal but stops over-
+  subsidising fossil incumbents — directly responding to "why do certain
+  agents invest 10× more, and how were they able to spend so much".
+
+**6. Joint budget gate is unchanged from v8.5.7** but the §[8.5.7]
+description has been promoted into a top-level explanation block
+(below) for the user's "what did you actually do with the joint gate"
+question. The gate sizes quantity against `expected_clearing × q +
+collateral` (uniform-price pay-as-you-clear semantics), not against
+`bid_p × q`. A high `bid_p` therefore does not artificially shrink qty
+in expectation. `bid_p` is only clipped when `bid_p × q > 5×cash` (an
+ε-greedy safety belt). `obs[40]` (price-clip delta) and `obs[41]`
+(qty-clip ratio) feedback are preserved so the gate is learnable.
+
+**Discussions documented but NOT implemented (per user direction):**
+* Phase-2 reward `baseline=clearing` (the high-price-environment fix):
+  deferred to a config-toggled experiment. The bid sub-head already uses
+  `baseline = need × clearing_price`, but Phase-2 financial reward still
+  centers at `anchor × need`, biasing it toward sub-anchor equilibria.
+  Requires an A/B sweep before changing.
+* `gap_penalty` floor `max(eff_pen, sec_ema, anchor)`: kept (v8.5.2/3).
+* Acceptance bonus on winning bids: rejected.
+* qty_mult_low lift, anti-bimodal heuristics: rejected.
+* Front-loading ESG further: rejected (already too front-loaded).
+* ESG redesign as "saved Mt × clearing_price" reward channel: out of
+  scope for this iteration; the current ESG signal is dimensionless EF-
+  ratio centred against a linear baseline, not a saved-carbon channel.
+
+Citations:
+* `scripts/train.py:48` (compute_fundamental_anchor import for quality)
+* `scripts/train.py:2145-2289` (per-episode quality computation block)
+* `scripts/train.py:986-1003` (`ep_fields` includes 6 Q_* columns)
+* `scripts/train.py:2530-2546` (console `Q=` readout)
+* `src/environment/company.py:556` (streak reset removed)
+* `src/environment/company.py:873-1081` (obs[43] kwarg, docstring,
+  base-44 array, `obs_dim_phase1` = 44)
+* `src/environment/ets_environment.py:3280-3340` (`_get_obs_phase1`
+  computes `_expected_clearing_for_obs` and passes
+  `compliance_affordability` per agent)
+* `configs/default.yaml` (p_fail_max 0.40, debt_headrooms halved,
+  dynamic_budget_ceiling_multiplier 2.5)
+* `tests/test_environment.py:534-542` (44-base assertion)
+* `tests/test_company.py:473-496` (44 / 44+21 / 44+12 dims)
+* `tests/test_bid_change_limit.py:313-332` (ditto)
+
+---
+
 ## [8.5.7]
 
 Three diagnostic / mechanism changes addressing the disappointing reward-vs-
