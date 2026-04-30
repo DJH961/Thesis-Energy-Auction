@@ -795,6 +795,10 @@ class PPOAgent:
         # PPO epochs
         total_a_loss = 0.0
         total_v_loss = 0.0
+        # Split-head loss accumulators (logging-only). The IPPO path has no
+        # bid/invest split, so those stay at zero; secondary-policy loss is
+        # tracked separately for the notebook's split-head plots.
+        total_sec_loss = 0.0
         n_up = 0
 
         for _epoch in range(self.n_epochs):
@@ -813,6 +817,10 @@ class PPOAgent:
                     v_pred, ret_t[mb],
                     old_values_t[mb] if self.clip_value else None
                 )
+
+                # Pre-declare so critic-only warmup minibatches still
+                # populate the secondary-loss accumulator below.
+                sec_policy_loss = torch.tensor(0.0, device=self.device)
 
                 if actor_update:
                     # Phase-split: auction policy only on auction rows, secondary only on secondary rows.
@@ -942,6 +950,7 @@ class PPOAgent:
 
                 total_a_loss += policy_loss.item()
                 total_v_loss += value_loss.item()
+                total_sec_loss += float(sec_policy_loss.item()) if torch.is_tensor(sec_policy_loss) else 0.0
                 n_up += 1
 
             if actor_update and self.target_kl > 0 and epoch_kl_count > 0:
@@ -953,11 +962,21 @@ class PPOAgent:
 
         avg_a = total_a_loss / max(n_up, 1)
         avg_v = total_v_loss / max(n_up, 1)
+        avg_sec = total_sec_loss / max(n_up, 1)
         self.actor_loss_history.append(avg_a)
         self.critic_loss_history.append(avg_v)
-        return {"actor_loss": avg_a, "critic_loss": avg_v}
-
-    # ------------------------------------------------------------------
+        return {
+            "actor_loss": avg_a,
+            "critic_loss": avg_v,
+            # IPPO path has no invest sub-head; report zeros so consumers can
+            # treat the dict shape uniformly across HAPPO and IPPO.
+            "actor_loss_invest": 0.0,
+            "actor_loss_bid": 0.0,
+            "actor_loss_secondary": avg_sec,
+            "critic_loss_invest": 0.0,
+            # Aliased to the centralised value loss (no separate sec critic).
+            "critic_loss_secondary": avg_v,
+        }
     # HAPPO: Sequential multi-agent update
     # ------------------------------------------------------------------
 
@@ -1197,6 +1216,16 @@ class PPOAgent:
 
         total_a_loss = 0.0
         total_v_loss = 0.0
+        # Split-head loss accumulators (v8.5 logging additions). When the bid
+        # and invest heads share the auction policy these are the per-block
+        # PPO clipped policy losses; secondary is the dedicated head; the
+        # invest critic is the second value-network when split_invest_head.
+        # Populated unconditionally so the return dict carries usable
+        # diagnostics regardless of the split_invest_head flag.
+        total_bid_loss = 0.0
+        total_inv_loss = 0.0
+        total_sec_loss = 0.0
+        total_v_inv_loss = 0.0
         n_up = 0
 
         for _epoch in range(self.n_epochs):
@@ -1225,6 +1254,13 @@ class PPOAgent:
                 else:
                     invest_value_loss = torch.tensor(0.0, device=self.device)
 
+                # Pre-declare split-head accumulator scalars so the
+                # diagnostic sums below are well-defined on critic-only
+                # warmup minibatches (actor_update=False).
+                bid_loss = torch.tensor(0.0, device=self.device)
+                inv_loss = torch.tensor(0.0, device=self.device)
+                sec_policy_loss = torch.tensor(0.0, device=self.device)
+
                 if actor_update:
                     # Phase-split: auction policy only on auction rows, secondary only on secondary rows.
                     is_auc_mb = is_auction[mb]   # [mb_size] bool
@@ -1232,6 +1268,11 @@ class PPOAgent:
 
                     auc_policy_loss = torch.tensor(0.0, device=self.device)
                     sec_policy_loss = torch.tensor(0.0, device=self.device)
+                    # Split-head sub-losses default to zero; populated below
+                    # when split_invest_head and adv_inv_t are active so the
+                    # outer loop can accumulate them for diagnostics.
+                    bid_loss = torch.tensor(0.0, device=self.device)
+                    inv_loss = torch.tensor(0.0, device=self.device)
                     auc_ent = torch.zeros(1, device=self.device)
                     sec_ent = torch.zeros(1, device=self.device)
                     auc_log_ratio = torch.zeros(1, 1, device=self.device)
@@ -1419,6 +1460,14 @@ class PPOAgent:
 
                 total_a_loss += policy_loss.item()
                 total_v_loss += value_loss.item()
+                # Split-head accumulators (HAPPO). When split_invest_head is
+                # False, bid_loss / inv_loss remain at zero (auc_policy_loss
+                # already captured in total_a_loss). sec_policy_loss and
+                # invest_value_loss are recorded unconditionally.
+                total_bid_loss += float(bid_loss.item()) if torch.is_tensor(bid_loss) else 0.0
+                total_inv_loss += float(inv_loss.item()) if torch.is_tensor(inv_loss) else 0.0
+                total_sec_loss += float(sec_policy_loss.item()) if torch.is_tensor(sec_policy_loss) else 0.0
+                total_v_inv_loss += float(invest_value_loss.item()) if torch.is_tensor(invest_value_loss) else 0.0
                 n_up += 1
 
             if actor_update and self.target_kl > 0 and epoch_kl_count > 0:
@@ -1430,9 +1479,27 @@ class PPOAgent:
 
         avg_a = total_a_loss / max(n_up, 1)
         avg_v = total_v_loss / max(n_up, 1)
+        avg_bid = total_bid_loss / max(n_up, 1)
+        avg_inv = total_inv_loss / max(n_up, 1)
+        avg_sec = total_sec_loss / max(n_up, 1)
+        avg_v_inv = total_v_inv_loss / max(n_up, 1)
         self.actor_loss_history.append(avg_a)
         self.critic_loss_history.append(avg_v)
-        return {"actor_loss": avg_a, "critic_loss": avg_v}
+        return {
+            "actor_loss": avg_a,
+            "critic_loss": avg_v,
+            # Bid sub-loss (auction policy, dims 0..1). Zero when split disabled.
+            "actor_loss_bid": avg_bid,
+            # Invest sub-loss (auction policy, dims 2..end). Zero when split disabled.
+            "actor_loss_invest": avg_inv,
+            # Dedicated secondary-market head policy loss.
+            "actor_loss_secondary": avg_sec,
+            # Investment-critic loss (separate value head when split is on).
+            "critic_loss_invest": avg_v_inv,
+            # No dedicated secondary critic exists; alias the centralised
+            # value loss so notebook split-head plots have a populated column.
+            "critic_loss_secondary": avg_v,
+        }
 
     def compute_post_update_ratio(self, buf_tensors) -> torch.Tensor:
         """
