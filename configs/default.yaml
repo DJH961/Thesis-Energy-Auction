@@ -169,7 +169,7 @@ auction:
     # only a fraction by default keeps the spike reserve. Set to 1.0 for
     # full treasury access; treasury_max_abs (M€, 0 = no cap) is an
     # additional optional absolute ceiling.
-    treasury_fraction: 0.5
+    treasury_fraction: 0.33
     treasury_max_abs: 0.0
     # Need floor in step A1: by default uses the deterministic
     # `estimate_need` the agent saw at obs time (fair — only clip on
