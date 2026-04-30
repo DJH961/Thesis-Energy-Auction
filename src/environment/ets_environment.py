@@ -1528,42 +1528,58 @@ class ETSEnvironment(gym.Env):
         # usage. Set `include_loan_headroom: true` only if you want the
         # gate to align with the post-clearing settlement waterfall (in
         # which case loans become an ordinary tool, not an emergency).
+        # Treasury fraction: by default the gate only counts a fraction of
+        # treasury toward the bid-cash buffer. Treasury is meant to be
+        # emergency money for genuine price spikes; if the gate counts
+        # 100% of it the agent learns to routinely bid against treasury,
+        # leaving no headroom for actual stress. Set treasury_fraction=1.0
+        # to recover the previous behaviour.
+        bg_treasury_frac = float(bg_cfg.get("treasury_fraction", 0.5))
+        bg_treasury_frac = max(0.0, min(1.0, bg_treasury_frac))
+        bg_treasury_max_abs = float(bg_cfg.get("treasury_max_abs", 0.0))
         bg_include_loan = bool(bg_cfg.get("include_loan_headroom", False))
         loan_cfg_gate = self.config.get("budget", {}).get("emergency_loan", {})
         gate_loan_enabled = bool(loan_cfg_gate.get("enabled", False))
         gate_max_loan_frac = (float(loan_cfg_gate.get("max_loan_fraction", 0.0))
                               if (gate_loan_enabled and bg_include_loan) else 0.0)
 
-        # Shock-aware need floor: when true (default), the `need` floor in
-        # step A1 uses the realised emission shock for the current year
-        # (drawn upstream in step 4 of step_auction, before the gate runs).
-        # This is information the agent did NOT have when forming its bid,
-        # but it matches what the auction will actually settle: the gate
-        # therefore won't clip qty below the actual obligation in
-        # positive-shock years. Set to false to use the deterministic
-        # `estimate_need` floor instead (pre-shock, what the agent saw).
-        bg_shock_aware = bool(bg_cfg.get("shock_aware_need_floor", True))
+        # Need-floor mode (Step A1 protection level):
+        #   shock_aware_need_floor=false (default) → use the deterministic
+        #     `estimate_needs[i]` the agent saw in its observation. Fair
+        #     to the agent: only clip on info available at bid-time.
+        #   shock_aware_need_floor=true → use the realised shock that the
+        #     env drew upstream in step 4 of step_auction. Matches what
+        #     the auction will actually settle, but corrects the bid on
+        #     info the agent did not have.
+        bg_shock_aware = bool(bg_cfg.get("shock_aware_need_floor", False))
 
         self._last_budget_price_clip[:] = 0.0
         if bg_enabled:
             for i, company in enumerate(self.companies):
                 if not self._is_agent_active(i):
                     continue
-                # Cash buffer: operating + treasury (+ loan headroom only
-                # if explicitly opted in via include_loan_headroom).
+                # Cash buffer: operating + (treasury × treasury_fraction)
+                # [+ loan headroom only if include_loan_headroom=true].
+                # Treasury is partial by default — it's stress-reserve, not
+                # routine bid sizing.
                 op_cash = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
+                treasury_full = float(company.get_treasury_available())
+                treasury_capped = bg_treasury_frac * treasury_full
+                if bg_treasury_max_abs > 0.0:
+                    treasury_capped = min(treasury_capped, bg_treasury_max_abs)
                 loan_headroom = gate_max_loan_frac * max(float(company.annual_budget), 1.0)
-                cash = op_cash + company.get_treasury_available() + loan_headroom
+                cash = op_cash + treasury_capped + loan_headroom
                 bid_p = float(bid_actions[i, 0])
                 bid_q = float(bid_actions[i, 1])
                 if bid_p < 1e-6 or bid_q < 1e-6:
                     continue
 
                 # Need floor (Step A1 protection level).
-                # Uses the realised shock when shock_aware_need_floor=true
-                # (default): epsilons[i] is drawn upstream and matches what
-                # the auction will settle. Otherwise falls back to the
-                # deterministic estimate the agent saw at obs time.
+                # By default uses the deterministic estimate the agent saw
+                # at obs time — fair to the agent, only clipping on info
+                # available at bid time. If shock_aware_need_floor=true,
+                # uses the realised shock (drawn upstream in step 4 of
+                # step_auction) which matches what the auction will settle.
                 # estimate_needs already includes carry_forward; only the
                 # emission component is shock-amplified.
                 base_need = float(estimate_needs[i])

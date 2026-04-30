@@ -12,38 +12,30 @@ knobs themselves live in `src/environment/ets_environment.py`
 
 ## 1. Formula
 
-For agent $i$ in year $t$:
+For agent *i* in year *t*:
 
-$$
-\text{esg\_raw}_t = \text{scale} \cdot
-\Big(
-  w_{\text{stock}} \cdot \text{ef\_ratio}_t
-  + w_{\text{flow}} \cdot \text{ef\_ratio}_t \cdot \frac{\text{anchor\_real}_t}{\text{anchor\_real}_0}
-  + \text{speed\_coef} \cdot \max(0, \Delta\text{green}_t)
-\Big)
-$$
+```
+esg_raw_t = scale × ( w_stock × ef_ratio_t
+                    + w_flow  × ef_ratio_t × (anchor_real_t / anchor_real_0)
+                    + speed_coef × max(0, Δgreen_t) )
 
-$$
-\text{esg\_signal}_t =
-\begin{cases}
-\text{esg\_raw}_t \cdot \text{compliance\_gate}_t & \text{if } \text{esg\_raw}_t \ge 0 \\
-\text{esg\_raw}_t & \text{otherwise (defensive branch)}
-\end{cases}
-$$
+esg_signal_t = esg_raw_t × compliance_gate_t   if esg_raw_t ≥ 0
+             = esg_raw_t                       otherwise (defensive branch)
+```
 
 with
 
-- $\text{ef\_ratio}_t = \max\!\left(0,\; \dfrac{ef_0 - ef_t}{ef_0}\right)$ — cumulative
-  emission-factor improvement vs. the agent's year-0 mix.
-- $\text{anchor\_real}_t = \text{compute\_fundamental\_anchor}(t) / \text{infl}(t)$
-  — fundamental anchor in real terms; it encodes the cap trajectory and
-  inflation, and is the same anchor used by the budget gate, the
-  bid-head reward floor, and the quality metric volatility component.
-- $\Delta\text{green}_t = \max(0,\; \text{green\_frac}_t - \text{green\_frac}_{t-1})$
-  — current-year transition motion.
-- $\text{compliance\_gate}_t$ — smooth blend approaching linear
-  `coverage_frac` above `compliance_gate_blend_threshold` (0.90 default)
-  and softening below; only attenuates non-negative `esg_raw`.
+- `ef_ratio_t = max(0, (ef_0 − ef_t) / ef_0)` — cumulative emission-factor
+  improvement vs. the agent's year-0 mix.
+- `anchor_real_t = compute_fundamental_anchor(t) / infl(t)` — fundamental
+  anchor in real terms; encodes the cap trajectory and inflation, and is
+  the same anchor used by the budget gate, the bid-head reward floor,
+  and the quality metric volatility component.
+- `Δgreen_t = max(0, green_frac_t − green_frac_{t−1})` — current-year
+  transition motion.
+- `compliance_gate_t` — smooth blend approaching linear `coverage_frac`
+  above `compliance_gate_blend_threshold` (0.90 default) and softening
+  below; only attenuates non-negative `esg_raw`.
 
 ### What each term does
 
@@ -92,62 +84,85 @@ base = w_cost × (-cost_norm_centered) + w_green × esg_signal
 
 For balanced agents (`w_cost = w_green = 0.5`, the A2/A4/A6/A8
 archetypes), the goal is a roughly even contribution from each channel
-across an episode. The ESG channel is positive-only and the financial
-channel is centred on the fair-price baseline, so `esg.scale` is the
-single knob used to calibrate magnitudes.
+across an episode. The financial channel is centred on the fair-price
+baseline (`expected_compliance_norm = 1.0`), so a policy that bids at
+the fundamental anchor pays cost_norm ≈ 1 and the **signed** financial
+reward is ≈ 0 by construction. What drives the policy gradient is the
+year-over-year *swing* of the financial channel (positive when the
+clearing dips below anchor, negative when it spikes), so the right
+calibration target is the **absolute** per-(year, agent) magnitude
+on each side. ESG is positive-only and `esg.scale` is the single knob
+used to match magnitudes.
 
-### Empirical sweep
+### Why the previous "flat 80 EUR/t" sweep was wrong
 
-Deterministic compliant rollout (8 learning agents, 0 bots, all bid
-80 EUR/t × 1.0×need, green agents invest 5 %/yr in solar; tail-window
-sum across the last 6 years):
+The first calibration of this PR bid at a flat 80 EUR/t every year,
+which is well below the mid-game anchor (~120–150 EUR/t real). That
+gave cost_norm < 1.0 throughout the tail and left the financial
+channel sitting at a spurious `+2.25` over the last 6 years — a
+"buy-cheap windfall" no realistic policy can earn. A trained PPO
+policy converges to bidding at or above the anchor (under-bidding
+loses the auction → debt cascade), where signed Σ FIN ≈ 0. Re-running
+the sweep against an **anchor-tracking** rollout (the steady-state of a
+trained policy) shifts the calibration significantly.
 
-| `esg.scale` | Σ \|ESG\| | Σ \|FIN\| | %ESG | Comment |
+### Empirical sweep — anchor-tracking rollout
+
+8 learning agents, 0 bots, all bid the per-year fundamental anchor ×
+1.0 × need; green agents invest 5 %/yr in solar; tail-window absolute
+sum across the last 6 years:
+
+| `esg.scale` | Σ \|ESG\| | Σ \|FIN\| | %\|ESG\| | Comment |
 |---|---|---|---|---|
-| 0.15 | 1.42 | 2.25 | 39 % | financial-heavy |
-| 0.20 | 1.89 | 2.25 | 46 % | slight financial bias |
-| **0.25** | **2.37** | **2.25** | **51 %** | **calibrated, ≈50/50** |
-| 0.30 | 2.84 | 2.25 | 56 % | slight ESG bias |
-| 0.50 | 4.74 | 2.25 | 68 % | ESG-dominated |
-| 1.00 | 9.47 | 2.25 | 81 % | ESG-dominated |
+| 0.10 | 0.94 | 4.39 | 18 % | financial-heavy |
+| 0.15 | 1.41 | 4.39 | 24 % | financial-heavy |
+| 0.20 | 1.88 | 4.39 | 30 % | financial bias |
+| 0.25 | 2.35 | 4.39 | 35 % | edge of window |
+| 0.30 | 2.83 | 4.39 | 39 % | financial bias |
+| **0.50** | **4.71** | **4.39** | **52 %** | **calibrated, ≈50/50** |
+| 1.00 | 9.42 | 4.39 | 68 % | ESG-dominated |
 
-`scale = 0.25` is the default. A regression test
-(`tests/test_rewards.py::test_esg_balance_with_financial_50_50`) pins
-the balance to `[35 %, 65 %]` so future changes to either channel will
-trip the test. **Re-tune `scale` (not `stock_weight` / `flow_weight`)
-if the balance drifts.**
+`scale = 0.50` is the new default (was `0.25`, calibrated against the
+flat-80 rollout that overstated FIN). The regression test
+(`tests/test_rewards.py::test_esg_balance_with_financial_50_50`) now
+runs the anchor-tracking rollout and pins the balance to `[35 %, 65 %]`.
+**Re-tune `scale` (not `stock_weight` / `flow_weight`) if the balance
+drifts.**
 
-### Per-year trajectory at `scale = 0.25`
+### Per-year trajectory at `scale = 0.50` (anchor-tracking, balanced agents)
 
 ```
-Year   ESG/yr   FIN/yr   %ESG   ef_ratio   anchor_ratio
- 0     +0.00    +0.07    0%     0.44       1.00
- 1     +0.00    +0.30    0%     0.44       1.02
- 2     +0.00    +0.27    0%     0.44       1.07
- 3     +0.01    +0.12    7%     0.44       1.09     ← compliance gate kicks in
- 4     +0.01    +0.01   62%     0.44       1.11
- 5     +0.02    +0.02   54%     0.44       1.18
- 6     +0.02    +0.05   33%     0.44       1.24     ← typical mid-game
- 7     +0.03    +0.22   12%     0.44       1.28
- 8     +0.02    +0.31    7%     0.44       1.33
- 9     +0.01    +0.41    3%     0.44       1.37     ← scarcity-cost peak
-10     +0.05    -0.11   30%     0.44       1.44
-11     +0.03    -0.08   29%     0.44       1.47
-                              tail-window: 51 % ESG
+Year   ESG/yr   FIN/yr    %|ESG|   ef     anc_r   cov_frac
+ 0     +0.000   −0.589      0 %   0.00   1.00     1.00
+ 1     +0.000   −0.582      0 %   0.00   1.02     1.00
+ 2     +0.084   −0.542     14 %   0.03   1.07     1.00
+ 3     +0.205   −0.485     30 %   0.08   1.09     1.00
+ 4     +0.349   −0.416     46 %   0.13   1.11     1.00
+ 5     +0.481   −0.363     57 %   0.17   1.18     1.00
+ 6     +0.588   −0.192     75 %   0.20   1.24     0.50    ← typical mid-game
+ 7     +0.653   +0.009     99 %   0.27   1.28     0.25
+ 8     +0.661   +0.046     93 %   0.32   1.33     0.75
+ 9     +0.430   +0.914     32 %   0.37   1.37     0.17    ← scarcity-cost peak
+10     +1.125   −1.281     47 %   0.41   1.44     0.52
+11     +1.251   +0.393     76 %   0.46   1.47     0.75
+                                          tail-window: 52 % ESG
 ```
 
-The shape is intentional: compliance dominates the early signal (ESG
-gated to ≈0 when coverage_frac < 0.9), ESG meaningful in the middle,
-financial costs of cap-tightening dominate near the peak (years 7–9),
-then both balance again in the final two years.
+The shape: financial channel is large and *negative* in the early
+years (capital cost of green build-out depresses cost_norm-centered
+into negative territory), ESG ramps as `ef_ratio` and anchor scarcity
+both grow, and both channels swing freely in the late game as scarcity
+binds. Signed Σ FIN ≈ 0 across the tail (years 6–11); the |abs|
+contribution is what the policy gradient sees.
 
 ---
 
 ## 3. Strengths
 
 1. **Late investment rewarded by TVM, not horizon penalty.** A year-11
-   agent at `ef_ratio = 0.5` receives $+0.39$ at the default scale.
-   Earlier investment is still preferred because more years of stock+flow
+   agent at `ef_ratio = 0.5` receives ≈ `+0.79` at the default
+   `scale = 0.50` (`0.50 × (1×0.5 + 1.5×0.5×1.47 + 0)`). Earlier
+   investment is still preferred because more years of stock+flow
    accrual remain — TVM is preserved organically.
 2. **Sustained green share earns reward every year.** Stock term ≠ 0
    for any positive `ef_ratio`. Stops the front-load-then-stop pattern.
@@ -189,7 +204,7 @@ then both balance again in the final two years.
 | Scenario | ESG behaviour | Verdict |
 |---|---|---|
 | **Always coal** (`ef_ratio = 0`) | ESG = 0 every year. Financial channel still pays compliance cost. | ✓ correct — penalty is on the financial side |
-| **Always green** (`ef_ratio = 1`) | Peak ≈ `0.25 × (1 + 1.5 × 1.47 + 0) = 0.80` per year; cumulative ≈ 3.5 over 12 years. | ✓ upper bound of green reward in steady state |
+| **Always green** (`ef_ratio = 1`) | Peak ≈ `0.50 × (1 + 1.5 × 1.47 + 0) = 1.60` per year; cumulative ≈ 7 over 12 years. | ✓ upper bound of green reward in steady state |
 | **Late-starter** (invests entirely in year 6) | Years 0–6 ESG = 0; years 7–11 `ef_ratio` rises to ~0.7. Cumulative ESG ≈ 1.5. **Better than NEVER** (cumulative 0). | ✓ pre-redesign would have given negative cumulative reward, pushing the policy toward "never invest" |
 | **Front-loader** (invests entirely in year 0) | `ef_ratio = 0.7` from year 0 onwards; stock term contributes every year, flow term ramps with anchor. Cumulative ESG ≈ 5.5. | ✓ TVM-correct preference for early investment preserved |
 | **Deceptive bidder** (high bid_p but only 90 % coverage) | Compliance gate cuts ESG to ~70 % of nominal. Financial channel still pays the compliance cost. | ✓ gaming defeated |

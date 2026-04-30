@@ -24,8 +24,9 @@ esg_raw = scale × ( stock_w × ef_ratio
 Stock term pays sustained green share every year; flow term monetises
 avoided carbon at the live anchor (social shadow price); speed bonus
 is uniform across the episode (no front-loading). Compliance gate
-retained. Calibrated default `esg.scale = 0.25` produces a ~50/50
-financial-vs-ESG split for `[w_cost = 0.5, w_green = 0.5]` agents.
+retained. Calibrated default `esg.scale = 0.50` produces a ~50/50
+financial-vs-ESG split (in absolute per-(year, agent) magnitude) for
+`[w_cost = 0.5, w_green = 0.5]` agents on an anchor-tracking rollout.
 A regression test pins this balance to `[35 %, 65 %]`. Full design,
 balance sweep, stress scenarios, and realism notes live in
 `docs/esg_reward_design.md`. New diagnostic columns
@@ -44,21 +45,26 @@ expected settlement exceeds available cash:
    loses the auction in expectation.
 3. Last resort: shrink `bid_q` below need.
 
-The gate's cash buffer is **operating + treasury** by default. Emergency-
-loan headroom is opt-in (`include_loan_headroom=false`): the loan is a
-settlement-time safety net, not a sizing buffer, so by default the gate
-does not let agents routinely bid into loan territory. The `need` floor
-uses the realised emission shock for the current year (drawn upstream
-in `step_auction` before the gate runs, so the env knows it — agents
-did not have this info at bid-time); set `shock_aware_need_floor=false`
-for the pre-shock estimate. `MA3_inflated = price_ma3 × infl(t)/infl(t-1)`
-so expected_clearing doesn't lag in inflation regimes. Knobs:
+The cash buffer is `operating + treasury_fraction × treasury` by
+default (`treasury_fraction = 0.5`) — treasury is meant to absorb
+genuine price spikes and is therefore only partially exposed to
+routine bid sizing. Emergency-loan headroom is opt-in
+(`include_loan_headroom = false`): the loan is a settlement-time
+safety net, not a sizing buffer, so the gate doesn't let agents
+routinely bid into loan territory. The `need` floor uses the
+deterministic estimate the agent saw at obs time by default — fair
+to the agent, only clipping on info available at bid time;
+`shock_aware_need_floor = true` switches to the realised shock
+(drawn upstream in `step_auction` before the gate runs, so the env
+knows it — agents did not have this info at bid-time).
+`MA3_inflated = price_ma3 × infl(t)/infl(t-1)` so expected_clearing
+doesn't lag in inflation regimes. Knobs:
 `auction.budget_gate.{enabled, safety_mult, notional_safety_mult,
-protect_need_floor, inflation_aware_ma3, include_loan_headroom,
-shock_aware_need_floor}`. Setting `protect_need_floor = false` collapses
-the protocol back to a single qty-shrink stage; the legacy
-`leverage_multiplier` and `budget_price_clip` knobs no longer drive
-bid sizing.
+protect_need_floor, inflation_aware_ma3, treasury_fraction,
+treasury_max_abs, include_loan_headroom, shock_aware_need_floor}`.
+Setting `protect_need_floor = false` collapses the protocol back to
+a single qty-shrink stage; the legacy `leverage_multiplier` and
+`budget_price_clip` knobs no longer drive bid sizing.
 
 **U/D/M/B/C compliance attribution.** Mutually-exclusive partition of
 non-compliant years per agent:
@@ -127,9 +133,16 @@ cap_mult}`.
 - Re-train recommended: ESG redesign changes magnitudes for any
   `w_green > 0` agent.
 - New YAML knobs are read with safe defaults.
-- The `esg.scale=0.25` default is calibrated for the 50/50
-  financial-ESG split; re-tune `scale` (not `stock_weight` /
-  `flow_weight`) if the balance drifts.
+- The `esg.scale = 0.50` default is calibrated for the 50/50
+  financial-ESG split (in absolute per-(year, agent) magnitude on
+  an anchor-tracking rollout); re-tune `scale` (not `stock_weight` /
+  `flow_weight`) if the balance drifts. The first calibration of
+  this PR (`scale = 0.25`) was against a flat-80 EUR/t rollout that
+  let bidders buy below anchor and overstated the financial channel
+  by ~2× — corrected here.
+- `ets.unsold_to_msr` flipped from `false` to `true` in the default
+  config so unsold auction volumes are absorbed by the MSR rather
+  than rolling forward indefinitely.
 
 ## [8.5.6]
 

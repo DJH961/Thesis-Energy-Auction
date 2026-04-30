@@ -1729,15 +1729,20 @@ def test_joint_gate_inflation_aware_ma3():
 
 
 def test_esg_balance_with_financial_50_50():
-    """v8.6.1: For balanced [w_cost=0.5, w_green=0.5] agents, the ESG and
+    """For balanced [w_cost=0.5, w_green=0.5] agents, the ESG and
     financial channels should each contribute ~50% of the absolute reward
-    signal (per user direction in the v8.6.0 PR follow-up review).
+    signal.
 
-    The test runs a deterministic compliant rollout (anchor-priced bids,
-    moderate green investment) and checks that |Σ w_g·esg| / (|fin| + |esg|)
-    falls in [0.35, 0.65] across the episode tail. The default scale=0.25
-    was empirically calibrated for this target — if the test fails, either
-    the scale needs re-tuning or the reward composition has drifted.
+    Uses an anchor-tracking deterministic rollout — bids track the
+    fundamental anchor each year, which is the steady-state behaviour a
+    trained PPO policy converges to (under-bidding loses the auction
+    and triggers the debt cascade). With anchor-tracking bids the
+    financial channel's signed sum is ≈ 0 (cost_norm ≈ 1.0 at the
+    anchor) but its absolute magnitude is non-trivial because it swings
+    ± year-over-year with scarcity. The check is on |Σ ESG| / (|FIN|+|ESG|)
+    in the tail window. The default scale was empirically calibrated for
+    this target — if the test fails, either the scale needs re-tuning or
+    the reward composition has drifted.
     """
     # Load WITHOUT the test-helper's lrf overrides, which inflate scarcity
     # and break the compliance gate. Use the default 12-year trajectory.
@@ -1752,13 +1757,14 @@ def test_esg_balance_with_financial_50_50():
     env = ETSEnvironment(config, seed=42)
     env.reset(seed=42)
 
-    # Deterministic compliant rollout using the test helper. Auction at 80 EUR/t
-    # (above year-0 reserve), qty_mult=1.0×need; green agents do a small
-    # solar investment each year, financial agents skip investment.
+    # Deterministic compliant rollout: bids track the fundamental anchor
+    # (what trained policies converge to). qty_mult=1.0×need; green
+    # agents do a small solar investment each year.
+    from src.utils.price_anchor import compute_fundamental_anchor
     for yr_idx in range(env.n_years):
         n = env.n_agents
         a = np.zeros((n, 6), dtype=np.float32)
-        a[:, 0] = 80.0  # bid at 80 EUR/t (above reserve, near anchor in early years)
+        a[:, 0] = float(compute_fundamental_anchor(yr_idx, config))
         a[:, 1] = 1.0   # qty_mult ≈ 1.0×need
         for i in range(n):
             if env.companies[i].w_green > 0.4:
@@ -1784,8 +1790,11 @@ def test_esg_balance_with_financial_50_50():
             cn = (c.get("compliance_norm", 0.0)
                   + c.get("capital_norm", 0.0)
                   + c.get("soft_norm", 0.0))
-            total_fin += comp.w_cost * (-(cn - 1.0))
-            total_esg += comp.w_green * c.get("esg_signal", 0.0)
+            # Sum absolute per-(year,agent) contributions: with anchor-
+            # tracking bids cost_norm ≈ 1 so signed Σ FIN ≈ 0, but the
+            # year-over-year swing is what drives the policy gradient.
+            total_fin += abs(comp.w_cost * (-(cn - 1.0)))
+            total_esg += abs(comp.w_green * c.get("esg_signal", 0.0))
 
     abs_total = abs(total_esg) + abs(total_fin)
     assert abs_total > 1e-6, f"Both channels are zero — degenerate rollout"

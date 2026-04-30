@@ -53,7 +53,7 @@ ets:
   reserve_price_mode: "static"
   reserve_discount: 0.80
   reserve_initial: 50.0
-  unsold_to_msr: false
+  unsold_to_msr: true
   max_rollover_multiplier: 1.5
   price_history_anchor: "auction"
 
@@ -164,12 +164,19 @@ auction:
     # into loan territory. Enable only to align gate sizing with the
     # full settlement waterfall.
     include_loan_headroom: false
-    # When true, the `need` floor in step A1 uses the realised emission
-    # shock for the current year (drawn upstream before the gate runs,
-    # so the env knows it). The agent did not have this info at bid-time,
-    # but it matches what the auction will actually settle. Set to false
-    # to use the deterministic pre-shock estimate the agent saw.
-    shock_aware_need_floor: true
+    # Treasury fraction in the cash buffer. Treasury is meant to absorb
+    # genuine price spikes, not be a routine bid-sizing buffer; counting
+    # only a fraction by default keeps the spike reserve. Set to 1.0 for
+    # full treasury access; treasury_max_abs (M€, 0 = no cap) is an
+    # additional optional absolute ceiling.
+    treasury_fraction: 0.5
+    treasury_max_abs: 0.0
+    # Need floor in step A1: by default uses the deterministic
+    # `estimate_need` the agent saw at obs time (fair — only clip on
+    # info available at bid time). Set to true to use the realised
+    # shock, which matches what the auction will actually settle but
+    # corrects bids on info the agent did not have.
+    shock_aware_need_floor: false
   carry_forward_defaults: true
 
 trading:
@@ -329,7 +336,7 @@ reward:
 # the full design rationale, balance calibration, and stress scenarios.
 esg:
   enabled: true
-  scale: 0.25           # calibrated for ~50/50 fin/ESG balance for [0.5, 0.5] agents
+  scale: 0.50           # calibrated for ~50/50 fin/ESG balance for [0.5, 0.5] agents
   stock_weight: 1.0     # weight on ef_ratio "we are green right now"
   flow_weight:  1.5     # weight on ef_ratio × anchor_real_ratio (saved-carbon at live anchor)
   speed_coef: 0.3       # bonus on max(0, Δgreen); uniform across episode (no front-loading)
