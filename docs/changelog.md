@@ -5,6 +5,108 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.5.6]
+
+Tier-3 mitigations for seed-driven price-basin lock-in (the bimodal sweep
+behaviour where, e.g., `default s=23` settles into a high-price basin
+(μ ≈ 120 EUR/t, R̄ ≈ −7) while `default s=41` settles into a low-price
+basin (μ ≈ 65 EUR/t, R̄ ≈ −3)). Two narrow changes:
+
+**1. Per-agent RNG for ε-greedy exploration (`PPOAgent`).**
+`select_auction_action` and `select_secondary_action` previously consumed
+ε-greedy randomness from the global `np.random` namespace. With 8 agents
+sampling sequentially each step, this meant agent 0's `np.random.random()
+< ε` gate, agent 1's WTP-anchor uniform draw, agent 2's qty-mult Gaussian,
+etc. were all interleaved on a single shared stream — a hidden coupling
+across agents that made exploration sensitive to the master seed in ways
+that were hard to disentangle from environment seeding. All eight calls
+in those two methods now use `self._rng` (already constructed per-agent
+in `__init__` as `np.random.default_rng(seed + agent_id)`). Existing
+behaviour is preserved when `epsilon == 0`. New regression tests cover
+both phases.
+
+**2. Anchor-snap exploration (`exploration.anchor_snap`).**
+At the start of each episode, with probability `prob_per_episode`, each
+non-HPP-swapped agent's `auction_policy.price_head.bias` is saved and
+overwritten with the fundamental-anchor calibration for the duration of
+the rollout, then restored before the PPO update. Gives a policy that
+has settled into the high-price basin a probabilistic exit toward the
+low (fundamental) basin without permanently overwriting learned weights.
+Default: **`enabled: false`**, `prob_per_episode: 0.02`. The mechanism
+is wired in and tested but defaulted off pending empirical validation:
+snapped-rollout transitions are retained in the PPO buffer with their
+log-probs recorded under the snapped policy and re-evaluated under the
+restored policy at update time, so for policies far from the anchor the
+importance-ratio clamp may saturate. Enable opt-in for basin-lock-in
+sweeps. PPO's clipped surrogate plus dual-clip handle the resulting
+mild off-policy correction in the regimes where the snap is closest to
+the current policy.
+
+Citations: `src/agents/ppo_agent.py` (eight `np.random.* → self._rng.*`
+swaps; new `snap_price_head_to_anchor` / `restore_price_head` methods);
+`scripts/train.py` (anchor-snap config read; per-episode snap/restore
+inside the rollout loop, sequenced before HPP restore);
+`configs/default.yaml` `exploration.anchor_snap` block;
+`tests/test_anchor_snap_and_rng.py` (5 new tests).
+
+---
+
+## [8.5.5]
+
+Bug-fix / infrastructure release. Pure logging-output change — **no
+training-quality, RNG, or numerical paths altered**. Two back-to-back
+runs of `--seed 42` produce byte-identical `training_log_s42.csv` and
+`year_log_s42.csv` before and after the change.
+
+### Fix 1 (v8.5.5) — bound training-output disk usage on long sweeps
+
+**Background.** On Azure `Standard_D16ds_v5` (~600 GB scratch) a sweep of
+the 120 k-episode `default.yaml` running 4 variants × seeds in parallel
+hit `DiskFullError: ... available space: 9915 MB` at ~91 % completion.
+Two output paths grow without bound during a run:
+
+1. **`results/snapshots/`** — `train_one_seed` calls `shutil.copy2` on
+   the *cumulative* `training_log_*.csv` and `year_log_*.csv` every
+   `logging.snapshot_interval` (default 2500) episodes, with an
+   episode-suffixed filename. The source files grow throughout the run
+   and *all* historical copies were retained, so the snapshots
+   directory grew **quadratically** with episode count. With ~48
+   snapshot pairs over a 120 k-episode run and a year-log of order 10s
+   of GB per seed, this alone occupied hundreds of GB per seed — and
+   the sweep launcher multiplies that by `parallel_workers`.
+2. **`results/checkpoints_*_s<seed>/`** — `prune_checkpoints` ran only
+   on clean exit, so the `n_episodes / save_interval` periodic
+   `.pt` files (× `n_agents`) all coexisted on disk until the very end
+   of training.
+
+**Fix.** Two new `logging:` knobs in `configs/default.yaml`, both
+defaulting to "bounded" behaviour:
+
+* `logging.snapshot_keep_recent` (default `1`) — only the K most-recent
+  `(training_log, year_log)` snapshot pairs for each seed are kept.
+  After each new copy in `train_one_seed`, older pairs for the same
+  `(run_tag, seed)` are deleted. Default 1 turns the snapshots
+  directory into a single rolling pair → **O(file-size) instead of
+  O(N_snapshots × file-size)**.
+* `logging.checkpoint_pruning.online` (default `true`) — invokes
+  `prune_checkpoints` after each periodic `.pt` save, not only at clean
+  exit. Bounds the on-disk count of periodic checkpoint files to
+  ≤ `(n_keep_recent + n_keep_milestones) × n_agents` at all times during
+  training. The end-of-run prune still runs and is a no-op when online
+  pruning has kept the directory in shape. The `agent_*_best.pt` files
+  and the ep-0 baseline are preserved by `prune_checkpoints` regardless.
+
+**Behaviour preserved.** No CSV column, write order, fsync cadence,
+checkpoint format, RNG draw, or numerical computation changes. The
+content of `training_log` and `year_log` is identical; only the
+`snapshots/` and `checkpoints_*/` directory housekeeping changes.
+
+**Citations.** `scripts/train.py` snapshot block and the periodic-save
+block under `train_one_seed`; new `_snapshot_keep_recent` resolution at
+the top of the same function; `configs/default.yaml` `logging:` block.
+
+---
+
 ## [8.5.4]
 
 Bug-fix / infrastructure release. Pure efficiency change — **no

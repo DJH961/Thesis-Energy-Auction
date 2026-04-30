@@ -621,6 +621,74 @@ def prune_checkpoints(
     )
 
 
+def enforce_snapshot_retention(
+    snap_dir: str,
+    tag_part: str,
+    seed: int,
+    keep_recent: int,
+) -> int:
+    """Bound the ``snapshots/`` directory to the K most-recent CSV pairs.
+
+    Each call to ``train_one_seed`` periodically copies the cumulative
+    ``training_log_<tag>_s<seed>.csv`` and ``year_log_<tag>_s<seed>.csv``
+    into ``results/snapshots/`` with an ``_ep<N>`` suffix. Without
+    retention, all historical copies stay on disk and the directory grows
+    quadratically in episode count — long Azure runs hit
+    ``DiskFullError`` near the end of training as a result.
+
+    This helper deletes ``(training_log, year_log)`` snapshot pairs for
+    the given ``(tag_part, seed)`` whose ``_ep`` suffix is **not** among
+    the top ``keep_recent`` largest. Other files in ``snap_dir`` are left
+    alone (different seeds/tags share the directory).
+
+    Parameters
+    ----------
+    snap_dir : str
+        Snapshots directory.
+    tag_part : str
+        Run-tag infix (``""`` or ``"_<tag>"``) matching the snapshot
+        filename convention used by ``train_one_seed``.
+    seed : int
+        Seed of the run whose snapshots should be pruned.
+    keep_recent : int
+        Number of most-recent snapshot pairs to keep. Must be ≥ 1.
+
+    Returns
+    -------
+    int
+        Number of files deleted.
+    """
+    import re
+
+    if keep_recent < 1:
+        keep_recent = 1
+    if not os.path.isdir(snap_dir):
+        return 0
+
+    ep_pat = re.compile(
+        rf"^training_log{re.escape(tag_part)}_s{seed}_ep(\d+)\.csv$"
+    )
+    existing_eps = sorted(
+        int(m.group(1))
+        for f in os.listdir(snap_dir)
+        for m in [ep_pat.match(f)]
+        if m is not None
+    )
+    stale = existing_eps[:-keep_recent]
+    deleted = 0
+    for old_ep in stale:
+        for prefix in ("training_log", "year_log"):
+            p = os.path.join(
+                snap_dir, f"{prefix}{tag_part}_s{seed}_ep{old_ep}.csv"
+            )
+            try:
+                os.remove(p)
+                deleted += 1
+            except OSError:
+                pass
+    return deleted
+
+
 def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = None):
     # Isolate per-run auto-resolved schedule values (e.g. shaping decay)
     # so earlier short runs do not mutate config used by later long runs.
@@ -807,6 +875,19 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
         auto_note = " [auto]" if eps_decay_auto else ""
         print(f"Epsilon-greedy: {eps_start:.2f} → {eps_final:.2f} "
               f"over {eps_decay_episodes} episodes (physical-space){auto_note}.")
+
+    # Anchor-snap exploration (Tier-3 mitigation for seed-driven price-basin
+    # lock-in): with low probability per episode, save & temporarily snap
+    # each agent's auction price_head.bias to the fundamental anchor for
+    # the duration of the rollout, then restore before the PPO update.
+    anchor_snap_cfg = explore_cfg.get("anchor_snap", {}) or {}
+    anchor_snap_enabled = bool(anchor_snap_cfg.get("enabled", False))
+    anchor_snap_prob = float(anchor_snap_cfg.get("prob_per_episode", 0.0))
+    if anchor_snap_enabled and anchor_snap_prob > 0.0:
+        print(
+            f"Anchor-snap exploration: p={anchor_snap_prob:.3f} per episode "
+            f"(per-agent, episode-scoped, restored before PPO update)."
+        )
 
     # Historical Policy Pool (HPP) — anti-regression safety net
     hpp_cfg = config.get("hpp", {})
@@ -1026,6 +1107,24 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
     log_interval = config["logging"]["log_interval"]
     save_interval = config["logging"]["save_interval"]
     _snapshot_interval = int(config["logging"].get("snapshot_interval", 0))
+    # Bound disk usage of the ``snapshots/`` directory. Each snapshot is a
+    # ``shutil.copy2`` of the *cumulative* training/year CSVs, so unbounded
+    # retention scales quadratically with episode count and reliably exhausts
+    # the local disk on long Azure runs (DiskFullError near end of training).
+    # ``snapshot_keep_recent`` caps the number of historical copies kept on
+    # disk per seed (oldest copies are deleted after each new snapshot).
+    # Default 1 → a single rolling snapshot pair, turning the footprint from
+    # O(N²) into O(N).
+    _snapshot_keep_recent = max(
+        1, int(config["logging"].get("snapshot_keep_recent", 1))
+    )
+    # Pre-resolve checkpoint-pruning config so the periodic-save loop avoids
+    # nested ``.get()`` lookups every save_interval episodes.
+    _prune_cfg = config.get("logging", {}).get("checkpoint_pruning", {})
+    _prune_enabled = bool(_prune_cfg.get("enabled", True))
+    _prune_online = bool(_prune_cfg.get("online", True))
+    _prune_n_recent = int(_prune_cfg.get("n_keep_recent", 5))
+    _prune_n_milestones = int(_prune_cfg.get("n_keep_milestones", 20))
     # Flush logs every N episodes to reduce data loss if training aborts early.
     csv_flush_interval = int(
         config["logging"].get("csv_flush_interval", 1000)
@@ -1152,6 +1251,17 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                         int(episode_rng.integers(len(hpp_pools[i])))]
                     agents[i].auction_policy.load_state_dict(hist_auc)
                     agents[i].secondary_policy.load_state_dict(hist_sec)
+
+        # Anchor-snap (Tier-3): probabilistic per-agent price-head bias snap
+        # to the fundamental anchor for this episode's rollout. Skipped for
+        # HPP-swapped agents since their actor has already been replaced.
+        anchor_snapped_biases = {}  # agent_idx → saved bias tensor
+        if anchor_snap_enabled and anchor_snap_prob > 0.0:
+            for i in range(n_agents):
+                if i in hpp_swapped:
+                    continue
+                if episode_rng.random() < anchor_snap_prob:
+                    anchor_snapped_biases[i] = agents[i].snap_price_head_to_anchor(year=0)
 
         for year in range(effective_n_years):
             # === PHASE 1: Auction + Investment ===
@@ -1391,6 +1501,12 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             obs1 = obs1_next
             if terminated:
                 break
+
+        # Anchor-snap restore (must run before HPP restore; HPP-swapped
+        # agents are excluded from anchor_snapped_biases by construction).
+        if anchor_snapped_biases:
+            for i, saved_bias in anchor_snapped_biases.items():
+                agents[i].restore_price_head(saved_bias)
 
         # HPP: restore current policies (swapped agents used historical for rollout only)
         if hpp_swapped:
@@ -2397,9 +2513,25 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             for i, agent in enumerate(agents):
                 agent.save(os.path.join(ckpt_dir, f"agent_{i}_ep{episode}.pt"))
             _flush_csv_logs(episode, force=True)
+            # Online checkpoint pruning: bound the number of periodic ``.pt``
+            # files retained on disk during the run. Without this, all
+            # ``n_episodes / save_interval`` checkpoints (× n_agents) live on
+            # disk until clean exit, contributing to mid-run disk pressure.
+            if _prune_enabled and _prune_online:
+                prune_checkpoints(
+                    ckpt_dir=ckpt_dir,
+                    n_agents=n_agents,
+                    n_keep_recent=_prune_n_recent,
+                    n_keep_milestones=_prune_n_milestones,
+                )
 
         # Periodic log snapshots: copy CSV logs at regular intervals for
         # mid-run analysis without waiting for training to finish.
+        # Disk usage is bounded by ``logging.snapshot_keep_recent`` (default 1):
+        # only the K most-recent (training_log, year_log) snapshot pairs for
+        # this seed are retained; older pairs are removed after each new copy
+        # so the snapshots directory stays at O(K × file-size) instead of
+        # O(N_snapshots × file-size).
         if _snapshot_interval > 0 and episode > 0 and episode % _snapshot_interval == 0:
             import shutil
             snap_dir = os.path.join(results_dir, "snapshots")
@@ -2409,6 +2541,13 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             snap_yr = os.path.join(snap_dir, f"year_log{_tag_part}_s{seed}_ep{episode}.csv")
             shutil.copy2(ep_path, snap_ep)
             shutil.copy2(yr_path, snap_yr)
+            # Cap snapshots directory disk usage. See ``enforce_snapshot_retention``.
+            enforce_snapshot_retention(
+                snap_dir=snap_dir,
+                tag_part=_tag_part,
+                seed=seed,
+                keep_recent=_snapshot_keep_recent,
+            )
 
         ep_total = total_rewards.sum()
         if ep_total > best_total_reward:
@@ -2427,14 +2566,13 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
 
     # Checkpoint pruning — runs only on clean completion so interrupted runs
     # always retain every checkpoint written up to the point of failure.
-    prune_cfg = config.get("logging", {}).get("checkpoint_pruning", {})
-    if prune_cfg.get("enabled", True):
+    if _prune_enabled:
         ckpt_dir = os.path.join(results_dir, f"checkpoints{_tag_part}_s{seed}")
         prune_checkpoints(
             ckpt_dir=ckpt_dir,
             n_agents=n_agents,
-            n_keep_recent=int(prune_cfg.get("n_keep_recent", 5)),
-            n_keep_milestones=int(prune_cfg.get("n_keep_milestones", 20)),
+            n_keep_recent=_prune_n_recent,
+            n_keep_milestones=_prune_n_milestones,
         )
 
     _yr_flush_buffer()

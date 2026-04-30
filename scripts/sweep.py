@@ -241,14 +241,10 @@ def _summarize_csv(
     def _ok(x: float) -> bool:
         return x == x  # not NaN
 
-    # Pick the most recent COMPLETE episode (one that has at least year 1
-    # and year max). Walk back from the last row, group by episode.
+    # Group tail rows by episode, then pick the most-recent *complete* episode.
     last_row_ep = int(_f(yr_rows[-1], "episode", -1))
     if last_row_ep < 0:
         return None, None
-    # Find the last episode whose final-year row is present. We define
-    # "final" as the maximum ``year`` value seen for that episode in the
-    # tail window, falling back to whatever years are available.
     by_ep: dict[int, list[dict]] = {}
     for r in yr_rows:
         ep = int(_f(r, "episode", -1))
@@ -257,7 +253,29 @@ def _summarize_csv(
         by_ep.setdefault(ep, []).append(r)
     if not by_ep:
         return None, None
-    target_ep = max(by_ep.keys())
+
+    # Determine the expected episode length: the maximum number of year-rows
+    # seen for any single episode in the tail window.  For a full 12-year
+    # episode this will be 12; it may be smaller very early in training
+    # before any episode has completed.
+    expected_years = max(len(rows) for rows in by_ep.values())
+
+    # Walk backwards through episodes (highest → lowest) and pick the first
+    # one that is "complete": it has at least ``expected_years`` rows and
+    # the year values form a contiguous run (no gaps / duplicate rows from
+    # a mid-write snapshot).
+    target_ep = max(by_ep.keys())  # fallback: most-recent started episode
+    for ep in sorted(by_ep.keys(), reverse=True):
+        rows = by_ep[ep]
+        if len(rows) < expected_years:
+            continue
+        years_present = sorted(int(_f(r, "year", -1)) for r in rows)
+        if years_present[0] < 0:
+            continue
+        if years_present[-1] == years_present[0] + len(years_present) - 1:
+            target_ep = ep
+            break
+
     ep_rows = sorted(by_ep[target_ep], key=lambda r: int(_f(r, "year", 0)))
     if not ep_rows:
         return None, None

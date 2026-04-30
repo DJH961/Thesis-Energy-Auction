@@ -390,6 +390,35 @@ class PPOAgent:
         with torch.no_grad():
             self.auction_policy.price_head.bias.fill_(raw)
 
+    def snap_price_head_to_anchor(self, year: int = 0):
+        """Save the current ``auction_policy.price_head.bias`` and overwrite it
+        with the fundamental anchor for the given year.
+
+        Returns a clone of the *original* bias tensor so callers can restore
+        it later via :meth:`restore_price_head`. Used by the anchor-snap
+        exploration mechanism (Tier-3 mitigation for seed-driven price-basin
+        lock-in): with small probability per episode, training swaps the
+        learned bias for the anchor for the duration of the rollout, giving
+        a high-price-basin policy a probabilistic exit toward the
+        fundamental low-price basin without permanent intervention.
+        """
+        with torch.no_grad():
+            saved = self.auction_policy.price_head.bias.detach().clone()
+        # Reuse the same calibration logic so the snapped bias matches
+        # exactly what inject_fundamental_anchor would produce.
+        self.inject_fundamental_anchor(year=year)
+        return saved
+
+    def restore_price_head(self, saved_bias: "torch.Tensor | None") -> None:
+        """Restore a previously-saved ``price_head.bias`` tensor.
+
+        Pairs with :meth:`snap_price_head_to_anchor`.
+        """
+        if saved_bias is None:
+            return
+        with torch.no_grad():
+            self.auction_policy.price_head.bias.copy_(saved_bias)
+
     def set_bc_anchor(self):
         """
         Snapshot current auction and secondary policy weights as a frozen
@@ -454,7 +483,7 @@ class PPOAgent:
             # (0, 1) and investment dims (2..) to their own advantages later.
             action, raw, log_prob = self.auction_policy.act_per_dim(obs_t, deterministic)
 
-        if not deterministic and epsilon > 0.0 and np.random.random() < epsilon:
+        if not deterministic and epsilon > 0.0 and self._rng.random() < epsilon:
             with torch.no_grad():
                 low = self.auction_policy.action_bias - self.auction_policy.action_scale
                 high = self.auction_policy.action_bias + self.auction_policy.action_scale
@@ -497,13 +526,13 @@ class PPOAgent:
                     wtp_anchor = float(np.clip(wtp_base, price_min, price_max))
 
                     if wtp_anchor <= price_min + 1e-9:
-                        sampled_price = np.random.uniform(price_min, price_max * 0.5)
+                        sampled_price = self._rng.uniform(price_min, price_max * 0.5)
                     elif wtp_anchor >= price_max - 1e-9:
-                        sampled_price = np.random.uniform(price_min, wtp_anchor)
-                    elif np.random.random() < 0.5:
-                        sampled_price = np.random.uniform(price_min, wtp_anchor)
+                        sampled_price = self._rng.uniform(price_min, wtp_anchor)
+                    elif self._rng.random() < 0.5:
+                        sampled_price = self._rng.uniform(price_min, wtp_anchor)
                     else:
-                        sampled_price = np.random.uniform(wtp_anchor, price_max)
+                        sampled_price = self._rng.uniform(wtp_anchor, price_max)
                     rand_action[0, 0] = float(sampled_price)
                 else:
                     # Anchored exploration: sample each dim from Gaussian around
@@ -532,24 +561,24 @@ class PPOAgent:
                         wtp_base = 0.5 * last_secondary_buy_price + 0.5 * wtp_e
                     wtp_anc = float(np.clip(wtp_base, price_min, price_max))
                     rand_action[0, 0] = np.clip(
-                        np.random.normal(wtp_anc, max(wtp_anc * 0.3, 15.0)),
+                        self._rng.normal(wtp_anc, max(wtp_anc * 0.3, 15.0)),
                         price_min, price_max)
 
                     # [1] qty_multiplier: Gaussian around 1.0 (cover full need)
                     rand_action[0, 1] = np.clip(
-                        np.random.normal(1.0, 0.15),
+                        self._rng.normal(1.0, 0.15),
                         low[1].item(), high[1].item())
 
                     # [2] invest_frac: Gaussian around 0.03 (moderate investment)
                     rand_action[0, 2] = np.clip(
-                        np.random.normal(0.03, 0.02),
+                        self._rng.normal(0.03, 0.02),
                         low[2].item(), high[2].item())
 
                     # [3-5] tech logits: slight solar/onshore preference, moderate spread
                     # onshore=0.3, offshore=-0.5, solar=0.5 (reflects cost/speed reality)
-                    rand_action[0, 3] = np.clip(np.random.normal(0.3, 0.5), -1.0, 1.0)
-                    rand_action[0, 4] = np.clip(np.random.normal(-0.5, 0.5), -1.0, 1.0)
-                    rand_action[0, 5] = np.clip(np.random.normal(0.5, 0.5), -1.0, 1.0)
+                    rand_action[0, 3] = np.clip(self._rng.normal(0.3, 0.5), -1.0, 1.0)
+                    rand_action[0, 4] = np.clip(self._rng.normal(-0.5, 0.5), -1.0, 1.0)
+                    rand_action[0, 5] = np.clip(self._rng.normal(0.5, 0.5), -1.0, 1.0)
 
                 # Convert to raw (normalised) space
                 rand_raw = torch.clamp(
@@ -578,7 +607,7 @@ class PPOAgent:
         with torch.no_grad():
             action, raw, log_prob = self.secondary_policy.act(obs_t, deterministic)
 
-        if not deterministic and epsilon > 0.0 and np.random.random() < epsilon:
+        if not deterministic and epsilon > 0.0 and self._rng.random() < epsilon:
             with torch.no_grad():
                 low = self.secondary_policy.action_bias - self.secondary_policy.action_scale
                 high = self.secondary_policy.action_bias + self.secondary_policy.action_scale
@@ -600,13 +629,13 @@ class PPOAgent:
                         clearing_ref = self.expected_price_fallback
                     clearing_ref = float(np.clip(clearing_ref, sec_price_low, sec_price_high))
                     rand_action[0, 0] = np.clip(
-                        np.random.normal(clearing_ref, max(10.0, 0.15 * clearing_ref)),
+                        self._rng.normal(clearing_ref, max(10.0, 0.15 * clearing_ref)),
                         sec_price_low, sec_price_high)
 
                     # [1] sec_qty: Gaussian around 0 with moderate spread.
                     # Positive = buy, negative = sell; neutral center lets both be explored.
                     rand_action[0, 1] = np.clip(
-                        np.random.normal(0.0, 1.0),
+                        self._rng.normal(0.0, 1.0),
                         low[1].item(), high[1].item())
 
                 rand_raw = torch.clamp(
