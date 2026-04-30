@@ -1456,9 +1456,11 @@ class ETSEnvironment(gym.Env):
 
         # Compute effective reserve price and expected clearing first — the
         # joint budget gate sizes quantity against EXPECTED settlement cost
-        # (clearing_price × alloc), not against bid_p × bid_q. In a uniform-
-        # price auction, bid_p only determines whether the bid wins; what
-        # the agent actually pays is the marginal clearing price.
+        # (uniform clearing price × alloc), not against bid_p × bid_q. In a
+        # uniform-price auction every winner pays the same clearing price
+        # (set by the lowest accepted bid), so bid_p only determines whether
+        # the bid wins; what the agent actually pays is the uniform clearing
+        # price.
         effective_reserve = self._compute_dynamic_reserve()
         self._last_effective_reserve = effective_reserve
         price_ma3 = self._compute_price_ma3()

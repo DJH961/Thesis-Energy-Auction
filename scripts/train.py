@@ -993,7 +993,7 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                       f"inv_solar_share_A{i+1}",
                       # v8.5.7 compliance attribution buckets (year counts per episode):
                       # U=pure-underbid, D=pure-debt-cascade, M=mixed (both),
-                      # B=bank-covered with auction-shortfall, C=sec-covered with auction-shortfall.
+                      # B=auction-short but compliant via own bank, C=auction-short but compliant via secondary buy.
                       f"udbc_U_total_A{i+1}", f"udbc_D_total_A{i+1}",
                       f"udbc_M_total_A{i+1}", f"udbc_B_total_A{i+1}",
                       f"udbc_C_total_A{i+1}"]
@@ -1942,10 +1942,12 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
         #   C (Sec-covered)  : alloc_y < emissions_y+cf_i, compliant,     net_sec_buy
         #
         # Identity: U + D + M == #non-compliant years for every agent.
-        # Note: a pure "no-cf, no-underbid, non-compliant" year is impossible
-        # by no-short-selling (max_sell rule keeps post-trade holdings ≥
-        # obligation when alloc covers obligation), so all non-compliant years
-        # fall into U ∪ D ∪ M. Logged as `__residual` if it ever happens.
+        # Note: a "no-cf, no-underbid, non-compliant" year is impossible by
+        # the no-short-selling rule (max_sell keeps post-trade holdings ≥
+        # obligation when alloc covers obligation), so all non-compliant
+        # years fall into U ∪ D ∪ M. The `__residual` counter is a defensive
+        # sanity check that detects implementation bugs which would violate
+        # this invariant; it should always be 0 in correct runs.
         per_agent_compliance_attr = []
         for i in range(n_total_agents):
             buy_vol = 0.0; sell_vol = 0.0
