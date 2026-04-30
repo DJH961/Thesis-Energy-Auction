@@ -350,6 +350,7 @@ def _summarize_csv(
     # Reward: last-N episodes mean across agents (from training CSV).
     r_now: float = float("nan")
     sec_match: float = float("nan")
+    quality_score: float = float("nan")
     if training_csv is not None:
         _ep_header, ep_rows_train = _read_csv_tail(training_csv, tail_bytes)
         if _ep_header and ep_rows_train:
@@ -365,8 +366,9 @@ def _summarize_csv(
                         _mean([_f(r, f"reward_A{i+1}") for i in range(n_total_train)])
                     )
                 r_now = _mean(r_now_vals)
-            # Match rate from the latest episode of the training CSV.
+            # Match rate and quality score from the latest episode of the training CSV.
             sec_match = _f(ep_rows_train[-1], "secondary_match_rate")
+            quality_score = _f(ep_rows_train[-1], "quality_score")
 
     # Format. Field order: Ep | px | sec | comp | green | R̄.
     parts: list[str] = []
@@ -407,6 +409,9 @@ def _summarize_csv(
 
     if _ok(r_now):
         parts.append(f"R̄ {r_now:+.1f}")
+
+    if _ok(quality_score):
+        parts.append(f"Q={quality_score:.3f}")
 
     return " | ".join(parts), last_ep
 

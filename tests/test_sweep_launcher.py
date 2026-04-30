@@ -139,21 +139,25 @@ class TestSummarizeCsv:
                     w.writerow(row)
 
     def _write_train_csv(self, path, episodes, n_agents, *, reward=None,
-                         match_rate=None):
+                         match_rate=None, quality_score=None):
         import csv as _csv
 
         if reward is None:
             reward = lambda ep, a: -2.0
         if match_rate is None:
             match_rate = lambda ep: 0.4
-        headers = ["episode", "secondary_match_rate"]
+        headers = ["episode", "secondary_match_rate", "quality_score"]
         for i in range(n_agents):
             headers.append(f"reward_A{i+1}")
         with open(path, "w", newline="") as f:
             w = _csv.DictWriter(f, fieldnames=headers)
             w.writeheader()
             for ep in episodes:
-                row = {"episode": ep, "secondary_match_rate": match_rate(ep)}
+                row = {
+                    "episode": ep,
+                    "secondary_match_rate": match_rate(ep),
+                    "quality_score": quality_score(ep) if quality_score is not None else "",
+                }
                 for i in range(n_agents):
                     row[f"reward_A{i+1}"] = reward(ep, i)
                 w.writerow(row)
@@ -263,19 +267,40 @@ class TestSummarizeCsv:
         assert len(line) <= 220, f"summary too long: {len(line)} chars: {line}"
 
     def test_field_order(self, sweep_module, tmp_path):
-        """Fields must appear in order: episode | px | sec | comp | green | R̄."""
+        """Fields must appear in order: episode | px | sec | comp | green | R̄ | Q=."""
         yr = tmp_path / "year.csv"
         tr = tmp_path / "train.csv"
         self._write_year_csv(yr, episodes=[1], n_agents=1)
-        self._write_train_csv(tr, episodes=[1], n_agents=1)
+        self._write_train_csv(tr, episodes=[1], n_agents=1,
+                              quality_score=lambda ep: 0.75)
         line, _ = sweep_module._summarize_csv(
             str(yr), training_csv=str(tr), n_episodes=10,
         )
         assert line is not None
-        order_keys = ["Ep ", "| px ", "| sec ", "| comp ", "| green ", "| R̄ "]
+        order_keys = ["Ep ", "| px ", "| sec ", "| comp ", "| green ", "| R̄ ", "| Q="]
         positions = [line.find(k) for k in order_keys]
         assert all(p >= 0 for p in positions), f"missing field in: {line}"
         assert positions == sorted(positions), f"wrong order: {line}"
+
+    def test_quality_score_from_training_csv(self, sweep_module, tmp_path):
+        yr = tmp_path / "year.csv"
+        tr = tmp_path / "train.csv"
+        self._write_year_csv(yr, episodes=[1], n_agents=1)
+        self._write_train_csv(tr, episodes=[1], n_agents=1,
+                              quality_score=lambda ep: 0.532)
+        line, _ = sweep_module._summarize_csv(str(yr), training_csv=str(tr))
+        assert line is not None
+        assert "Q=0.532" in line
+
+    def test_quality_score_absent_when_missing(self, sweep_module, tmp_path):
+        yr = tmp_path / "year.csv"
+        tr = tmp_path / "train.csv"
+        self._write_year_csv(yr, episodes=[1], n_agents=1)
+        # Training CSV has no quality_score column — field must be omitted.
+        self._write_train_csv(tr, episodes=[1], n_agents=1)
+        line, _ = sweep_module._summarize_csv(str(yr), training_csv=str(tr))
+        assert line is not None
+        assert "Q=" not in line
 
     def test_returns_last_ep(self, sweep_module, tmp_path):
         p = tmp_path / "year.csv"
