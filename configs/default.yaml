@@ -136,6 +136,16 @@ auction:
   leverage_multiplier: 3.0
   suspension_length: 0
   budget_price_clip: true
+  # v8.5.7 joint budget gate. Replaces the cascade of leverage / 10%-notional /
+  # budget-price-clip gates. Quantity is sized against EXPECTED settlement cost
+  # (clearing × alloc + collateral) so a high willingness-to-pay (bid_p) does
+  # not artificially shrink qty in expectation. The legacy `leverage_multiplier`
+  # and `budget_price_clip` knobs above are retained for back-compat but no
+  # longer drive bid sizing when budget_gate.enabled=true.
+  budget_gate:
+    enabled: true
+    safety_mult: 1.2          # buffer over expected_clearing for upward surprise
+    notional_safety_mult: 5.0 # soft cap on bid_p × bid_q relative to cash
   carry_forward_defaults: true
 
 trading:

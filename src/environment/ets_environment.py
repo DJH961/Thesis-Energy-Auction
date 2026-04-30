@@ -1454,115 +1454,131 @@ class ETSEnvironment(gym.Env):
                 bid_actions[i, 1] = max(lot_size, round(bid_actions[i, 1] / lot_size) * lot_size)
             requested_qtys[i] = bid_actions[i, 1]  # capture before any gates
 
-        # Leverage gate — clip bid_quantity by leverage_multiplier × available_cash / bid_price.
-        # Prevents agents from submitting notional bids far exceeding their cash.
-        aq_cfg = self.config["auction"]
-        lev_mult = float(aq_cfg.get("leverage_multiplier", 3.0))
-        if lev_mult > 0.0:
-            for i, company in enumerate(self.companies):
-                if not self._is_agent_active(i):
-                    continue
-                cash = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
-                bid_p = float(bid_actions[i, 0])
-                if bid_p > 1e-6:
-                    max_notional_qty = lev_mult * cash / bid_p
-                    if bid_actions[i, 1] > max_notional_qty:
-                        bid_actions[i, 1] = max_notional_qty
-
-        # Compute effective reserve price (dynamic or static)
+        # Compute effective reserve price and expected clearing first — the
+        # joint budget gate sizes quantity against EXPECTED settlement cost
+        # (clearing_price × alloc), not against bid_p × bid_q. In a uniform-
+        # price auction, bid_p only determines whether the bid wins; what
+        # the agent actually pays is the marginal clearing price.
         effective_reserve = self._compute_dynamic_reserve()
         self._last_effective_reserve = effective_reserve
         price_ma3 = self._compute_price_ma3()
-        expected_clearing = max(effective_reserve, price_ma3)
+        anchor_for_gate = compute_fundamental_anchor(year, self.config, cap_t_actual=cap_t)
+        # Use the highest of the three so we don't underestimate clearing risk.
+        expected_clearing = max(effective_reserve, price_ma3, anchor_for_gate)
 
-        # This clip exists as a training-stability safety net for learning agents during
-        # exploration, not as an economic mechanism. The heuristic policy is self-consistent
-        # and should not trigger it. If clip events fire for bot-only runs, this indicates a
-        # heuristic/env mismatch.
-        coll_cfg = self.config.get("auction", {}).get("collateral", {})
-        if coll_cfg.get("enabled", True):
-            coll_frac = float(coll_cfg.get("collateral_fraction",
-                                            coll_cfg.get("opportunity_cost_rate", 0.05)
-                                            * coll_cfg.get("hold_fraction", 0.02)))
-            max_coll_share = float(coll_cfg.get("max_collateral_budget_share", 0.50))
+        # Collateral parameters (used both by the joint gate and by the
+        # pre-bid collateral lock further down).
+        aq_cfg = self.config["auction"]
+        coll_cfg = aq_cfg.get("collateral", {})
+        coll_enabled = bool(coll_cfg.get("enabled", True))
+        coll_frac = float(coll_cfg.get("collateral_fraction",
+                                        coll_cfg.get("opportunity_cost_rate", 0.05)
+                                        * coll_cfg.get("hold_fraction", 0.02)))
+        max_coll_share = float(coll_cfg.get("max_collateral_budget_share", 0.50))
 
-            if coll_frac > 0.0:
-                for i, company in enumerate(self.companies):
-                    if not self._is_agent_active(i):
-                        continue
-                    bid_p = float(bid_actions[i, 0])
-                    bid_q = float(bid_actions[i, 1])
-                    if bid_q < 1e-6 or bid_p < 1e-6:
-                        continue
-                    budget_remaining = max(
-                        0.0,
-                        float(company.annual_budget - company.budget_spent_this_year),
-                    )
-                    above_clearing = max(0.0, bid_p - expected_clearing)
-                    collateral = coll_frac * above_clearing * bid_q
-                    max_collateral = max_coll_share * budget_remaining
-                    if collateral > max_collateral and max_collateral > 0 and budget_remaining > 1.0:
-                        scale = max_collateral / max(collateral, 1e-9)
-                        bid_actions[i, 1] *= scale
-                        self._collateral_clip_events[i] = self._collateral_clip_events.get(i, 0) + 1
+        # Joint budget gate (v8.5.7).
+        # ------------------------------------------------------------------
+        # Replaces the previous cascade of leverage / 10%-notional / budget-
+        # price-clip gates, which fired sequentially against bid_p × bid_q
+        # and produced "worst-of-both-worlds" outcomes (qty cut first, then
+        # price cut against the already-shrunk qty, often leaving a bid
+        # that lost the auction even though the agent was solvent).
+        #
+        # The new gate sizes quantity against expected settlement cost so
+        # the agent can keep a high willingness-to-pay (bid_p) without
+        # losing quantity in expectation. It only fires when expected
+        # settlement + collateral exceed available cash, which is rare in
+        # normal play. obs[40] (price clip delta) and obs[41] (qty clip
+        # ratio) feedback is preserved so policies can learn to avoid it.
+        #
+        # Tunable knobs (under auction.budget_gate, all optional):
+        #   enabled (bool, default True)        — turn the joint gate on/off
+        #   safety_mult (float, default 1.2)    — buffer over expected_clearing
+        #                                         (absorbs upward price surprise)
+        #   notional_safety_mult (float, def 5) — soft cap on bid_p × bid_q
+        #                                         relative to cash; protects
+        #                                         from absurd notional bids
+        #                                         that would exceed even the
+        #                                         margin-call collateral pot.
+        bg_cfg = aq_cfg.get("budget_gate", {})
+        bg_enabled = bool(bg_cfg.get("enabled", True))
+        bg_safety = max(1.0, float(bg_cfg.get("safety_mult", 1.2)))
+        bg_notional_safety = max(1.0, float(bg_cfg.get("notional_safety_mult", 5.0)))
+
+        self._last_budget_price_clip[:] = 0.0
+        if bg_enabled:
+            for i, company in enumerate(self.companies):
+                if not self._is_agent_active(i):
+                    continue
+                cash = max(0.0, float(company.annual_budget - company.budget_spent_this_year)
+                           + company.get_treasury_available())
+                bid_p = float(bid_actions[i, 0])
+                bid_q = float(bid_actions[i, 1])
+                if bid_p < 1e-6 or bid_q < 1e-6:
+                    continue
+                # Step A: size quantity so EXPECTED settlement + collateral fit.
+                # cost_per_mt_expected = safety × clearing + collateral(bid_p)/Mt
+                coll_per_mt = coll_frac * max(0.0, bid_p - effective_reserve) if coll_enabled else 0.0
+                cost_per_mt_expected = bg_safety * expected_clearing + coll_per_mt
+                if cost_per_mt_expected > 1e-6:
+                    max_q_budget = cash / cost_per_mt_expected
+                    if bid_q > max_q_budget:
+                        bid_q = max(0.0, max_q_budget)
+                        bid_actions[i, 1] = bid_q
+                # Step B: soft notional safety on bid_p × bid_q. If the agent
+                # bid an absurdly high price (e.g., ε-greedy noise at price_max
+                # with full need-coverage qty), clip bid_p down. This is the
+                # only place bid_p is touched. Anchored on cash so it scales
+                # with budget and only triggers in pathological cases.
+                if bid_q > 1e-6:
+                    notional_cap = bg_notional_safety * cash
+                    notional = bid_p * bid_q
+                    if notional > notional_cap and notional_cap > 0.0:
+                        new_p = notional_cap / bid_q
+                        new_p = float(np.clip(new_p,
+                                              float(aq_cfg["price_min"]),
+                                              float(aq_cfg["price_max"])))
+                        self._last_budget_price_clip[i] = new_p - bid_p
+                        bid_actions[i, 0] = new_p
+
+        # Per-agent collateral-budget-share gate. Even with the joint gate
+        # the *upfront* collateral lock can still exceed
+        # max_collateral_budget_share × cash if bid_p is very high. Keep the
+        # soft scale to avoid suspension-by-collateral-default during
+        # exploration. This gate only activates when the joint gate's
+        # expected-cost sizing didn't already shrink qty enough.
+        if coll_enabled and coll_frac > 0.0:
+            for i, company in enumerate(self.companies):
+                if not self._is_agent_active(i):
+                    continue
+                bid_p = float(bid_actions[i, 0])
+                bid_q = float(bid_actions[i, 1])
+                if bid_q < 1e-6 or bid_p < 1e-6:
+                    continue
+                budget_remaining = max(
+                    0.0,
+                    float(company.annual_budget - company.budget_spent_this_year),
+                )
+                above_clearing = max(0.0, bid_p - expected_clearing)
+                collateral = coll_frac * above_clearing * bid_q
+                max_collateral = max_coll_share * budget_remaining
+                if collateral > max_collateral and max_collateral > 0 and budget_remaining > 1.0:
+                    scale = max_collateral / max(collateral, 1e-9)
+                    bid_actions[i, 1] *= scale
+                    self._collateral_clip_events[i] = self._collateral_clip_events.get(i, 0) + 1
 
         self._phase1_bid_prices = bid_actions[:, 0].copy()
         self._phase1_bid_quantities = bid_actions[:, 1].copy()  # Mt after multiplier expansion
 
-        # Budget-based gate: agents who cannot cover 10% of bid notional get qty
-        # scaled (NOT zeroed) so the bid fits within available cash. Hard zero
-        # caused a gradient discontinuity and, combined with the bid_qty_clip_ratio
-        # observation feedback, drove policies to under-bid systematically.
-        # v8.4.2 bug fix: replace hard zero with a soft scale.
-        for i in range(self.n_total):
-            if not self._is_agent_active(i):
-                continue
-            cash = max(0.0, float(self.companies[i].annual_budget
-                                  - self.companies[i].budget_spent_this_year)
-                       + self.companies[i].get_treasury_available())
-            bid_p = float(bid_actions[i, 0])
-            bid_q = float(bid_actions[i, 1])
-            if bid_p > 1e-6 and bid_q > 1e-6:
-                required_cash = bid_p * bid_q * 0.10
-                if cash < required_cash:
-                    # Scale qty so that bid_p × bid_q × 0.10 == cash
-                    max_affordable_qty = cash / (bid_p * 0.10)
-                    bid_actions[i, 1] = max(0.0, max_affordable_qty)
-
-        # Record bid qty clip ratios (actual / requested after all gates)
+        # Record bid qty clip ratios (actual / requested after all gates) for obs[41].
         for i in range(self.n_agents):
             rq = requested_qtys[i]
             aq = float(bid_actions[i, 1])
             self._last_bid_qty_clip_ratio[i] = float(np.clip(aq / max(rq, 1e-6), 0.0, 1.0)) if rq > 1e-6 else 1.0
 
-        # Budget price clip: soft clip at 1.5x max affordable price.
-        budget_price_clip = self.config["auction"].get("budget_price_clip", True)
-        self._last_budget_price_clip[:] = 0.0
-        if budget_price_clip:
-            for i, company in enumerate(self.companies):
-                if not self._is_agent_active(i):
-                    continue
-                op_remaining = max(0.0, float(company.annual_budget - company.budget_spent_this_year)
-                                   - float(self._collateral_locked[i]))
-                cash = op_remaining + company.get_treasury_available()
-                cash = max(cash, 1.0)
-                bid_q = max(float(bid_actions[i, 1]), 1e-6)
-                max_affordable_price = cash / bid_q
-                if bid_actions[i, 0] > 1.5 * max_affordable_price:
-                    _orig_bid = float(bid_actions[i, 0])
-                    _clipped_price = float(np.clip(
-                        max_affordable_price,
-                        float(self.config["auction"]["price_min"]),
-                        float(self.config["auction"]["price_max"]),
-                    ))
-                    bid_actions[i, 0] = _clipped_price
-                    self._last_budget_price_clip[i] = _clipped_price - _orig_bid  # negative if clipped down
-
         # Pre-bid collateral locking — fraction of margin above reserve.
-        # Reduces effective cash available when checking ability to settle payment.
-        coll_frac_e4 = float(coll_cfg.get("collateral_fraction",
-                                           coll_cfg.get("opportunity_cost_rate", 0.05)
-                                           * coll_cfg.get("hold_fraction", 0.02)))
+        # Uses the (possibly clipped) bid_p / bid_q from the joint gate.
+        coll_frac_e4 = coll_frac
         collateral_locked = np.zeros(self.n_total)
         for i in range(self.n_total):
             if not self._is_agent_active(i):
