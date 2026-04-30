@@ -1021,6 +1021,28 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
         "phantom_avg_bid_qty",      # mean phantom bid qty across years in episode
     ]
     ep_fields += ["adv_yr1_mean_A1"]  # year-1 mean advantage for agent 0 (pre-normalization diagnostic)
+    # adv_yr1_mean for all learning agents (extends the legacy A1-only diagnostic)
+    for i in range(n_agents):
+        ep_fields += [f"adv_yr1_mean_A{i+1}"]
+    # Episode-level invest_cost aggregate (sum across years) per agent — for
+    # the notebook's "System Investment per Episode" plot. The year-level CSV
+    # already has invest_cost_A* per (episode, year); this is the reduction.
+    for i in range(n_total_agents):
+        ep_fields += [f"invest_cost_A{i+1}"]
+    # Episode-level alias for secondary clearing price; notebook expects
+    # `secondary_price` at the ep level (mirrors the year_log column name).
+    ep_fields += ["secondary_price"]
+    # U/D/B/C compliance attribution buckets (v8.5.1) — per-episode counts of
+    # (agent, year) cells in each bucket. Computed in the writerow block from
+    # `per_agent_compliance_attr`.
+    for i in range(n_total_agents):
+        ep_fields += [f"udbc_U_total_A{i+1}", f"udbc_D_total_A{i+1}",
+                      f"udbc_B_total_A{i+1}", f"udbc_C_total_A{i+1}"]
+    # Split-head losses (v8.5): invest sub-head of the auction policy and the
+    # separate secondary-market head. Populated from latest_losses dicts.
+    for i in range(n_agents):
+        ep_fields += [f"actor_loss_invest_A{i+1}", f"critic_loss_invest_A{i+1}",
+                      f"actor_loss_secondary_A{i+1}", f"critic_loss_secondary_A{i+1}"]
     ep_csv = open(ep_path, "w", newline="")
     ep_writer = csv.DictWriter(ep_csv, fieldnames=ep_fields)
     ep_writer.writeheader()
@@ -1136,6 +1158,10 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
     last_available_losses = [None] * n_agents
     last_loss_episode = [None] * n_agents
     _last_adv_yr1_mean_A1: float = 0.0  # year-1 mean advantage for agent 0 (updated on update episodes)
+    # Per-agent year-1 mean advantage (parallel array, populated in HAPPO loop
+    # for every learning agent so the notebook's split-head/year-1 diagnostics
+    # can render bucket plots beyond the legacy A1-only column).
+    _last_adv_yr1_mean_per_agent: list = [0.0] * n_agents
 
     train_t0 = time.time()
     recent_ep_durations = collections.deque(maxlen=200)
@@ -1582,6 +1608,16 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                 _buf0 = gae_data[0][2] if gae_data and gae_data[0][2] is not None else None
                 if _buf0 is not None and "per_year_adv_mean" in _buf0 and len(_buf0["per_year_adv_mean"]) > 1:
                     _last_adv_yr1_mean_A1 = float(_buf0["per_year_adv_mean"][1])
+                # Capture year-1 mean advantage for every learning agent so the
+                # notebook can plot adv_yr1_mean_A* across the cohort (not
+                # just A1).
+                for _ag_idx in range(n_agents):
+                    _buf_ag = gae_data[_ag_idx][2] if _ag_idx < len(gae_data) else None
+                    if (_buf_ag is not None
+                            and "per_year_adv_mean" in _buf_ag
+                            and len(_buf_ag["per_year_adv_mean"]) > 1):
+                        _last_adv_yr1_mean_per_agent[_ag_idx] = float(
+                            _buf_ag["per_year_adv_mean"][1])
 
                 # 2. Sequential update order: worst-to-best by EMA reward (dynamic) or
                 # by initial emission factor (static fallback).
@@ -2227,6 +2263,53 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             ep_row[f"streak_zeroqty_A{i+1}"] = int(_streak_qty[i])
 
         ep_row["adv_yr1_mean_A1"] = round(_last_adv_yr1_mean_A1, 4)
+        # Per-agent year-1 mean advantage (extends the legacy A1-only diagnostic
+        # to every learning agent so the notebook's split-head plots aren't blank).
+        for i in range(n_agents):
+            ep_row[f"adv_yr1_mean_A{i+1}"] = round(_last_adv_yr1_mean_per_agent[i], 4)
+        # Per-agent episode-level invest_cost (sum across years). Year-level is
+        # logged in year_log.csv; this is the reduction the notebook expects in
+        # training_log.csv for the "System Investment per Episode" plot.
+        for i in range(n_total_agents):
+            ep_row[f"invest_cost_A{i+1}"] = round(
+                sum(yl.get("invest_costs", [0.0] * n_total_agents)[i]
+                    for yl in env.episode_log),
+                4,
+            )
+        # secondary_price (alias for the existing secondary_avg_price). The
+        # notebook expects the column name `secondary_price` to mirror the
+        # year_log schema; we duplicate the value here rather than rename to
+        # preserve back-compat with downstream consumers.
+        ep_row["secondary_price"] = round(avg_sec_price, 2)
+        # U/D/B/C compliance attribution buckets — per-episode counts of
+        # (agent, year) cells in each bucket. Already computed above into
+        # `per_agent_compliance_attr`.
+        for i in range(n_total_agents):
+            attr_i = per_agent_compliance_attr[i]
+            ep_row[f"udbc_U_total_A{i+1}"] = int(attr_i["u"])
+            ep_row[f"udbc_D_total_A{i+1}"] = int(attr_i["d"])
+            ep_row[f"udbc_B_total_A{i+1}"] = int(attr_i["b"])
+            ep_row[f"udbc_C_total_A{i+1}"] = int(attr_i["c"])
+        # Split-head losses (v8.5): invest sub-head of the auction policy and
+        # the separate secondary-market head. The agent's update_happo / update
+        # methods return these in the loss dict when split_invest_head is on
+        # (and as 0.0 fallbacks otherwise).
+        for i in range(n_agents):
+            li = latest_losses[i] if i < len(latest_losses) else None
+            if li:
+                ep_row[f"actor_loss_invest_A{i+1}"] = round(
+                    float(li.get("actor_loss_invest", 0.0)), 6)
+                ep_row[f"critic_loss_invest_A{i+1}"] = round(
+                    float(li.get("critic_loss_invest", 0.0)), 6)
+                ep_row[f"actor_loss_secondary_A{i+1}"] = round(
+                    float(li.get("actor_loss_secondary", 0.0)), 6)
+                ep_row[f"critic_loss_secondary_A{i+1}"] = round(
+                    float(li.get("critic_loss_secondary", 0.0)), 6)
+            else:
+                ep_row[f"actor_loss_invest_A{i+1}"] = 0.0
+                ep_row[f"critic_loss_invest_A{i+1}"] = 0.0
+                ep_row[f"actor_loss_secondary_A{i+1}"] = 0.0
+                ep_row[f"critic_loss_secondary_A{i+1}"] = 0.0
         ep_writer.writerow(ep_row)
 
         # Aggregate MSR intervention frequencies for a single run-level summary.
