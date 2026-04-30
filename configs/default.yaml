@@ -458,8 +458,16 @@ exploration:
   # probabilistic exit toward the low (fundamental) basin without
   # permanently overwriting learned weights. Set ``enabled: false`` to
   # disable, or ``prob_per_episode: 0`` for the same effect.
+  #
+  # Defaulted to ``enabled: false`` pending empirical validation: the
+  # snapped-rollout transitions are retained in the PPO buffer, but the
+  # log-prob is recorded under the snapped policy and re-evaluated under
+  # the restored policy at update time. PPO's clipped surrogate + dual-clip
+  # absorb mild off-policy correction, but for policies far from the anchor
+  # (which is precisely the basin-lock-in regime) the importance-ratio
+  # clamp can saturate. Opt in for basin-lock-in sweeps when needed.
   anchor_snap:
-    enabled: true
+    enabled: false
     prob_per_episode: 0.02
 
 cap_curriculum:

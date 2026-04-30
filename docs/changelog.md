@@ -32,10 +32,15 @@ overwritten with the fundamental-anchor calibration for the duration of
 the rollout, then restored before the PPO update. Gives a policy that
 has settled into the high-price basin a probabilistic exit toward the
 low (fundamental) basin without permanently overwriting learned weights.
-Default: `enabled: true`, `prob_per_episode: 0.02` (≈1 in 50 episodes
-per agent). Snapped agents' rollout experience is retained — PPO's
-clipped surrogate plus dual-clip handle the resulting mild off-policy
-correction.
+Default: **`enabled: false`**, `prob_per_episode: 0.02`. The mechanism
+is wired in and tested but defaulted off pending empirical validation:
+snapped-rollout transitions are retained in the PPO buffer with their
+log-probs recorded under the snapped policy and re-evaluated under the
+restored policy at update time, so for policies far from the anchor the
+importance-ratio clamp may saturate. Enable opt-in for basin-lock-in
+sweeps. PPO's clipped surrogate plus dual-clip handle the resulting
+mild off-policy correction in the regimes where the snap is closest to
+the current policy.
 
 Citations: `src/agents/ppo_agent.py` (eight `np.random.* → self._rng.*`
 swaps; new `snap_price_head_to_anchor` / `restore_price_head` methods);
