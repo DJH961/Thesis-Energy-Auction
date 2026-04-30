@@ -1,4 +1,4 @@
-# ETS MARL — Configuration v8.5.6
+# ETS MARL — Configuration v8.5.7
 # 8 learning agents, HAPPO sequential update, split Phase-1 bid/invest heads.
 
 # Run version banner — printed at the top of training output so the version

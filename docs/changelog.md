@@ -5,6 +5,104 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.5.7]
+
+Three diagnostic / mechanism changes addressing the disappointing reward-vs-
+realism mismatch and persistent compliance gaps observed in the
+`default_vs_unsold_to_msr` sweep.
+
+**1. Compliance bucket redefinition (U / D / M / B / C).**
+The previous U/D/B/C partition was structurally degenerate: the no-short-
+selling rule (`max_sell = alloc + bank − emissions − cf`) makes the original
+"D" bucket (non-compliant despite `alloc ≥ obligation`) mathematically
+unreachable, so every non-compliant year fell into U regardless of whether
+it was caused by *this year's* under-bidding or by inherited carry-forward
+debt. The redefinition partitions non-compliant years into:
+
+* **U (pure under-bid)** — `alloc < emissions` AND no inherited cf
+* **D (pure debt-cascade)** — `alloc ≥ emissions` AND inherited cf > 0
+* **M (mixed)** — `alloc < emissions` AND inherited cf > 0
+
+Identity: `U + D + M == #non-compliant years`. The B / C buckets
+(compliant-with-stress) are unchanged. New per-episode CSV columns
+`udbc_{U,D,M,B,C}_total_A*` are written for every agent. The terminal
+"Why" column header changes from `U/D/B/C` to `U/D/M/B/C`. Sweep notebook
+plot updated to a 2×3 grid showing all five buckets.
+
+**2. Joint price-and-quantity budget gate.**
+Replaces the previous cascade of three sequential gates (leverage QTY clip
+→ 10%-notional QTY clip → budget-price clip), which fired in a fixed order
+against `bid_p × bid_q` and produced "worst-of-both-worlds" outcomes:
+quantity was first cut against high `bid_p`, then `bid_p` was cut against
+the already-shrunk `bid_q`, often leaving a bid that lost the auction
+even though the agent was solvent at the actual clearing price.
+
+In a uniform-price auction the agent pays `clearing × alloc`, not
+`bid_p × alloc`, so cash-binding on `bid_p` is the wrong reference. The
+new joint gate sizes quantity against expected settlement cost:
+
+```
+expected_clearing = max(reserve, MA3, anchor)
+cost_per_mt = safety_mult × expected_clearing + collateral(bid_p) per Mt
+max_q_budget = cash / cost_per_mt
+bid_q ← min(bid_q, max_q_budget)
+```
+
+Bid price is left untouched in the normal case so a high willingness-to-
+pay still wins the auction; a soft *notional-safety* cap clips `bid_p`
+only when `bid_p × bid_q > notional_safety_mult × cash` (i.e. truly
+absurd notionals during ε-greedy exploration). The pre-existing collateral-
+budget-share gate is retained as a final safety net but rarely fires
+once the joint gate has shrunk qty.
+
+Configurable under `auction.budget_gate.{enabled,safety_mult,
+notional_safety_mult}` with defaults `{true, 1.2, 5.0}`. Legacy knobs
+`auction.leverage_multiplier` and `auction.budget_price_clip` are retained
+for back-compat but no longer drive bid sizing when the joint gate is
+enabled. Observation feedback (`obs[40]` price-clip delta, `obs[41]`
+qty-clip ratio) is preserved so policies can still learn to avoid the
+gate.
+
+**3. Sweep-notebook quality metric (analysis-only, anchor-invariant).**
+Adds §5.8 to `notebooks/ets_marl - Sweep Analysis.ipynb`. Composite
+score `Q ∈ [0, 1]` for thesis-table use:
+
+```
+Q = 0.30 × compliance        (1 − non_compliance_rate)
+  + 0.25 × price_realism     (1 − mean(|price − anchor|/anchor))
+  + 0.25 × saved_carbon      (∑ saved_Mt × anchor / ∑ baseline_Mt × anchor)
+  + 0.10 × cost_efficiency   (1 − total_real_cost / counterfactual_cost)
+  − 0.10 × volatility        (price_std / price_mean)
+```
+
+The saved-carbon component values greening from the *avoided-emissions*
+perspective rather than the invest-amount: each agent's year-1 emissions
+provide the do-nothing baseline; the saved tonnes are monetised at the
+fundamental anchor (the social shadow price the reward function uses
+internally). Cost efficiency uses the same counterfactual baseline as
+the denominator. The metric is computed on the converged tail window only
+and is **never fed back into training**; it lets a realistic-price run
+(seed_53 unsold_to_msr_on @ 188 EUR/t) score appropriately against an
+unrealistic flat-near-reserve run (seed_23 unsold_to_msr_on @ 56 EUR/t)
+even though their *training* rewards rank the other way.
+
+Citations:
+* `scripts/train.py:1929-2007` (`per_agent_compliance_attr` rewrite,
+  U/D/M partition, `__residual` sanity counter)
+* `scripts/train.py:986-1003,2199-2210` (CSV column registration and
+  per-episode write)
+* `scripts/train.py:2369-2374,2419-2434` (Why column header + bot table)
+* `src/environment/ets_environment.py:1457-1610` (joint budget gate
+  block; legacy cascade removed)
+* `configs/default.yaml` `auction.budget_gate` block
+* `notebooks/ets_marl - Sweep Analysis.ipynb` cells 26 (UDBC plot
+  expanded to 5 buckets) and 30-31 (new §5.8 markdown + code cell)
+* `tests/test_environment.py:677-682` (default-stress test now sets
+  `auction.budget_gate.enabled: false` to keep producing settlement
+  defaults; old `leverage_multiplier=100.0` no longer disables sizing)
+
+---
+
 ## [8.5.6]
 
 Tier-3 mitigations for seed-driven price-basin lock-in (the bimodal sweep
