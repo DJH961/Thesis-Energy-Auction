@@ -1,9 +1,148 @@
 # Changelog — ETS MARL (`ets_marl_happo_current`)
 
-Version numbers reflect the `# ETS MARL — Configuration vX.Y[.Z]` header in `configs/default.yaml`
-and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
+Version numbers reflect the `version` field in `pyproject.toml`
+(and `configs/default.yaml`).
 
 ---
+
+## [8.6.0]
+
+ESG saved-carbon hybrid, two-stage joint budget gate (loan- and shock-
+aware), anchor-ratio quality volatility, U/D/M compliance attribution,
+forward-looking affordability observation, and an episode-level
+quality metric.
+
+**ESG reward — saved-carbon hybrid.** Replaces the prior linear horizon
+penalty (`ef_baseline = year/(n_years-1)`) with
+
+```
+esg_raw = scale × ( stock_w × ef_ratio
+                  + flow_w  × ef_ratio × (anchor_real_t / anchor_real_0)
+                  + speed_coef × max(0, Δgreen) )
+```
+
+Stock term pays sustained green share every year; flow term monetises
+avoided carbon at the live anchor (social shadow price); speed bonus
+is uniform across the episode (no front-loading). Compliance gate
+retained. Calibrated default `esg.scale = 0.50` produces a ~50/50
+financial-vs-ESG split (in absolute per-(year, agent) magnitude) for
+`[w_cost = 0.5, w_green = 0.5]` agents on an anchor-tracking rollout.
+A regression test pins this balance to `[35 %, 65 %]`. Full design,
+balance sweep, stress scenarios, and realism notes live in
+`docs/esg_reward_design.md`. New diagnostic columns
+`esg_stock_term`, `esg_flow_term`; `esg_anchor_ratio` now reflects
+`anchor_real_t / anchor_real_0` (was a 1.0 placeholder).
+
+**Joint budget gate — two-stage, last-line-of-defence.** Bid quantity
+is sized against EXPECTED settlement cost (uniform clearing × alloc +
+collateral), not bid_p × bid_q, so a high willingness-to-pay does not
+artificially shrink qty in expectation. Three-stage protocol when the
+expected settlement exceeds available cash:
+1. Shrink `bid_q` toward `need` (compliance floor, never below need
+   if originally ≥ need).
+2. If still over-budget, reduce `bid_p` toward
+   `max(reserve, MA3_inflated)`. Below that floor, lowering price only
+   loses the auction in expectation.
+3. Last resort: shrink `bid_q` below need.
+
+The cash buffer is `operating + treasury_fraction × treasury` by
+default (`treasury_fraction = 0.5`) — treasury is meant to absorb
+genuine price spikes and is therefore only partially exposed to
+routine bid sizing. Emergency-loan headroom is opt-in
+(`include_loan_headroom = false`): the loan is a settlement-time
+safety net, not a sizing buffer, so the gate doesn't let agents
+routinely bid into loan territory. The `need` floor uses the
+deterministic estimate the agent saw at obs time by default — fair
+to the agent, only clipping on info available at bid time;
+`shock_aware_need_floor = true` switches to the realised shock
+(drawn upstream in `step_auction` before the gate runs, so the env
+knows it — agents did not have this info at bid-time).
+`MA3_inflated = price_ma3 × infl(t)/infl(t-1)` so expected_clearing
+doesn't lag in inflation regimes. Knobs:
+`auction.budget_gate.{enabled, safety_mult, notional_safety_mult,
+protect_need_floor, inflation_aware_ma3, treasury_fraction,
+treasury_max_abs, include_loan_headroom, shock_aware_need_floor}`.
+Setting `protect_need_floor = false` collapses the protocol back to
+a single qty-shrink stage; the legacy `leverage_multiplier` and
+`budget_price_clip` knobs no longer drive bid sizing.
+
+**U/D/M/B/C compliance attribution.** Mutually-exclusive partition of
+non-compliant years per agent:
+- **U** — `alloc < emiss` AND no inherited carry-forward
+- **D** — `alloc ≥ emiss` AND inherited carry-forward (debt cascade)
+- **M** — both (mixed)
+
+Identity `U + D + M == #non-compliant years`; `B / C` are
+compliant-with-stress (bank-covered / sec-covered). Written to
+`training_log_*.csv` as `udbc_{U,D,M,B,C}_total_A*`. Sweep notebook
+plot expanded to a 2×3 grid.
+
+**Anchor-invariant convergence quality metric.** Per-episode
+`quality_score`, `Q_compliance`, `Q_price_realism`, `Q_saved_carbon`,
+`Q_cost_eff`, `Q_volatility` written to `training_log_*.csv` and a
+compact `Q=0.532` printed to console. Composite
+
+```
+Q = 0.30 × compliance        + 0.25 × price_realism
+  + 0.25 × saved_carbon      + 0.10 × cost_efficiency
+  − 0.10 × volatility
+```
+
+Volatility uses `std/mean` of the **clearing/anchor ratio** (the
+fundamental anchor encodes both inflation and cap-scarcity), so a
+trajectory that perfectly tracks the fundamental scores volatility ≈ 0.
+Saved-carbon is monetised at the per-year fundamental anchor; cost
+efficiency uses the same counterfactual baseline as the denominator.
+Computed on the tail window only and **never fed back into training**.
+
+**Observation space.** New `obs[43]=compliance_affordability`:
+`(need × expected_clearing) / cash` clipped `[0, 3]` then divided by 3.
+`expected_clearing = max(reserve, MA3, anchor)` — same formula as the
+budget gate. `obs_dim_phase1` is now 44.
+
+**Reward bid-head fair-price baseline.** `compliance_norm_excess =
+(auction_cost + mac + collateral − baseline_cost) / compliance_denom`
+where `baseline_cost = need × last_clearing_price / infl`. Buying
+exactly `need` at the clearing price is reward-neutral; over-buying is
+a small positive cost; under-buying triggers `gap_penalty` priced at
+the remediation rate `min(max(eff_pen, sec_ema, anchor), cap_mult ×
+eff_pen) / infl`. Knobs: `reward.sec_proxy.{enabled, ema_alpha,
+cap_mult}`.
+
+**Calibration changes carried into the default config.**
+- `risk.p_fail_max`: 0.65 → 0.40 (aligns with policy-supported FID
+  risk for offshore wind / solar).
+- `budget.dynamic_budget_ceiling_multiplier`: 1.5 → 2.5 (lets
+  high-anchor years actually translate carbon-passthrough revenue
+  into investable cash).
+- `budget.debt_headrooms` halved & rebalanced (the prior schedule
+  over-subsidised coal-heavy incumbents under revenue passthrough).
+- `_consecutive_successes` no longer resets on a single failure.
+- BCL active in year 0 too, anchored on
+  `max(price_ma3_early, fundamental_anchor) ± value`.
+
+**Notebook integration.**
+- `Sweep Analysis.ipynb` §5.8 prefers `quality_score` / `Q_*`
+  columns from the training log; the recompute path is kept only as
+  a fallback for old logs.
+- `Full Run & Analysis.ipynb` gains §A4b (UDBC compliance
+  attribution) and §A7 (Quality Metric panel with rolling-mean
+  per-component traces).
+
+**Migration notes.**
+- Re-train recommended: ESG redesign changes magnitudes for any
+  `w_green > 0` agent.
+- New YAML knobs are read with safe defaults.
+- The `esg.scale = 0.50` default is calibrated for the 50/50
+  financial-ESG split (in absolute per-(year, agent) magnitude on
+  an anchor-tracking rollout); re-tune `scale` (not `stock_weight` /
+  `flow_weight`) if the balance drifts. The first calibration of
+  this PR (`scale = 0.25`) was against a flat-80 EUR/t rollout that
+  let bidders buy below anchor and overstated the financial channel
+  by ~2× — corrected here.
+- `ets.unsold_to_msr` flipped from `false` to `true` in the default
+  config so unsold auction volumes are absorbed by the MSR rather
+  than rolling forward indefinitely.
 
 ## [8.5.6]
 

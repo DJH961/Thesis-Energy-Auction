@@ -1,0 +1,26 @@
+# =============================================================================
+# Default-config sweep — 4 unrelated seeds, no overrides
+# =============================================================================
+# Runs the base configuration with four unusual, pairwise-coprime seeds to
+# probe seed sensitivity at default settings only. No variant-level
+# parameter changes; the only axis is the seed.
+#
+# Run with:
+#     python scripts/sweep.py --spec configs/sweeps/default_seeds.yaml
+#
+# Each seed gets its own training_log_s{seed}.csv / year_log_s{seed}.csv
+# under output_dir/default/.
+# =============================================================================
+
+base_config: configs/default.yaml
+output_dir: results/sweeps/default_seeds
+
+# Four seeds chosen to be unrelated — no powers of two, no anniversaries,
+# no single-digit favourites. Drawn from primes / large composites.
+seeds: [738, 219, 581, 904]
+
+parallel_workers: 4
+threads_per_worker: null
+
+variants:
+  - name: default

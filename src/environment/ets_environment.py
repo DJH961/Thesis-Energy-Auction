@@ -1454,115 +1454,252 @@ class ETSEnvironment(gym.Env):
                 bid_actions[i, 1] = max(lot_size, round(bid_actions[i, 1] / lot_size) * lot_size)
             requested_qtys[i] = bid_actions[i, 1]  # capture before any gates
 
-        # Leverage gate — clip bid_quantity by leverage_multiplier × available_cash / bid_price.
-        # Prevents agents from submitting notional bids far exceeding their cash.
-        aq_cfg = self.config["auction"]
-        lev_mult = float(aq_cfg.get("leverage_multiplier", 3.0))
-        if lev_mult > 0.0:
-            for i, company in enumerate(self.companies):
-                if not self._is_agent_active(i):
-                    continue
-                cash = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
-                bid_p = float(bid_actions[i, 0])
-                if bid_p > 1e-6:
-                    max_notional_qty = lev_mult * cash / bid_p
-                    if bid_actions[i, 1] > max_notional_qty:
-                        bid_actions[i, 1] = max_notional_qty
-
-        # Compute effective reserve price (dynamic or static)
+        # Compute effective reserve price and expected clearing first — the
+        # joint budget gate sizes quantity against EXPECTED settlement cost
+        # (uniform clearing price × alloc), not against bid_p × bid_q. In a
+        # uniform-price auction every winner pays the same clearing price
+        # (set by the lowest accepted bid), so bid_p only determines whether
+        # the bid wins; what the agent actually pays is the uniform clearing
+        # price.
         effective_reserve = self._compute_dynamic_reserve()
         self._last_effective_reserve = effective_reserve
         price_ma3 = self._compute_price_ma3()
-        expected_clearing = max(effective_reserve, price_ma3)
+        anchor_for_gate = compute_fundamental_anchor(year, self.config, cap_t_actual=cap_t)
 
-        # This clip exists as a training-stability safety net for learning agents during
-        # exploration, not as an economic mechanism. The heuristic policy is self-consistent
-        # and should not trigger it. If clip events fire for bot-only runs, this indicates a
-        # heuristic/env mismatch.
-        coll_cfg = self.config.get("auction", {}).get("collateral", {})
-        if coll_cfg.get("enabled", True):
-            coll_frac = float(coll_cfg.get("collateral_fraction",
-                                            coll_cfg.get("opportunity_cost_rate", 0.05)
-                                            * coll_cfg.get("hold_fraction", 0.02)))
-            max_coll_share = float(coll_cfg.get("max_collateral_budget_share", 0.50))
+        # Inflation-aware projection of MA3: prior-year nominal clearings
+        # are scaled by infl(t)/infl(t-1) so the gate doesn't undersize
+        # the cash buffer in inflation regimes. Anchor is already
+        # inflation-aware (cap + inflation are baked in internally).
+        bg_cfg_for_infl = self.config["auction"].get("budget_gate", {})
+        if bool(bg_cfg_for_infl.get("inflation_aware_ma3", True)) and year > 0:
+            infl_t  = float(self._inflation_factor(year))
+            infl_tm = float(self._inflation_factor(year - 1))
+            if infl_tm > 1e-6:
+                price_ma3_inflated = price_ma3 * (infl_t / infl_tm)
+            else:
+                price_ma3_inflated = price_ma3
+        else:
+            price_ma3_inflated = price_ma3
+        # Use the highest of the three so we don't underestimate clearing risk.
+        expected_clearing = max(effective_reserve, price_ma3_inflated, anchor_for_gate)
 
-            if coll_frac > 0.0:
-                for i, company in enumerate(self.companies):
-                    if not self._is_agent_active(i):
-                        continue
-                    bid_p = float(bid_actions[i, 0])
-                    bid_q = float(bid_actions[i, 1])
-                    if bid_q < 1e-6 or bid_p < 1e-6:
-                        continue
-                    budget_remaining = max(
-                        0.0,
-                        float(company.annual_budget - company.budget_spent_this_year),
-                    )
-                    above_clearing = max(0.0, bid_p - expected_clearing)
-                    collateral = coll_frac * above_clearing * bid_q
-                    max_collateral = max_coll_share * budget_remaining
-                    if collateral > max_collateral and max_collateral > 0 and budget_remaining > 1.0:
-                        scale = max_collateral / max(collateral, 1e-9)
-                        bid_actions[i, 1] *= scale
-                        self._collateral_clip_events[i] = self._collateral_clip_events.get(i, 0) + 1
+        # Collateral parameters (used both by the joint gate and by the
+        # pre-bid collateral lock further down).
+        aq_cfg = self.config["auction"]
+        coll_cfg = aq_cfg.get("collateral", {})
+        coll_enabled = bool(coll_cfg.get("enabled", True))
+        coll_frac = float(coll_cfg.get("collateral_fraction",
+                                        coll_cfg.get("opportunity_cost_rate", 0.05)
+                                        * coll_cfg.get("hold_fraction", 0.02)))
+        max_coll_share = float(coll_cfg.get("max_collateral_budget_share", 0.50))
+
+        # Joint budget gate.
+        # ------------------------------------------------------------------
+        # Sizes quantity against EXPECTED settlement cost (uniform clearing
+        # price × alloc + collateral), not bid_p × bid_q. In a uniform-price
+        # auction every winner pays the same clearing price, so bid_p only
+        # determines whether a bid wins; what the agent actually pays is
+        # the uniform clearing.
+        #
+        # Role: last line of defence against insolvent settlement. The gate
+        # only fires when expected settlement + collateral exceed the
+        # agent's *ordinary* cash. obs[40] / obs[41] expose the clip
+        # signals so policies can learn to size bids inside the gate.
+        #
+        # Two-stage overbudget protocol:
+        #   Step A1: shrink bid_q toward `need` (compliance floor) — never
+        #            below need if the agent originally chose to cover need.
+        #   Step A2: if still overbudget, reduce bid_p toward
+        #            max(reserve, MA3_inflated). Below that, lowering price
+        #            only loses the auction in expectation.
+        #   Step A3: last-resort shrink bid_q below need (genuine insolvency).
+        # `protect_need_floor=false` collapses the protocol to a single
+        # qty-shrink stage.
+        bg_cfg = aq_cfg.get("budget_gate", {})
+        bg_enabled = bool(bg_cfg.get("enabled", True))
+        bg_safety = max(1.0, float(bg_cfg.get("safety_mult", 1.2)))
+        bg_notional_safety = max(1.0, float(bg_cfg.get("notional_safety_mult", 5.0)))
+        bg_protect_need = bool(bg_cfg.get("protect_need_floor", True))
+
+        # Loan headroom inclusion is OFF by default. The emergency loan is
+        # an end-of-year safety net at settlement, not a sizing buffer:
+        # including it here would let the gate authorise every agent to
+        # bid up to (operating + treasury + loan), driving routine loan
+        # usage. Set `include_loan_headroom: true` only if you want the
+        # gate to align with the post-clearing settlement waterfall (in
+        # which case loans become an ordinary tool, not an emergency).
+        # Treasury fraction: by default the gate only counts a fraction of
+        # treasury toward the bid-cash buffer. Treasury is meant to be
+        # emergency money for genuine price spikes; if the gate counts
+        # 100% of it the agent learns to routinely bid against treasury,
+        # leaving no headroom for actual stress. Set treasury_fraction=1.0
+        # to recover the previous behaviour.
+        bg_treasury_frac = float(bg_cfg.get("treasury_fraction", 0.5))
+        bg_treasury_frac = max(0.0, min(1.0, bg_treasury_frac))
+        bg_treasury_max_abs = float(bg_cfg.get("treasury_max_abs", 0.0))
+        bg_include_loan = bool(bg_cfg.get("include_loan_headroom", False))
+        loan_cfg_gate = self.config.get("budget", {}).get("emergency_loan", {})
+        gate_loan_enabled = bool(loan_cfg_gate.get("enabled", False))
+        gate_max_loan_frac = (float(loan_cfg_gate.get("max_loan_fraction", 0.0))
+                              if (gate_loan_enabled and bg_include_loan) else 0.0)
+
+        # Need-floor mode (Step A1 protection level):
+        #   shock_aware_need_floor=false (default) → use the deterministic
+        #     `estimate_needs[i]` the agent saw in its observation. Fair
+        #     to the agent: only clip on info available at bid-time.
+        #   shock_aware_need_floor=true → use the realised shock that the
+        #     env drew upstream in step 4 of step_auction. Matches what
+        #     the auction will actually settle, but corrects the bid on
+        #     info the agent did not have.
+        bg_shock_aware = bool(bg_cfg.get("shock_aware_need_floor", False))
+
+        self._last_budget_price_clip[:] = 0.0
+        if bg_enabled:
+            for i, company in enumerate(self.companies):
+                if not self._is_agent_active(i):
+                    continue
+                # Cash buffer: operating + (treasury × treasury_fraction)
+                # [+ loan headroom only if include_loan_headroom=true].
+                # Treasury is partial by default — it's stress-reserve, not
+                # routine bid sizing.
+                op_cash = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
+                treasury_full = float(company.get_treasury_available())
+                treasury_capped = bg_treasury_frac * treasury_full
+                if bg_treasury_max_abs > 0.0:
+                    treasury_capped = min(treasury_capped, bg_treasury_max_abs)
+                loan_headroom = gate_max_loan_frac * max(float(company.annual_budget), 1.0)
+                cash = op_cash + treasury_capped + loan_headroom
+                bid_p = float(bid_actions[i, 0])
+                bid_q = float(bid_actions[i, 1])
+                if bid_p < 1e-6 or bid_q < 1e-6:
+                    continue
+
+                # Need floor (Step A1 protection level).
+                # By default uses the deterministic estimate the agent saw
+                # at obs time — fair to the agent, only clipping on info
+                # available at bid time. If shock_aware_need_floor=true,
+                # uses the realised shock (drawn upstream in step 4 of
+                # step_auction) which matches what the auction will settle.
+                # estimate_needs already includes carry_forward; only the
+                # emission component is shock-amplified.
+                base_need = float(estimate_needs[i])
+                if bg_shock_aware and epsilons.size > i:
+                    shock_i = float(epsilons[i])
+                    cf_i = float(getattr(company, "_carry_forward", 0.0))
+                    need_i = max(0.0, (base_need - cf_i) * (1.0 + max(0.0, shock_i)) + cf_i)
+                else:
+                    need_i = max(0.0, base_need)
+
+                def _cost_per_mt(p):
+                    coll = coll_frac * max(0.0, p - effective_reserve) if coll_enabled else 0.0
+                    return bg_safety * expected_clearing + coll
+
+                # Step A1: shrink bid_q toward need (never below need if the
+                # agent originally requested ≥ need; preserve sub-need bids).
+                cost_per_mt_expected = _cost_per_mt(bid_p)
+                if cost_per_mt_expected > 1e-6 and (bid_q * cost_per_mt_expected) > cash:
+                    max_q_budget = cash / cost_per_mt_expected
+                    if bg_protect_need and bid_q > need_i and need_i > 0.0:
+                        # Floor the qty cut at need (don't push the agent
+                        # below its own compliance ask if it can be helped).
+                        bid_q = max(min(bid_q, max(max_q_budget, need_i)), 0.0)
+                    else:
+                        bid_q = max(0.0, max_q_budget)
+                    bid_actions[i, 1] = bid_q
+
+                # Step A2: if still overbudget after qty floor, reduce bid_p
+                # toward the realistic clearing floor (max(reserve, MA3_infl)).
+                # Below that, lowering p doesn't help the agent — it only
+                # loses the auction. So the gate stops there.
+                if bg_protect_need and bid_q > 1e-6:
+                    cost_per_mt_now = _cost_per_mt(bid_p)
+                    if (bid_q * cost_per_mt_now) > cash and coll_enabled and coll_frac > 0.0:
+                        # Solve for max bid_p s.t. bid_q × cost_per_mt(bid_p) = cash.
+                        # cost_per_mt(p) = bg_safety × expected_clearing + coll_frac × max(0, p - reserve)
+                        residual = (cash / bid_q) - bg_safety * expected_clearing
+                        if coll_frac > 1e-9:
+                            max_above_reserve = residual / coll_frac
+                        else:
+                            max_above_reserve = float('inf')
+                        # The price floor for A2 is max(reserve, MA3_inflated)
+                        # — below this we'd just lose the auction in expectation.
+                        price_floor = max(float(effective_reserve), float(price_ma3_inflated))
+                        new_p_target = float(effective_reserve) + max(0.0, max_above_reserve)
+                        new_p = max(price_floor, new_p_target)
+                        new_p = float(np.clip(new_p,
+                                              float(aq_cfg["price_min"]),
+                                              float(aq_cfg["price_max"])))
+                        if new_p < bid_p:
+                            self._last_budget_price_clip[i] = new_p - bid_p  # signed (negative)
+                            bid_actions[i, 0] = new_p
+                            bid_p = new_p
+
+                # Step A3: last-resort qty cut below need. Only fires when
+                # even at the price floor + qty=need the bid still exceeds cash.
+                cost_per_mt_final = _cost_per_mt(bid_p)
+                if cost_per_mt_final > 1e-6 and (bid_q * cost_per_mt_final) > cash:
+                    max_q_final = cash / cost_per_mt_final
+                    if max_q_final < bid_q:
+                        bid_q = max(0.0, max_q_final)
+                        bid_actions[i, 1] = bid_q
+
+                # Step B: soft notional safety on bid_p × bid_q. If the agent
+                # bid an absurdly high price (e.g., ε-greedy noise at price_max
+                # with full need-coverage qty), clip bid_p down. This is the
+                # only place bid_p is touched when need-floor protection is off,
+                # and it's anchored on cash so it scales with budget and only
+                # triggers in pathological cases.
+                if bid_q > 1e-6:
+                    notional_cap = bg_notional_safety * cash
+                    notional = bid_p * bid_q
+                    if notional > notional_cap and notional_cap > 0.0:
+                        new_p = notional_cap / bid_q
+                        new_p = float(np.clip(new_p,
+                                              float(aq_cfg["price_min"]),
+                                              float(aq_cfg["price_max"])))
+                        # Combine with any A2 clip already recorded.
+                        if new_p < bid_p:
+                            self._last_budget_price_clip[i] += new_p - bid_p
+                            bid_actions[i, 0] = new_p
+
+        # Per-agent collateral-budget-share gate. Even with the joint gate
+        # the *upfront* collateral lock can still exceed
+        # max_collateral_budget_share × cash if bid_p is very high. Keep the
+        # soft scale to avoid suspension-by-collateral-default during
+        # exploration. This gate only activates when the joint gate's
+        # expected-cost sizing didn't already shrink qty enough.
+        if coll_enabled and coll_frac > 0.0:
+            for i, company in enumerate(self.companies):
+                if not self._is_agent_active(i):
+                    continue
+                bid_p = float(bid_actions[i, 0])
+                bid_q = float(bid_actions[i, 1])
+                if bid_q < 1e-6 or bid_p < 1e-6:
+                    continue
+                budget_remaining = max(
+                    0.0,
+                    float(company.annual_budget - company.budget_spent_this_year),
+                )
+                above_clearing = max(0.0, bid_p - expected_clearing)
+                collateral = coll_frac * above_clearing * bid_q
+                max_collateral = max_coll_share * budget_remaining
+                if collateral > max_collateral and max_collateral > 0 and budget_remaining > 1.0:
+                    scale = max_collateral / max(collateral, 1e-9)
+                    bid_actions[i, 1] *= scale
+                    self._collateral_clip_events[i] = self._collateral_clip_events.get(i, 0) + 1
 
         self._phase1_bid_prices = bid_actions[:, 0].copy()
         self._phase1_bid_quantities = bid_actions[:, 1].copy()  # Mt after multiplier expansion
 
-        # Budget-based gate: agents who cannot cover 10% of bid notional get qty
-        # scaled (NOT zeroed) so the bid fits within available cash. Hard zero
-        # caused a gradient discontinuity and, combined with the bid_qty_clip_ratio
-        # observation feedback, drove policies to under-bid systematically.
-        # v8.4.2 bug fix: replace hard zero with a soft scale.
-        for i in range(self.n_total):
-            if not self._is_agent_active(i):
-                continue
-            cash = max(0.0, float(self.companies[i].annual_budget
-                                  - self.companies[i].budget_spent_this_year)
-                       + self.companies[i].get_treasury_available())
-            bid_p = float(bid_actions[i, 0])
-            bid_q = float(bid_actions[i, 1])
-            if bid_p > 1e-6 and bid_q > 1e-6:
-                required_cash = bid_p * bid_q * 0.10
-                if cash < required_cash:
-                    # Scale qty so that bid_p × bid_q × 0.10 == cash
-                    max_affordable_qty = cash / (bid_p * 0.10)
-                    bid_actions[i, 1] = max(0.0, max_affordable_qty)
-
-        # Record bid qty clip ratios (actual / requested after all gates)
+        # Record bid qty clip ratios (actual / requested after all gates) for obs[41].
         for i in range(self.n_agents):
             rq = requested_qtys[i]
             aq = float(bid_actions[i, 1])
             self._last_bid_qty_clip_ratio[i] = float(np.clip(aq / max(rq, 1e-6), 0.0, 1.0)) if rq > 1e-6 else 1.0
 
-        # Budget price clip: soft clip at 1.5x max affordable price.
-        budget_price_clip = self.config["auction"].get("budget_price_clip", True)
-        self._last_budget_price_clip[:] = 0.0
-        if budget_price_clip:
-            for i, company in enumerate(self.companies):
-                if not self._is_agent_active(i):
-                    continue
-                op_remaining = max(0.0, float(company.annual_budget - company.budget_spent_this_year)
-                                   - float(self._collateral_locked[i]))
-                cash = op_remaining + company.get_treasury_available()
-                cash = max(cash, 1.0)
-                bid_q = max(float(bid_actions[i, 1]), 1e-6)
-                max_affordable_price = cash / bid_q
-                if bid_actions[i, 0] > 1.5 * max_affordable_price:
-                    _orig_bid = float(bid_actions[i, 0])
-                    _clipped_price = float(np.clip(
-                        max_affordable_price,
-                        float(self.config["auction"]["price_min"]),
-                        float(self.config["auction"]["price_max"]),
-                    ))
-                    bid_actions[i, 0] = _clipped_price
-                    self._last_budget_price_clip[i] = _clipped_price - _orig_bid  # negative if clipped down
-
         # Pre-bid collateral locking — fraction of margin above reserve.
-        # Reduces effective cash available when checking ability to settle payment.
-        coll_frac_e4 = float(coll_cfg.get("collateral_fraction",
-                                           coll_cfg.get("opportunity_cost_rate", 0.05)
-                                           * coll_cfg.get("hold_fraction", 0.02)))
+        # Uses the (possibly clipped) bid_p / bid_q from the joint gate.
+        coll_frac_e4 = coll_frac
         collateral_locked = np.zeros(self.n_total)
         for i in range(self.n_total):
             if not self._is_agent_active(i):
@@ -1995,9 +2132,9 @@ class ETSEnvironment(gym.Env):
             Investment sub-head reward (capital cost only).
 
         ``r_auction = r_auction_bid + r_auction_invest`` so the ``r_auction``
-        return value is identical to the pre-v8.5 single-stream value, while
-        the split components let the train loop route the bid and investment
-        sub-heads to their own advantage streams.
+        return value is the joint auction-phase reward; the split components
+        let the train loop route the bid and investment sub-heads to their
+        own advantage streams.
         """
         r_auction = np.zeros(self.n_agents)
         r_auction_bid = np.zeros(self.n_agents)
@@ -2046,8 +2183,7 @@ class ETSEnvironment(gym.Env):
             # Coverage-gap rate = expected cost of remediation per missing Mt.
             # Floor: max(eff_pen, sec_ema, anchor). Cap: cap_mult × eff_pen.
             # When `sec_proxy.enabled=false`, fall back to bare eff_pen / infl
-            # (legacy v8.5.0 behaviour) — the rolling+capped proxy is the
-            # only place these knobs are read.
+            # — the rolling+capped proxy is the only place these knobs are read.
             eff_pen_rate_nom = company.effective_penalty_rate(self.current_year)
             if self._sec_proxy_enabled:
                 sec_ema_nom = self._sec_price_ema  # None until first sec clear
@@ -2726,6 +2862,11 @@ class ETSEnvironment(gym.Env):
         esg_cfg     = self.config.get("esg", {})
         esg_enabled = esg_cfg.get("enabled", False)
         esg_scale   = float(esg_cfg.get("scale", 2.0))
+        # ESG hybrid weights — stock (sustained green share) + flow
+        # (saved-carbon at live anchor) + small motion bonus. See
+        # docs/esg_reward_design.md for derivation and balance calibration.
+        _esg_stock_w = float(esg_cfg.get("stock_weight", 1.0))
+        _esg_flow_w  = float(esg_cfg.get("flow_weight",  1.5))
         _speed_early = float(esg_cfg.get("speed_coef", 0.5))
         _speed_late  = float(esg_cfg.get("speed_coef_late", _speed_early))
         _year_frac   = self.current_year / max(self.n_years - 1, 1)
@@ -2750,6 +2891,12 @@ class ETSEnvironment(gym.Env):
         next_year       = min(self.current_year + 1, self.n_years - 1)
         cap_t_next      = float(self.cap_schedule.get_cap(next_year))
         anchor_next_nom = compute_fundamental_anchor(next_year, self.config, cap_t_actual=cap_t_next)
+        # Year-0 anchor (real terms) — denominator for the ESG flow term.
+        # infl(0) == 1.0 by construction so anchor_0_nom == anchor_0_real.
+        anchor_0_real   = max(
+            compute_fundamental_anchor(0, self.config, cap_t_actual=cap_0),
+            1.0,
+        )
 
         # Banking timing signal config (read once outside agent loop)
         banking_cfg     = reward_cfg.get("banking_signal", {})
@@ -2894,11 +3041,13 @@ class ETSEnvironment(gym.Env):
             penalty_prospective = remediation_cost
             shortfall = shortfall_realized
 
-            # ESG: no time decay, budget_real anchor
+            # ESG: saved-carbon hybrid — stock + flow + tiny motion bonus.
             esg_signal       = 0.0
             esg_anchor_ratio = 0.0
             gate_activation  = 1.0
             compliance_gate  = 1.0
+            esg_stock_term   = 0.0
+            esg_flow_term    = 0.0
 
             if esg_enabled and company.initial_ef > 1e-6:
                 ef_ratio    = max(0.0,
@@ -2907,16 +3056,39 @@ class ETSEnvironment(gym.Env):
                 green_delta = max(0.0, company.green_frac - company.prev_green_frac)
                 speed_bonus = esg_speed_coef * green_delta
 
-                # Centered ESG: subtract a linear `year/n_years` baseline so a
-                # do-nothing agent receives zero-mean signal and an
-                # ahead-of-trajectory agent receives a positive one. This
-                # eliminates the positive-floor that previously biased HAPPO
-                # ordering against agents with `w_green > 0`.
-                ef_baseline = float(self.current_year) / max(float(self.n_years - 1), 1.0)
-                ef_baseline = float(np.clip(ef_baseline, 0.0, 1.0))
-                ef_centered = ef_ratio - ef_baseline
-                esg_raw = esg_scale * (ef_centered + speed_bonus)
-                esg_anchor_ratio = 1.0  # retained as a logged channel only
+                # Saved-carbon hybrid:
+                #   stock_term = ef_ratio
+                #     "we are green right now" — pays every year the agent
+                #     maintains a high green share, so sustained operation
+                #     of low-EF capacity earns reward (not just the one-off
+                #     transition events).
+                #   flow_term  = ef_ratio × (anchor_real_t / anchor_real_0)
+                #     algebraically equals
+                #     (saved_Mt_this_year × anchor_real_t) /
+                #     (initial_baseline_emiss × anchor_real_0),
+                #     i.e. avoided carbon valued at the live social shadow
+                #     price, normalised by the per-agent year-0 carbon
+                #     liability. Rises with cap scarcity (real anchor goes
+                #     up over the trajectory) so a green company earns more
+                #     in scarcity-heavy years than in early years, matching
+                #     the social-value perspective.
+                #   speed_bonus = speed_coef × max(0, Δgreen)
+                #     small bonus for actual motion this year (positive
+                #     reinforcement of investment events). speed_coef is
+                #     uniform across the episode — no front-loading bias.
+                # See docs/esg_reward_design.md for the full derivation,
+                # stress-test scenarios, and balance calibration.
+                esg_anchor_ratio_local = anchor_t / max(infl, 1e-6) / anchor_0_real
+                esg_stock_term = ef_ratio
+                esg_flow_term  = ef_ratio * esg_anchor_ratio_local
+                esg_raw        = esg_scale * (
+                    _esg_stock_w * esg_stock_term
+                    + _esg_flow_w  * esg_flow_term
+                    + speed_bonus
+                )
+                # Logged channel — now reflects real semantics (anchor real
+                # premium relative to year-0 anchor real), not a placeholder 1.0.
+                esg_anchor_ratio = float(esg_anchor_ratio_local)
 
                 annual_need_i = max(company.compute_estimate_need(), 1e-6)
                 if precompliance_holdings is not None:
@@ -2928,8 +3100,11 @@ class ETSEnvironment(gym.Env):
                 gate_blend      = max(0.0, min(1.0, (gate_blend_threshold - coverage_frac) / gate_blend_width))
                 compliance_gate = coverage_frac ** (1.0 + gate_blend)
                 gate_activation = float(1.0 + gate_blend)
-                # Gate only attenuates positive ESG; do not flip the sign of a
-                # negative (behind-trajectory) signal under low coverage.
+                # Gate only attenuates positive ESG (compliance comes first
+                # by design). Raw ESG under the saved-carbon hybrid is
+                # monotonically ≥ 0; the negative branch is kept defensively
+                # for future config knobs that might reintroduce subtractive
+                # terms.
                 if esg_raw >= 0.0:
                     esg_signal = esg_raw * compliance_gate
                 else:
@@ -2941,12 +3116,11 @@ class ETSEnvironment(gym.Env):
                 )
             else:
                 coverage_frac_auction = 1.0
-            # v8.4.2 bug fix: apply the coverage gate ONLY when the financial reward
-            # is a saving (cost_norm_centered < 0 → -cost_norm_centered > 0). Gating
-            # the cost branch too made "skip the auction" (reward=0) dominate
-            # "win at clearing ≥ anchor" (reward<0), pushing policies toward
-            # under-bidding. Costs are now applied at full weight regardless of
-            # coverage; only over-savings get coverage-discounted.
+            # Apply coverage gate ONLY when the financial reward is a saving
+            # (cost_norm_centered < 0). Gating the cost branch too biases
+            # the policy toward under-bidding ("skip auction" gives 0,
+            # winning at clearing ≥ anchor would be < 0). Costs apply at
+            # full weight; only over-savings are coverage-discounted.
             if cost_norm_centered < 0.0:
                 financial_reward = coverage_frac_auction * company.w_cost * (-cost_norm_centered)
             else:
@@ -3016,7 +3190,9 @@ class ETSEnvironment(gym.Env):
                 "remediation_cost":     float(remediation_cost),
                 "scarcity_amp":         float(scarcity_amp),
                 "esg_signal":           float(esg_signal),
-                "esg_anchor_ratio":     float(esg_anchor_ratio),     # always 1.0 (logged channel only)
+                "esg_anchor_ratio":     float(esg_anchor_ratio),     # anchor_real_t / anchor_real_0
+                "esg_stock_term":       float(esg_stock_term),       # ef_ratio
+                "esg_flow_term":        float(esg_flow_term),        # ef_ratio × anchor_ratio
                 "base_reward":          float(base_reward),
                 "opp_cost_shaping":     float(opp_cost_shaping),
                 "coverage_gap_shaping": float(coverage_gap_shaping),
@@ -3248,6 +3424,18 @@ class ETSEnvironment(gym.Env):
             / max(cap_t, 1e-6), 0.0, 1.0
         ))
 
+        # Forward-looking expected clearing for compliance affordability obs[43].
+        # Same formula the joint budget gate uses, so the obs reflects the same
+        # cost basis the gate will actually apply at auction time.
+        _anchor_for_obs = compute_fundamental_anchor(
+            self.current_year, self.config, cap_t_actual=float(cap_t)
+        )
+        _expected_clearing_for_obs = max(
+            float(self._last_effective_reserve),
+            float(price_ma3),
+            float(_anchor_for_obs),
+        )
+
         obs_list = []
         for i in range(self.n_agents):  # only learning agents get observations
             c = self.companies[i]
@@ -3303,6 +3491,16 @@ class ETSEnvironment(gym.Env):
                 last_budget_price_clip=float(self._last_budget_price_clip[i]),
                 last_bid_qty_clip_ratio=float(self._last_bid_qty_clip_ratio[i]),
                 last_invest_clip_ratio=float(self._last_invest_clip_ratio[i]),
+                compliance_affordability=(
+                    # forward-looking signal: how much of remaining cash a need-
+                    # covering bid at expected clearing would consume
+                    (max(c.compute_estimate_need(), 0.0) * _expected_clearing_for_obs)
+                    / max(
+                        float(c.annual_budget - c.budget_spent_this_year)
+                        + c.get_treasury_available(),
+                        1.0,
+                    )
+                ),
             )
             obs_list.append(obs_i)
 

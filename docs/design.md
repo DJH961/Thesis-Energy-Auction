@@ -52,8 +52,7 @@ All winners pay the same clearing price (the marginal accepted bid).
   EUR/t and is active in year 0 too. The BCL reference is
   `max(price_ma3, fundamental_anchor(year))` so it does not drift below the equilibrium price
   in low-price regimes. BCL clip signals are exposed as observation dimensions for gradient feedback.
-- A soft budget price clip clamps a bid to ~1.5× the agent's max affordable price (kept as a
-  separate observation dimension so the policy can still see when it was clipped).
+- A **joint budget gate** (`auction.budget_gate`) sizes bid quantity against EXPECTED settlement cost (`safety_mult × max(reserve, MA3_inflated, anchor) + collateral(bid_p) per Mt`), not against `bid_p × bid_q`. In a uniform-price auction the agent pays the clearing price, not its bid, so cash-binding on `bid_p` is the wrong reference. The gate is a last line of defence: it only fires when expected settlement exceeds the gate's cash buffer. The cash buffer is `operating + treasury_fraction × treasury` by default (`treasury_fraction = 0.5`) — treasury is meant to absorb genuine price spikes, not be a routine bid-sizing buffer. Emergency-loan headroom is also not included by default (`include_loan_headroom = false`); the loan is a settlement-time safety net, and including it would let agents bid into loan territory. When the bid would over-spend cash the gate runs a two-stage protocol (`protect_need_floor=true`, default): (1) shrink `bid_q` toward `need` (compliance floor); (2) if still over-budget, reduce `bid_p` toward `max(reserve, MA3_inflated)`; (3) last-resort, shrink `bid_q` below need. A soft notional cap (`bid_p × bid_q ≤ notional_safety_mult × cash`) clips truly absurd ε-greedy notionals. The `need` floor uses the deterministic `estimate_need` the agent saw at obs time by default — fair to the agent, only clipping on info available at bid time. `shock_aware_need_floor = true` switches to the realised shock (drawn upstream in `step_auction` before the gate runs) which matches what the auction will settle but corrects bids on info the agent did not have. `MA3_inflated = price_ma3 × infl(t)/infl(t-1)` so expected_clearing doesn't lag in inflation regimes. Clip signals are exposed as observation dimensions for gradient feedback.
 - If enabled, under-subscription can cancel the auction; default behavior is to clear partial demand.
 - Unsold volume is configurable: rolled into next year's auction supply (default) or absorbed into the MSR reserve.
 
@@ -284,7 +283,7 @@ Participants can sell from current allocation plus bank (no short selling beyond
 
 ### 6.1 Phase 1 observation
 
-Base dimension: **43**.
+Base dimension: **44**.
 
 Includes:
 - time and cap
@@ -299,13 +298,13 @@ Includes:
 - safety / collateral dims (collateral load last, bid affordability last)
 - emergency-loan state (loan outstanding norm, years under loan norm, last cover ratio, treasury norm)
 - own last secondary buy price (WTP anchor)
-- bid-change-limit / soft-clip dims: PCL headroom, bid-price clip signal, soft-budget price clip
-  signal, qty clip ratio, invest clip ratio (year 0 always unconstrained)
+- bid-change-limit / clip dims: PCL headroom, bid-price clip signal, budget-gate price clip signal, qty clip ratio, invest clip ratio (year 0 always unconstrained)
+- forward-looking compliance affordability: `obs[43] = (estimate_need × expected_clearing) / max(cash, 1)` clipped `[0, 3]` then divided by 3, with `expected_clearing = max(reserve, MA3, anchor)`. 0 ≈ trivially affordable; 0.33 (raw 1.0) = compliance consumes the entire remaining cash; 1.0 (raw 3.0) = compliance unaffordable from cash alone. Replaces purely lagged clip-feedback with a forward-looking budget anchor so agents don't need to learn affordability through repeated clip events.
 
 With opponent modeling enabled:
 
 $$
-obsDimPhase1 = 43 + 7 (N_{total} - 1)
+obsDimPhase1 = 44 + 7 (N_{total} - 1)
 $$
 
 Each opponent contributes a **7D lagged tuple** (year t−1 snapshot, read from `_opponent_snapshots_prev`):
@@ -328,7 +327,7 @@ End of year t step_secondary() saves prev, then writes new current snapshot.
 Year t+1 Phase 1 obs reads updated _opponent_snapshots_prev (year t).
 ```
 
-Default (`N_total=8`): phase 1 dimension = `43 + 7 × 7 = 92`.
+Default (`N_total=8`): phase 1 dimension = `44 + 7 × 7 = 93`.
 
 ### 6.2 Phase 2 observation
 
@@ -350,7 +349,7 @@ $$
 obsDimPhase2 = obsDimPhase1 + 12
 $$
 
-Default (`N_total=8`): phase 2 dimension = `92 + 12 = 104`.
+Default (`N_total=8`): phase 2 dimension = `93 + 12 = 105`.
 
 ## 7. Reward Design
 
@@ -411,37 +410,33 @@ Objective weight structure:
 - Financial agents (`w_cost=1.0`, `w_green=0.0`): optimize pure cost minimization.
 - ESG-balanced agents (`w_cost=0.5`, `w_green=0.5`): trade off cost and ESG signal.
 
-**ESG signal formula** (centred on a linear baseline):
+**ESG signal — saved-carbon hybrid.** The ESG component pays both a stock and a flow term, with a small motion bonus and an asymmetric compliance gate:
 
 $$
-ef\_centered_t = \tfrac{ef_{0} - ef_{t}}{ef_{0}} - \tfrac{t}{n\_years - 1}
+\text{ef\_ratio}_t = \max\!\left(0,\; \tfrac{ef_{0} - ef_{t}}{ef_{0}}\right)
 $$
 
 $$
-esg\_raw_t = esg\_scale \cdot \left(ef\_centered_t + speed\_coef_t \cdot \Delta green_t\right)
+\text{esg\_raw}_t = \text{esg\_scale} \cdot \Big(
+  w_{\text{stock}} \cdot \text{ef\_ratio}_t
+  + w_{\text{flow}} \cdot \text{ef\_ratio}_t \cdot \tfrac{\text{anchor\_real}_t}{\text{anchor\_real}_0}
+  + \text{speed\_coef} \cdot \max(0, \Delta\text{green}_t)
+\Big)
+$$
+
+$$
+\text{esg\_signal}_t = \text{esg\_raw}_t \cdot \text{compliance\_gate}_t \quad\text{(only when esg\_raw} \ge 0\text{)}
 $$
 
 where:
 
-- `ef_ratio = (ef_0 − ef_t) / ef_0` is cumulative emission-factor improvement.
-- The `t / (n_years − 1)` baseline subtracts the linear decarbonization
-  trajectory: a do-nothing agent earns zero-mean ESG signal across the
-  episode; only progress *ahead of* the linear trajectory is rewarded,
-  while progress *behind* it produces a negative signal.
-- `speed_bonus = speed_coef_t × max(0, green_frac − prev_green_frac)` rewards
-  current-year greening. The coefficient interpolates linearly from
-  `esg.speed_coef` at year 0 to `esg.speed_coef_late` at year n_years−1
-  so early decarbonization receives the bigger speed kick.
-- `compliance_gate` is a smooth blend that approaches linear `coverage_frac`
-  above `compliance_gate_blend_threshold` and softens below. It only
-  attenuates non-negative `esg_raw`: a behind-trajectory agent's negative
-  signal is not flipped under low coverage.
-- `esg_anchor_ratio` is retained in `_last_reward_channels` as `1.0` for
-  backward log compatibility but no longer multiplied into `esg_raw`.
-- There is **no** `time_ratio` decay; ESG improvement is equally valuable
-  in early and late years.
-- `esg_signal = esg_raw × compliance_gate` if `esg_raw ≥ 0`, else `esg_raw`.
-- Default `esg_scale = 2.0` is calibrated so that a mid-journey ESG agent (`ef_ratio ≈ 0.5`) contributes roughly equal ESG and financial weight — enabling positive net rewards for fully compliant, well-greened agents without re-introducing revenue.
+- **Stock term** (`stock_weight × ef_ratio`) — pays every year the agent maintains a high green share, so sustained operation of low-EF capacity earns reward (not just the one-off transition events).
+- **Flow term** (`flow_weight × ef_ratio × anchor_real_t / anchor_real_0`) — algebraically equals *(saved Mt this year × anchor_real_t) / (initial baseline emissions × anchor_real_0)*, i.e. avoided carbon valued at the live social shadow price. Rises with cap scarcity (the real anchor goes up over the trajectory) so a green agent earns more in scarcity-heavy years than in early years, matching the social-value perspective.
+- **Speed bonus** (`speed_coef × max(0, Δgreen)`) — small bonus for actual motion this year. `speed_coef` is uniform across the episode by default (no front-loading bias).
+- **Compliance gate** is a smooth blend that approaches linear `coverage_frac` above `compliance_gate_blend_threshold` and softens below. It only attenuates non-negative `esg_raw`; the negative branch is reserved for future subtractive variants.
+- **Time of value is preserved organically**: an early greener earns more total ESG over the remaining years (more years × `ef_ratio` accrual + flow term ramping with the anchor), without any artificial horizon penalty.
+
+The `esg.scale` knob is calibrated so that a balanced agent (`w_cost = w_green = 0.5`) receives roughly equal financial-vs-ESG input across the episode (the default `esg.scale = 0.50` produces ~52 %/48 % ESG/financial on an anchor-tracking rollout). See `docs/esg_reward_design.md` for the empirical balance sweep, per-year trajectory, stress scenarios, and realism vs. real-world ESG-rated utilities.
 
 **Terminal values** in final year:
 
@@ -496,6 +491,34 @@ The two compliance-shaping terms decay with the `shaping_weight` schedule (`rewa
 | `S_composite` | `w_cost × S_fin + w_green × S_grn + 0.3 × S_pen` | Weighted blend |
 
 Scores are logged to year-level CSV as `diag_S_*_Ai` and printed in training console.
+
+**Convergence quality metric.** A separate per-episode anchor-invariant composite score is written to `training_log_*.csv` as `quality_score`, alongside the five components `Q_compliance`, `Q_price_realism`, `Q_saved_carbon`, `Q_cost_eff`, `Q_volatility`:
+
+$$
+Q = 0.30 \cdot Q_{\text{comp}} + 0.25 \cdot Q_{\text{realism}} + 0.25 \cdot Q_{\text{saved}} + 0.10 \cdot Q_{\text{cost}} - 0.10 \cdot Q_{\text{vol}}
+$$
+
+with components computed as:
+
+- `Q_compliance = 1 − non_compliance_rate`
+- `Q_price_realism = 1 − mean(|clearing − anchor| / anchor)` (mean-absolute deviation around the fundamental anchor)
+- `Q_saved_carbon = (Σ saved_Mt × anchor) / (Σ baseline_Mt × anchor)` — saved tonnes monetised at the per-year fundamental anchor (the social shadow price)
+- `Q_cost_eff = 1 − total_real_cost / counterfactual_cost`
+- `Q_volatility = std/mean(clearing / anchor)` — the **anchor ratio** (not nominal clearing): the fundamental anchor encodes both inflation and cap-scarcity, so a trajectory that perfectly tracks the fundamental scores volatility ≈ 0; only unintended dispersion is penalised.
+
+A compact `Q=0.532` is printed to console; the per-component breakdown lives only in the CSV and the analysis notebooks. The metric is computed on the converged tail window only and is **never fed back into training**.
+
+**Compliance attribution (U/D/M/B/C).** Per-agent year-bucket counts written to the training log as `udbc_{U,D,M,B,C}_total_A*`, partitioning the episode's years by why each was compliant or not:
+
+| Bucket | Definition |
+|---|---|
+| `U` | Pure under-bid: `alloc < emiss` AND no inherited carry-forward |
+| `D` | Pure debt-cascade: `alloc ≥ emiss` AND inherited carry-forward |
+| `M` | Mixed: `alloc < emiss` AND inherited carry-forward |
+| `B` | Compliant under stress, covered from own bank |
+| `C` | Compliant under stress, covered via secondary purchase |
+
+Identity: `U + D + M = #non-compliant years`. The buckets disambiguate "the agent failed compliance because it under-bid this year" from "it inherited debt from a previous year and could not catch up", which the binary compliance flag alone hides.
 
 ## 8. Learning System
 

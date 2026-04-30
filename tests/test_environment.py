@@ -530,8 +530,8 @@ def test_burnin_prev_ma3_seeded():
 # ---------------------------------------------------------------------------
 
 def test_p8_obs_dims():
-    """Phase 1 obs should be 43D base (+ 7*(N_total-1) opponent dims) with opponent modeling.
-    43 base dims: 38 prior + 5 clip feedback dims [38]-[42].
+    """Phase 1 obs should be 44D base (+ 7*(N_total-1) opponent dims) with opponent modeling.
+    44 base dims: 38 prior + 5 clip feedback dims [38]-[42] + compliance affordability [43] (v8.5.8).
     N_total = learning + bot agents."""
     env = load_env()
     obs, _ = env.reset()
@@ -539,7 +539,7 @@ def test_p8_obs_dims():
     n_total = n_agents + env.config["companies"].get("n_bot_agents", 0)
     opp_enabled = env.config.get("opponent_modeling", {}).get("enabled", False)
     opp_dims = env.config.get("opponent_obs", {}).get("dims_per_opponent", 7)
-    expected_p1 = 43 + (opp_dims * (n_total - 1) if opp_enabled else 0)
+    expected_p1 = 44 + (opp_dims * (n_total - 1) if opp_enabled else 0)
     expected_p2 = expected_p1 + 12  # +12: alloc, price, compliance_pos, shock, auction_savings, coverage_ratio, carry_forward_norm, collateral_locked_norm, budget_remaining_phase2_norm, compliance_liability_norm, compliance_gap_norm, sec_qty_clip_ratio
     assert obs.shape == (n_agents, expected_p1), (
         f"Phase 1 obs: expected ({n_agents}, {expected_p1}), got {obs.shape}"
@@ -677,6 +677,10 @@ def test_defaulted_volume_not_double_counted_with_unsold_rollover():
     config = copy.deepcopy(config)
     config["companies"]["n_bot_agents"] = 0
     config["auction"]["leverage_multiplier"] = 100.0
+    # v8.5.7: also disable the joint budget gate so 500 EUR/t × 2 Mt bids
+    # actually reach clearing and trigger settlement-time defaults. Otherwise
+    # the joint gate would shrink qty before clearing and no defaults occur.
+    config["auction"]["budget_gate"] = {"enabled": False}
     config["budget"]["annual_budgets"] = [200.0] * 8  # well below price_max × per-agent alloc
     # BCL clips year-0 bids to ≈[ma3-V, ma3+V]; this stress test relies on
     # extreme 500 EUR/t bids to trigger affordability defaults, so disable
