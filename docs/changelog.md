@@ -32,7 +32,7 @@ balance sweep, stress scenarios, and realism notes live in
 `esg_stock_term`, `esg_flow_term`; `esg_anchor_ratio` now reflects
 `anchor_real_t / anchor_real_0` (was a 1.0 placeholder).
 
-**Joint budget gate — two-stage, loan- and shock-aware.** Bid quantity
+**Joint budget gate — two-stage, last-line-of-defence.** Bid quantity
 is sized against EXPECTED settlement cost (uniform clearing × alloc +
 collateral), not bid_p × bid_q, so a high willingness-to-pay does not
 artificially shrink qty in expectation. Three-stage protocol when the
@@ -44,14 +44,18 @@ expected settlement exceeds available cash:
    loses the auction in expectation.
 3. Last resort: shrink `bid_q` below need.
 
-Cash buffer includes operating budget + treasury + emergency-loan
-headroom (matches the post-clearing settlement waterfall). Need floor
-incorporates the realised emission shock for the current year, so a
-positive shock cannot trigger a qty cut below the actual obligation.
-`MA3_inflated = price_ma3 × infl(t)/infl(t-1)` so expected_clearing
-doesn't lag in inflation regimes. Knobs: `auction.budget_gate.{enabled,
-safety_mult, notional_safety_mult, protect_need_floor,
-inflation_aware_ma3}`. Setting `protect_need_floor = false` collapses
+The gate's cash buffer is **operating + treasury** by default. Emergency-
+loan headroom is opt-in (`include_loan_headroom=false`): the loan is a
+settlement-time safety net, not a sizing buffer, so by default the gate
+does not let agents routinely bid into loan territory. The `need` floor
+uses the realised emission shock for the current year (drawn upstream
+in `step_auction` before the gate runs, so the env knows it — agents
+did not have this info at bid-time); set `shock_aware_need_floor=false`
+for the pre-shock estimate. `MA3_inflated = price_ma3 × infl(t)/infl(t-1)`
+so expected_clearing doesn't lag in inflation regimes. Knobs:
+`auction.budget_gate.{enabled, safety_mult, notional_safety_mult,
+protect_need_floor, inflation_aware_ma3, include_loan_headroom,
+shock_aware_need_floor}`. Setting `protect_need_floor = false` collapses
 the protocol back to a single qty-shrink stage; the legacy
 `leverage_multiplier` and `budget_price_clip` knobs no longer drive
 bid sizing.

@@ -1496,16 +1496,15 @@ class ETSEnvironment(gym.Env):
         # Joint budget gate.
         # ------------------------------------------------------------------
         # Sizes quantity against EXPECTED settlement cost (uniform clearing
-        # price × alloc + collateral), not against bid_p × bid_q. In a
-        # uniform-price auction every winner pays the same clearing price
-        # (set by the lowest accepted bid), so bid_p only determines whether
-        # the bid wins; what the agent actually pays is the uniform clearing
-        # price.
+        # price × alloc + collateral), not bid_p × bid_q. In a uniform-price
+        # auction every winner pays the same clearing price, so bid_p only
+        # determines whether a bid wins; what the agent actually pays is
+        # the uniform clearing.
         #
-        # The gate fires only when expected settlement + collateral exceed
-        # the agent's available cash (operating + treasury + loan headroom).
-        # obs[40] (price clip delta) and obs[41] (qty clip ratio) feedback
-        # is preserved so policies can learn to avoid the gate.
+        # Role: last line of defence against insolvent settlement. The gate
+        # only fires when expected settlement + collateral exceed the
+        # agent's *ordinary* cash. obs[40] / obs[41] expose the clip
+        # signals so policies can learn to size bids inside the gate.
         #
         # Two-stage overbudget protocol:
         #   Step A1: shrink bid_q toward `need` (compliance floor) — never
@@ -1513,40 +1512,45 @@ class ETSEnvironment(gym.Env):
         #   Step A2: if still overbudget, reduce bid_p toward
         #            max(reserve, MA3_inflated). Below that, lowering price
         #            only loses the auction in expectation.
-        #   Step A3: if still overbudget, fall back to shrinking bid_q below
-        #            need (last resort, for the genuinely-insolvent case).
-        # The `protect_need_floor` knob, when false, collapses the protocol
-        # back to a single qty-shrink stage.
-        #
-        # `need` here uses the realised emission shock for the current year
-        # (already drawn in step 4 of step_auction): the gate floors at the
-        # actual obligation if the shock has been revealed, so a positive
-        # shock can't push the gate to clip the agent below compliance.
+        #   Step A3: last-resort shrink bid_q below need (genuine insolvency).
+        # `protect_need_floor=false` collapses the protocol to a single
+        # qty-shrink stage.
         bg_cfg = aq_cfg.get("budget_gate", {})
         bg_enabled = bool(bg_cfg.get("enabled", True))
         bg_safety = max(1.0, float(bg_cfg.get("safety_mult", 1.2)))
         bg_notional_safety = max(1.0, float(bg_cfg.get("notional_safety_mult", 5.0)))
         bg_protect_need = bool(bg_cfg.get("protect_need_floor", True))
 
-        # Loan headroom: the post-clearing settlement waterfall draws on
-        # operating → treasury → emergency loan (up to max_loan_fraction ×
-        # annual_budget). If the gate ignores this third bucket it
-        # under-bids relative to the actual settlement capacity, which
-        # double-clamps already-clipped agents and silently widens the
-        # compliance gap. Including it here matches the gate's expected
-        # cost to what the auction will actually settle for.
+        # Loan headroom inclusion is OFF by default. The emergency loan is
+        # an end-of-year safety net at settlement, not a sizing buffer:
+        # including it here would let the gate authorise every agent to
+        # bid up to (operating + treasury + loan), driving routine loan
+        # usage. Set `include_loan_headroom: true` only if you want the
+        # gate to align with the post-clearing settlement waterfall (in
+        # which case loans become an ordinary tool, not an emergency).
+        bg_include_loan = bool(bg_cfg.get("include_loan_headroom", False))
         loan_cfg_gate = self.config.get("budget", {}).get("emergency_loan", {})
         gate_loan_enabled = bool(loan_cfg_gate.get("enabled", False))
         gate_max_loan_frac = (float(loan_cfg_gate.get("max_loan_fraction", 0.0))
-                              if gate_loan_enabled else 0.0)
+                              if (gate_loan_enabled and bg_include_loan) else 0.0)
+
+        # Shock-aware need floor: when true (default), the `need` floor in
+        # step A1 uses the realised emission shock for the current year
+        # (drawn upstream in step 4 of step_auction, before the gate runs).
+        # This is information the agent did NOT have when forming its bid,
+        # but it matches what the auction will actually settle: the gate
+        # therefore won't clip qty below the actual obligation in
+        # positive-shock years. Set to false to use the deterministic
+        # `estimate_need` floor instead (pre-shock, what the agent saw).
+        bg_shock_aware = bool(bg_cfg.get("shock_aware_need_floor", True))
 
         self._last_budget_price_clip[:] = 0.0
         if bg_enabled:
             for i, company in enumerate(self.companies):
                 if not self._is_agent_active(i):
                     continue
-                # Cash buffer: operating + treasury + loan headroom (matches
-                # the post-clearing settlement waterfall in step_auction).
+                # Cash buffer: operating + treasury (+ loan headroom only
+                # if explicitly opted in via include_loan_headroom).
                 op_cash = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
                 loan_headroom = gate_max_loan_frac * max(float(company.annual_budget), 1.0)
                 cash = op_cash + company.get_treasury_available() + loan_headroom
@@ -1555,17 +1559,20 @@ class ETSEnvironment(gym.Env):
                 if bid_p < 1e-6 or bid_q < 1e-6:
                     continue
 
-                # Need floor uses the *realised* obligation (deterministic
-                # need + emission shock + carry-forward) so a positive
-                # shock can't trigger a qty cut below the actual compliance
-                # requirement. epsilons[i] was drawn upstream; falls back
-                # to estimate_needs[i] when the shock channel is disabled.
-                base_need = float(estimate_needs[i])
-                shock_i = float(epsilons[i]) if epsilons.size > i else 0.0
+                # Need floor (Step A1 protection level).
+                # Uses the realised shock when shock_aware_need_floor=true
+                # (default): epsilons[i] is drawn upstream and matches what
+                # the auction will settle. Otherwise falls back to the
+                # deterministic estimate the agent saw at obs time.
                 # estimate_needs already includes carry_forward; only the
                 # emission component is shock-amplified.
-                cf_i = float(getattr(company, "_carry_forward", 0.0))
-                need_i = max(0.0, (base_need - cf_i) * (1.0 + max(0.0, shock_i)) + cf_i)
+                base_need = float(estimate_needs[i])
+                if bg_shock_aware and epsilons.size > i:
+                    shock_i = float(epsilons[i])
+                    cf_i = float(getattr(company, "_carry_forward", 0.0))
+                    need_i = max(0.0, (base_need - cf_i) * (1.0 + max(0.0, shock_i)) + cf_i)
+                else:
+                    need_i = max(0.0, base_need)
 
                 def _cost_per_mt(p):
                     coll = coll_frac * max(0.0, p - effective_reserve) if coll_enabled else 0.0
