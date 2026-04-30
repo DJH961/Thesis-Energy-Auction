@@ -1,10 +1,9 @@
-# ETS MARL — Configuration v8.6.0
+# ETS MARL — Default training configuration.
 # 8 learning agents, HAPPO sequential update, split Phase-1 bid/invest heads.
 
-# Run version banner — printed at the top of training output so the version
-# of every run is visible from stdout. Bump in lockstep with pyproject.toml
-# `version` and the header comment above.
-version: "8.5.6"
+# Run version banner — printed at the top of training output. Bump in
+# lockstep with pyproject.toml `version`.
+version: "8.6.0"
 
 simulation:
   n_years: 12
@@ -108,10 +107,8 @@ investment:
 
 risk:
   p_fail_min: 0.08
-  # v8.5.8: reduced from 0.65 → 0.40 to align with policy-supported industry
-  # FID risk for offshore wind / solar (10-15% with PPA, ~30% under merchant
-  # exposure). 0.65 was punitively high and combined with the experience-
-  # discount loop to produce 10× inter-agent invest variance.
+  # Aligned with policy-supported industry FID risk for offshore wind /
+  # solar (10–15 % with PPA, ~30 % under merchant exposure).
   p_fail_max: 0.40
   p_fail_alpha: 0.7
   experience_discount: 0.10
@@ -140,28 +137,24 @@ auction:
   leverage_multiplier: 3.0
   suspension_length: 0
   budget_price_clip: true
-  # v8.5.7 joint budget gate. Replaces the cascade of leverage / 10%-notional /
-  # budget-price-clip gates. Quantity is sized against EXPECTED settlement cost
-  # (clearing × alloc + collateral) so a high willingness-to-pay (bid_p) does
-  # not artificially shrink qty in expectation. The legacy `leverage_multiplier`
-  # and `budget_price_clip` knobs above are retained for back-compat but no
-  # longer drive bid sizing when budget_gate.enabled=true.
+  # Joint budget gate. Sizes bid quantity against EXPECTED settlement
+  # cost (uniform clearing × alloc + collateral), not bid_p × bid_q, so
+  # a high willingness-to-pay doesn't shrink qty in expectation.
   budget_gate:
     enabled: true
     safety_mult: 1.2          # buffer over expected_clearing for upward surprise
     notional_safety_mult: 5.0 # soft cap on bid_p × bid_q relative to cash
-    # v8.6 two-stage gate. When the bid would over-spend cash:
+    # Two-stage protocol when over-budget:
     #   protect_need_floor=true → first shrink qty toward `need` only
     #     (never below need if originally ≥ need), then if still
-    #     overbudget reduce bid_p toward max(reserve, MA3_inflated),
+    #     over-budget reduce bid_p toward max(reserve, MA3_inflated),
     #     then as last resort shrink qty below need.
-    #   protect_need_floor=false → legacy v8.5.7 single-stage behaviour
-    #     (always shrink qty first, never touch price unless notional cap).
+    #   protect_need_floor=false → single-stage qty-only shrink.
     protect_need_floor: true
     # inflation_aware_ma3=true → scale price_ma3 by infl(t)/infl(t-1)
-    # before taking max(reserve, MA3, anchor). Anchor is already inflation-
-    # aware; without this MA3 lags real expected clearing in a high-
-    # inflation regime and the gate undersizes its cash buffer.
+    # before taking max(reserve, MA3, anchor). Anchor is already
+    # inflation-aware; without this MA3 lags real expected clearing in
+    # high-inflation regimes and the gate undersizes its cash buffer.
     inflation_aware_ma3: true
   carry_forward_defaults: true
 
@@ -179,24 +172,19 @@ secondary:
 
 budget:
   mode: "revenue_based"
-  # v8.5.8: debt_headrooms halved (and rebalanced from coal-heavy bias).
-  # Anchor trajectory is 70 EUR/t (year 1) → 150 EUR/t (year 12); revenue
-  # passthrough makes coal-heavy agents earn far more than greens at high
-  # carbon prices. The previous [475, 305, 125, -25] schedule plus a 1.5×
-  # cap meant coal-heavy agents had 56% more cash than greens in low-price
-  # regimes (cap doesn't bind) AND ~13% more in high-price regimes (cap
-  # binds for both). Halving the schedule preserves the transition-finance
-  # signal but stops over-subsidising fossil incumbents.
+  # Debt headrooms (and bot mirror) are kept moderate so revenue
+  # passthrough doesn't over-subsidise fossil incumbents in high-carbon-
+  # price regimes (coal-heavy agents earn passthrough revenue from every
+  # cleared MWh; an excessive headroom on top would compound that edge).
   debt_headrooms: [240.0, 240.0, 155.0, 155.0, 65.0, 65.0, -25.0, -25.0]
   bot_debt_headrooms: [240.0, 240.0, 155.0, 155.0, 65.0, 65.0, -25.0, -25.0]
   budget_ema_alpha: 0.3
   annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
   bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
-  # v8.5.8: raised from 1.5 → 2.5. With anchor trajectory 70 → 150 EUR/t
-  # (≈2.14×), the prior 1.5× cap discarded ~40% of the high-year carbon-
-  # passthrough revenue, freezing budgets in years 6+ even as the system
-  # value of every Mt rose. 2.5× lets the high-price years actually translate
-  # into investable cash so the green transition is fundable when it matters.
+  # Dynamic budget ceiling — ceiling = multiplier × annual_budgets[i].
+  # Sized so high-anchor years still translate carbon-passthrough revenue
+  # into investable cash; too-low values freeze budgets just as the
+  # transition becomes urgent.
   dynamic_budget_ceiling_multiplier: 2.5
   overspend_penalty_coef: 0.5
   contingency_zone: 0.10
@@ -317,27 +305,20 @@ reward:
   compliance_gate_blend_threshold: 0.90
   compliance_gate_blend_width: 0.30
 
-# ESG (v8.6 saved-carbon hybrid):
-#   esg = w_green × scale × (stock_w × ef_ratio + flow_w × ef_ratio × (anchor_real_t / anchor_real_0)
-#                           + speed_coef × max(0, Δgreen)) × compliance_gate
-# Stock term rewards SUSTAINED green share every year (no front-loading).
-# Flow term monetises avoided carbon at the live anchor — rises with cap
-# scarcity, mirroring the social shadow price of carbon. Removed the prior
-# v8.5 ef_baseline = year/(n_years−1) horizon penalty that punished late
-# investment as if year 12 were the end of civilisation.
-#
-# Calibration (v8.6.1): scale=0.25 was empirically chosen so a balanced
-# [w_cost=0.5, w_green=0.5] agent receives ≈50/50 reward input from the
-# financial channel and ESG over a full episode (tail-window |ESG|/|FIN|
-# ≈ 1.05, i.e. 51 % ESG / 49 % Financial). See docs/changelog.md
-# §[8.6.0] "ESG balance analysis" for the full sweep table.
-# Re-tune `scale` (NOT stock_weight / flow_weight) if the balance drifts.
+# ESG saved-carbon hybrid:
+#   esg = w_green × scale × (stock_w × ef_ratio
+#                          + flow_w × ef_ratio × (anchor_real_t / anchor_real_0)
+#                          + speed_coef × max(0, Δgreen)) × compliance_gate
+# Stock term rewards SUSTAINED green share every year. Flow term monetises
+# avoided carbon at the live anchor — rises with cap scarcity, mirroring
+# the social shadow price of carbon. See docs/esg_reward_design.md for
+# the full design rationale, balance calibration, and stress scenarios.
 esg:
   enabled: true
-  scale: 0.25           # calibrated for 50/50 fin/ESG balance for [0.5, 0.5] agents
+  scale: 0.25           # calibrated for ~50/50 fin/ESG balance for [0.5, 0.5] agents
   stock_weight: 1.0     # weight on ef_ratio "we are green right now"
   flow_weight:  1.5     # weight on ef_ratio × anchor_real_ratio (saved-carbon at live anchor)
-  speed_coef: 0.3       # v8.6: uniform across episode — no front-loading
+  speed_coef: 0.3       # bonus on max(0, Δgreen); uniform across episode (no front-loading)
   speed_coef_late: 0.3  # equal to speed_coef → flat over time
 
 opponent_modeling:

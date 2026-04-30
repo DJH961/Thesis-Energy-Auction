@@ -552,14 +552,11 @@ class Company:
 
         if success:
             self._consecutive_successes += 1
-        # v8.5.8: do NOT reset _consecutive_successes on a single failure.
-        # The previous reset created a positive-feedback loop where lucky
-        # agents (who hit 2 successes in a row early) unlocked the experience
-        # discount permanently, while agents with one early failure had to
-        # restart the streak from zero — driving 10× inter-agent invest
-        # variance from tiny seed-luck differences. The streak now monotonic-
-        # ally accumulates, so accumulated experience is no longer wiped out
-        # by one failed project.
+        # Successes accumulate monotonically; a single failed project does
+        # not wipe out earned experience. Resetting on failure would create
+        # a positive-feedback loop where early lucky agents permanently
+        # unlock the experience discount while early-unlucky ones never do,
+        # producing large inter-agent invest variance from seed luck.
 
         if self._jitter_enabled:
             lam = float(self._jitter_lambdas[tech_idx])
@@ -922,7 +919,7 @@ class Company:
              1.0 = no qty gate fired; <1 = leverage/collateral/budget gate reduced qty
         [42] last_invest_clip_ratio: actual_invest_frac / requested_invest_frac clipped [0,1]
              1.0 = no cap applied; <1 = budget/capex gate reduced investment
-        [43] compliance_affordability: forward-looking budget signal (v8.5.8).
+        [43] compliance_affordability: forward-looking budget signal.
              = (estimate_need × expected_clearing) / max(cash, 1), clipped [0, 3], normalized /3.
              Tells the agent how much of its remaining cash a need-covering bid at the
              expected clearing price would consume. 0 ≈ trivially affordable; 0.33 (raw 1.0)

@@ -982,7 +982,7 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
         "ep_default_count",
         "ep_mean_bid_qty_mult",
         "ep_mean_coal_budget_headroom",
-        # v8.5.8 anchor-invariant quality metric (analysis-only, mirrors notebook §5.8)
+        # Anchor-invariant quality metric (analysis-only, mirrors notebook §5.8)
         "quality_score", "Q_compliance", "Q_price_realism",
         "Q_saved_carbon", "Q_cost_eff", "Q_volatility",
     ]
@@ -995,7 +995,7 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                       f"sec_buy_intent_share_A{i+1}", f"sec_sell_intent_share_A{i+1}",
                       f"inv_onshore_share_A{i+1}", f"inv_offshore_share_A{i+1}",
                       f"inv_solar_share_A{i+1}",
-                      # v8.5.7 compliance attribution buckets (year counts per episode):
+                      # Compliance attribution buckets (year counts per episode):
                       # U=pure-underbid, D=pure-debt-cascade, M=mixed (both),
                       # B=auction-short but compliant via own bank, C=auction-short but compliant via secondary buy.
                       f"udbc_U_total_A{i+1}", f"udbc_D_total_A{i+1}",
@@ -1043,8 +1043,8 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
     # `secondary_price` at the ep level (mirrors the year_log column name).
     ep_fields += ["secondary_price"]
     # U/D/M/B/C compliance attribution buckets are already declared above
-    # (lines 998-1003, v8.5.7 redefinition with M=mixed). No duplicate here.
-    # Split-head losses (v8.5): invest sub-head of the auction policy and the
+    # (in the per-agent loop). No duplicate here.
+    # Split-head losses: invest sub-head of the auction policy and the
     # separate secondary-market head. Populated from latest_losses dicts.
     for i in range(n_agents):
         ep_fields += [f"actor_loss_invest_A{i+1}", f"critic_loss_invest_A{i+1}",
@@ -1313,8 +1313,8 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             obs2, auction_info = env.step_auction(auction_actions)
 
             # Split rewards — compute auction-phase intermediate reward.
-            # v8.5: returns the joint reward plus its decomposition into
-            # bid (compliance + gap) and invest (capital) sub-streams.
+            # Returns the joint reward plus its decomposition into bid
+            # (compliance + gap) and invest (capital) sub-streams.
             r_auction, r_auction_bid, r_auction_invest = env.compute_auction_rewards()
 
             # MAPPO: construct global states for each transition phase
@@ -1553,7 +1553,7 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
         # HAPPO dynamic order: update per-agent EMA of episode total reward.
         # Zero out swapped agents' contributions: their rewards came from
         # historical policies, not the current policies we are about to update.
-        # v8.5: when ``happo_order_metric == "advantage"``, the EMA tracks the
+        # When ``happo_order_metric == "advantage"``, the EMA tracks the
         # per-agent mean GAE advantage before advantage standardization
         # (mean/std), after any per-phase reward normalization/clipping, so
         # the update order is less sensitive to different reward floors across
@@ -1949,7 +1949,7 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
 
         # Per-agent secondary buy/sell breakdown across the episode
         per_agent_sec_stats = []
-        # Per-agent compliance attribution (v8.5.7 redefinition).
+        # Per-agent compliance attribution (U/D/M/B/C buckets).
         #
         # Mutually-exclusive year buckets so the column reads as a clean
         # partition. Each year is classified using:
@@ -2179,8 +2179,8 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
         ep_mean_coal_budget_headroom = float(np.mean(coal_headrooms)) if coal_headrooms else float("nan")
 
         # ──────────────────────────────────────────────────────────────────
-        # v8.5.8 — Convergence Quality Metric (per-episode, written to CSV
-        # and printed in console). Mirrors notebook §5.8 logic. Anchor-
+        # Convergence Quality Metric (per-episode, written to CSV and
+        # printed in console). Mirrors notebook §5.8 logic. Anchor-
         # invariant composite of compliance, price-realism, saved-carbon
         # at anchor, cost efficiency vs counterfactual, and volatility.
         # Analysis-only — never feeds back into training/PPO.
@@ -2283,15 +2283,12 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                 Q_cost_eff = float("nan")
 
             # 5. Volatility penalty (std/mean of clearing/anchor ratio).
-            # v8.6 (revised): use the FUNDAMENTAL ANCHOR as reference, not
-            # just an inflation deflator. The anchor encodes BOTH inflation
-            # and cap-scarcity, so a price trajectory that perfectly tracks
-            # the anchor (e.g., 70 EUR/t in y1 → 150 EUR/t in y12 because
-            # both supply and money are doing what the model expects) has
-            # ratio ≈ 1 every year and therefore volatility ≈ 0. Earlier
-            # logic flagged this as ~8% volatility purely from inflation,
-            # then ~30%+ once cap-scarcity was accounted for too. The anchor
-            # ratio strips both out and only penalises *unintended* dispersion.
+            # The fundamental anchor encodes BOTH inflation and cap-
+            # scarcity, so a price trajectory that perfectly tracks the
+            # anchor has ratio ≈ 1 every year and therefore volatility ≈ 0.
+            # Using the anchor (not nominal clearing) strips out the
+            # baked-in inflation+scarcity trend and only penalises
+            # unintended dispersion around the fundamental.
             ratios = []
             for yl in env.episode_log:
                 yr_idx = int(yl.get("year", 0))
@@ -2359,7 +2356,7 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             "ep_default_count": ep_default_count,
             "ep_mean_bid_qty_mult": round(ep_mean_bid_qty_mult, 4) if not np.isnan(ep_mean_bid_qty_mult) else None,
             "ep_mean_coal_budget_headroom": round(ep_mean_coal_budget_headroom, 2) if not np.isnan(ep_mean_coal_budget_headroom) else None,
-            # v8.5.8 anchor-invariant convergence quality (analysis-only).
+            # Anchor-invariant convergence quality (analysis-only).
             "quality_score":      round(quality_score, 4) if not np.isnan(quality_score) else None,
             "Q_compliance":       round(Q_compliance, 4) if not np.isnan(Q_compliance) else None,
             "Q_price_realism":    round(Q_price_realism, 4) if not np.isnan(Q_price_realism) else None,
@@ -2409,7 +2406,7 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             ep_row[f"inv_onshore_share_A{i+1}"] = round(inv_onshore_share[i], 4)
             ep_row[f"inv_offshore_share_A{i+1}"] = round(inv_offshore_share[i], 4)
             ep_row[f"inv_solar_share_A{i+1}"] = round(inv_solar_share[i], 4)
-            # Compliance attribution (v8.5.7): per-episode bucket counts.
+            # Compliance attribution: per-episode bucket counts.
             # U = pure-underbid this year only; D = pure debt-cascade only;
             # M = mixed (both underbid and inherited debt). U+D+M = #non-compliant years.
             # B/C = compliant-with-stress, bank-covered / sec-covered.
@@ -2494,8 +2491,8 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
         # preserve back-compat with downstream consumers.
         ep_row["secondary_price"] = round(avg_sec_price, 2)
         # U/D/M/B/C compliance attribution buckets are already written above
-        # (lines 2417-2425, v8.5.7 redefinition). No duplicate write here.
-        # Split-head losses (v8.5): invest sub-head of the auction policy and
+        # (in the per-agent loop). No duplicate write here.
+        # Split-head losses: invest sub-head of the auction policy and
         # the separate secondary-market head. The agent's update_happo / update
         # methods return these in the loss dict when split_invest_head is on
         # (and as 0.0 fallbacks otherwise).
@@ -2611,10 +2608,9 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             # ── Control plane ──────────────────────────────────────────
             _q_str = ""
             if not (isinstance(quality_score, float) and np.isnan(quality_score)):
-                # v8.6: top-level only. Per-component breakdown lives in the CSV
-                # (Q_compliance, Q_price_realism, Q_saved_carbon, Q_cost_eff,
-                # Q_volatility) and the analysis notebooks; the console block was
-                # getting too noisy.
+                # Top-level Q only on console. Per-component breakdown lives
+                # in the CSV (Q_compliance, Q_price_realism, Q_saved_carbon,
+                # Q_cost_eff, Q_volatility) and the analysis notebooks.
                 _q_str = f" │ Q={quality_score:.3f}"
             print(f"  Ep {episode:5d} │ {_format_hms(elapsed_s)} elapsed  ETA {_format_hms(eta_s)}"
                   f"  ({avg_ep_s:.2f} s/ep)"
