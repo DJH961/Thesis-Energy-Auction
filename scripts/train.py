@@ -876,6 +876,19 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
         print(f"Epsilon-greedy: {eps_start:.2f} → {eps_final:.2f} "
               f"over {eps_decay_episodes} episodes (physical-space){auto_note}.")
 
+    # Anchor-snap exploration (Tier-3 mitigation for seed-driven price-basin
+    # lock-in): with low probability per episode, save & temporarily snap
+    # each agent's auction price_head.bias to the fundamental anchor for
+    # the duration of the rollout, then restore before the PPO update.
+    anchor_snap_cfg = explore_cfg.get("anchor_snap", {}) or {}
+    anchor_snap_enabled = bool(anchor_snap_cfg.get("enabled", False))
+    anchor_snap_prob = float(anchor_snap_cfg.get("prob_per_episode", 0.0))
+    if anchor_snap_enabled and anchor_snap_prob > 0.0:
+        print(
+            f"Anchor-snap exploration: p={anchor_snap_prob:.3f} per episode "
+            f"(per-agent, episode-scoped, restored before PPO update)."
+        )
+
     # Historical Policy Pool (HPP) — anti-regression safety net
     hpp_cfg = config.get("hpp", {})
     hpp_enabled = hpp_cfg.get("enabled", False)
@@ -1239,6 +1252,17 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                     agents[i].auction_policy.load_state_dict(hist_auc)
                     agents[i].secondary_policy.load_state_dict(hist_sec)
 
+        # Anchor-snap (Tier-3): probabilistic per-agent price-head bias snap
+        # to the fundamental anchor for this episode's rollout. Skipped for
+        # HPP-swapped agents since their actor has already been replaced.
+        anchor_snapped_biases = {}  # agent_idx → saved bias tensor
+        if anchor_snap_enabled and anchor_snap_prob > 0.0:
+            for i in range(n_agents):
+                if i in hpp_swapped:
+                    continue
+                if episode_rng.random() < anchor_snap_prob:
+                    anchor_snapped_biases[i] = agents[i].snap_price_head_to_anchor(year=0)
+
         for year in range(effective_n_years):
             # === PHASE 1: Auction + Investment ===
             auction_actions = np.zeros((n_agents, 6), dtype=np.float32)
@@ -1477,6 +1501,12 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             obs1 = obs1_next
             if terminated:
                 break
+
+        # Anchor-snap restore (must run before HPP restore; HPP-swapped
+        # agents are excluded from anchor_snapped_biases by construction).
+        if anchor_snapped_biases:
+            for i, saved_bias in anchor_snapped_biases.items():
+                agents[i].restore_price_head(saved_bias)
 
         # HPP: restore current policies (swapped agents used historical for rollout only)
         if hpp_swapped:

@@ -5,6 +5,47 @@ and, from v6.1.0 onwards, the `version` field in `pyproject.toml`.
 
 ---
 
+## [8.5.6]
+
+Tier-3 mitigations for seed-driven price-basin lock-in (the bimodal sweep
+behaviour where, e.g., `default s=23` settles into a high-price basin
+(μ ≈ 120 EUR/t, R̄ ≈ −7) while `default s=41` settles into a low-price
+basin (μ ≈ 65 EUR/t, R̄ ≈ −3)). Two narrow changes:
+
+**1. Per-agent RNG for ε-greedy exploration (`PPOAgent`).**
+`select_auction_action` and `select_secondary_action` previously consumed
+ε-greedy randomness from the global `np.random` namespace. With 8 agents
+sampling sequentially each step, this meant agent 0's `np.random.random()
+< ε` gate, agent 1's WTP-anchor uniform draw, agent 2's qty-mult Gaussian,
+etc. were all interleaved on a single shared stream — a hidden coupling
+across agents that made exploration sensitive to the master seed in ways
+that were hard to disentangle from environment seeding. All eight calls
+in those two methods now use `self._rng` (already constructed per-agent
+in `__init__` as `np.random.default_rng(seed + agent_id)`). Existing
+behaviour is preserved when `epsilon == 0`. New regression tests cover
+both phases.
+
+**2. Anchor-snap exploration (`exploration.anchor_snap`).**
+At the start of each episode, with probability `prob_per_episode`, each
+non-HPP-swapped agent's `auction_policy.price_head.bias` is saved and
+overwritten with the fundamental-anchor calibration for the duration of
+the rollout, then restored before the PPO update. Gives a policy that
+has settled into the high-price basin a probabilistic exit toward the
+low (fundamental) basin without permanently overwriting learned weights.
+Default: `enabled: true`, `prob_per_episode: 0.02` (≈1 in 50 episodes
+per agent). Snapped agents' rollout experience is retained — PPO's
+clipped surrogate plus dual-clip handle the resulting mild off-policy
+correction.
+
+Citations: `src/agents/ppo_agent.py` (eight `np.random.* → self._rng.*`
+swaps; new `snap_price_head_to_anchor` / `restore_price_head` methods);
+`scripts/train.py` (anchor-snap config read; per-episode snap/restore
+inside the rollout loop, sequenced before HPP restore);
+`configs/default.yaml` `exploration.anchor_snap` block;
+`tests/test_anchor_snap_and_rng.py` (5 new tests).
+
+---
+
 ## [8.5.5]
 
 Bug-fix / infrastructure release. Pure logging-output change — **no
