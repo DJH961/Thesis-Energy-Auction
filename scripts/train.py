@@ -2250,12 +2250,28 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             else:
                 Q_cost_eff = float("nan")
 
-            # 5. Volatility penalty (std/mean of clearing across the episode)
-            if len(prices_ep) > 1:
-                p_mu = float(np.mean(prices_ep))
-                p_sd = float(np.std(prices_ep))
+            # 5. Volatility penalty (std/mean of clearing/anchor ratio).
+            # v8.6 (revised): use the FUNDAMENTAL ANCHOR as reference, not
+            # just an inflation deflator. The anchor encodes BOTH inflation
+            # and cap-scarcity, so a price trajectory that perfectly tracks
+            # the anchor (e.g., 70 EUR/t in y1 → 150 EUR/t in y12 because
+            # both supply and money are doing what the model expects) has
+            # ratio ≈ 1 every year and therefore volatility ≈ 0. Earlier
+            # logic flagged this as ~8% volatility purely from inflation,
+            # then ~30%+ once cap-scarcity was accounted for too. The anchor
+            # ratio strips both out and only penalises *unintended* dispersion.
+            ratios = []
+            for yl in env.episode_log:
+                yr_idx = int(yl.get("year", 0))
+                cp_nom = float(yl.get("clearing_price", 0.0) or 0.0)
+                anc_nom = float(_anchors_per_year.get(yr_idx, 0.0))
+                if anc_nom > 1e-6 and cp_nom > 1e-6:
+                    ratios.append(cp_nom / anc_nom)
+            if len(ratios) > 1:
+                r_mu = float(np.mean(ratios))
+                r_sd = float(np.std(ratios))
                 Q_volatility = (
-                    float(np.clip(p_sd / p_mu, 0.0, 1.0)) if p_mu > 1e-6 else float("nan")
+                    float(np.clip(r_sd / r_mu, 0.0, 1.0)) if r_mu > 1e-6 else float("nan")
                 )
             else:
                 Q_volatility = float("nan")
@@ -2523,14 +2539,11 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             # ── Control plane ──────────────────────────────────────────
             _q_str = ""
             if not (isinstance(quality_score, float) and np.isnan(quality_score)):
-                # Compact quality readout: composite + each component (cmp/prc/sav/eff/vol)
-                def _qf(x):
-                    return "  -- " if (x is None or (isinstance(x, float) and np.isnan(x))) else f"{x:.2f}"
-                _q_str = (
-                    f" │ Q={quality_score:.3f}"
-                    f" (c{_qf(Q_compliance)}/p{_qf(Q_price_realism)}"
-                    f"/s{_qf(Q_saved_carbon)}/e{_qf(Q_cost_eff)}/v{_qf(Q_volatility)})"
-                )
+                # v8.6: top-level only. Per-component breakdown lives in the CSV
+                # (Q_compliance, Q_price_realism, Q_saved_carbon, Q_cost_eff,
+                # Q_volatility) and the analysis notebooks; the console block was
+                # getting too noisy.
+                _q_str = f" │ Q={quality_score:.3f}"
             print(f"  Ep {episode:5d} │ {_format_hms(elapsed_s)} elapsed  ETA {_format_hms(eta_s)}"
                   f"  ({avg_ep_s:.2f} s/ep)"
                   f" │ ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"

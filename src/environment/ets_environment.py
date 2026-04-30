@@ -1465,8 +1465,24 @@ class ETSEnvironment(gym.Env):
         self._last_effective_reserve = effective_reserve
         price_ma3 = self._compute_price_ma3()
         anchor_for_gate = compute_fundamental_anchor(year, self.config, cap_t_actual=cap_t)
+
+        # v8.6: inflation-aware MA3. MA3 is built from prior-year nominal
+        # clearings, so projecting it to the *current* year requires scaling
+        # by infl(t)/infl(t-1). Without this, in a high-inflation regime the
+        # gate underestimates the clearing price and oversizes bid quantity.
+        # Anchor is already inflation-aware (uses cap & inflation internally).
+        bg_cfg_for_infl = self.config["auction"].get("budget_gate", {})
+        if bool(bg_cfg_for_infl.get("inflation_aware_ma3", True)) and year > 0:
+            infl_t  = float(self._inflation_factor(year))
+            infl_tm = float(self._inflation_factor(year - 1))
+            if infl_tm > 1e-6:
+                price_ma3_inflated = price_ma3 * (infl_t / infl_tm)
+            else:
+                price_ma3_inflated = price_ma3
+        else:
+            price_ma3_inflated = price_ma3
         # Use the highest of the three so we don't underestimate clearing risk.
-        expected_clearing = max(effective_reserve, price_ma3, anchor_for_gate)
+        expected_clearing = max(effective_reserve, price_ma3_inflated, anchor_for_gate)
 
         # Collateral parameters (used both by the joint gate and by the
         # pre-bid collateral lock further down).
@@ -1506,6 +1522,20 @@ class ETSEnvironment(gym.Env):
         bg_enabled = bool(bg_cfg.get("enabled", True))
         bg_safety = max(1.0, float(bg_cfg.get("safety_mult", 1.2)))
         bg_notional_safety = max(1.0, float(bg_cfg.get("notional_safety_mult", 5.0)))
+        # v8.6: two-stage overbudget protocol.
+        # When expected settlement exceeds cash:
+        #   Step A1: shrink bid_q toward `need` (compliance floor) — never
+        #            below need if the agent originally chose to cover need.
+        #   Step A2: if still overbudget, reduce bid_p toward
+        #            max(reserve, MA3_inflated). Never below realistic
+        #            clearing — that would just lose the auction.
+        #   Step A3: if still overbudget, fall back to shrinking bid_q below
+        #            need (last resort). Same behaviour as v8.5.7's single
+        #            stage — preserved for the genuinely-insolvent case.
+        # The compromise (A2) lets the agent stay compliant at a slightly
+        # lower price, which mirrors how a real CFO would respond when the
+        # treasury can't fund the desk's headline price.
+        bg_protect_need = bool(bg_cfg.get("protect_need_floor", True))
 
         self._last_budget_price_clip[:] = 0.0
         if bg_enabled:
@@ -1518,20 +1548,68 @@ class ETSEnvironment(gym.Env):
                 bid_q = float(bid_actions[i, 1])
                 if bid_p < 1e-6 or bid_q < 1e-6:
                     continue
-                # Step A: size quantity so EXPECTED settlement + collateral fit.
-                # cost_per_mt_expected = safety × clearing + collateral(bid_p)/Mt
-                coll_per_mt = coll_frac * max(0.0, bid_p - effective_reserve) if coll_enabled else 0.0
-                cost_per_mt_expected = bg_safety * expected_clearing + coll_per_mt
-                if cost_per_mt_expected > 1e-6:
+
+                need_i = float(estimate_needs[i])
+                # v8.6 two-stage gate. Recompute coll-per-Mt as bid_p changes.
+                def _cost_per_mt(p):
+                    coll = coll_frac * max(0.0, p - effective_reserve) if coll_enabled else 0.0
+                    return bg_safety * expected_clearing + coll
+
+                # Step A1: shrink bid_q toward need (never below need if the
+                # agent originally requested ≥ need; preserve sub-need bids).
+                cost_per_mt_expected = _cost_per_mt(bid_p)
+                if cost_per_mt_expected > 1e-6 and (bid_q * cost_per_mt_expected) > cash:
                     max_q_budget = cash / cost_per_mt_expected
-                    if bid_q > max_q_budget:
+                    if bg_protect_need and bid_q > need_i and need_i > 0.0:
+                        # Floor the qty cut at need (don't push the agent
+                        # below its own compliance ask if it can be helped).
+                        bid_q = max(min(bid_q, max(max_q_budget, need_i)), 0.0)
+                    else:
                         bid_q = max(0.0, max_q_budget)
+                    bid_actions[i, 1] = bid_q
+
+                # Step A2: if still overbudget after qty floor, reduce bid_p
+                # toward the realistic clearing floor (max(reserve, MA3_infl)).
+                # Below that, lowering p doesn't help the agent — it only
+                # loses the auction. So the gate stops there.
+                if bg_protect_need and bid_q > 1e-6:
+                    cost_per_mt_now = _cost_per_mt(bid_p)
+                    if (bid_q * cost_per_mt_now) > cash and coll_enabled and coll_frac > 0.0:
+                        # Solve for max bid_p s.t. bid_q × cost_per_mt(bid_p) = cash.
+                        # cost_per_mt(p) = bg_safety × expected_clearing + coll_frac × max(0, p - reserve)
+                        residual = (cash / bid_q) - bg_safety * expected_clearing
+                        if coll_frac > 1e-9:
+                            max_above_reserve = residual / coll_frac
+                        else:
+                            max_above_reserve = float('inf')
+                        # The price floor for A2 is max(reserve, MA3_inflated)
+                        # — below this we'd just lose the auction in expectation.
+                        price_floor = max(float(effective_reserve), float(price_ma3_inflated))
+                        new_p_target = float(effective_reserve) + max(0.0, max_above_reserve)
+                        new_p = max(price_floor, new_p_target)
+                        new_p = float(np.clip(new_p,
+                                              float(aq_cfg["price_min"]),
+                                              float(aq_cfg["price_max"])))
+                        if new_p < bid_p:
+                            self._last_budget_price_clip[i] = new_p - bid_p  # signed (negative)
+                            bid_actions[i, 0] = new_p
+                            bid_p = new_p
+
+                # Step A3: last-resort qty cut below need. Only fires when
+                # even at the price floor + qty=need the bid still exceeds cash.
+                cost_per_mt_final = _cost_per_mt(bid_p)
+                if cost_per_mt_final > 1e-6 and (bid_q * cost_per_mt_final) > cash:
+                    max_q_final = cash / cost_per_mt_final
+                    if max_q_final < bid_q:
+                        bid_q = max(0.0, max_q_final)
                         bid_actions[i, 1] = bid_q
+
                 # Step B: soft notional safety on bid_p × bid_q. If the agent
                 # bid an absurdly high price (e.g., ε-greedy noise at price_max
                 # with full need-coverage qty), clip bid_p down. This is the
-                # only place bid_p is touched. Anchored on cash so it scales
-                # with budget and only triggers in pathological cases.
+                # only place bid_p is touched when need-floor protection is off,
+                # and it's anchored on cash so it scales with budget and only
+                # triggers in pathological cases.
                 if bid_q > 1e-6:
                     notional_cap = bg_notional_safety * cash
                     notional = bid_p * bid_q
@@ -1540,8 +1618,10 @@ class ETSEnvironment(gym.Env):
                         new_p = float(np.clip(new_p,
                                               float(aq_cfg["price_min"]),
                                               float(aq_cfg["price_max"])))
-                        self._last_budget_price_clip[i] = new_p - bid_p
-                        bid_actions[i, 0] = new_p
+                        # Combine with any A2 clip already recorded.
+                        if new_p < bid_p:
+                            self._last_budget_price_clip[i] += new_p - bid_p
+                            bid_actions[i, 0] = new_p
 
         # Per-agent collateral-budget-share gate. Even with the joint gate
         # the *upfront* collateral lock can still exceed
@@ -2744,6 +2824,13 @@ class ETSEnvironment(gym.Env):
         esg_cfg     = self.config.get("esg", {})
         esg_enabled = esg_cfg.get("enabled", False)
         esg_scale   = float(esg_cfg.get("scale", 2.0))
+        # v8.6 ESG hybrid weights — stock (sustained green share) + flow
+        # (saved-carbon at live anchor). Defaults preserve roughly the v8.5.x
+        # magnitude with esg.scale=1.0; if scale is left at the legacy 2.0 the
+        # signal is ~2× stronger so users explicitly see they're on the new
+        # formula.
+        _esg_stock_w = float(esg_cfg.get("stock_weight", 1.0))
+        _esg_flow_w  = float(esg_cfg.get("flow_weight",  1.5))
         _speed_early = float(esg_cfg.get("speed_coef", 0.5))
         _speed_late  = float(esg_cfg.get("speed_coef_late", _speed_early))
         _year_frac   = self.current_year / max(self.n_years - 1, 1)
@@ -2768,6 +2855,12 @@ class ETSEnvironment(gym.Env):
         next_year       = min(self.current_year + 1, self.n_years - 1)
         cap_t_next      = float(self.cap_schedule.get_cap(next_year))
         anchor_next_nom = compute_fundamental_anchor(next_year, self.config, cap_t_actual=cap_t_next)
+        # Year-0 anchor (real terms) — denominator for the ESG flow term.
+        # infl(0) == 1.0 by construction so anchor_0_nom == anchor_0_real.
+        anchor_0_real   = max(
+            compute_fundamental_anchor(0, self.config, cap_t_actual=cap_0),
+            1.0,
+        )
 
         # Banking timing signal config (read once outside agent loop)
         banking_cfg     = reward_cfg.get("banking_signal", {})
@@ -2912,11 +3005,13 @@ class ETSEnvironment(gym.Env):
             penalty_prospective = remediation_cost
             shortfall = shortfall_realized
 
-            # ESG: no time decay, budget_real anchor
+            # ESG: v8.6 saved-carbon hybrid — stock + flow + tiny motion bonus.
             esg_signal       = 0.0
             esg_anchor_ratio = 0.0
             gate_activation  = 1.0
             compliance_gate  = 1.0
+            esg_stock_term   = 0.0
+            esg_flow_term    = 0.0
 
             if esg_enabled and company.initial_ef > 1e-6:
                 ef_ratio    = max(0.0,
@@ -2925,16 +3020,50 @@ class ETSEnvironment(gym.Env):
                 green_delta = max(0.0, company.green_frac - company.prev_green_frac)
                 speed_bonus = esg_speed_coef * green_delta
 
-                # Centered ESG: subtract a linear `year/n_years` baseline so a
-                # do-nothing agent receives zero-mean signal and an
-                # ahead-of-trajectory agent receives a positive one. This
-                # eliminates the positive-floor that previously biased HAPPO
-                # ordering against agents with `w_green > 0`.
-                ef_baseline = float(self.current_year) / max(float(self.n_years - 1), 1.0)
-                ef_baseline = float(np.clip(ef_baseline, 0.0, 1.0))
-                ef_centered = ef_ratio - ef_baseline
-                esg_raw = esg_scale * (ef_centered + speed_bonus)
-                esg_anchor_ratio = 1.0  # retained as a logged channel only
+                # v8.6 saved-carbon hybrid:
+                #   stock_term = ef_ratio
+                #     "we are green right now" — pays every year the agent
+                #     maintains a high green share. Stops the front-load-
+                #     then-stop pattern (current behaviour: agents invest
+                #     years 1-3 then never again because only Δgreen pays).
+                #   flow_term  = ef_ratio × (anchor_real_t / anchor_real_0)
+                #     algebraically equals
+                #     (saved_Mt_this_year × anchor_real_t) /
+                #     (initial_baseline_emiss × anchor_real_0),
+                #     i.e. avoided carbon valued at the live social shadow
+                #     price, normalised by the per-agent year-0 carbon
+                #     liability. Rises with cap scarcity (real anchor goes
+                #     up over the trajectory) so a green company earns more
+                #     in years 6-12 than in year 1, exactly matching the
+                #     social-value perspective.
+                #   speed_bonus = speed_coef × max(0, Δgreen)
+                #     small bonus for actual motion this year (positive
+                #     reinforcement of investment events). Default
+                #     speed_coef is uniform across the episode (no
+                #     front-loading; addresses the "agents only invest in
+                #     years 1-3" complaint).
+                #
+                # NOTE on the prior "ef_baseline = year / (n_years - 1)"
+                # subtraction (REMOVED in v8.6): that linear ramp encoded
+                # an artificial horizon. A year-11 agent with ef_ratio=0.5
+                # received esg_centered = 0.5 - 11/11 = -0.5 — a STRONG
+                # negative signal for late investment, equivalent to
+                # "the world ends at year 12 so investment after year 6 is
+                # net-negative". User feedback: late investment is bad
+                # because of TVM, not because there's no future. The new
+                # form preserves TVM (more years of stock × flow accrual
+                # for earlier investment) without the horizon penalty.
+                esg_anchor_ratio_local = anchor_t / max(infl, 1e-6) / anchor_0_real
+                esg_stock_term = ef_ratio
+                esg_flow_term  = ef_ratio * esg_anchor_ratio_local
+                esg_raw        = esg_scale * (
+                    _esg_stock_w * esg_stock_term
+                    + _esg_flow_w  * esg_flow_term
+                    + speed_bonus
+                )
+                # Logged channel — now reflects real semantics (anchor real
+                # premium relative to year-0 anchor real), not a placeholder 1.0.
+                esg_anchor_ratio = float(esg_anchor_ratio_local)
 
                 annual_need_i = max(company.compute_estimate_need(), 1e-6)
                 if precompliance_holdings is not None:
@@ -2946,8 +3075,11 @@ class ETSEnvironment(gym.Env):
                 gate_blend      = max(0.0, min(1.0, (gate_blend_threshold - coverage_frac) / gate_blend_width))
                 compliance_gate = coverage_frac ** (1.0 + gate_blend)
                 gate_activation = float(1.0 + gate_blend)
-                # Gate only attenuates positive ESG; do not flip the sign of a
-                # negative (behind-trajectory) signal under low coverage.
+                # Gate only attenuates positive ESG (compliance comes first
+                # per direction). v8.6 raw ESG is monotonically ≥ 0 (no
+                # subtractive baseline), so the negative-branch is now
+                # effectively unreachable; kept defensively for future
+                # config knobs that might reintroduce subtractive terms.
                 if esg_raw >= 0.0:
                     esg_signal = esg_raw * compliance_gate
                 else:
@@ -3034,7 +3166,9 @@ class ETSEnvironment(gym.Env):
                 "remediation_cost":     float(remediation_cost),
                 "scarcity_amp":         float(scarcity_amp),
                 "esg_signal":           float(esg_signal),
-                "esg_anchor_ratio":     float(esg_anchor_ratio),     # always 1.0 (logged channel only)
+                "esg_anchor_ratio":     float(esg_anchor_ratio),     # v8.6: anchor_real_t / anchor_real_0
+                "esg_stock_term":       float(esg_stock_term),       # v8.6: ef_ratio
+                "esg_flow_term":        float(esg_flow_term),        # v8.6: ef_ratio × anchor_ratio
                 "base_reward":          float(base_reward),
                 "opp_cost_shaping":     float(opp_cost_shaping),
                 "coverage_gap_shaping": float(coverage_gap_shaping),
