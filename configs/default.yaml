@@ -326,10 +326,11 @@ reward:
 # v8.5 ef_baseline = year/(n_years−1) horizon penalty that punished late
 # investment as if year 12 were the end of civilisation.
 #
-# Calibration (v8.6.1): scale=1.3 was empirically chosen so a balanced
+# Calibration (v8.6.1): scale=0.25 was empirically chosen so a balanced
 # [w_cost=0.5, w_green=0.5] agent receives ≈50/50 reward input from the
-# financial channel and ESG over a full episode (tail-mean ratio ≈ 0.95).
-# See docs/changelog.md §[8.6.0] "ESG balance analysis" for the trace.
+# financial channel and ESG over a full episode (tail-window |ESG|/|FIN|
+# ≈ 1.05, i.e. 51 % ESG / 49 % Financial). See docs/changelog.md
+# §[8.6.0] "ESG balance analysis" for the full sweep table.
 # Re-tune `scale` (NOT stock_weight / flow_weight) if the balance drifts.
 esg:
   enabled: true

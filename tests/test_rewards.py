@@ -1731,7 +1731,7 @@ def test_joint_gate_inflation_aware_ma3():
 def test_esg_balance_with_financial_50_50():
     """v8.6.1: For balanced [w_cost=0.5, w_green=0.5] agents, the ESG and
     financial channels should each contribute ~50% of the absolute reward
-    signal (per user direction in PR #N).
+    signal (per user direction in the v8.6.0 PR follow-up review).
 
     The test runs a deterministic compliant rollout (anchor-priced bids,
     moderate green investment) and checks that |Σ w_g·esg| / (|fin| + |esg|)
