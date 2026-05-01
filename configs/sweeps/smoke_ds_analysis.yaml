@@ -1,0 +1,37 @@
+# =============================================================================
+# Smoke sweep — exercises the data-science analysis notebook end-to-end.
+# =============================================================================
+# Tiny 100-episode runs (smoke_100 base) covering two variants and two seeds.
+# Used by `notebooks/ets_marl - Data Science Analysis.ipynb` as a self-contained
+# smoke dataset; never intended for thesis figures.
+#
+# Run with:
+#     python scripts/sweep.py --spec configs/sweeps/smoke_ds_analysis.yaml
+# =============================================================================
+
+base_config: configs/smoke_100.yaml
+output_dir: results/sweeps/smoke_ds_analysis
+
+seeds: [42, 123]
+
+parallel_workers: 4
+threads_per_worker: null
+
+variants:
+  # Default smoke run — mixed reward weights as in the base config.
+  - name: default
+
+  # All-financial reward weighting: every learning agent uses [w_cost=1, w_green=0].
+  # Used by S2 to test whether removing the ESG component collapses the
+  # strategy space relative to the default mix.
+  - name: all_financial
+    overrides:
+      companies.reward_weights:
+        - [1.0, 0.0]
+        - [1.0, 0.0]
+        - [1.0, 0.0]
+        - [1.0, 0.0]
+        - [1.0, 0.0]
+        - [1.0, 0.0]
+        - [1.0, 0.0]
+        - [1.0, 0.0]
