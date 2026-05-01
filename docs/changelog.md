@@ -67,6 +67,14 @@ straight off the episode log:
   outstanding-loan balance, and a per-agent coverage-gap × penalty-rate
   table. Every column access uses `if col in df.columns`, so the cell
   silently no-ops on logs from older versions.
+* **`Default RQ Analysis.ipynb`** — new **RQ4** block (RQ4.1–4.4)
+  covering coverage-gap & carry-forward trajectory, auction concentration
+  (HHI / max-share / unsold), secondary-market intent-vs-execution, and
+  converged-window credit-stress (peak loan, peak carry-forward) by
+  archetype × reward-weighting.
+* **`Sweep Analysis.ipynb`** — new section §5.9 cross-variant comparison
+  on the v8.6.1 columns (HHI, max-agent-share, unsold, system peak loan,
+  system peak carry-forward), bar-charted with cross-seed std bars.
 * **`Data Science Analysis.ipynb`** — `EPISODE_FEATURES` and
   `YEAR_FEATURES` lists (consumed by `build_strategy_features`) extended
   with the new columns. The aggregator's existing `if col in df.columns`
