@@ -12,3 +12,4 @@ scikit-learn>=1.4
 scipy>=1.11
 seaborn>=0.13.2
 torch==2.2.2
+tqdm>=4.66

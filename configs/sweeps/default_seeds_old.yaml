@@ -15,14 +15,7 @@
 base_config: configs/default.yaml
 output_dir: results/sweeps
 
-# Four seeds chosen to be unrelated — no powers of two, no anniversaries,
-# no single-digit favourites. Pairwise coprime, all mathematically
-# distinguished:
-#   1729 = 7·13·19   (Hardy–Ramanujan / smallest taxicab number)
-#   8191              (Mersenne prime M_13 = 2^13 − 1)
-#   6561 = 3^8        (pure power of three)
-#   5041 = 71² = 7!+1 (Brocard's problem pair)
-seeds: [1729, 8191, 6561, 5041]
+seeds: [738, 219, 581, 904]
 
 parallel_workers: 4
 threads_per_worker: null
