@@ -15,10 +15,8 @@ study how the regulatory mechanisms of the EU ETS shape company
 behaviour, and how individual strategies aggregate into market-level
 outcomes.
 
-Detailed design notes, config schemas, reward derivations, data
-dictionaries, and analysis plans live under [`docs/`](docs/). This
-README is the entry point and intentionally short — it points at the
-right doc for each follow-up question.
+Detailed design notes, config schemas, reward derivations, and data
+dictionaries live under [`docs/`](docs/).
 
 ---
 
@@ -47,11 +45,10 @@ framing — including which notebook addresses which RQ — lives in
 > strategies of power companies in this market, and how do these
 > individual strategies aggregate into market-level outcomes?
 
-The default-config analysis notebook
-(`notebooks/ets_marl - Default RQ Analysis.ipynb`) addresses RQ1 in
-full, RQ2 *descriptively* within a single config, and RQ3 in full.
-Cross-config sensitivity (true RQ2) is deferred to a separate
-experiments notebook driven by the sweep specs in `configs/sweeps/`.
+Notebook coverage and the mapping from each RQ to the analysis it draws
+on are tracked in [`docs/research_questions.md`](docs/research_questions.md);
+cross-config sensitivity (true RQ2) is driven by the sweep specs in
+`configs/sweeps/`.
 
 ---
 
@@ -189,27 +186,21 @@ unique when collected into a single folder. See
 
 ---
 
-## Documentation Index
+## Documentation
 
-| Doc | What's in it |
-|---|---|
-| [`docs/design.md`](docs/design.md) | Environment & algorithm design (cap / MSR / auction / secondary / budgets / loans / phantom bidder / treasury / …) |
-| [`docs/research_questions.md`](docs/research_questions.md) | Full RQ framing and notebook → RQ mapping |
-| [`docs/reward_function.md`](docs/reward_function.md) | Reward components, normalisation, shaping, terminal values |
-| [`docs/esg_reward_design.md`](docs/esg_reward_design.md) | ESG signal derivation, balance calibration, stress scenarios |
-| [`docs/action_space.md`](docs/action_space.md) | Phase-1 / Phase-2 action vector definition |
-| [`docs/config_dictionary.md`](docs/config_dictionary.md) | Every config knob, default, and effect |
-| [`docs/data_dictionary.md`](docs/data_dictionary.md) | Schema of training_log_*.csv, year_log_*.csv, checkpoint files |
-| [`docs/data_science_analysis_plan.md`](docs/data_science_analysis_plan.md) | Track-A / Track-B analysis plan with curriculum mapping |
-| [`docs/changelog.md`](docs/changelog.md) | Release notes and version history |
-| [`docs/PROJECT_SCALE_AND_STATS.md`](docs/PROJECT_SCALE_AND_STATS.md) | Code-base scale, run sizes, runtime profile |
-| [`docs/BUGS_AND_ISSUES.md`](docs/BUGS_AND_ISSUES.md) | Known issues |
+The [`docs/`](docs/) directory holds the thesis-supporting reference
+material — environment and algorithm design, reward derivations, the
+config dictionary, the data dictionary for the training-log / year-log
+CSVs, ESG calibration notes, the changelog, and additional thesis
+write-ups. Start with [`docs/design.md`](docs/design.md) for
+environment and algorithm design,
+[`docs/research_questions.md`](docs/research_questions.md) for the RQ
+framing, and [`docs/config_dictionary.md`](docs/config_dictionary.md)
+for every config knob and its effect.
 
-The `notebooks/` directory ships analysis notebooks that consume the
-training-log / year-log CSVs documented in `docs/data_dictionary.md`.
-`ets_marl - Default RQ Analysis.ipynb` is the thesis-RQ notebook for
-the default config; `ets_marl - Sweep Analysis.ipynb` and `ets_marl -
-Full Run & Analysis.ipynb` are the operational diagnostics notebooks.
+The `notebooks/` directory contains analysis notebooks that consume the
+training-log / year-log CSVs documented in `docs/data_dictionary.md`
+(operational diagnostics, sweep analysis, and per-RQ thesis notebooks).
 
 ---
 

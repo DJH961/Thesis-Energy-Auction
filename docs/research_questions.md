@@ -2,7 +2,7 @@
 
 The questions below frame the thesis. They are reproduced verbatim in the
 top-level `README.md`; this document keeps them alongside the other
-methodological notes (`data_dictionary.md`, `data_science_analysis_plan.md`,
+methodological notes (`data_dictionary.md`, `planning/data_science_analysis_plan.md`,
 `reward_function.md`) and points the reader at the artefacts that address
 each one.
 
@@ -38,7 +38,7 @@ warning regimes dominating the converged window).
 |---|---|
 | Default-config training dynamics & seed stability | `notebooks/ets_marl - Default RQ Analysis.ipynb`, §RQ1 |
 | Per-seed deep dives (single-run sanity) | `notebooks/ets_marl - Full Run & Analysis.ipynb` |
-| Methodology mapping (PELT, plateau detection, fan charts) | `docs/data_science_analysis_plan.md` §A1, §A2, §A3 |
+| Methodology mapping (PELT, plateau detection, fan charts) | `planning/data_science_analysis_plan.md` §A1, §A2, §A3 |
 
 ---
 
@@ -61,7 +61,7 @@ default-only analysis).
 |---|---|
 | Within-default regulatory behaviour (descriptive baseline) | `notebooks/ets_marl - Default RQ Analysis.ipynb`, §RQ2 |
 | Cross-variant sensitivity (LRF / MSR / penalty sweeps) | *experiments notebook — TBD*; sweep configs under `configs/sweeps/` |
-| Methodology mapping (descriptive comparison + RF/GBM variant classification) | `docs/data_science_analysis_plan.md` §B3, §B5 |
+| Methodology mapping (descriptive comparison + RF/GBM variant classification) | `planning/data_science_analysis_plan.md` §B3, §B5 |
 
 ---
 
@@ -81,7 +81,7 @@ financial-vs-environmental contrast directly inside one config.
 | Where it is addressed | Artefact |
 |---|---|
 | Per-archetype bidding, investment, secondary-market role, UDBC pathway, reward decomposition | `notebooks/ets_marl - Default RQ Analysis.ipynb`, §RQ3 |
-| Strategy clustering & theory tests (LCOE crossover, archetype heterogeneity) | `docs/data_science_analysis_plan.md` §B1, §B4 |
+| Strategy clustering & theory tests (LCOE crossover, archetype heterogeneity) | `planning/data_science_analysis_plan.md` §B1, §B4 |
 
 ---
 
