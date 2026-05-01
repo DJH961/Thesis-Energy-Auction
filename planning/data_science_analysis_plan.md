@@ -72,7 +72,7 @@ We have two specific predictions from theory in Ch. 3 plus one credibility check
 
 **H2 (heterogeneity).** "High-fossil agents transition faster." Label = 1 if agent invested meaningfully in green by year 6. Features: archetype dummies, initial mix vector, mean clearing price the agent saw. Same model setup. Coefficient sign on archetype dummies is the test.
 
-**Anchor check (mini, embedded here).** Does the converged-window mean clearing price track the fundamental anchor we computed in `src/utils/price_anchor.py`? Plot the two trajectories together over years 0–11 and report the correlation coefficient and mean absolute deviation. This is one figure and two numbers, not a full predictive model — that's the right scope. If they align, the simulation is producing economically grounded prices, which feeds RQ1 too (cross-referenced in C1/C2 as a credibility signal).
+**Anchor check (mini, embedded here).** Does the converged-window mean clearing price track the fundamental anchor we computed in `src/utils/price_anchor.py`? Plot the two trajectories together over years `0..(n_years-1)` (default 0–11 in this repo) and report the correlation coefficient and mean absolute deviation. This is one figure and two numbers, not a full predictive model — that's the right scope. If they align, the simulation is producing economically grounded prices, which feeds RQ1 too (cross-referenced in C1/C2 as a credibility signal).
 
 **Thesis output.** One table summarising H1 and H2 (estimate, sign, evaluation metric), one partial-dependence plot for H1, one anchor-vs-realised figure. Section in Ch. 7.3.
 
@@ -124,7 +124,7 @@ These are short — they open Ch. 7 and establish that the rest of the analyses 
 - **Rolling-mean plateau check** (Lecture 2) — first episode where the rolling mean stays inside a tolerance band for K consecutive windows.
 - **PELT change-point detection** (specialized, `ruptures` library) — objective change-point.
 
-Use both, report the convergence episode where they agree. The PELT result is what we use as the cutoff for everything in §2 and §3.
+Use both, report the convergence episode where they agree. If they disagree, use the later cutoff as the conservative boundary and flag the run as detector-discordant in the methods notes. The resulting cutoff is what we use for everything in §2 and §3.
 
 **Thesis output.** Two figures (reward and price trajectories with marked convergence point) and a short paragraph. Maybe 1.5 pages in Ch. 7.1.
 
@@ -133,7 +133,7 @@ Use both, report the convergence episode where they agree. The PELT result is wh
 ### C2. Reproducibility across seeds
 **Supports claim RQ1.b.**
 
-**Method.** For ~6 headline metrics, compute mean ± std across seeds within episode bins. Fan charts (median + ± 1 std band). For the converged window, a small table of (metric, mean across seeds, std across seeds). Lecture-2-style EDA on the seed dimension.
+**Method.** For six headline metrics (`quality_score`, `ep_mean_clearing_price`, `clearing_price_last`, mean `green_frac_A{i}`, mean `penalty_A{i}`, `secondary_volume`), compute mean ± std across seeds within episode bins. Fan charts (median + ± 1 std band). For the converged window, a small table of (metric, mean across seeds, std across seeds). Lecture-2-style EDA on the seed dimension.
 
 This also serves as the validity floor for R1: if cross-seed std on the default config is comparable to cross-variant differences, we have to caveat R1 heavily. Reporting both side-by-side is the honest move.
 
