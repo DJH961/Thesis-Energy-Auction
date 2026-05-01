@@ -369,8 +369,21 @@ def test_year_log_keys():
                 "allocations", "penalties", "rewards", "green_fracs",
                 "tech_mixes", "holdings", "invest_costs",
                 "bank_start", "shortfalls", "delta_greens", "queue_sizes", "bid_prices",
-                "emission_shocks", "cf_shocks", "cancellations"]:  # P5/P6
+                "emission_shocks", "cf_shocks", "cancellations",  # P5/P6
+                # v8.6.1 expanded logging
+                "old_carry_forward", "new_carry_forward", "coverage_gaps",
+                "effective_penalty_rates", "common_emission_shock",
+                "secondary_n_buyers_intent", "secondary_n_sellers_intent",
+                "secondary_n_buyers_executed", "secondary_n_sellers_executed",
+                "treasury_reserves", "treasury_drawn", "loan_outstanding",
+                "auction_stats", "effective_reserve", "anchor_t"]:
         assert key in log, f"Missing key in year_log: {key}"
+
+    # auction_stats sub-dict scalars used by the year-level CSV.
+    astats = log["auction_stats"]
+    for k in ("total_demand", "unsold", "hhi", "max_agent_share_actual",
+             "auction_failed", "defaults", "defaulted_volume"):
+        assert k in astats, f"Missing key in auction_stats: {k}"
 
 
 # ---------------------------------------------------------------------------

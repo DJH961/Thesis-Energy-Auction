@@ -1166,6 +1166,19 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
     for i in range(n_agents):
         ep_fields += [f"actor_loss_invest_A{i+1}", f"critic_loss_invest_A{i+1}",
                       f"actor_loss_secondary_A{i+1}", f"critic_loss_secondary_A{i+1}"]
+    # Episode-level totals derived from year-level series. Useful for sweep
+    # comparisons without rolling up the year_log every time.
+    ep_fields += [
+        "year0_tnac",            # TNAC at end of year 0
+        "yearT_tnac",            # TNAC at end of final year
+        "ep_total_unsold",       # Sum of auction_unsold across the episode (Mt)
+        "ep_auction_failures",   # # of years auction_failed=true
+        "ep_total_defaults",     # # of (agent, year) settlement defaults this episode
+    ]
+    for i in range(n_total_agents):
+        ep_fields += [f"peak_loan_outstanding_A{i+1}",      # max emergency-loan balance during episode (M€)
+                      f"peak_carry_forward_A{i+1}",         # max debt-cascade balance during episode (Mt)
+                      f"final_treasury_reserve_A{i+1}"]     # year-T treasury balance (M€)
     ep_csv = open(ep_path, "w", newline="")
     ep_writer = csv.DictWriter(ep_csv, fieldnames=ep_fields)
     ep_writer.writeheader()
@@ -1177,7 +1190,18 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                  "msr_total_cancelled", "msr_withhold_this_year", "msr_release_this_year",
                  "inflation_rate", "inflation_factor",
                  "phantom_bid_price", "phantom_bid_qty", "phantom_active",
-                 "marginal_ef_used"]
+                 "marginal_ef_used",
+                 # Auction-internals scalars (flattened from auction_stats); useful
+                 # for diagnosing supply/demand imbalances and bid concentration.
+                 "auction_total_demand", "auction_unsold", "auction_hhi",
+                 "auction_max_agent_share", "auction_failed",
+                 "auction_defaults", "auction_defaulted_volume",
+                 "effective_reserve_price",
+                 # Secondary-market participation counts.
+                 "secondary_n_buyers_intent", "secondary_n_sellers_intent",
+                 "secondary_n_buyers_executed", "secondary_n_sellers_executed",
+                 # System-wide common emission shock & fundamental anchor.
+                 "common_emission_shock", "fundamental_anchor"]
     for i in range(n_total_agents):
         yr_fields += [f"bank_start_A{i+1}", f"alloc_A{i+1}", f"emissions_A{i+1}",
                       f"trade_qty_A{i+1}", f"trade_cost_A{i+1}", f"green_frac_A{i+1}",
@@ -1212,7 +1236,16 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                       f"invest_frac_pre_clip_A{i+1}",
                       f"invest_frac_post_clip_A{i+1}",
                       f"available_budget_A{i+1}",
-                      f"compliance_share_of_available_A{i+1}"]
+                      f"compliance_share_of_available_A{i+1}",
+                      # Compliance / debt-cascade trajectory
+                      f"carry_forward_start_A{i+1}",
+                      f"carry_forward_end_A{i+1}",
+                      f"coverage_gap_A{i+1}",
+                      f"effective_penalty_rate_A{i+1}",
+                      # Credit state (treasury + emergency loan)
+                      f"treasury_reserve_A{i+1}",
+                      f"treasury_drawn_A{i+1}",
+                      f"loan_outstanding_A{i+1}"]
     yr_csv = open(yr_path, "w", newline="")
     yr_writer = csv.DictWriter(yr_csv, fieldnames=yr_fields)
     yr_writer.writeheader()
@@ -1525,6 +1558,7 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
 
             # --- Year-level logging ---
             yl = info.get("year_log", {})
+            _astats = yl.get("auction_stats", {}) or {}
             yr_row = {
                 "episode": episode, "year": year,
                 "cap": yl.get("cap", 0), "auction_volume": yl.get("auction_volume", 0),
@@ -1539,6 +1573,23 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                 "phantom_bid_price": yl.get("phantom_bid_price", 0.0),
                 "phantom_bid_qty": yl.get("phantom_bid_qty", 0.0),
                 "phantom_active": int(bool(yl.get("phantom_active", False))),
+                # Auction-internals scalars (from auction_stats sub-dict).
+                "auction_total_demand":     round(float(_astats.get("total_demand", 0.0)), 4),
+                "auction_unsold":           round(float(_astats.get("unsold", 0.0)), 4),
+                "auction_hhi":              round(float(_astats.get("hhi", 0.0)), 4),
+                "auction_max_agent_share":  round(float(_astats.get("max_agent_share_actual", 0.0)), 4),
+                "auction_failed":           int(bool(_astats.get("auction_failed", False))),
+                "auction_defaults":         int(_astats.get("defaults", 0)),
+                "auction_defaulted_volume": round(float(_astats.get("defaulted_volume", 0.0)), 4),
+                "effective_reserve_price":  round(float(yl.get("effective_reserve", 0.0)), 4),
+                # Secondary-market participation counts.
+                "secondary_n_buyers_intent":    int(yl.get("secondary_n_buyers_intent", 0)),
+                "secondary_n_sellers_intent":   int(yl.get("secondary_n_sellers_intent", 0)),
+                "secondary_n_buyers_executed":  int(yl.get("secondary_n_buyers_executed", 0)),
+                "secondary_n_sellers_executed": int(yl.get("secondary_n_sellers_executed", 0)),
+                # System-wide common emission shock and fundamental anchor.
+                "common_emission_shock": round(float(yl.get("common_emission_shock", 0.0)), 6),
+                "fundamental_anchor":    round(float(yl.get("anchor_t") or 0.0), 4),
             }
             for i in range(n_total_agents):
                 def _get(log_key, default=0):
@@ -1601,6 +1652,15 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                 yr_row[f"invest_frac_post_clip_A{i+1}"] = round(float(agent_diag.get("invest_frac_post_compliance_clip", float("nan"))), 6) if not np.isnan(float(agent_diag.get("invest_frac_post_compliance_clip", float("nan")))) else None
                 yr_row[f"available_budget_A{i+1}"] = round(float(agent_diag.get("available_budget", float("nan"))), 2) if not np.isnan(float(agent_diag.get("available_budget", float("nan")))) else None
                 yr_row[f"compliance_share_of_available_A{i+1}"] = round(float(agent_diag.get("compliance_cost_share_of_budget", float("nan"))), 4) if not np.isnan(float(agent_diag.get("compliance_cost_share_of_budget", float("nan")))) else None
+                # Compliance / debt-cascade trajectory.
+                yr_row[f"carry_forward_start_A{i+1}"] = round(_get("old_carry_forward", default=0.0), 4)
+                yr_row[f"carry_forward_end_A{i+1}"]   = round(_get("new_carry_forward", default=0.0), 4)
+                yr_row[f"coverage_gap_A{i+1}"]        = round(_get("coverage_gaps", default=0.0), 4)
+                yr_row[f"effective_penalty_rate_A{i+1}"] = round(_get("effective_penalty_rates", default=0.0), 4)
+                # Credit-state (treasury + emergency loan).
+                yr_row[f"treasury_reserve_A{i+1}"] = round(_get("treasury_reserves", default=0.0), 4)
+                yr_row[f"treasury_drawn_A{i+1}"]   = round(_get("treasury_drawn",    default=0.0), 4)
+                yr_row[f"loan_outstanding_A{i+1}"] = round(_get("loan_outstanding",  default=0.0), 4)
             # Diagnostic scores (one set per learning agent)
             try:
                 diag_scores = env.compute_diagnostic_score()
@@ -2233,6 +2293,40 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             for i in range(n_total_agents)
         ]
 
+        # Year-0 / year-T TNAC (single scalars per episode), and totals derived
+        # from the year-level series so notebook sweep code doesn't have to
+        # roll them up itself.
+        _logs_ep = env.episode_log
+        ep_year0_tnac = float(_logs_ep[0].get("tnac", 0.0)) if _logs_ep else 0.0
+        ep_yearT_tnac = float(_logs_ep[-1].get("tnac", 0.0)) if _logs_ep else 0.0
+        ep_total_unsold = sum(
+            float((yl.get("auction_stats", {}) or {}).get("unsold", 0.0))
+            for yl in _logs_ep
+        )
+        ep_auction_failures = sum(
+            int(bool((yl.get("auction_stats", {}) or {}).get("auction_failed", False)))
+            for yl in _logs_ep
+        )
+        ep_total_defaults = sum(
+            int((yl.get("auction_stats", {}) or {}).get("defaults", 0))
+            for yl in _logs_ep
+        )
+        ep_peak_loan = [
+            max((float(yl.get("loan_outstanding", [0.0] * n_total_agents)[i])
+                 for yl in _logs_ep), default=0.0)
+            for i in range(n_total_agents)
+        ]
+        ep_peak_carry_forward = [
+            max((float(yl.get("new_carry_forward", [0.0] * n_total_agents)[i])
+                 for yl in _logs_ep), default=0.0)
+            for i in range(n_total_agents)
+        ]
+        ep_final_treasury = [
+            float(_logs_ep[-1].get("treasury_reserves", [0.0] * n_total_agents)[i])
+            if _logs_ep else 0.0
+            for i in range(n_total_agents)
+        ]
+
         # Episode trajectory stats (across all years) — used in console only
         first_log   = env.episode_log[0] if env.episode_log else {}
         n_years_ep  = len(env.episode_log)
@@ -2483,6 +2577,12 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             "Q_saved_carbon":     round(Q_saved_carbon, 4) if not np.isnan(Q_saved_carbon) else None,
             "Q_cost_eff":         round(Q_cost_eff, 4) if not np.isnan(Q_cost_eff) else None,
             "Q_volatility":       round(Q_volatility, 4) if not np.isnan(Q_volatility) else None,
+            # Episode-level totals derived from year_log (avoid notebook roll-up).
+            "year0_tnac":          round(ep_year0_tnac, 4),
+            "yearT_tnac":          round(ep_yearT_tnac, 4),
+            "ep_total_unsold":     round(float(ep_total_unsold), 4),
+            "ep_auction_failures": int(ep_auction_failures),
+            "ep_total_defaults":   int(ep_total_defaults),
         }
         for i in range(n_total_agents):
             # Post-warmstart initial bank for "Holdings by Year" plot
@@ -2536,6 +2636,10 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             ep_row[f"udbc_M_total_A{i+1}"] = int(attr_i["m"])
             ep_row[f"udbc_B_total_A{i+1}"] = int(attr_i["b"])
             ep_row[f"udbc_C_total_A{i+1}"] = int(attr_i["c"])
+            # Credit / debt state — episode-level peaks and final balances.
+            ep_row[f"peak_loan_outstanding_A{i+1}"] = round(float(ep_peak_loan[i]), 4)
+            ep_row[f"peak_carry_forward_A{i+1}"]    = round(float(ep_peak_carry_forward[i]), 4)
+            ep_row[f"final_treasury_reserve_A{i+1}"] = round(float(ep_final_treasury[i]), 4)
 
         # Episode-mean diagnostic scores per learning agent
         for i in range(n_agents):
