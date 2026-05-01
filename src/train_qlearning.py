@@ -69,6 +69,23 @@ def _format_hms(seconds: float) -> str:
     return str(datetime.timedelta(seconds=max(0, int(round(float(seconds))))))
 
 
+def _trend_arrow(seq) -> str:
+    """Trailing trend arrow used by HAPPO console: ↑/↓/→ depending on the
+    relative change between the first and last value of the per-year series."""
+    if not seq or len(seq) < 2:
+        return ""
+    a, b = float(seq[0]), float(seq[-1])
+    if abs(a) < 1e-9:
+        rel = b
+    else:
+        rel = (b - a) / abs(a)
+    if rel > 0.05:
+        return "  ↑"
+    if rel < -0.05:
+        return "  ↓"
+    return "  →"
+
+
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
@@ -245,15 +262,40 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
 
     tag_part = f"_{run_tag}" if run_tag else ""
 
-    print(f"\n{'='*70}")
-    print(f"Q-Learning Baseline Training — seed {seed}"
+    # Read log_interval up-front so the legend banner can reference it.
+    log_interval = config.get("logging", {}).get("log_interval", 50)
+
+    print(f"\n{'═'*70}")
+    print(f"  Q-Learning Baseline Training — seed {seed}"
           f"{' [tag=' + run_tag + ']' if run_tag else ''}")
     print(f"  Episodes: {n_episodes}  |  Alpha: {alpha}  |  Gamma: {gamma}")
-    print(f"  Epsilon: {eps_start:.2f} -> {eps_end:.2f} over {eps_decay_episodes} episodes")
+    print(f"  Epsilon: {eps_start:.2f} → {eps_end:.2f} over {eps_decay_episodes} episodes")
     print(f"  Learning agents: {n_agents}  |  Bots: {n_bot_agents}"
           f"  |  Years/episode: {n_years}")
     print(f"  States: {StateDiscretizer.N_STATES}  |  Actions: 6×4 profiles")
-    print(f"{'='*70}\n")
+    print(f"  Console log every {log_interval} episodes")
+    print(f"{'═'*70}")
+    print("  Console legend (HAPPO-mirrored, per log_interval episode):")
+    print("  │  Ep / elapsed / ETA   Episode number · wall-clock · estimated remaining")
+    print("  │  ε                    Current epsilon-greedy exploration rate")
+    print("  │  Q                    Anchor-invariant quality_score in [-5, +5]")
+    print("  │  Price/yr             Auction clearing price per simulated year (€/t)")
+    print("  │  Emiss/yr             Total system emissions per year (Mt)")
+    print("  │  Bid/yr               Total agent bid demand per year (Mt)")
+    print("  │  Auct/yr              Auction supply after cap+rollover+MSR (Mt)")
+    print("  │  Per-agent table:")
+    print("  │     Green             Green fraction at start → end of episode (Δpp)")
+    print("  │     Emiss/Alloc       Mean per-year emissions / allocations (Mt)")
+    print("  │     Sf                Shortfall years / total years")
+    print("  │     Why(B/C)          Compliant years (B) and non-compliant years (C)")
+    print("  │     yr1€/yrN€/avg€    First-year, last-year, qty-weighted average bid (€/t)")
+    print("  │     lo€/hi€           Lowest / highest bid price across the episode (€/t)")
+    print("  │     BidMt             Mean bid quantity per year (Mt)")
+    print("  │     Rew               Episode total reward (M€-equivalent)")
+    print("  │     a1/a2             Last-year auction / secondary profile chosen")
+    print("  │  Event Board          Defaults, treasury draws, emergency loans (years/peak)")
+    print(f"{'═'*70}\n")
+
 
     # Create environment (handles bots internally via heuristic_policy)
     env = ETSEnvironment(config, seed=seed)
@@ -268,7 +310,6 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
     # Setup logging
     results_dir = config.get("logging", {}).get("results_dir", "results/qlearning/")
     os.makedirs(results_dir, exist_ok=True)
-    log_interval = config.get("logging", {}).get("log_interval", 50)
 
     ep_path = os.path.join(results_dir, f"ql_training_log{tag_part}_s{seed}.csv")
     ep_fields = _ep_fields(n_total_agents)
@@ -481,32 +522,266 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
             ep_csv.flush()
             yr_csv.flush()
 
-        # Console output
+        # Console output — HAPPO-style heavy box
         if (episode + 1) % log_interval == 0:
             elapsed = time.time() - train_t0
             eps_per_sec = (episode + 1) / max(elapsed, 1e-6)
             eta = (n_episodes - episode - 1) / max(eps_per_sec, 0.01)
+            avg_ep_s = elapsed / max(episode + 1, 1)
             n_buf = min(episode + 1, log_interval)
 
             avg_reward = reward_buffer[:n_buf].mean(axis=0)
             avg_green = green_buffer[:n_buf].mean(axis=0)
             avg_compliance = compliance_buffer[:n_buf].mean(axis=0)
             avg_shortfall = shortfall_buffer[:n_buf].mean(axis=0)
-            avg_price = float(np.mean(price_buffer[-n_buf:])) if price_buffer else 0.0
+
+            # Per-year market trajectories of the most recent episode.
+            yr_price = []
+            yr_emiss_total = []
+            yr_bid_total = []
+            yr_auct_vol = []
+            for yl in env.episode_log:
+                yr_price.append(float(yl.get("clearing_price", 0.0) or 0.0))
+                emi = yl.get("emissions", []) or []
+                yr_emiss_total.append(float(sum(emi[: n_total_agents])))
+                bqs = yl.get("bid_quantities", []) or []
+                yr_bid_total.append(float(sum(max(0.0, q) for q in bqs[: n_total_agents])))
+                yr_auct_vol.append(float(yl.get("auction_supply", 0.0) or 0.0))
+
+            # Per-agent bid trajectories (yr1/yrN/avg/lo/hi/BidMt) — same
+            # structure HAPPO prints. Walk env.episode_log once per agent.
+            yr1_bid = np.zeros(n_total_agents)
+            yrN_bid = np.zeros(n_total_agents)
+            min_bid = np.zeros(n_total_agents)
+            max_bid = np.zeros(n_total_agents)
+            avg_bid = np.zeros(n_total_agents)
+            avg_bidqty = np.zeros(n_total_agents)
+            ep_mean_emiss = np.zeros(n_total_agents)
+            ep_mean_alloc = np.zeros(n_total_agents)
+            ep_shortfall_years = np.zeros(n_total_agents, dtype=int)
+            for i in range(n_total_agents):
+                bids = []
+                qtys = []
+                emis = []
+                allocs = []
+                sfy = 0
+                for yl in env.episode_log:
+                    bp = yl.get("bid_prices", []) or []
+                    bq = yl.get("bid_quantities", []) or []
+                    em = yl.get("emissions", []) or []
+                    al = yl.get("allocations", []) or []
+                    sf = yl.get("shortfalls", []) or []
+                    if i < len(bp):
+                        bids.append(float(bp[i]))
+                    if i < len(bq):
+                        qtys.append(max(0.0, float(bq[i])))
+                    if i < len(em):
+                        emis.append(float(em[i]))
+                    if i < len(al):
+                        allocs.append(float(al[i]))
+                    if i < len(sf) and float(sf[i]) > 1e-6:
+                        sfy += 1
+                if bids:
+                    yr1_bid[i] = bids[0]
+                    yrN_bid[i] = bids[-1]
+                    min_bid[i] = min(bids)
+                    max_bid[i] = max(bids)
+                    if qtys and sum(qtys) > 1e-9:
+                        avg_bid[i] = float(np.dot(bids, qtys) / sum(qtys))
+                    else:
+                        avg_bid[i] = float(np.mean(bids))
+                if qtys:
+                    avg_bidqty[i] = float(np.mean(qtys))
+                if emis:
+                    ep_mean_emiss[i] = float(np.mean(emis))
+                if allocs:
+                    ep_mean_alloc[i] = float(np.mean(allocs))
+                ep_shortfall_years[i] = sfy
+
+            # Secondary stats (per agent + system-level)
+            per_agent_sec = [
+                {"buy_y": 0, "buy_v": 0.0, "buy_px": 0.0,
+                 "sell_y": 0, "sell_v": 0.0, "sell_px": 0.0}
+                for _ in range(n_total_agents)
+            ]
+            total_sec_vol = 0.0
+            years_with_trades = 0
+            for yl in env.episode_log:
+                tq = yl.get("trade_qtys", []) or []
+                tc = yl.get("trade_costs", []) or []
+                spx = float(yl.get("secondary_clearing", 0.0) or 0.0)
+                year_had_trade = False
+                for i in range(min(n_total_agents, len(tq))):
+                    q = float(tq[i])
+                    c = float(tc[i]) if i < len(tc) else 0.0
+                    if q > 1e-6:
+                        per_agent_sec[i]["buy_y"] += 1
+                        per_agent_sec[i]["buy_v"] += q
+                        per_agent_sec[i]["buy_px"] += abs(c)
+                        total_sec_vol += q
+                        year_had_trade = True
+                    elif q < -1e-6:
+                        per_agent_sec[i]["sell_y"] += 1
+                        per_agent_sec[i]["sell_v"] += -q
+                        per_agent_sec[i]["sell_px"] += abs(c)
+                        year_had_trade = True
+                if year_had_trade:
+                    years_with_trades += 1
+            sec_match_rate = years_with_trades / max(len(env.episode_log), 1)
+            for s in per_agent_sec:
+                if s["buy_v"] > 1e-9:
+                    s["buy_px"] = s["buy_px"] / s["buy_v"]
+                if s["sell_v"] > 1e-9:
+                    s["sell_px"] = s["sell_px"] / s["sell_v"]
+
+            # Event Board: defaults / treasury draws / emergency loans
+            default_counts = {}
+            treasury_counts = {}
+            loan_counts = {}
+            loan_peak = {}
+            for yl in env.episode_log:
+                aud = yl.get("auction_stats", {}) or {}
+                for di in aud.get("defaults_agents", []) or []:
+                    idx = int(di)
+                    default_counts[idx] = default_counts.get(idx, 0) + 1
+                td = yl.get("treasury_drawn", []) or []
+                for idx, t in enumerate(td):
+                    if float(t or 0.0) > 0:
+                        treasury_counts[idx] = treasury_counts.get(idx, 0) + 1
+                lo = yl.get("loan_outstanding", []) or []
+                for idx, v in enumerate(lo):
+                    v = float(v or 0.0)
+                    if v > 0:
+                        loan_counts[idx] = loan_counts.get(idx, 0) + 1
+                        loan_peak[idx] = max(loan_peak.get(idx, 0.0), v)
 
             qs = quality["quality_score"]
             qs_str = "n/a" if np.isnan(qs) else f"{qs:+.2f}"
-            print(f"Ep {episode+1:5d}/{n_episodes} | "
-                  f"eps={epsilon:.3f} | "
-                  f"price={avg_price:.1f} | Q={qs_str} | "
-                  f"elapsed={_format_hms(elapsed)} ETA={_format_hms(eta)}")
+
+            avg_emiss_year = (
+                float(np.mean(yr_emiss_total)) if yr_emiss_total else 0.0
+            )
+
+            W = 155
+            sep = "═" * W
+            thin = "─" * W
+
+            # ── Control plane ────────────────────────────────────────────
+            print(sep)
+            print(f"  Ep {episode+1:5d}/{n_episodes} │ "
+                  f"{_format_hms(elapsed)} elapsed  ETA {_format_hms(eta)}"
+                  f"  ({avg_ep_s:.2f} s/ep)"
+                  f" │ ε={epsilon:.3f} │ Q={qs_str}")
+
+            # ── Market trajectories ──────────────────────────────────────
+            price_traj = " ".join(f"{p:5.0f}" for p in yr_price)
+            emiss_traj = " ".join(f"{e:5.1f}" for e in yr_emiss_total)
+            bid_traj   = " ".join(f"{b:5.1f}" for b in yr_bid_total)
+            auct_traj  = " ".join(f"{c:5.1f}" for c in yr_auct_vol)
+            price_std_ep = float(np.std(yr_price)) if len(yr_price) > 1 else 0.0
+            print(f"  {'Price/yr':<8}: {price_traj}   (σ={price_std_ep:.0f}){_trend_arrow(yr_price)}")
+            print(f"  {'Emiss/yr':<8}: {emiss_traj}   (avg {avg_emiss_year:.1f} Mt/yr){_trend_arrow(yr_emiss_total)}")
+            print(f"  {'Bid/yr':<8}: {bid_traj}   (agents' total auction demand, Mt){_trend_arrow(yr_bid_total)}")
+            print(f"  {'Auct/yr':<8}: {auct_traj}   (auction supply after cap+rollover+MSR, TNAC={last_tnac:.1f} Mt){_trend_arrow(yr_auct_vol)}")
+
+            # ── Health snapshot ──────────────────────────────────────────
+            sys_comply = float(np.mean(avg_compliance)) * 100
+            avg_secp = (
+                episode_sec_value / episode_sec_volume
+                if episode_sec_volume > 1e-9 else 0.0
+            )
+            print(f"  Health: comply={sys_comply:.0f}%"
+                  f"  green(learning avg)={float(np.mean(avg_green))*100:.0f}%"
+                  f" │ Sec: {total_sec_vol:.1f}Mt  match={sec_match_rate*100:.0f}%"
+                  f"  avg={avg_secp:.0f}€")
+
+            # ── Per-agent table ──────────────────────────────────────────
+            print(thin)
+            print(f"  {'':4}  {'Green':>16}  {'Emiss':>5} {'Alloc':>5}"
+                  f" {'Sf':>5} {'Why(B/C)':>9}  "
+                  f"{'yr1€':>5} {'yrN€':>5} {'avg€':>5} {'lo€':>5} {'hi€':>5} {'BidMt':>6}"
+                  f"  {'Rew':>8}  {'a1/a2':>5}  Secondary")
 
             for i in range(n_agents):
-                print(f"  A{i+1}: rew={avg_reward[i]:+7.2f}  "
-                      f"green={avg_green[i]*100:5.1f}%  "
-                      f"comply={avg_compliance[i]*100:5.1f}%  "
-                      f"short={avg_shortfall[i]:.3f}Mt")
-            print()
+                g0 = float(env.companies[i].prev_green_frac) * 100
+                g1 = float(env.companies[i].green_frac) * 100
+                dg = g1 - g0
+                grn_str = f"{g0:3.0f}→{g1:3.0f}%({dg:+3.0f}pp)"
+                sfy = ep_shortfall_years[i]
+                ny = max(len(env.episode_log), 1)
+                sf_str = f"{int(sfy):2d}/{ny:<2d}"
+                b_years = ny - int(sfy)
+                why_str = f"{b_years:2d}/{int(sfy):2d}"
+
+                ss = per_agent_sec[i]
+                sec_parts = []
+                if ss["buy_y"] > 0:
+                    sec_parts.append(f"B{ss['buy_y']}y/{ss['buy_v']:.1f}Mt@{ss['buy_px']:.0f}€")
+                if ss["sell_y"] > 0:
+                    sec_parts.append(f"S{ss['sell_y']}y/{ss['sell_v']:.1f}Mt@{ss['sell_px']:.0f}€")
+                sec_str = " ".join(sec_parts) if sec_parts else "HOLD"
+
+                print(f"  A{i+1} : {grn_str:>16}"
+                      f"  {ep_mean_emiss[i]:5.2f} {ep_mean_alloc[i]:5.2f}"
+                      f" {sf_str:>5} {why_str:>9}  "
+                      f"{yr1_bid[i]:5.0f} {yrN_bid[i]:5.0f} {avg_bid[i]:5.0f} {min_bid[i]:5.0f} {max_bid[i]:5.0f} {avg_bidqty[i]:6.2f}"
+                      f"  {avg_reward[i]:8.1f}"
+                      f"  {int(last_a1_profiles[i]):>2}/{int(last_a2_profiles[i]):<2}"
+                      f"  {sec_str}")
+
+            # ── Bot rows (driven by heuristic policy) ────────────────────
+            if n_bot_agents > 0:
+                print(thin)
+                for b in range(n_bot_agents):
+                    j = n_agents + b
+                    g0 = float(env.companies[j].prev_green_frac) * 100
+                    g1 = float(env.companies[j].green_frac) * 100
+                    dg = g1 - g0
+                    grn_str = f"{g0:3.0f}→{g1:3.0f}%({dg:+3.0f}pp)"
+                    sfy = ep_shortfall_years[j]
+                    ny = max(len(env.episode_log), 1)
+                    sf_str = f"{int(sfy):2d}/{ny:<2d}"
+                    why_str = f"{ny - int(sfy):2d}/{int(sfy):2d}"
+                    ss = per_agent_sec[j]
+                    sec_parts = []
+                    if ss["buy_y"] > 0:
+                        sec_parts.append(f"B{ss['buy_y']}y/{ss['buy_v']:.1f}Mt@{ss['buy_px']:.0f}€")
+                    if ss["sell_y"] > 0:
+                        sec_parts.append(f"S{ss['sell_y']}y/{ss['sell_v']:.1f}Mt@{ss['sell_px']:.0f}€")
+                    sec_str = " ".join(sec_parts) if sec_parts else "HOLD"
+                    print(f"  B{b+1} : {grn_str:>16}"
+                          f"  {ep_mean_emiss[j]:5.2f} {ep_mean_alloc[j]:5.2f}"
+                          f" {sf_str:>5} {why_str:>9}  "
+                          f"{yr1_bid[j]:5.0f} {yrN_bid[j]:5.0f} {avg_bid[j]:5.0f} {min_bid[j]:5.0f} {max_bid[j]:5.0f} {avg_bidqty[j]:6.2f}"
+                          f"  {total_rewards_total[j]:8.1f}"
+                          f"  {'   ':>5}"
+                          f"  {sec_str}")
+
+            # ── Event board ──────────────────────────────────────────────
+            print(thin)
+            print("  Event Board:")
+            if default_counts:
+                items = []
+                for idx in sorted(default_counts):
+                    tag = f"A{idx+1}" if idx < n_agents else f"B{idx-n_agents+1}"
+                    items.append(f"{tag}:{default_counts[idx]}")
+                print(f"  Defaults by agent (year-count): {'  '.join(items)}")
+            else:
+                print("  Defaults by agent: none")
+            if treasury_counts:
+                items = []
+                for idx in sorted(treasury_counts):
+                    tag = f"A{idx+1}" if idx < n_agents else f"B{idx-n_agents+1}"
+                    items.append(f"{tag}:{treasury_counts[idx]}yr")
+                print(f"  Treasury drawn (years): {'  '.join(items)}")
+            if loan_counts:
+                items = []
+                for idx in sorted(loan_counts):
+                    tag = f"A{idx+1}" if idx < n_agents else f"B{idx-n_agents+1}"
+                    items.append(f"{tag}:{loan_counts[idx]}yr/pk{loan_peak[idx]:.0f}M€")
+                print(f"  Emergency loans (years/peak outstanding): {'  '.join(items)}")
+            print(sep)
+
 
         # Periodic Q-table checkpoint
         if (episode + 1) % 100 == 0:
@@ -535,12 +810,12 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
     ep_csv.close()
     yr_csv.close()
 
-    print(f"\n{'='*70}")
-    print(f"Q-Learning training complete — seed {seed}")
+    print(f"\n{'═'*70}")
+    print(f"  Q-Learning training complete — seed {seed}")
     print(f"  Final Q-tables saved to {final_path}")
     print(f"  Episode log: {ep_path}")
     print(f"  Year log:    {yr_path}")
-    print(f"{'='*70}")
+    print(f"{'═'*70}")
 
     return agents, config
 
