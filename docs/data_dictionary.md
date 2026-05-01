@@ -160,10 +160,10 @@ single episode.
 | `actor_loss_invest_A{i}`, `critic_loss_invest_A{i}` | Split-head loss for the **investment** sub-head of the auction policy. |
 | `actor_loss_secondary_A{i}`, `critic_loss_secondary_A{i}` | Loss for the secondary-market policy. |
 
-### v8.6.1 — Episode-level credit / debt-cascade aggregates
+### Episode-level credit / debt-cascade aggregates
 
-These columns are reductions over the per-year series in `year_log_*.csv`,
-so notebooks don't have to re-aggregate them:
+Reductions over the per-year series in `year_log_*.csv`, pre-aggregated
+so notebooks don't have to roll them up:
 
 | Column | Meaning |
 |---|---|
@@ -202,11 +202,10 @@ the default 8-agent config.
 | `phantom_bid_price`, `phantom_bid_qty`, `phantom_active` | Phantom-bidder injection state. |
 | `marginal_ef_used` | Average emission factor of the marginal MWh dispatched this year (system-wide). |
 
-#### v8.6.1 — Auction & secondary-market scalars (single value per year)
+#### Auction & secondary-market scalars (single value per year)
 
-These columns are added in v8.6.1 to surface fields that previously lived
-inside the `auction_stats` sub-dict in `info["year_log"]`, plus a few new
-exogenous-state diagnostics:
+Year-level scalars surfaced from the `auction_stats` sub-dict in
+`info["year_log"]`, plus exogenous-state diagnostics:
 
 | Column | Meaning |
 |---|---|
@@ -266,7 +265,7 @@ exogenous-state diagnostics:
 | `available_budget_A{i}` | Effective annual budget at start of year (M€). |
 | `compliance_share_of_available_A{i}` | (auction + secondary + MAC) / `available_budget`. |
 
-#### v8.6.1 — Per-agent compliance & credit state (year-level)
+#### Per-agent compliance & credit state (year-level)
 
 | Column | Meaning |
 |---|---|
