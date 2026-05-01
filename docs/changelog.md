@@ -5,6 +5,61 @@ Version numbers reflect the `version` field in `pyproject.toml`
 
 ---
 
+## [8.6.2]
+
+**Bots-only baseline.** The heuristic bot policy
+(`src/agents/heuristic_policy.py`) was sunset when the agent space
+moved to PPO/HAPPO; it has been lightly modernised so it can run on
+the current default-config calibration as a *no-learning* credibility
+floor (cf. Q-learning at `[Unreleased]`):
+
+* `auction_action` now sizes its `available` cash buffer as
+  `operating + treasury_fraction × treasury` to mirror the env-side
+  joint budget gate (`auction.budget_gate.treasury_fraction`,
+  default `0.33`). Bots no longer ignore the corporate treasury
+  reserve when computing willingness-to-pay budget ceilings.
+* Capex throughput check now reads `company.effective_capex_throughput`
+  (the property that already accounts for emergency-loan squeeze and
+  realised-revenue modulation) when present, falling back to the raw
+  attribute for backwards compatibility.
+* `ETSEnvironment._generate_bot_auction_actions` and
+  `_generate_bot_secondary_actions` now pass the per-bot
+  `loan_outstanding_norm` through to the heuristic. The heuristic
+  already had loan-aware code paths (qty/invest pullback under loan
+  burden, more conservative secondary buying); the env was silently
+  passing the default `0.0` so those paths were dead. They are now
+  live for bots actually carrying emergency-loan debt.
+
+* **`configs/bots_only.yaml`** — production-calibrated config with
+  `n_agents=0, n_bot_agents=8` and the same cap / MSR / penalty /
+  ESG / treasury settings as `configs/default.yaml`. Inherits the
+  joint budget gate, dual-clip PPO settings (unused by bots, kept
+  only to satisfy `env.config["ppo"].gamma` lookups for terminal-
+  value discounting), and the v8.6 ESG hybrid.
+
+* **`scripts/run_bots_only.py`** — multi-seed, multi-episode driver.
+  Writes `training_log_<tag>_s<seed>.csv` and
+  `year_log_<tag>_s<seed>.csv` with a column superset that overlaps
+  the PPO / Q-learning trainer schemas (per-agent reward, green
+  fraction, shortfall, penalty, compliance rate; episode-level
+  clearing price / quality score / `Q_*` components from
+  `src/utils/quality_metric.compute_episode_quality`). Supports
+  `--seed`, `--seeds`, `--n-episodes`, `--run-tag`, `--output-dir`.
+
+* **`notebooks/ets_marl - Bots-Only Baseline.ipynb`** — analysis
+  notebook modelled on the Q-learning baseline + Full Run notebooks.
+  Sections: setup, configuration, single-episode sanity check, multi-
+  seed run, cross-seed market trajectories, per-bot summary table,
+  and an optional comparison panel that overlays bots-only / Q-
+  learning / PPO/HAPPO converged-window means when the corresponding
+  logs are present in `results/`.
+
+This is a bug-fix bump because no v8.6.0 / v8.6.1 user-facing config
+key changes; existing PPO runs (`n_bot_agents = 0` in
+`configs/default.yaml`) are bit-for-bit unchanged.
+
+---
+
 ## [Unreleased]
 
 **Q-learning baseline — apples-to-apples with the main simulation.** The

@@ -146,10 +146,27 @@ def auction_action(
     else:
         penalty_rate = base_penalty * float(inflation_factor)
 
-    # --- Coverage ratio ---
+    # --- Coverage ratio + cash buffer ---
+    # Cash buffer mirrors the env-side joint budget gate: operating
+    # budget plus a fraction of treasury reserves (treasury is meant to
+    # absorb genuine price spikes, not be the routine sizing buffer).
+    # Optional emergency-loan headroom is OFF by default for bidding —
+    # loans are an end-of-year settlement safety net, not a sizing tool.
     annual_need = max(company.compute_estimate_need(), 0.1)
     coverage_ratio = max(bank / annual_need, 0.0)
-    available = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
+    operating = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
+    gate_cfg = config.get("auction", {}).get("budget_gate", {})
+    treasury_fraction = float(gate_cfg.get("treasury_fraction", 0.33))
+    treasury_avail = 0.0
+    try:
+        treasury_avail = float(company.get_treasury_available())
+    except Exception:
+        treasury_avail = 0.0
+    treasury_max_abs = float(gate_cfg.get("treasury_max_abs", 0.0) or 0.0)
+    treasury_buffer = treasury_fraction * treasury_avail
+    if treasury_max_abs > 0.0:
+        treasury_buffer = min(treasury_buffer, treasury_max_abs)
+    available = operating + treasury_buffer
 
     # --- Bid price (WTP-based: willingness-to-pay bounded by penalty cap) ---
     mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
@@ -252,8 +269,13 @@ def auction_action(
             invest_frac = 0.005
 
     # --- Capex throughput check ---
-    # Scale down invest_frac if estimated cost exceeds remaining capex capacity
-    capex_tp = getattr(company, 'capex_throughput', 1e9)
+    # Scale down invest_frac if estimated cost exceeds remaining capex capacity.
+    # Use the loan/revenue-aware effective property when present; fall back to
+    # the raw attribute for older Company versions.
+    capex_tp = getattr(company, 'effective_capex_throughput', None)
+    if capex_tp is None:
+        capex_tp = getattr(company, 'capex_throughput', 1e9)
+    capex_tp = float(capex_tp)
     capex_spent = getattr(company, 'capex_spent_this_year', 0.0)
     capex_remaining = max(0.0, capex_tp - capex_spent)
     est_cost = company.compute_investment_cost(best_tech, invest_frac, current_year)
