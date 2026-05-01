@@ -2526,8 +2526,10 @@ class ETSEnvironment(gym.Env):
                 float(c.effective_penalty_rate(self.current_year)) for c in self.companies
             ],
             # Per-agent pre-secondary coverage gap = max(0, need - alloc), in Mt.
+            # Computed directly from `allocations` so bot agents (indices ≥ n_agents)
+            # are covered too — the reward-channel cache is learning-agent-only.
             "coverage_gaps": [
-                float(self._last_auction_reward_channels.get(i, {}).get("coverage_gap", 0.0))
+                float(max(0.0, self.companies[i].compute_estimate_need() - float(allocations[i])))
                 for i in range(self.n_total)
             ],
             # Secondary-market participation counts (year-level scalars).
