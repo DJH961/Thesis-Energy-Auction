@@ -7,6 +7,44 @@ Version numbers reflect the `version` field in `pyproject.toml`
 
 ## [Unreleased]
 
+**Seed stability — environment stochasticity is now invariant to agent actions.**
+`ETSEnvironment` previously routed every random draw through one shared
+`np.random.default_rng` (`self.rng`), which was also handed to every
+`Company` (project success, jitter delay, cancellations) and to
+`market_clearing_ets` (auction tiebreak). Because those streams are
+consumed conditionally on agent actions, a different reward function
+(or any policy change) shifted the global stream and silently changed
+subsequent emission shocks, capacity-factor noise, AR(1) price shocks,
+and opponent-obs queue noise for the *same* seed.
+
+The stream is now split via `np.random.SeedSequence(seed).spawn(...)`
+into three independent generators built in `_init_env_rng_streams` /
+`_build_company_rng_streams`:
+
+* `self._env_rng` — exogenous environment stochasticity that must stay
+  seed-stable regardless of agent behaviour: inflation path, emission
+  shocks (`ε_it`), capacity-factor noise, AR(1) expected-price shock,
+  opponent-obs queue noise, bot persistent noise, urgency scalars,
+  warm-start / burn-in draws, phantom bidder.
+* `self._auction_rng` — auction tiebreak only (its draw count equals the
+  number of valid bids and is therefore action-dependent).
+* `self._company_rngs[i]` — one independent generator per `Company`
+  for action-conditional draws (`plan_investment` success + jitter
+  delay, `cancel_queued_projects`).
+
+`self.rng` is preserved as a backward-compatible alias for
+`self._env_rng`. Result: for a fixed seed, two episodes with arbitrarily
+different agent actions produce identical inflation paths, emission
+shocks, CF noise, AR(1) shocks, and queue noise. New regression tests
+in `tests/test_environment.py`
+(`test_env_stochasticity_invariant_to_agent_actions`,
+`test_seed_stability_same_actions_same_outcome`,
+`test_per_company_rng_independence`) lock this in.
+
+---
+
+## [Previously Unreleased]
+
 **Q-learning baseline — apples-to-apples with the main simulation.** The
 tabular Q-learning baseline (`src/train_qlearning.py`,
 `scripts/evaluate_qlearning.py`) has been re-aligned with the PPO/HAPPO
