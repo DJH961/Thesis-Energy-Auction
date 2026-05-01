@@ -7,6 +7,46 @@ Version numbers reflect the `version` field in `pyproject.toml`
 
 ## [Unreleased]
 
+**Q-learning baseline — apples-to-apples with the main simulation.** The
+tabular Q-learning baseline (`src/train_qlearning.py`,
+`scripts/evaluate_qlearning.py`) has been re-aligned with the PPO/HAPPO
+trainer's environment-interaction surface so the two algorithms can be
+compared on the same default config:
+
+* **Multi-seed driver.** `--seeds 42 123 456` (or `simulation.seeds` from
+  config) loops sequentially over seeds; `--seed` still takes a single
+  seed. Each seed produces its own `ql_training_log_s<seed>.csv`,
+  `ql_year_log_s<seed>.csv`, and `qtables_s<seed>_final.npz`.
+* **`--run-tag` filename infix** mirroring `scripts/train.py` for
+  sweep-launcher integration. Outputs become
+  `ql_{training,year}_log_<tag>_s<seed>.csv`.
+* **Year-log column superset** that overlaps with the PPO `year_log`
+  schema: per-agent `bank_start`, `alloc`, `emissions`, `trade_qty`,
+  `trade_cost`, `holdings`, `bank_end`, `invest_cost`, `collateral_cost`,
+  `bid_price`, `mac_reduction`, `mac_cost`, `terminal_bank_value`,
+  `terminal_queue_value`, `sec_price_mult`, `sec_qty_action`,
+  `sec_action_side`, `bid_qty_mult`, `delta_green`, etc. — so analysis
+  notebooks can load either log into the same dataframe shape.
+* **Episode-log overlap.** New `ep_mean_clearing_price`, `mean_price`,
+  `secondary_avg_price`, `price_start`, `price_peak`, `price_std`
+  fields, plus the same anchor-invariant `quality_score` (and the five
+  `Q_*` components) the PPO trainer logs. The metric computation is
+  factored into a new shared utility `src/utils/quality_metric.py`
+  (`compute_episode_quality`, `compute_quality_score`); covered by
+  `tests/test_quality_metric.py`.
+* **Bot-aware logging.** Both episode and year logs now record all
+  `n_agents + n_bot_agents` columns when bots are enabled; bot reward
+  comes from `info["year_log"]["rewards"]` (env-side aggregation) and
+  bot profile indices are `-1`.
+* **Q-learning notebook** (`notebooks/ets_marl - Q-Learning Baseline.ipynb`)
+  restored and extended with **§12 Sub-RQ 1 — Q-learning vs the
+  default-config PPO sweep**: cross-seed fan charts (mean ± 1 std) for
+  clearing price, compliance rate, mean green fraction, and
+  `quality_score`; rolling-mean plateau detection for RQ 1.a; converged-
+  window mean ± cross-seed std table for RQ 1.b. The notebook frames the
+  Q-learning baseline explicitly as the credibility floor — the gap to
+  PPO is what tells us the simulation is non-trivial *and* solvable.
+
 **Quality score — signed `[-5, +5]` range.** The per-episode
 `quality_score` reported in console + `training_log_*.csv` and consumed
 by the sweep launcher is now a signed composite in `[-5, +5]` (was a

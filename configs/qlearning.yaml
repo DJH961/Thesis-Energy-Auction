@@ -1,24 +1,47 @@
 # ============================================================
 # ETS MARL — Q-Learning Baseline Configuration
-# Inherits environment settings from default.yaml (loaded first),
-# then overrides RL-specific parameters for tabular Q-learning.
+#
+# Loaded as an *override* on top of the base environment config
+# (default: configs/default.yaml). The base config provides
+# everything the env needs (companies, auction, MSR, penalty, ESG,
+# warm-start, …); this file only changes algorithm-, eval-, and
+# logging-specific knobs so the Q-learning baseline runs in the
+# *same* environment as the PPO/HAPPO trainer.
+#
+# Usage:
+#   python src/train_qlearning.py \
+#       --config configs/default.yaml \
+#       --ql-config configs/qlearning.yaml \
+#       [--seeds 42 123 456] [--run-tag <name>]
 # ============================================================
+
+# Override n_episodes for the tabular learner. With 243 states ×
+# 24 action profiles per agent, Q-learning saturates much faster
+# than PPO; 5000 episodes is enough to see convergence and
+# produce stable greedy policies for the comparison notebook.
+simulation:
+  n_episodes: 5000
+  # Inherits ``seeds`` from the base config (default [42, 123, 456])
+  # unless overridden via --seed/--seeds at the CLI.
 
 # --- Q-Learning hyperparameters ---
 qlearning:
-  n_episodes: 5000
-  alpha: 0.1             # learning rate
-  gamma: 0.95            # discount factor
-  epsilon_start: 1.0     # initial exploration rate
-  epsilon_end: 0.05      # final exploration rate
-  epsilon_decay_frac: 0.7  # fraction of episodes over which epsilon decays
+  n_episodes: 5000          # mirrors simulation.n_episodes for the QL loop
+  alpha: 0.1                # learning rate
+  gamma: 0.95               # discount factor
+  epsilon_start: 1.0        # initial exploration rate (uniform random)
+  epsilon_end: 0.05         # final exploration rate (mostly greedy)
+  epsilon_decay_frac: 0.7   # fraction of episodes over which epsilon decays linearly
 
-# --- Evaluation ---
+# --- Evaluation (greedy) ---
 evaluation:
-  n_episodes: 100         # greedy eval episodes after training
-  epsilon: 0.0            # fully greedy
+  n_episodes: 100           # greedy episodes run after training each seed
+  epsilon: 0.0              # fully greedy
 
 # --- Logging ---
+# Outputs land under ``results_dir`` with names mirroring
+# ``scripts/train.py`` (``ql_training_log[_<tag>]_s<seed>.csv``,
+# ``ql_year_log[_<tag>]_s<seed>.csv``, ``qtables[_<tag>]_s<seed>_final.npz``).
 logging:
   log_interval: 50
   save_interval: 500
