@@ -1,0 +1,14 @@
+# Shared dependencies for notebooks in /notebooks
+# Enable installation from the optional starter cell in each notebook.
+gymnasium>=1.2.3
+imbalanced-learn>=0.12
+ipython>=8.0
+matplotlib>=3.10.8
+numpy==1.26.4
+pandas==2.2.3
+PyYAML>=6.0.3
+ruptures>=1.1.9
+scikit-learn>=1.4
+scipy>=1.11
+seaborn>=0.13.2
+torch==2.2.2

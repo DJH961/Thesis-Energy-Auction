@@ -63,6 +63,16 @@ def _to_python(value):
     return value
 
 
+def _format_eta(seconds: float) -> str:
+    """Format ETA seconds as h:mm:ss or mm:ss for concise progress logs."""
+    sec = max(0, int(round(seconds)))
+    hours, rem = divmod(sec, 3600)
+    mins, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
 def run_bots_only_seed(
     config: dict,
     seed: int,
@@ -246,12 +256,17 @@ def run_bots_only_seed(
         if (ep + 1) % log_interval == 0 or ep == 0:
             qs = train_row["quality_score"]
             qs_str = "nan" if np.isnan(qs) else f"{qs:+.2f}"
+            elapsed = time.time() - t0
+            episodes_done = ep + 1
+            avg_sec_per_ep = elapsed / max(episodes_done, 1)
+            eta_seconds = avg_sec_per_ep * max(n_episodes - episodes_done, 0)
             print(
                 f"[bots-only s={seed}] ep {ep+1:5d}/{n_episodes} | "
                 f"clr̄={train_row['ep_mean_clearing_price']:6.1f} | "
                 f"comply={compliance_rate*100:5.1f}% | "
                 f"green̄={train_row['mean_green_frac']*100:5.1f}% | "
-                f"Q={qs_str}"
+                f"Q={qs_str} | "
+                f"ETA={_format_eta(eta_seconds)}"
             )
 
     train_csv.close()

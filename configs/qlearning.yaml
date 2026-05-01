@@ -17,16 +17,16 @@
 
 # Override n_episodes for the tabular learner. With 243 states ×
 # 24 action profiles per agent, Q-learning saturates much faster
-# than PPO; 5000 episodes is enough to see convergence and
+# than PPO; 10000 episodes is enough to see convergence and
 # produce stable greedy policies for the comparison notebook.
 simulation:
-  n_episodes: 5000
+  n_episodes: 10000
   # Inherits ``seeds`` from the base config (default [42, 123, 456])
   # unless overridden via --seed/--seeds at the CLI.
 
 # --- Q-Learning hyperparameters ---
 qlearning:
-  n_episodes: 5000          # mirrors simulation.n_episodes for the QL loop
+  n_episodes: 10000          # mirrors simulation.n_episodes for the QL loop
   alpha: 0.1                # learning rate
   gamma: 0.95               # discount factor
   epsilon_start: 1.0        # initial exploration rate (uniform random)
@@ -43,7 +43,7 @@ evaluation:
 # ``scripts/train.py`` (``ql_training_log[_<tag>]_s<seed>.csv``,
 # ``ql_year_log[_<tag>]_s<seed>.csv``, ``qtables[_<tag>]_s<seed>_final.npz``).
 logging:
-  log_interval: 50
+  log_interval: 100
   save_interval: 500
   csv_flush_interval: 500
   results_dir: "results/qlearning/"

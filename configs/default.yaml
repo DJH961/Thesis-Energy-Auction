@@ -8,7 +8,7 @@ version: "8.6.3"
 simulation:
   n_years: 12
   n_episodes: 120000
-  seeds: [42, 123, 456]
+  seeds: [1729, 8191, 6561, 5041]
 
 # "auto" picks CUDA if available, else CPU.
 device: auto

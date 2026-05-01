@@ -14,8 +14,8 @@ simulation:
   # Heuristic bots are fully deterministic-given-seed once the
   # per-bot noise draw is fixed, so a few hundred episodes are enough
   # to characterise the steady-state market — there is no learning.
-  n_episodes: 500
-  seeds: [42, 123, 456]
+  n_episodes: 10000
+  seeds: [1729, 8191, 6561, 5041]
 
 device: auto
 
