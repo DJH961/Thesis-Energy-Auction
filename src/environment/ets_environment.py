@@ -1137,6 +1137,7 @@ class ETSEnvironment(gym.Env):
 
             idx = self.n_agents + b  # bots indexed after learning agents
             urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
+            loan_norm = float(self.companies[idx].get_loan_outstanding_norm())
             action = heuristic_policy.auction_action(
                 self.companies[idx], price_ma3, self.current_year,
                 self.n_years, self.config,
@@ -1149,6 +1150,7 @@ class ETSEnvironment(gym.Env):
                 urgency_multiplier=float(self._bot_urgency_mult[b]),
                 urgency_denom=urgency_denom,
                 collateral_load_last=float(self._last_collateral_load[idx]),
+                loan_outstanding_norm=loan_norm,
             )
             if self._enhanced_noise_enabled and bool(self._bot_budget_stressed[b]):
                 action[1] = float(np.clip(action[1] * budget_stress_qty_mult, qty_low, qty_high))
@@ -1169,6 +1171,7 @@ class ETSEnvironment(gym.Env):
 
             idx = self.n_agents + b  # bots indexed after learning agents
             urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
+            loan_norm = float(self.companies[idx].get_loan_outstanding_norm())
             actions[b] = heuristic_policy.secondary_action(
                 self.companies[idx],
                 bank=float(self.holdings[idx]),
@@ -1180,6 +1183,7 @@ class ETSEnvironment(gym.Env):
                 valuation_noise=float(self._bot_valuation_noise[b]),
                 urgency_multiplier=float(self._bot_urgency_mult[b]),
                 urgency_denom=urgency_denom,
+                loan_outstanding_norm=loan_norm,
             )
         return actions
 
