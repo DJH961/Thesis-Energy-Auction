@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import sys
 
 import pytest
@@ -61,7 +62,6 @@ def test_neutral_trajectory_scores_zero():
 
 def test_score_stays_within_bounds_for_random_inputs():
     """Score is clipped to [-5, +5] for any [0,1] input combination."""
-    import random
     rng = random.Random(0)
     for _ in range(200):
         q = compute_quality_score(
