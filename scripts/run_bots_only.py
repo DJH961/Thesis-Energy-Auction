@@ -245,7 +245,7 @@ def run_bots_only_seed(
 
         if (ep + 1) % log_interval == 0 or ep == 0:
             qs = train_row["quality_score"]
-            qs_str = f"{qs:+.2f}" if qs == qs else "nan"   # NaN-safe
+            qs_str = "nan" if np.isnan(qs) else f"{qs:+.2f}"
             print(
                 f"[bots-only s={seed}] ep {ep+1:5d}/{n_episodes} | "
                 f"clr̄={train_row['ep_mean_clearing_price']:6.1f} | "

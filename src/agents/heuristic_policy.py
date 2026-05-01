@@ -272,10 +272,11 @@ def auction_action(
     # Scale down invest_frac if estimated cost exceeds remaining capex capacity.
     # Use the loan/revenue-aware effective property when present; fall back to
     # the raw attribute for older Company versions.
-    capex_tp = getattr(company, 'effective_capex_throughput', None)
-    if capex_tp is None:
-        capex_tp = getattr(company, 'capex_throughput', 1e9)
-    capex_tp = float(capex_tp)
+    capex_tp = float(getattr(
+        company,
+        'effective_capex_throughput',
+        getattr(company, 'capex_throughput', 1e9),
+    ))
     capex_spent = getattr(company, 'capex_spent_this_year', 0.0)
     capex_remaining = max(0.0, capex_tp - capex_spent)
     est_cost = company.compute_investment_cost(best_tech, invest_frac, current_year)
