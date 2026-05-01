@@ -174,3 +174,80 @@ class TestSelectMethodsPassYear:
             a1_idx=1, epsilon=0.0, current_year=5)
         assert action.shape == (2,)
         assert 0 <= idx < 4
+
+
+class TestQLearningWindowDiagnostics:
+    """The trainer's HAPPO-mirrored console relies on per-window
+    counters (TD-error, ε-pick share, state coverage). These must stay
+    consistent across reset/select/update calls."""
+
+    def test_initial_diagnostics_zero(self):
+        ag = QLearningAgent(agent_id=0, seed=42)
+        assert ag.window_td_mean_abs() == 0.0
+        assert ag.window_explore_share() == 0.0
+        assert ag.coverage_states() == 0
+        assert ag.coverage_fraction() == 0.0
+        assert ag.mean_max_q() == 0.0
+        assert ag.greedy_policy_diversity() == 0
+
+    def test_update_records_td_and_visit(self):
+        ag = QLearningAgent(agent_id=0, alpha=0.5, gamma=0.9, seed=42)
+        # First update: Q starts at 0, target = 1.0 + 0.9*0 = 1.0,
+        # so |TD| = 1.0
+        ag.update(state=10, a1_idx=2, a2_idx=1,
+                  reward=1.0, next_state=11, done=False)
+        assert ag.coverage_states() == 1
+        assert abs(ag.window_td_mean_abs() - 1.0) < 1e-9
+        assert ag._td_count == 1
+        # Q has moved off zero on the visited cell
+        assert ag.q_table[10, 2, 1] != 0.0
+        assert ag.visit_counts[10, 2, 1] == 1
+
+    def test_reset_window_clears_counters(self, config):
+        ag = QLearningAgent(agent_id=0, seed=42)
+        company = _FakeCompany()
+        obs = np.zeros(36)
+        # Force ε-random pick so explore_picks > 0
+        ag.select_auction_action(obs, company, price_ma3=80.0,
+                                 config=config, epsilon=1.0)
+        ag.update(state=0, a1_idx=0, a2_idx=0,
+                  reward=2.0, next_state=1, done=False)
+        assert ag._td_count >= 1
+        assert ag._explore_picks >= 1
+        ag.reset_window_stats()
+        assert ag._td_count == 0
+        assert ag._explore_picks == 0
+        assert ag._greedy_picks == 0
+        assert ag.window_td_mean_abs() == 0.0
+        # Coverage is persistent across resets — only the rolling
+        # window counters get cleared.
+        assert ag.coverage_states() == 1
+
+    def test_explore_share_split(self, config):
+        ag = QLearningAgent(agent_id=0, seed=42)
+        company = _FakeCompany()
+        obs = np.zeros(36)
+        # epsilon=0 → all greedy
+        for _ in range(5):
+            ag.select_auction_action(obs, company, price_ma3=80.0,
+                                     config=config, epsilon=0.0)
+        assert ag._greedy_picks == 5
+        assert ag._explore_picks == 0
+        assert ag.window_explore_share() == 0.0
+        # epsilon=1 → all explore
+        for _ in range(5):
+            ag.select_auction_action(obs, company, price_ma3=80.0,
+                                     config=config, epsilon=1.0)
+        assert ag._explore_picks == 5
+        assert abs(ag.window_explore_share() - 0.5) < 1e-9
+
+    def test_mean_max_q_only_over_visited(self):
+        ag = QLearningAgent(agent_id=0, alpha=1.0, gamma=0.0, seed=42)
+        # One large positive reward at state 5; with γ=0 and α=1, the Q
+        # for that cell becomes exactly the reward.
+        ag.update(state=5, a1_idx=0, a2_idx=0,
+                  reward=42.0, next_state=6, done=True)
+        # mean_max_q is taken across visited states only — exactly one
+        # state has been visited so the answer must equal that Q value.
+        assert abs(ag.mean_max_q() - 42.0) < 1e-9
+        assert ag.coverage_states() == 1

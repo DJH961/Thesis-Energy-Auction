@@ -333,8 +333,107 @@ class QLearningAgent:
         # Q-table: Q(state, auction_profile, secondary_profile)
         self.q_table = np.zeros((n_states, n_a1, n_a2), dtype=np.float64)
 
+        # Per-cell update counter — used for Q-table coverage diagnostics.
+        # A "visited" state is one where at least one (a1,a2) cell has been
+        # updated at least once.
+        self.visit_counts = np.zeros((n_states, n_a1, n_a2), dtype=np.int64)
+
+        # Rolling diagnostics for the HAPPO-mirrored console: reset at the
+        # start of each log_interval window via reset_window_stats().
+        self._td_abs_sum = 0.0          # Σ |TD-error| this window
+        self._td_count = 0              # number of Bellman updates this window
+        self._explore_picks = 0         # ε-random actions this window
+        self._greedy_picks = 0          # greedy actions this window
+
         # Tracking for analysis
         self.action_history = []  # list of (state, a1_idx, a2_idx)
+
+    # -----------------------------------------------------------------
+    # Window diagnostics (mirrors HAPPO's per-log_interval bookkeeping)
+    # -----------------------------------------------------------------
+
+    def reset_window_stats(self) -> None:
+        """Reset the rolling TD-error / ε-pick counters for the next
+        ``log_interval`` window. Called by the trainer right after the
+        console block has been printed."""
+        self._td_abs_sum = 0.0
+        self._td_count = 0
+        self._explore_picks = 0
+        self._greedy_picks = 0
+
+    def window_td_mean_abs(self) -> float:
+        """Mean |TD-error| across all Bellman updates in the current window.
+        Returns 0.0 if no updates have been made (e.g. very first
+        log_interval call before any episode finished)."""
+        if self._td_count == 0:
+            return 0.0
+        return float(self._td_abs_sum / self._td_count)
+
+    def window_explore_share(self) -> float:
+        """Fraction of action selections in the current window that came
+        from the ε-random branch (in [0,1])."""
+        total = self._explore_picks + self._greedy_picks
+        if total == 0:
+            return 0.0
+        return float(self._explore_picks / total)
+
+    def window_update_count(self) -> int:
+        """Number of Bellman updates applied in the current window."""
+        return int(self._td_count)
+
+    def coverage_states(self) -> int:
+        """Number of distinct discrete states with at least one Bellman
+        update applied to any (a1,a2) cell. Range [0, N_STATES]."""
+        # Sum over the (a1,a2) axes — a state is "visited" if any cell
+        # has visit_counts > 0.
+        return int((self.visit_counts.sum(axis=(1, 2)) > 0).sum())
+
+    def coverage_fraction(self) -> float:
+        """Q-table state coverage as a fraction in [0, 1]."""
+        return float(self.coverage_states() / max(1, StateDiscretizer.N_STATES))
+
+    def _max_q_per_state(self) -> np.ndarray:
+        """Vector of max_{a1,a2} Q(s, a1, a2) for every state s."""
+        return self.q_table.reshape(self.q_table.shape[0], -1).max(axis=1)
+
+    def _greedy_flat_per_state(self) -> np.ndarray:
+        """Vector of argmax_{a1,a2} Q(s, a1, a2) (flattened) for every state."""
+        return self.q_table.reshape(self.q_table.shape[0], -1).argmax(axis=1)
+
+    def mean_max_q(self) -> float:
+        """Mean of max_{a1,a2} Q(s, a1, a2) across *visited* states.
+        Returns 0.0 if no state has been visited yet — this avoids the
+        N_STATES × 0.0 floor that would otherwise mask the learning
+        signal during the first few log windows."""
+        visited_mask = self.visit_counts.sum(axis=(1, 2)) > 0
+        n_visited = int(visited_mask.sum())
+        if n_visited == 0:
+            return 0.0
+        return float(self._max_q_per_state()[visited_mask].mean())
+
+    def greedy_policy_diversity(self) -> int:
+        """Number of *distinct* (a1,a2) profile pairs that appear in the
+        greedy policy across visited states. A small number means the
+        agent has converged onto a narrow strategy; a large number means
+        it still uses many different profiles depending on context."""
+        visited_mask = self.visit_counts.sum(axis=(1, 2)) > 0
+        if not visited_mask.any():
+            return 0
+        return int(np.unique(self._greedy_flat_per_state()[visited_mask]).size)
+
+    def top_auction_profile(self) -> int:
+        """Most-frequent greedy auction profile across visited states.
+        Returns 0 if no state has been visited yet (callers may render
+        this as 'Conservative' or 'n/a' depending on context)."""
+        visited_mask = self.visit_counts.sum(axis=(1, 2)) > 0
+        if not visited_mask.any():
+            return 0
+        # Greedy a1 = argmax over a1 of (max over a2)
+        q_a1 = self.q_table.max(axis=2)  # (n_states, n_a1)
+        greedy_a1 = q_a1.argmax(axis=1)  # (n_states,)
+        counts = np.bincount(greedy_a1[visited_mask],
+                             minlength=ActionProfileMapper.N_AUCTION_PROFILES)
+        return int(counts.argmax())
 
     def select_auction_action(self, obs: np.ndarray, company,
                               price_ma3: float, config: dict,
@@ -355,10 +454,12 @@ class QLearningAgent:
 
         if self.rng.random() < epsilon:
             profile_idx = int(self.rng.integers(0, n_profiles))
+            self._explore_picks += 1
         else:
             # Greedy: max Q over auction profiles, marginalized over secondary
             q_auction = self.q_table[state].max(axis=1)  # shape (n_a1,)
             profile_idx = int(np.argmax(q_auction))
+            self._greedy_picks += 1
 
         action_vec = self.mapper.get_auction_action(
             profile_idx, company, price_ma3, config, current_year=current_year)
@@ -387,9 +488,11 @@ class QLearningAgent:
 
         if self.rng.random() < epsilon:
             profile_idx = int(self.rng.integers(0, n_profiles))
+            self._explore_picks += 1
         else:
             q_sec = self.q_table[state, a1_idx, :]  # shape (n_a2,)
             profile_idx = int(np.argmax(q_sec))
+            self._greedy_picks += 1
 
         action_vec = self.mapper.get_secondary_action(
             profile_idx, company, clearing_price, config, current_year=current_year)
@@ -401,6 +504,10 @@ class QLearningAgent:
         Standard Q-learning update rule.
 
         Q(s, a1, a2) ← Q(s, a1, a2) + α [r + γ max_{a1',a2'} Q(s', a1', a2') - Q(s, a1, a2)]
+
+        Records the absolute TD-error and bumps the visit-count for the
+        updated cell so the trainer can surface a |TD| / Cov / maxQ
+        diagnostic block alongside the HAPPO-mirrored output.
         """
         current_q = self.q_table[state, a1_idx, a2_idx]
 
@@ -410,7 +517,13 @@ class QLearningAgent:
             next_max = self.q_table[next_state].max()
             target = reward + self.gamma * next_max
 
-        self.q_table[state, a1_idx, a2_idx] += self.alpha * (target - current_q)
+        td_error = target - current_q
+        self.q_table[state, a1_idx, a2_idx] += self.alpha * td_error
+
+        # Window diagnostics
+        self.visit_counts[state, a1_idx, a2_idx] += 1
+        self._td_abs_sum += abs(float(td_error))
+        self._td_count += 1
 
     def get_top_q_values(self, top_k: int = 5) -> list:
         """Return top-k (state, a1, a2, q_value) tuples by Q-value."""
