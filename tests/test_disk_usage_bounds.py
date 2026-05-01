@@ -32,6 +32,7 @@ sys.path.insert(
 )
 
 from scripts.train import (  # noqa: E402  (path setup above)
+    cleanup_snapshots_on_finish,
     enforce_snapshot_retention,
     prune_checkpoints,
 )
@@ -170,6 +171,92 @@ def test_enforce_snapshot_retention_clamps_keep_recent_to_one(tmp_path):
     # Most-recent pair survives.
     assert "training_log_s1_ep200.csv" in remaining
     assert "year_log_s1_ep200.csv" in remaining
+
+
+# ---------------------------------------------------------------------------
+# cleanup_snapshots_on_finish
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_snapshots_on_finish_deletes_all_pairs_for_seed(tmp_path):
+    """Clean end-of-run wipes every snapshot pair for this seed/tag.
+
+    The live cumulative training/year logs supersede mid-run snapshots
+    once a run completes, so retaining them only wastes local disk and
+    doubles the upload footprint when results/ is copied to Azure ML.
+    """
+    snap = tmp_path
+    eps = [2500, 5000, 7500, 10000]
+    for ep in eps:
+        _touch(snap / f"training_log_s42_ep{ep}.csv")
+        _touch(snap / f"year_log_s42_ep{ep}.csv")
+
+    deleted = cleanup_snapshots_on_finish(
+        snap_dir=str(snap), tag_part="", seed=42,
+    )
+
+    # All 4 pairs (8 files) gone.
+    assert deleted == 8
+    # Empty directory is removed too.
+    assert not os.path.exists(str(snap))
+
+
+def test_cleanup_snapshots_on_finish_isolates_other_seeds(tmp_path):
+    """Other seeds' / tags' snapshots must not be touched."""
+    snap = tmp_path
+    # Target seed.
+    for ep in (1000, 2000):
+        _touch(snap / f"training_log_s1_ep{ep}.csv")
+        _touch(snap / f"year_log_s1_ep{ep}.csv")
+    # Different seed.
+    _touch(snap / "training_log_s2_ep1000.csv")
+    _touch(snap / "year_log_s2_ep1000.csv")
+    # Different tag.
+    _touch(snap / "training_log_msr_off_s1_ep1000.csv")
+    _touch(snap / "year_log_msr_off_s1_ep1000.csv")
+
+    cleanup_snapshots_on_finish(snap_dir=str(snap), tag_part="", seed=1)
+
+    remaining = set(os.listdir(snap))
+    # Target seed/tag wiped.
+    assert "training_log_s1_ep1000.csv" not in remaining
+    assert "year_log_s1_ep2000.csv" not in remaining
+    # Other seed and tagged group preserved.
+    assert "training_log_s2_ep1000.csv" in remaining
+    assert "year_log_s2_ep1000.csv" in remaining
+    assert "training_log_msr_off_s1_ep1000.csv" in remaining
+    assert "year_log_msr_off_s1_ep1000.csv" in remaining
+    # Directory not removed because other files remain.
+    assert os.path.isdir(str(snap))
+
+
+def test_cleanup_snapshots_on_finish_with_run_tag(tmp_path):
+    """``tag_part`` selector only matches the requested tag group."""
+    snap = tmp_path
+    _touch(snap / "training_log_msr_off_s7_ep500.csv")
+    _touch(snap / "year_log_msr_off_s7_ep500.csv")
+    _touch(snap / "training_log_s7_ep500.csv")  # untagged group, keep
+    _touch(snap / "year_log_s7_ep500.csv")
+
+    cleanup_snapshots_on_finish(
+        snap_dir=str(snap), tag_part="_msr_off", seed=7,
+    )
+
+    remaining = set(os.listdir(snap))
+    assert "training_log_msr_off_s7_ep500.csv" not in remaining
+    assert "year_log_msr_off_s7_ep500.csv" not in remaining
+    assert "training_log_s7_ep500.csv" in remaining
+    assert "year_log_s7_ep500.csv" in remaining
+
+
+def test_cleanup_snapshots_on_finish_no_directory(tmp_path):
+    """Missing snapshot directory is a no-op, not an error."""
+    deleted = cleanup_snapshots_on_finish(
+        snap_dir=str(tmp_path / "does_not_exist"),
+        tag_part="",
+        seed=0,
+    )
+    assert deleted == 0
 
 
 # ---------------------------------------------------------------------------

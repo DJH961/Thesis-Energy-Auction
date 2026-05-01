@@ -411,7 +411,7 @@ def _summarize_csv(
         parts.append(f"R̄ {r_now:+.1f}")
 
     if _ok(quality_score):
-        parts.append(f"Q={quality_score:.3f}")
+        parts.append(f"Q={quality_score:+.2f}")
 
     return " | ".join(parts), last_ep
 
