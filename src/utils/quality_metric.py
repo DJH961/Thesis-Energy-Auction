@@ -132,6 +132,11 @@ def compute_episode_quality(
         for yl_idx, yl in enumerate(ep_log):
             yr = int(yl.get("year", yl_idx))
             if yr not in anchors_per_year:
+                # Clamp on year index for defensive robustness — episode
+                # logs from short/curriculum runs occasionally carry a
+                # year index past ``n_years - 1`` (e.g. terminal-payoff
+                # bookkeeping). Clamping keeps the anchor lookup well-
+                # defined; the underlying trajectory shape is unchanged.
                 cap_t_a = float(cap_for_year(min(yr, max(0, n_years - 1))))
                 anchors_per_year[yr] = float(compute_fundamental_anchor(
                     yr, config, cap_t_actual=cap_t_a

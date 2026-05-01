@@ -232,6 +232,10 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
     eps_start = ql_params.get("epsilon_start", 1.0)
     eps_end = ql_params.get("epsilon_end", 0.05)
     eps_decay_frac = ql_params.get("epsilon_decay_frac", 0.7)
+    # ``max(1, ...)`` keeps the linear-decay denominator well-defined
+    # even on micro smoke runs (e.g. n_episodes=1, eps_decay_frac=0.7
+    # → int rounds to 0). In that degenerate case the loop spends one
+    # episode at eps_start and no later episodes exist.
     eps_decay_episodes = max(1, int(n_episodes * eps_decay_frac))
 
     n_agents = config["companies"]["n_agents"]
@@ -433,6 +437,14 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
             "Q_cost_eff":      None if np.isnan(quality["Q_cost_eff"]) else round(quality["Q_cost_eff"], 4),
             "Q_volatility":    None if np.isnan(quality["Q_volatility"]) else round(quality["Q_volatility"], 4),
         }
+        # Precompute per-agent total penalty across the episode in a
+        # single pass over env.episode_log (avoids re-walking the log
+        # n_total_agents times inside the row-building loop below).
+        episode_penalties = np.zeros(n_total_agents, dtype=np.float64)
+        for yl in env.episode_log:
+            pens = yl.get("penalties", [])
+            for i in range(min(n_total_agents, len(pens))):
+                episode_penalties[i] += float(pens[i] or 0.0)
         for i in range(n_total_agents):
             company_i = env.companies[i] if i < len(env.companies) else None
             if i < n_agents:
@@ -455,11 +467,7 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
                 float(episode_compliant_years[i] / max(n_years, 1)), 3
             )
             ep_row[f"shortfall_A{i+1}"] = round(float(episode_shortfalls[i]), 4)
-            ep_row[f"penalty_A{i+1}"] = round(float(
-                sum(yl.get("penalties", [0] * n_total_agents)[i]
-                    if i < len(yl.get("penalties", [])) else 0
-                    for yl in env.episode_log)
-            ), 3)
+            ep_row[f"penalty_A{i+1}"] = round(float(episode_penalties[i]), 3)
             ep_row[f"bid_price_A{i+1}"] = round(float(last_clearing_price), 2)
             ep_row[f"queue_size_A{i+1}"] = int(
                 len(company_i._construction_queue) if company_i is not None else 0
