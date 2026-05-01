@@ -7,7 +7,7 @@
 # participant set and a few learning-related blocks that would be
 # silently dead under `n_agents=0`.
 
-version: "8.6.2"
+version: "8.6.3"
 
 simulation:
   n_years: 12

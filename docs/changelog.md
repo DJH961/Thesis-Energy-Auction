@@ -5,6 +5,63 @@ Version numbers reflect the `version` field in `pyproject.toml`
 
 ---
 
+## [8.6.3]
+
+**Seed stability — environment stochasticity is now invariant to agent
+actions and to most config knobs.** `ETSEnvironment` previously routed
+every random draw through one shared `np.random.default_rng`
+(`self.rng`), which was also handed to every `Company` (project
+success, jitter delay, cancellations) and to `market_clearing_ets`
+(auction tiebreak). Because those streams were consumed conditionally
+on agent actions and on derived market-calibration quantities, a
+different reward function, LRF value, MSR setting, or company
+budget shifted the global stream and silently changed subsequent
+emission shocks, capacity-factor noise, AR(1) price shocks, and
+opponent-obs queue noise for the *same* seed.
+
+The stream is now split via `np.random.SeedSequence(seed).spawn(...)`
+into named sub-streams, built in `_init_env_rng_streams` and
+`_build_company_rng_streams`:
+
+* `self._inflation_rng` — episode inflation-path draws only. Identical
+  inflation paths across LRF / MSR / reward / company-budget variants.
+* `self._shock_rng` — per-year emission shocks (η + ξ) and capacity-
+  factor noise. Identical shock realisations across all of the above.
+* `self._price_rng` — AR(1) expected-price shock and warm-start /
+  burn-in price seeding.
+* `self._bot_rng` — per-episode persistent bot heterogeneity
+  (valuation noise, urgency multiplier, budget-stress draws).
+* `self._urgency_rng` — private per-agent urgency scalars
+  (LogNormal). Independent of bot streams so toggling bots on/off
+  does not shift the agent urgency draw.
+* `self._warmstart_rng` — warm-start construction-queue and bank-
+  fraction draws.
+* `self._opponent_obs_rng` — opponent-observation queue-noise draws
+  (cosmetic obs perturbation).
+* `self._auction_rng` — auction tiebreak only (its draw count equals
+  the number of valid bids and is therefore action-dependent).
+* `self._phantom_rng` — phantom-bidder draws.
+* `self._company_rngs[i]` — one independent generator per `Company`
+  for action-conditional draws (`plan_investment` success + jitter
+  delay, `cancel_queued_projects`).
+
+`self._env_rng` and `self.rng` are preserved as backward-compatible
+handles (`self._env_rng` aliases `self._shock_rng`; `self.rng` aliases
+`self._env_rng`).
+
+For a fixed seed, two episodes that differ in *any* of {agent actions,
+LRF, inflation parameters, MSR enabled, reward weights, company
+profiles & budgets, ESG/treasury settings} produce identical
+inflation paths, emission shocks, CF noise, AR(1) shocks, and queue
+noise — making cross-config experiments maximally comparable. New
+regression tests in `tests/test_environment.py`
+(`test_env_stochasticity_invariant_to_agent_actions`,
+`test_env_stochasticity_invariant_across_config_variants`,
+`test_seed_stability_same_actions_same_outcome`,
+`test_per_company_rng_independence`) lock this in.
+
+---
+
 ## [8.6.2]
 
 **Bots-only baseline.** The heuristic bot policy

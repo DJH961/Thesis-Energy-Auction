@@ -108,7 +108,16 @@ class ETSEnvironment(gym.Env):
         self.n_years = cfg["simulation"]["n_years"]
 
         self._seed = seed
-        self.rng = np.random.default_rng(seed)
+        # Independent RNG streams keep environment-level stochasticity
+        # (inflation, emission shocks, CF noise, AR(1) shock, queue noise,
+        # bot persistent noise, urgency scalars, warm-start/burn-in draws,
+        # phantom bidder) invariant to changes in agent behaviour for a
+        # given seed. Auction tiebreaks and per-company action-conditional
+        # draws (project success, jitter delay, cancellations) live on
+        # their own streams so their draw counts cannot shift the env
+        # stream. Per-company streams are sized for the eventual self.n_total
+        # below; we (re)build them once self.companies is known.
+        self._init_env_rng_streams(seed)
 
         # Keep a pristine calibration config (pre-extension arrays) so re-calibration
         # does not accidentally count appended bot entries.
@@ -155,11 +164,18 @@ class ETSEnvironment(gym.Env):
             bot_debt_hr = bot_debt_hr[: self.n_bots]
             cfg["budget"]["debt_headrooms"] = cfg["budget"].get("debt_headrooms", []) + bot_debt_hr
 
+        # Now that n_total is known, (re)build per-company RNG streams so
+        # that each Company gets its own independent generator. Action-
+        # conditional draws inside one company (project success, jitter
+        # delay, cancellations) cannot then leak into other companies'
+        # streams or the env-level stream.
+        self._build_company_rng_streams()
+
         initial_mixes = cfg["companies"]["initial_mix"]
         self.companies: List[Company] = [
             Company(
                 agent_id=i, config=cfg,
-                initial_mix=initial_mixes[i], rng=self.rng,
+                initial_mix=initial_mixes[i], rng=self._company_rngs[i],
             )
             for i in range(self.n_total)
         ]
@@ -341,7 +357,7 @@ class ETSEnvironment(gym.Env):
         self.episode_log: List[dict] = []
 
         # Phantom bidder (financial intermediary demand)
-        self._phantom_bidder = PhantomBidder(config, self.rng)
+        self._phantom_bidder = PhantomBidder(config, self._phantom_rng)
 
         # Reward channel diagnostics
         self._last_reward_channels: dict = {}
@@ -454,6 +470,88 @@ class ETSEnvironment(gym.Env):
 
         return base_reserve
 
+    def _init_env_rng_streams(self, seed: Optional[int]):
+        """(Re)build independent RNG streams from a master seed.
+
+        Each named stream is spawned from a single ``SeedSequence`` so
+        that draws made for one purpose cannot shift draws made for
+        another. This is critical for cross-config experiments: changing
+        an inflation knob, MSR setting, LRF, reward weights, or company
+        profiles must not silently shift the per-year emission shocks
+        (or any other exogenous stream) for the same seed.
+
+        Streams:
+
+        * ``_inflation_rng`` — episode inflation-path draws. Dedicated
+          so toggling inflation variance (std/window) does not consume
+          values that other streams would otherwise draw.
+        * ``_shock_rng`` — per-year emission shocks (η + ξ) and
+          capacity-factor noise. Most safety-critical for comparability
+          across config variants.
+        * ``_price_rng`` — AR(1) expected-price shock and warm-start /
+          burn-in price seeding.
+        * ``_bot_rng`` — per-bot persistent heterogeneity (valuation
+          noise, urgency multiplier, budget-stress draws). Isolated so
+          enabling/disabling bots does not shift the agent-side streams.
+        * ``_urgency_rng`` — per-agent urgency scalars (LogNormal).
+        * ``_warmstart_rng`` — warm-start construction-queue and bank-
+          fraction draws.
+        * ``_opponent_obs_rng`` — opponent-observation queue-noise
+          (cosmetic obs perturbation).
+        * ``_auction_rng`` — auction tiebreak only. Number of draws is
+          action-dependent (equals # valid bids) so this MUST stay
+          isolated from any "exogenous" stream.
+        * ``_phantom_rng`` — phantom-bidder draws.
+        * Per-company streams (rebuilt by ``_build_company_rng_streams``)
+          for action-conditional in-Company draws (project success,
+          jitter delay, cancellations).
+
+        ``self._env_rng`` and ``self.rng`` are kept as backward-compatible
+        handles. ``self._env_rng`` aliases ``_shock_rng`` (the most
+        central exogenous stream); ``self.rng`` aliases ``self._env_rng``.
+        New code should prefer the named streams.
+        """
+        ss = np.random.SeedSequence(seed)
+        # Order is part of the API surface for reproducibility — APPEND
+        # new sub-streams; never reorder existing ones.
+        children = ss.spawn(10)
+        (
+            inflation_ss,
+            shock_ss,
+            price_ss,
+            bot_ss,
+            urgency_ss,
+            warmstart_ss,
+            opp_obs_ss,
+            auction_ss,
+            phantom_ss,
+            self._company_seed_seq,
+        ) = children
+        self._inflation_rng = np.random.default_rng(inflation_ss)
+        self._shock_rng = np.random.default_rng(shock_ss)
+        self._price_rng = np.random.default_rng(price_ss)
+        self._bot_rng = np.random.default_rng(bot_ss)
+        self._urgency_rng = np.random.default_rng(urgency_ss)
+        self._warmstart_rng = np.random.default_rng(warmstart_ss)
+        self._opponent_obs_rng = np.random.default_rng(opp_obs_ss)
+        self._auction_rng = np.random.default_rng(auction_ss)
+        self._phantom_rng = np.random.default_rng(phantom_ss)
+        # Backward-compat handles. ``_env_rng`` aliases the most central
+        # exogenous stream so legacy callers fall through to a deterministic
+        # generator. New code should target a named stream above.
+        self._env_rng = self._shock_rng
+        self.rng = self._env_rng
+
+    def _build_company_rng_streams(self):
+        """Spawn one independent RNG per company from the company seed seq.
+
+        Called after ``self.n_total`` is known. Re-called on reset so a
+        new master seed re-derives reproducible per-company streams.
+        """
+        n = max(1, int(self.n_total))
+        child_seeds = self._company_seed_seq.spawn(n)
+        self._company_rngs = [np.random.default_rng(s) for s in child_seeds]
+
     def _build_episode_inflation_path(self):
         """Build one inflation path per episode, shared by all agents."""
         pen_cfg = self.config.get("penalty", {})
@@ -462,13 +560,13 @@ class ETSEnvironment(gym.Env):
         rand_window = float(max(0.0, pen_cfg.get("inflation_random_window", 0.0)))
 
         if rand_std > 0.0:
-            rates = self.rng.normal(base_rate, rand_std, size=self.n_years)
+            rates = self._inflation_rng.normal(base_rate, rand_std, size=self.n_years)
             rates = np.maximum(rates, -0.99)
             self._inflation_rates = [float(r) for r in rates]
         elif rand_window > 0.0:
             low = max(-0.99, base_rate - rand_window)
             high = base_rate + rand_window
-            rates = self.rng.uniform(low, high, size=self.n_years)
+            rates = self._inflation_rng.uniform(low, high, size=self.n_years)
             self._inflation_rates = [float(r) for r in rates]
         else:
             self._inflation_rates = [base_rate for _ in range(self.n_years)]
@@ -494,7 +592,8 @@ class ETSEnvironment(gym.Env):
     def reset(self, seed: Optional[int] = None, options=None):
         if seed is not None:
             self._seed = seed
-            self.rng = np.random.default_rng(seed)
+            self._init_env_rng_streams(seed)
+            self._build_company_rng_streams()
 
         self.current_year = 0
         self.episode_done = False
@@ -611,12 +710,12 @@ class ETSEnvironment(gym.Env):
                 mult_low = bot_cfg.get("urgency_mult_low", 0.8)
                 mult_high = bot_cfg.get("urgency_mult_high", 1.2)
             for b in range(self.n_bots):
-                self._bot_valuation_noise[b] = self.rng.normal(0, noise_std)
-                self._bot_urgency_mult[b] = self.rng.uniform(mult_low, mult_high)
+                self._bot_valuation_noise[b] = self._bot_rng.normal(0, noise_std)
+                self._bot_urgency_mult[b] = self._bot_rng.uniform(mult_low, mult_high)
 
             if self._enhanced_noise_enabled:
                 stress_prob = float(self._enhanced_noise_cfg.get("budget_stress_prob", 0.0))
-                self._bot_budget_stressed = self.rng.random(self.n_bots) < stress_prob
+                self._bot_budget_stressed = self._bot_rng.random(self.n_bots) < stress_prob
             else:
                 self._bot_budget_stressed[:] = False
 
@@ -642,7 +741,7 @@ class ETSEnvironment(gym.Env):
         urgency_cfg = self.config.get("urgency_scalars", {})
         if urgency_cfg.get("enabled", False):
             sigma_u = float(urgency_cfg.get("lognormal_sigma", 0.30))
-            self._urgency_scalars = self.rng.lognormal(
+            self._urgency_scalars = self._urgency_rng.lognormal(
                 mean=0.0, sigma=sigma_u, size=self.n_agents
             ).astype(float)
         else:
@@ -651,7 +750,10 @@ class ETSEnvironment(gym.Env):
         initial_mixes = self.config["companies"]["initial_mix"]
         for i, company in enumerate(self.companies):
             company.reset(initial_mix=initial_mixes[i])
-            company.rng = self.rng
+            # Per-company RNG keeps action-conditional draws (project
+            # success, jitter delay, cancellations) isolated from the
+            # env-stochasticity stream and from other companies.
+            company.rng = self._company_rngs[i]
             company.set_inflation_path(self._inflation_rates)
 
         # Warm-start — seed construction queue, holdings, price history
@@ -777,14 +879,14 @@ class ETSEnvironment(gym.Env):
 
             for tech_idx, mu in green_specs:
                 lam = float(poisson_lambdas[tech_idx])
-                n_projects = int(self.rng.poisson(mu))
+                n_projects = int(self._warmstart_rng.poisson(mu))
                 for _ in range(n_projects):
-                    frac_delta = float(self.rng.uniform(0.005, 0.025))
+                    frac_delta = float(self._warmstart_rng.uniform(0.005, 0.025))
                     if total_seeded_frac + frac_delta > max_seedable:
                         frac_delta = max(0.0, max_seedable - total_seeded_frac)
                     if frac_delta < 1e-4:
                         continue
-                    completion_year = int(self.rng.integers(0, max(1, int(lam) + 2)))
+                    completion_year = int(self._warmstart_rng.integers(0, max(1, int(lam) + 2)))
                     company._construction_queue.append({
                         "tech_idx": tech_idx,
                         "frac_delta": frac_delta,
@@ -830,7 +932,7 @@ class ETSEnvironment(gym.Env):
                 self.holdings[i] = 0.0
                 continue
             annual_need = max(company.compute_estimate_need(), 0.1)
-            bank_frac = float(self.rng.uniform(bank_min, bank_max))
+            bank_frac = float(self._warmstart_rng.uniform(bank_min, bank_max))
             self.holdings[i] = bank_frac * annual_need
 
         # (B) Seed in-flight construction queues.
@@ -840,7 +942,7 @@ class ETSEnvironment(gym.Env):
         self._price_history = []
         for _ in range(n_seed_prices):
             seed_price = float(np.clip(
-                self.rng.normal(price_mean, price_std),
+                self._price_rng.normal(price_mean, price_std),
                 price_min,
                 price_max,
             ))
@@ -925,7 +1027,7 @@ class ETSEnvironment(gym.Env):
                 q_cap=float(auction_volume),
                 reserve_price=reserve_price,
                 max_agent_share=max_agent_share,
-                rng=self.rng,
+                rng=self._auction_rng,
                 cancel_under_subscribed=cancel_under_subscribed,
                 n_agents=self.n_total,
                 pricing_rule=self.config["auction"].get("pricing_rule", "uniform"),
@@ -964,9 +1066,9 @@ class ETSEnvironment(gym.Env):
             for i, company in enumerate(self.companies):
                 if not self._is_agent_active(i):
                     continue
-                if self.rng.random() < 0.3:
-                    invest_frac = float(self.rng.uniform(0.01, 0.03))
-                    tech_choice = int(self.rng.integers(0, 3))
+                if self._warmstart_rng.random() < 0.3:
+                    invest_frac = float(self._warmstart_rng.uniform(0.01, 0.03))
+                    tech_choice = int(self._warmstart_rng.integers(0, 3))
                     company.plan_investment(
                         tech_choice=tech_choice,
                         invest_frac=invest_frac,
@@ -987,7 +1089,7 @@ class ETSEnvironment(gym.Env):
         price_floor = compute_fundamental_anchor(0, self.config)
         vol_std = self.config["price"].get("volatility_std", 0.15)
         base_price = self.last_clearing_price if self._price_history else price_mean
-        shock = self.rng.normal(0, vol_std) * base_price
+        shock = self._price_rng.normal(0, vol_std) * base_price
         self.expected_price = max(
             rho * base_price + (1.0 - rho) * price_floor + shock,
             price_floor,
@@ -1082,7 +1184,7 @@ class ETSEnvironment(gym.Env):
         for i, company in enumerate(self.companies):
             if self._is_agent_active(i):
                 annual_need = company.compute_estimate_need()  # Mt
-                seed_multiple = float(self.rng.uniform(bank_min, bank_max))
+                seed_multiple = float(self._warmstart_rng.uniform(bank_min, bank_max))
                 self.holdings[i] = annual_need * seed_multiple
             else:
                 self.holdings[i] = 0.0
@@ -1094,7 +1196,7 @@ class ETSEnvironment(gym.Env):
                                       self.config["price"].get("burnin_std", 10.0)))
         for _ in range(n_burnin):
             synthetic_price = float(np.clip(
-                self.rng.normal(burnin_mean, burnin_std),
+                self._price_rng.normal(burnin_mean, burnin_std),
                 self.config["auction"]["price_min"],
                 self.config["auction"]["price_max"],
             ))
@@ -1103,7 +1205,7 @@ class ETSEnvironment(gym.Env):
             rho = self.config["price"].get("ar1_persistence", 0.85)
             price_floor = compute_fundamental_anchor(0, self.config)
             vol_std = self.config["price"].get("volatility_std", 0.15)
-            shock = self.rng.normal(0, vol_std) * synthetic_price
+            shock = self._price_rng.normal(0, vol_std) * synthetic_price
             self.expected_price = max(
                 rho * synthetic_price + (1.0 - rho) * price_floor + shock,
                 price_floor,
@@ -1231,7 +1333,7 @@ class ETSEnvironment(gym.Env):
         if jitter_cfg.get("enabled", False):
             for i, company in enumerate(self.companies):
                 pre_count = len(company._construction_queue)
-                recovered = company.cancel_queued_projects(self.rng)
+                recovered = company.cancel_queued_projects(self._company_rngs[i])
                 post_count = len(company._construction_queue)
                 cancellations[i] = pre_count - post_count
                 cancel_recoveries[i] = recovered
@@ -1361,8 +1463,8 @@ class ETSEnvironment(gym.Env):
         if unc_cfg.get("enabled", False):
             sigma = unc_cfg.get("sigma_demand", 0.07)
             rho = unc_cfg.get("corr_rho", 0.40)
-            eta_common = float(self.rng.normal(0, 1))  # system-wide shock
-            idio = self.rng.normal(0, 1, self.n_total)  # idiosyncratic shocks
+            eta_common = float(self._shock_rng.normal(0, 1))  # system-wide shock
+            idio = self._shock_rng.normal(0, 1, self.n_total)  # idiosyncratic shocks
             epsilons = rho * eta_common + np.sqrt(max(0.0, 1.0 - rho ** 2)) * idio
             epsilons *= sigma
             self._last_common_emission_shock = float(eta_common * sigma)
@@ -1378,7 +1480,7 @@ class ETSEnvironment(gym.Env):
             for i in range(self.n_total):
                 for t in range(5):
                     if cf_sigma[t] > 0:
-                        cf_noise[i, t] = float(self.rng.normal(0, cf_sigma[t]))
+                        cf_noise[i, t] = float(self._shock_rng.normal(0, cf_sigma[t]))
         self._current_cf_noise = cf_noise
 
         # 6. Compute realized emissions (capacity-factor noise + demand shock applied)
@@ -1761,7 +1863,7 @@ class ETSEnvironment(gym.Env):
             q_cap=auction_volume,
             reserve_price=effective_reserve,
             max_agent_share=self.config["auction"].get("max_agent_share", 1.0),
-            rng=self.rng,
+            rng=self._auction_rng,
             cancel_under_subscribed=self.config["auction"].get(
                 "cancel_under_subscribed", False),
             n_agents=n_agents_clearing,
@@ -2606,7 +2708,7 @@ class ETSEnvironment(gym.Env):
             log.get("auction_stats", {}).get("auction_failed", False)
         )
         if auction_succeeded_this_step and clearing_price > 0:
-            shock = self.rng.normal(0, vol_std) * clearing_price
+            shock = self._price_rng.normal(0, vol_std) * clearing_price
             self.expected_price = max(
                 rho * clearing_price + (1.0 - rho) * price_floor + shock,
                 price_floor,
@@ -2666,7 +2768,7 @@ class ETSEnvironment(gym.Env):
         for _si, _sc in enumerate(self.companies):
             need_i = max(_sc.compute_estimate_need(), 1e-6)
             queue_raw = float(sum(item["frac_delta"] for item in _sc._construction_queue))
-            queue_noisy = float(np.clip(queue_raw + self.rng.normal(0, queue_sigma), 0.0, 1.0))
+            queue_noisy = float(np.clip(queue_raw + self._opponent_obs_rng.normal(0, queue_sigma), 0.0, 1.0))
             tnac_share = float(np.clip(self.holdings[_si] / max(_total_holdings, 1e-6), 0.0, 1.0))
             net_sec = float(np.clip(
                 (self._sec_bought[_si] - self._sec_sold[_si]) / need_i, -1.0, 1.0
