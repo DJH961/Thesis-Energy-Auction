@@ -52,3 +52,45 @@ def test_training_smoke_runs_10_episodes(tmp_path):
 
     assert len(rows) == n_episodes
     assert int(float(rows[-1]["episode"])) == n_episodes - 1
+
+    # v8.6.1 expanded episode-level logging — pin the new column names.
+    n_total = cfg["companies"]["n_agents"] + cfg["companies"].get("n_bot_agents", 0)
+    expected_ep_cols = {
+        "year0_tnac", "yearT_tnac", "ep_total_unsold",
+        "ep_auction_failures", "ep_total_defaults",
+    }
+    for i in range(n_total):
+        expected_ep_cols.update({
+            f"peak_loan_outstanding_A{i+1}",
+            f"peak_carry_forward_A{i+1}",
+            f"final_treasury_reserve_A{i+1}",
+        })
+    assert expected_ep_cols.issubset(rows[0].keys()), \
+        f"Missing v8.6.1 episode columns: {expected_ep_cols - set(rows[0].keys())}"
+
+    # And the year-level expanded columns.
+    yr_log = Path(cfg["logging"]["results_dir"]) / f"year_log_s{seed}.csv"
+    assert yr_log.exists()
+    with yr_log.open(newline="", encoding="utf-8") as f:
+        yr_rows = list(csv.DictReader(f))
+    expected_yr_cols = {
+        "auction_total_demand", "auction_unsold", "auction_hhi",
+        "auction_max_agent_share", "auction_failed",
+        "auction_defaults", "auction_defaulted_volume",
+        "effective_reserve_price",
+        "secondary_n_buyers_intent", "secondary_n_sellers_intent",
+        "secondary_n_buyers_executed", "secondary_n_sellers_executed",
+        "common_emission_shock", "fundamental_anchor",
+    }
+    for i in range(n_total):
+        expected_yr_cols.update({
+            f"carry_forward_start_A{i+1}",
+            f"carry_forward_end_A{i+1}",
+            f"coverage_gap_A{i+1}",
+            f"effective_penalty_rate_A{i+1}",
+            f"treasury_reserve_A{i+1}",
+            f"treasury_drawn_A{i+1}",
+            f"loan_outstanding_A{i+1}",
+        })
+    assert expected_yr_cols.issubset(yr_rows[0].keys()), \
+        f"Missing v8.6.1 year columns: {expected_yr_cols - set(yr_rows[0].keys())}"
