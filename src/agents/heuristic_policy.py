@@ -135,7 +135,10 @@ def auction_action(
     inv = config["investment"]
     if reserve_price is None:
         reserve_price = config["ets"].get("reserve_price", 0.0)
-    is_green = (company.agent_id % 2) == 1  # odd indices = green-objective
+    # Green-vs-financial inferred from the configured reward weights, not
+    # an agent_id parity assumption — keeps the heuristic correct under
+    # arbitrary `bot_reward_weights` configurations.
+    is_green = float(getattr(company, "w_green", 0.0)) > 0.25
 
     # --- Penalty rate (valuation ceiling) ---
     pen_cfg = config.get("penalty", {})
@@ -146,10 +149,27 @@ def auction_action(
     else:
         penalty_rate = base_penalty * float(inflation_factor)
 
-    # --- Coverage ratio ---
+    # --- Coverage ratio + cash buffer ---
+    # Cash buffer mirrors the env-side joint budget gate: operating
+    # budget plus a fraction of treasury reserves (treasury is meant to
+    # absorb genuine price spikes, not be the routine sizing buffer).
+    # Optional emergency-loan headroom is OFF by default for bidding —
+    # loans are an end-of-year settlement safety net, not a sizing tool.
     annual_need = max(company.compute_estimate_need(), 0.1)
     coverage_ratio = max(bank / annual_need, 0.0)
-    available = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
+    operating = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
+    gate_cfg = config.get("auction", {}).get("budget_gate", {})
+    treasury_fraction = float(gate_cfg.get("treasury_fraction", 0.5))
+    treasury_avail = 0.0
+    try:
+        treasury_avail = float(company.get_treasury_available())
+    except Exception:
+        treasury_avail = 0.0
+    treasury_max_abs = float(gate_cfg.get("treasury_max_abs", 0.0) or 0.0)
+    treasury_buffer = treasury_fraction * treasury_avail
+    if treasury_max_abs > 0.0:
+        treasury_buffer = min(treasury_buffer, treasury_max_abs)
+    available = operating + treasury_buffer
 
     # --- Bid price (WTP-based: willingness-to-pay bounded by penalty cap) ---
     mac_cost = config.get("mac", {}).get("coal_to_gas_cost", 48.0)
@@ -252,8 +272,14 @@ def auction_action(
             invest_frac = 0.005
 
     # --- Capex throughput check ---
-    # Scale down invest_frac if estimated cost exceeds remaining capex capacity
-    capex_tp = getattr(company, 'capex_throughput', 1e9)
+    # Scale down invest_frac if estimated cost exceeds remaining capex capacity.
+    # Use the loan/revenue-aware effective property when present; fall back to
+    # the raw attribute for older Company versions.
+    capex_tp = float(getattr(
+        company,
+        'effective_capex_throughput',
+        getattr(company, 'capex_throughput', 1e9),
+    ))
     capex_spent = getattr(company, 'capex_spent_this_year', 0.0)
     capex_remaining = max(0.0, capex_tp - capex_spent)
     est_cost = company.compute_investment_cost(best_tech, invest_frac, current_year)
@@ -394,7 +420,12 @@ def secondary_action(
     elif trade_target < -0.01:
         sell_qty = min(abs(trade_target), qty_max)
         sec_qty = float(-sell_qty)
-        price_frac = max(0.3, urgency) + 0.15 * min(severity, 1.0)
+        # Surplus holders ask a modest spread above market; large surplus
+        # (high `severity`) accepts a slightly tighter spread to clear.
+        # Previous floor of 0.3 produced a 30% gap toward penalty even
+        # for non-urgent sellers, which is unrealistic and suppressed
+        # secondary volume.
+        price_frac = max(0.10, urgency) + 0.15 * min(severity, 1.0)
         sec_price = market_anchor + price_frac * (penalty_rate - market_anchor)
     else:
         sec_qty = 0.0

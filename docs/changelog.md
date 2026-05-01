@@ -5,48 +5,210 @@ Version numbers reflect the `version` field in `pyproject.toml`
 
 ---
 
-## [Unreleased]
+## [8.6.3]
 
-**Seed stability — environment stochasticity is now invariant to agent actions.**
-`ETSEnvironment` previously routed every random draw through one shared
-`np.random.default_rng` (`self.rng`), which was also handed to every
-`Company` (project success, jitter delay, cancellations) and to
-`market_clearing_ets` (auction tiebreak). Because those streams are
-consumed conditionally on agent actions, a different reward function
-(or any policy change) shifted the global stream and silently changed
-subsequent emission shocks, capacity-factor noise, AR(1) price shocks,
-and opponent-obs queue noise for the *same* seed.
+**Seed stability — environment stochasticity is now invariant to agent
+actions and to most config knobs.** `ETSEnvironment` previously routed
+every random draw through one shared `np.random.default_rng`
+(`self.rng`), which was also handed to every `Company` (project
+success, jitter delay, cancellations) and to `market_clearing_ets`
+(auction tiebreak). Because those streams were consumed conditionally
+on agent actions and on derived market-calibration quantities, a
+different reward function, LRF value, MSR setting, or company
+budget shifted the global stream and silently changed subsequent
+emission shocks, capacity-factor noise, AR(1) price shocks, and
+opponent-obs queue noise for the *same* seed.
 
 The stream is now split via `np.random.SeedSequence(seed).spawn(...)`
-into three independent generators built in `_init_env_rng_streams` /
+into named sub-streams, built in `_init_env_rng_streams` and
 `_build_company_rng_streams`:
 
-* `self._env_rng` — exogenous environment stochasticity that must stay
-  seed-stable regardless of agent behaviour: inflation path, emission
-  shocks (`ε_it`), capacity-factor noise, AR(1) expected-price shock,
-  opponent-obs queue noise, bot persistent noise, urgency scalars,
-  warm-start / burn-in draws, phantom bidder.
-* `self._auction_rng` — auction tiebreak only (its draw count equals the
-  number of valid bids and is therefore action-dependent).
+* `self._inflation_rng` — episode inflation-path draws only. Identical
+  inflation paths across LRF / MSR / reward / company-budget variants.
+* `self._shock_rng` — per-year emission shocks (η + ξ) and capacity-
+  factor noise. Identical shock realisations across all of the above.
+* `self._price_rng` — AR(1) expected-price shock and warm-start /
+  burn-in price seeding.
+* `self._bot_rng` — per-episode persistent bot heterogeneity
+  (valuation noise, urgency multiplier, budget-stress draws).
+* `self._urgency_rng` — private per-agent urgency scalars
+  (LogNormal). Independent of bot streams so toggling bots on/off
+  does not shift the agent urgency draw.
+* `self._warmstart_rng` — warm-start construction-queue and bank-
+  fraction draws.
+* `self._opponent_obs_rng` — opponent-observation queue-noise draws
+  (cosmetic obs perturbation).
+* `self._auction_rng` — auction tiebreak only (its draw count equals
+  the number of valid bids and is therefore action-dependent).
+* `self._phantom_rng` — phantom-bidder draws.
 * `self._company_rngs[i]` — one independent generator per `Company`
   for action-conditional draws (`plan_investment` success + jitter
   delay, `cancel_queued_projects`).
 
-`self.rng` is preserved as a backward-compatible alias for
-`self._env_rng`. Result: for a fixed seed, two episodes with arbitrarily
-different agent actions produce identical inflation paths, emission
-shocks, CF noise, AR(1) shocks, and queue noise. New regression tests
-in `tests/test_environment.py`
+`self._env_rng` and `self.rng` are preserved as backward-compatible
+handles (`self._env_rng` aliases `self._shock_rng`; `self.rng` aliases
+`self._env_rng`).
+
+For a fixed seed, two episodes that differ in *any* of {agent actions,
+LRF, inflation parameters, MSR enabled, reward weights, company
+profiles & budgets, ESG/treasury settings} produce identical
+inflation paths, emission shocks, CF noise, AR(1) shocks, and queue
+noise — making cross-config experiments maximally comparable. New
+regression tests in `tests/test_environment.py`
 (`test_env_stochasticity_invariant_to_agent_actions`,
+`test_env_stochasticity_invariant_across_config_variants`,
 `test_seed_stability_same_actions_same_outcome`,
 `test_per_company_rng_independence`) lock this in.
 
 ---
 
-## [Previously Unreleased]
+## [8.6.2]
 
-**Q-learning baseline — apples-to-apples with the main simulation.** The
-tabular Q-learning baseline (`src/train_qlearning.py`,
+**Bots-only baseline.** The heuristic bot policy
+(`src/agents/heuristic_policy.py`) was sunset when the agent space
+moved to PPO/HAPPO; it has been brought back into line with the
+current default-config calibration so it can serve as a *no-learning*
+credibility floor (cf. Q-learning at `[8.6.1]`):
+
+* `auction_action` now sizes its `available` cash buffer as
+  `operating + treasury_fraction × treasury` to mirror the env-side
+  joint budget gate (`auction.budget_gate.treasury_fraction`,
+  default `0.5` to match the env-side fallback). Bots no longer
+  ignore the corporate treasury reserve when computing willingness-
+  to-pay budget ceilings.
+* Capex throughput check now reads `company.effective_capex_throughput`
+  (the property that already accounts for emergency-loan squeeze and
+  realised-revenue modulation) when present, falling back to the raw
+  attribute for backwards compatibility.
+* Green-vs-financial classification now reads `company.w_green` (the
+  configured reward weight) instead of inferring from `agent_id`
+  parity. Robust to arbitrary `bot_reward_weights` configurations.
+* Secondary-market sell-side pricing floor lowered from `0.3 ×
+  (penalty − anchor)` to `0.10 × (penalty − anchor)` for non-urgent
+  sellers. The previous floor produced a ~30% gap above market for
+  surplus holders even when fully covered, which is unrealistic and
+  suppressed secondary volume; the new floor lets surplus actually
+  clear at a modest spread above the market anchor.
+* `ETSEnvironment._generate_bot_auction_actions` and
+  `_generate_bot_secondary_actions` now pass the per-bot
+  `loan_outstanding_norm` through to the heuristic. The heuristic
+  already had loan-aware code paths (qty/invest pullback under loan
+  burden, more conservative secondary buying); the env was silently
+  passing the default `0.0` so those paths were dead. They are now
+  live for bots actually carrying emergency-loan debt.
+
+* **`configs/bots_only.yaml`** — production-calibrated config with
+  `n_agents=0, n_bot_agents=8` and the same cap / MSR / penalty /
+  ESG / treasury settings as `configs/default.yaml`. Inherits the
+  joint budget gate, dual-clip PPO settings (unused by bots, kept
+  only to satisfy `env.config["ppo"].gamma` lookups for terminal-
+  value discounting), and the v8.6 ESG hybrid.
+
+* **`scripts/run_bots_only.py`** — multi-seed, multi-episode driver.
+  Writes `training_log_<tag>_s<seed>.csv` and
+  `year_log_<tag>_s<seed>.csv` with a column superset that overlaps
+  the PPO / Q-learning trainer schemas (per-agent reward, green
+  fraction, shortfall, penalty, compliance rate; episode-level
+  clearing price / quality score / `Q_*` components from
+  `src/utils/quality_metric.compute_episode_quality`). Supports
+  `--seed`, `--seeds`, `--n-episodes`, `--run-tag`, `--output-dir`.
+
+* **`notebooks/ets_marl - Bots-Only Baseline.ipynb`** — analysis
+  notebook modelled on the Q-learning baseline + Full Run notebooks.
+  Sections: setup, configuration, single-episode sanity check, multi-
+  seed run, cross-seed market trajectories, per-bot summary table,
+  and an optional comparison panel that overlays bots-only / Q-
+  learning / PPO/HAPPO converged-window means when the corresponding
+  logs are present in `results/`.
+
+This is a bug-fix bump because no v8.6.0 / v8.6.1 user-facing config
+key changes; existing PPO runs (`n_bot_agents = 0` in
+`configs/default.yaml`) are bit-for-bit unchanged.
+
+---
+
+## [8.6.1]
+
+A logging-coverage release. The training pipeline now exposes a much richer
+set of per-year and per-episode diagnostics, and the four analysis notebooks
+have been extended to consume them (with backward-compatible fallbacks for
+pre-8.6.1 logs). Also bundles the previously-unreleased Q-learning
+re-alignment, signed `quality_score`, and end-of-run snapshot cleanup.
+
+### Expanded year-level logging (`year_log_*.csv`)
+
+New columns surfaced from data the env already had access to but that
+analysis notebooks were previously reconstructing or fabricating from
+holdings deltas:
+
+* **Auction internals** flattened from the `auction_stats` sub-dict —
+  `auction_total_demand`, `auction_unsold`, `auction_hhi`,
+  `auction_max_agent_share`, `auction_failed`, `auction_defaults`,
+  `auction_defaulted_volume`, `effective_reserve_price`.
+* **Secondary-market participation counts** —
+  `secondary_n_buyers_intent`, `secondary_n_sellers_intent`,
+  `secondary_n_buyers_executed`, `secondary_n_sellers_executed`.
+* **Exogenous state** — `common_emission_shock` (system-wide η_t × σ
+  before the idiosyncratic component is mixed in) and
+  `fundamental_anchor` (MAC-scarcity-penalty anchor used as AR(1) floor
+  and obs reference price).
+* **Per-agent compliance / debt cascade** — `carry_forward_start_A{i}`,
+  `carry_forward_end_A{i}`, `coverage_gap_A{i}`,
+  `effective_penalty_rate_A{i}`. The first two trace the full
+  debt-cascade trajectory without notebooks reconstructing it from
+  holdings deltas; the latter two close the gap-penalty reward decomposition.
+* **Per-agent credit state** — `treasury_reserve_A{i}`,
+  `treasury_drawn_A{i}`, `loan_outstanding_A{i}`. Previously available
+  only in `info["year_log"]` at the dict level but never in the CSV.
+
+### Expanded episode-level logging (`training_log_*.csv`)
+
+Episode-level reductions of the year series so sweep notebooks can run
+straight off the episode log:
+
+* `year0_tnac`, `yearT_tnac` — start/end TNAC for the episode.
+* `ep_total_unsold` — sum of `auction_unsold` across the episode (Mt).
+* `ep_auction_failures` — # years the primary auction failed.
+* `ep_total_defaults` — sum of post-clearing settlement defaults.
+* `peak_loan_outstanding_A{i}` — per-agent maximum emergency-loan
+  balance held during the episode (M€).
+* `peak_carry_forward_A{i}` — per-agent maximum end-of-year
+  carry-forward debt during the episode (Mt).
+* `final_treasury_reserve_A{i}` — per-agent treasury balance at the end
+  of the final year (M€).
+
+### Notebook updates (backward-compatible)
+
+* **`Full Run & Analysis.ipynb`** — new section §A8 plotting auction
+  concentration (HHI, max-agent share), supply/demand balance, per-agent
+  end-of-year carry-forward debt, system-aggregate treasury vs
+  outstanding-loan balance, and a per-agent coverage-gap × penalty-rate
+  table. Every column access uses `if col in df.columns`, so the cell
+  silently no-ops on logs from older versions.
+* **`Default RQ Analysis.ipynb`** — new **RQ4** block (RQ4.1–4.4)
+  covering coverage-gap & carry-forward trajectory, auction concentration
+  (HHI / max-share / unsold), secondary-market intent-vs-execution, and
+  converged-window credit-stress (peak loan, peak carry-forward) by
+  archetype × reward-weighting.
+* **`Sweep Analysis.ipynb`** — new section §5.9 cross-variant comparison
+  on the v8.6.1 columns (HHI, max-agent-share, unsold, system peak loan,
+  system peak carry-forward), bar-charted with cross-seed std bars.
+* **`Data Science Analysis.ipynb`** — `EPISODE_FEATURES` and
+  `YEAR_FEATURES` lists (consumed by `build_strategy_features`) extended
+  with the new columns. The aggregator's existing `if col in df.columns`
+  guard means older logs silently NaN-fill the new features.
+* **`Episode Viewer.ipynb`** — new section §16 surfacing per-year
+  carry-forward / coverage-gap / treasury / loan and the auction
+  internals for the focal episode. Defensive fallback when columns
+  are absent.
+* **`Q-Learning Baseline.ipynb`** — new section §13 contrasting
+  Q-learning vs PPO on system-aggregate peak loan and peak
+  carry-forward in the converged window — the credibility floor a
+  cross-algo comparison should look at next to `quality_score`.
+
+### Q-learning baseline re-aligned with the main simulation
+
+The tabular Q-learning baseline (`src/train_qlearning.py`,
 `scripts/evaluate_qlearning.py`) has been re-aligned with the PPO/HAPPO
 trainer's environment-interaction surface so the two algorithms can be
 compared on the same default config:
@@ -85,10 +247,11 @@ compared on the same default config:
   Q-learning baseline explicitly as the credibility floor — the gap to
   PPO is what tells us the simulation is non-trivial *and* solvable.
 
-**Quality score — signed `[-5, +5]` range.** The per-episode
-`quality_score` reported in console + `training_log_*.csv` and consumed
-by the sweep launcher is now a signed composite in `[-5, +5]` (was a
-near-flat `[0, 1]` band that empirically only spanned `≈ 0.4–0.7`,
+### Quality score — signed `[-5, +5]` range
+
+The per-episode `quality_score` reported in console + `training_log_*.csv`
+and consumed by the sweep launcher is now a signed composite in `[-5, +5]`
+(was a near-flat `[0, 1]` band that empirically only spanned `≈ 0.4–0.7`,
 making run-to-run progress hard to read). The five components
 (`Q_compliance`, `Q_price_realism`, `Q_saved_carbon`, `Q_cost_eff`,
 `Q_volatility`) keep their existing `[0, 1]` semantics for backwards
@@ -102,17 +265,26 @@ launcher format updated to `Q=+1.23` / `Q=-0.45`. The aggregation lives
 in the new `compute_quality_score(...)` helper in `scripts/train.py`
 and is unit-tested in `tests/test_quality_score.py`.
 
-**Snapshots auto-cleanup at end-of-run.** Mid-run snapshot CSV pairs in
-`results/snapshots/` are exact copies of the cumulative
-`training_log` / `year_log` taken every `snapshot_interval` episodes
-for partial-progress analysis. Once the seed finishes cleanly, the
-live cumulative log strictly supersedes any rolling snapshot, so the
-snapshot pair was pure duplication — it doubled per-seed log size
-locally and was uploaded a second time when Azure ML copied
-`results/` to its output store. `train_one_seed` now deletes this
-seed's snapshot pairs at clean end-of-run (and removes the
-`snapshots/` directory if empty); other seeds/tags are left
-untouched. Opt out via `logging.snapshot_delete_on_finish: false`.
+### Snapshots auto-cleanup at end-of-run
+
+Mid-run snapshot CSV pairs in `results/snapshots/` are exact copies of
+the cumulative `training_log` / `year_log` taken every
+`snapshot_interval` episodes for partial-progress analysis. Once the
+seed finishes cleanly, the live cumulative log strictly supersedes any
+rolling snapshot, so the snapshot pair was pure duplication — it
+doubled per-seed log size locally and was uploaded a second time when
+Azure ML copied `results/` to its output store. `train_one_seed` now
+deletes this seed's snapshot pairs at clean end-of-run (and removes the
+`snapshots/` directory if empty); other seeds/tags are left untouched.
+Opt out via `logging.snapshot_delete_on_finish: false`.
+
+### Migration notes
+
+* All new columns use safe defaults / `.get()` fallbacks downstream.
+  Older logs (pre-8.6.1) are still readable; analysis cells that
+  reference new columns gracefully no-op.
+* `data_dictionary.md` documents every new column.
+* No retraining required for this release.
 
 ---
 

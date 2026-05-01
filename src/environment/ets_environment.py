@@ -236,6 +236,9 @@ class ETSEnvironment(gym.Env):
         # Stores the shocked realized emissions and the shock values for obs/logging
         self._current_emissions = np.zeros(self.n_total)   # shocked
         self._current_emission_shocks = np.zeros(self.n_total)  # ε_it values
+        # Common (system-wide) component of the correlated emission shock,
+        # before idiosyncratic noise — exposed for year-log diagnostics.
+        self._last_common_emission_shock: float = 0.0
 
         # CF noise per agent per tech — computed per year in step_auction()
         self._current_cf_noise = np.zeros((self.n_total, 5))
@@ -354,7 +357,7 @@ class ETSEnvironment(gym.Env):
         self.episode_log: List[dict] = []
 
         # Phantom bidder (financial intermediary demand)
-        self._phantom_bidder = PhantomBidder(config, self._env_rng)
+        self._phantom_bidder = PhantomBidder(config, self._phantom_rng)
 
         # Reward channel diagnostics
         self._last_reward_channels: dict = {}
@@ -470,29 +473,73 @@ class ETSEnvironment(gym.Env):
     def _init_env_rng_streams(self, seed: Optional[int]):
         """(Re)build independent RNG streams from a master seed.
 
-        Three logical streams are spawned from a SeedSequence so that
-        action-conditional draws cannot shift the env-stochasticity stream:
+        Each named stream is spawned from a single ``SeedSequence`` so
+        that draws made for one purpose cannot shift draws made for
+        another. This is critical for cross-config experiments: changing
+        an inflation knob, MSR setting, LRF, reward weights, or company
+        profiles must not silently shift the per-year emission shocks
+        (or any other exogenous stream) for the same seed.
 
-        * ``self._env_rng`` — exogenous environment stochasticity that must
-          stay seed-stable regardless of how agents act (inflation path,
-          emission shocks, capacity-factor noise, AR(1) price shock,
-          opponent-obs queue noise, bot persistent noise, urgency scalars,
-          warm-start / burn-in draws, phantom bidder).
-        * ``self._auction_rng`` — auction tiebreak only (number of draws is
-          action-dependent because it equals the number of valid bids).
+        Streams:
+
+        * ``_inflation_rng`` — episode inflation-path draws. Dedicated
+          so toggling inflation variance (std/window) does not consume
+          values that other streams would otherwise draw.
+        * ``_shock_rng`` — per-year emission shocks (η + ξ) and
+          capacity-factor noise. Most safety-critical for comparability
+          across config variants.
+        * ``_price_rng`` — AR(1) expected-price shock and warm-start /
+          burn-in price seeding.
+        * ``_bot_rng`` — per-bot persistent heterogeneity (valuation
+          noise, urgency multiplier, budget-stress draws). Isolated so
+          enabling/disabling bots does not shift the agent-side streams.
+        * ``_urgency_rng`` — per-agent urgency scalars (LogNormal).
+        * ``_warmstart_rng`` — warm-start construction-queue and bank-
+          fraction draws.
+        * ``_opponent_obs_rng`` — opponent-observation queue-noise
+          (cosmetic obs perturbation).
+        * ``_auction_rng`` — auction tiebreak only. Number of draws is
+          action-dependent (equals # valid bids) so this MUST stay
+          isolated from any "exogenous" stream.
+        * ``_phantom_rng`` — phantom-bidder draws.
         * Per-company streams (rebuilt by ``_build_company_rng_streams``)
-          for action-conditional draws inside each Company (project
-          success, jitter delay, cancellations).
+          for action-conditional in-Company draws (project success,
+          jitter delay, cancellations).
 
-        ``self.rng`` is kept as a backward-compatible alias for
-        ``self._env_rng`` so external code reading ``env.rng`` still sees
-        an env-level generator.
+        ``self._env_rng`` and ``self.rng`` are kept as backward-compatible
+        handles. ``self._env_rng`` aliases ``_shock_rng`` (the most
+        central exogenous stream); ``self.rng`` aliases ``self._env_rng``.
+        New code should prefer the named streams.
         """
         ss = np.random.SeedSequence(seed)
-        env_ss, auction_ss, self._company_seed_seq = ss.spawn(3)
-        self._env_rng = np.random.default_rng(env_ss)
+        # Order is part of the API surface for reproducibility — APPEND
+        # new sub-streams; never reorder existing ones.
+        children = ss.spawn(10)
+        (
+            inflation_ss,
+            shock_ss,
+            price_ss,
+            bot_ss,
+            urgency_ss,
+            warmstart_ss,
+            opp_obs_ss,
+            auction_ss,
+            phantom_ss,
+            self._company_seed_seq,
+        ) = children
+        self._inflation_rng = np.random.default_rng(inflation_ss)
+        self._shock_rng = np.random.default_rng(shock_ss)
+        self._price_rng = np.random.default_rng(price_ss)
+        self._bot_rng = np.random.default_rng(bot_ss)
+        self._urgency_rng = np.random.default_rng(urgency_ss)
+        self._warmstart_rng = np.random.default_rng(warmstart_ss)
+        self._opponent_obs_rng = np.random.default_rng(opp_obs_ss)
         self._auction_rng = np.random.default_rng(auction_ss)
-        # Backward-compat alias. New code should prefer the named streams.
+        self._phantom_rng = np.random.default_rng(phantom_ss)
+        # Backward-compat handles. ``_env_rng`` aliases the most central
+        # exogenous stream so legacy callers fall through to a deterministic
+        # generator. New code should target a named stream above.
+        self._env_rng = self._shock_rng
         self.rng = self._env_rng
 
     def _build_company_rng_streams(self):
@@ -513,13 +560,13 @@ class ETSEnvironment(gym.Env):
         rand_window = float(max(0.0, pen_cfg.get("inflation_random_window", 0.0)))
 
         if rand_std > 0.0:
-            rates = self._env_rng.normal(base_rate, rand_std, size=self.n_years)
+            rates = self._inflation_rng.normal(base_rate, rand_std, size=self.n_years)
             rates = np.maximum(rates, -0.99)
             self._inflation_rates = [float(r) for r in rates]
         elif rand_window > 0.0:
             low = max(-0.99, base_rate - rand_window)
             high = base_rate + rand_window
-            rates = self._env_rng.uniform(low, high, size=self.n_years)
+            rates = self._inflation_rng.uniform(low, high, size=self.n_years)
             self._inflation_rates = [float(r) for r in rates]
         else:
             self._inflation_rates = [base_rate for _ in range(self.n_years)]
@@ -562,6 +609,7 @@ class ETSEnvironment(gym.Env):
         self._fossil_frac_history = [[] for _ in range(self.n_total)]
         self._current_emissions = np.zeros(self.n_total)
         self._current_emission_shocks = np.zeros(self.n_total)
+        self._last_common_emission_shock = 0.0
         self._current_cf_noise = np.zeros((self.n_total, 5))
         self._p6_cancellations = np.zeros(self.n_total, dtype=int)
         self._last_terminal_bank_values = np.zeros(self.n_total)
@@ -662,12 +710,12 @@ class ETSEnvironment(gym.Env):
                 mult_low = bot_cfg.get("urgency_mult_low", 0.8)
                 mult_high = bot_cfg.get("urgency_mult_high", 1.2)
             for b in range(self.n_bots):
-                self._bot_valuation_noise[b] = self._env_rng.normal(0, noise_std)
-                self._bot_urgency_mult[b] = self._env_rng.uniform(mult_low, mult_high)
+                self._bot_valuation_noise[b] = self._bot_rng.normal(0, noise_std)
+                self._bot_urgency_mult[b] = self._bot_rng.uniform(mult_low, mult_high)
 
             if self._enhanced_noise_enabled:
                 stress_prob = float(self._enhanced_noise_cfg.get("budget_stress_prob", 0.0))
-                self._bot_budget_stressed = self._env_rng.random(self.n_bots) < stress_prob
+                self._bot_budget_stressed = self._bot_rng.random(self.n_bots) < stress_prob
             else:
                 self._bot_budget_stressed[:] = False
 
@@ -693,7 +741,7 @@ class ETSEnvironment(gym.Env):
         urgency_cfg = self.config.get("urgency_scalars", {})
         if urgency_cfg.get("enabled", False):
             sigma_u = float(urgency_cfg.get("lognormal_sigma", 0.30))
-            self._urgency_scalars = self._env_rng.lognormal(
+            self._urgency_scalars = self._urgency_rng.lognormal(
                 mean=0.0, sigma=sigma_u, size=self.n_agents
             ).astype(float)
         else:
@@ -831,14 +879,14 @@ class ETSEnvironment(gym.Env):
 
             for tech_idx, mu in green_specs:
                 lam = float(poisson_lambdas[tech_idx])
-                n_projects = int(self._env_rng.poisson(mu))
+                n_projects = int(self._warmstart_rng.poisson(mu))
                 for _ in range(n_projects):
-                    frac_delta = float(self._env_rng.uniform(0.005, 0.025))
+                    frac_delta = float(self._warmstart_rng.uniform(0.005, 0.025))
                     if total_seeded_frac + frac_delta > max_seedable:
                         frac_delta = max(0.0, max_seedable - total_seeded_frac)
                     if frac_delta < 1e-4:
                         continue
-                    completion_year = int(self._env_rng.integers(0, max(1, int(lam) + 2)))
+                    completion_year = int(self._warmstart_rng.integers(0, max(1, int(lam) + 2)))
                     company._construction_queue.append({
                         "tech_idx": tech_idx,
                         "frac_delta": frac_delta,
@@ -884,7 +932,7 @@ class ETSEnvironment(gym.Env):
                 self.holdings[i] = 0.0
                 continue
             annual_need = max(company.compute_estimate_need(), 0.1)
-            bank_frac = float(self._env_rng.uniform(bank_min, bank_max))
+            bank_frac = float(self._warmstart_rng.uniform(bank_min, bank_max))
             self.holdings[i] = bank_frac * annual_need
 
         # (B) Seed in-flight construction queues.
@@ -894,7 +942,7 @@ class ETSEnvironment(gym.Env):
         self._price_history = []
         for _ in range(n_seed_prices):
             seed_price = float(np.clip(
-                self._env_rng.normal(price_mean, price_std),
+                self._price_rng.normal(price_mean, price_std),
                 price_min,
                 price_max,
             ))
@@ -1018,9 +1066,9 @@ class ETSEnvironment(gym.Env):
             for i, company in enumerate(self.companies):
                 if not self._is_agent_active(i):
                     continue
-                if self._env_rng.random() < 0.3:
-                    invest_frac = float(self._env_rng.uniform(0.01, 0.03))
-                    tech_choice = int(self._env_rng.integers(0, 3))
+                if self._warmstart_rng.random() < 0.3:
+                    invest_frac = float(self._warmstart_rng.uniform(0.01, 0.03))
+                    tech_choice = int(self._warmstart_rng.integers(0, 3))
                     company.plan_investment(
                         tech_choice=tech_choice,
                         invest_frac=invest_frac,
@@ -1041,7 +1089,7 @@ class ETSEnvironment(gym.Env):
         price_floor = compute_fundamental_anchor(0, self.config)
         vol_std = self.config["price"].get("volatility_std", 0.15)
         base_price = self.last_clearing_price if self._price_history else price_mean
-        shock = self._env_rng.normal(0, vol_std) * base_price
+        shock = self._price_rng.normal(0, vol_std) * base_price
         self.expected_price = max(
             rho * base_price + (1.0 - rho) * price_floor + shock,
             price_floor,
@@ -1136,7 +1184,7 @@ class ETSEnvironment(gym.Env):
         for i, company in enumerate(self.companies):
             if self._is_agent_active(i):
                 annual_need = company.compute_estimate_need()  # Mt
-                seed_multiple = float(self._env_rng.uniform(bank_min, bank_max))
+                seed_multiple = float(self._warmstart_rng.uniform(bank_min, bank_max))
                 self.holdings[i] = annual_need * seed_multiple
             else:
                 self.holdings[i] = 0.0
@@ -1148,7 +1196,7 @@ class ETSEnvironment(gym.Env):
                                       self.config["price"].get("burnin_std", 10.0)))
         for _ in range(n_burnin):
             synthetic_price = float(np.clip(
-                self._env_rng.normal(burnin_mean, burnin_std),
+                self._price_rng.normal(burnin_mean, burnin_std),
                 self.config["auction"]["price_min"],
                 self.config["auction"]["price_max"],
             ))
@@ -1157,7 +1205,7 @@ class ETSEnvironment(gym.Env):
             rho = self.config["price"].get("ar1_persistence", 0.85)
             price_floor = compute_fundamental_anchor(0, self.config)
             vol_std = self.config["price"].get("volatility_std", 0.15)
-            shock = self._env_rng.normal(0, vol_std) * synthetic_price
+            shock = self._price_rng.normal(0, vol_std) * synthetic_price
             self.expected_price = max(
                 rho * synthetic_price + (1.0 - rho) * price_floor + shock,
                 price_floor,
@@ -1191,6 +1239,7 @@ class ETSEnvironment(gym.Env):
 
             idx = self.n_agents + b  # bots indexed after learning agents
             urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
+            loan_norm = float(self.companies[idx].get_loan_outstanding_norm())
             action = heuristic_policy.auction_action(
                 self.companies[idx], price_ma3, self.current_year,
                 self.n_years, self.config,
@@ -1203,6 +1252,7 @@ class ETSEnvironment(gym.Env):
                 urgency_multiplier=float(self._bot_urgency_mult[b]),
                 urgency_denom=urgency_denom,
                 collateral_load_last=float(self._last_collateral_load[idx]),
+                loan_outstanding_norm=loan_norm,
             )
             if self._enhanced_noise_enabled and bool(self._bot_budget_stressed[b]):
                 action[1] = float(np.clip(action[1] * budget_stress_qty_mult, qty_low, qty_high))
@@ -1223,6 +1273,7 @@ class ETSEnvironment(gym.Env):
 
             idx = self.n_agents + b  # bots indexed after learning agents
             urgency_denom = urgency_denoms[b] if b < len(urgency_denoms) else 1.5
+            loan_norm = float(self.companies[idx].get_loan_outstanding_norm())
             actions[b] = heuristic_policy.secondary_action(
                 self.companies[idx],
                 bank=float(self.holdings[idx]),
@@ -1234,6 +1285,7 @@ class ETSEnvironment(gym.Env):
                 valuation_noise=float(self._bot_valuation_noise[b]),
                 urgency_multiplier=float(self._bot_urgency_mult[b]),
                 urgency_denom=urgency_denom,
+                loan_outstanding_norm=loan_norm,
             )
         return actions
 
@@ -1411,12 +1463,14 @@ class ETSEnvironment(gym.Env):
         if unc_cfg.get("enabled", False):
             sigma = unc_cfg.get("sigma_demand", 0.07)
             rho = unc_cfg.get("corr_rho", 0.40)
-            eta_common = float(self._env_rng.normal(0, 1))  # system-wide shock
-            idio = self._env_rng.normal(0, 1, self.n_total)  # idiosyncratic shocks
+            eta_common = float(self._shock_rng.normal(0, 1))  # system-wide shock
+            idio = self._shock_rng.normal(0, 1, self.n_total)  # idiosyncratic shocks
             epsilons = rho * eta_common + np.sqrt(max(0.0, 1.0 - rho ** 2)) * idio
             epsilons *= sigma
+            self._last_common_emission_shock = float(eta_common * sigma)
         else:
             epsilons = np.zeros(self.n_total)
+            self._last_common_emission_shock = 0.0
         self._current_emission_shocks = epsilons
 
         # 5. Generate capacity factor noise per tech per agent
@@ -1426,7 +1480,7 @@ class ETSEnvironment(gym.Env):
             for i in range(self.n_total):
                 for t in range(5):
                     if cf_sigma[t] > 0:
-                        cf_noise[i, t] = float(self._env_rng.normal(0, cf_sigma[t]))
+                        cf_noise[i, t] = float(self._shock_rng.normal(0, cf_sigma[t]))
         self._current_cf_noise = cf_noise
 
         # 6. Compute realized emissions (capacity-factor noise + demand shock applied)
@@ -2273,8 +2327,10 @@ class ETSEnvironment(gym.Env):
                 "compliance_norm":      float(compliance_norm),         # legacy diag (full auction_cost)
                 "compliance_norm_excess": float(compliance_norm_excess), # actual reward signal
                 "capital_norm":         float(capital_norm),
+                "coverage_gap":         float(coverage_gap),
                 "coverage_gap_penalty": float(gap_penalty),
                 "expected_remediation_rate_real": float(expected_remediation_rate_real),
+                "effective_penalty_rate_nom":     float(eff_pen_rate_nom),
                 "sec_price_ema":        float(sec_proxy_nom),
                 "r_bid":                float(r_auction_bid[i]),
                 "r_invest":             float(r_auction_invest[i]),
@@ -2565,6 +2621,31 @@ class ETSEnvironment(gym.Env):
             ],
             "investment_costs": invest_costs.tolist(),
             "old_carry_forward": old_carry_forward.tolist(),  # carry-forward debt at year start (pre-compliance)
+            # Carry-forward at end of year (post-compliance). Combined with
+            # `old_carry_forward` this gives a full debt-cascade trajectory
+            # without notebooks having to reconstruct it from holdings deltas.
+            "new_carry_forward": [float(c._carry_forward) for c in self.companies],
+            # Per-agent effective (inflation-adjusted) penalty rate this year
+            # — drives the gap-penalty term in the reward and the secondary
+            # price cap. Logged so reward decomposition is fully reproducible.
+            "effective_penalty_rates": [
+                float(c.effective_penalty_rate(self.current_year)) for c in self.companies
+            ],
+            # Per-agent pre-secondary coverage gap = max(0, need - alloc), in Mt.
+            # Computed directly from `allocations` so bot agents (indices ≥ n_agents)
+            # are covered too — the reward-channel cache is learning-agent-only.
+            "coverage_gaps": [
+                float(max(0.0, self.companies[i].compute_estimate_need() - float(allocations[i])))
+                for i in range(self.n_total)
+            ],
+            # Secondary-market participation counts (year-level scalars).
+            "secondary_n_buyers_intent":   int(np.sum(secondary_qtys >  1e-6)),
+            "secondary_n_sellers_intent":  int(np.sum(secondary_qtys < -1e-6)),
+            "secondary_n_buyers_executed": int(np.sum(trade_qtys >  1e-6)),
+            "secondary_n_sellers_executed":int(np.sum(trade_qtys < -1e-6)),
+            # System-wide common emission shock component (η_t × σ),
+            # before the idiosyncratic component is mixed in.
+            "common_emission_shock": float(self._last_common_emission_shock),
         })
 
         # ── Per-agent per-year diagnostics ───────────────────────────────────
@@ -2627,7 +2708,7 @@ class ETSEnvironment(gym.Env):
             log.get("auction_stats", {}).get("auction_failed", False)
         )
         if auction_succeeded_this_step and clearing_price > 0:
-            shock = self._env_rng.normal(0, vol_std) * clearing_price
+            shock = self._price_rng.normal(0, vol_std) * clearing_price
             self.expected_price = max(
                 rho * clearing_price + (1.0 - rho) * price_floor + shock,
                 price_floor,
@@ -2687,7 +2768,7 @@ class ETSEnvironment(gym.Env):
         for _si, _sc in enumerate(self.companies):
             need_i = max(_sc.compute_estimate_need(), 1e-6)
             queue_raw = float(sum(item["frac_delta"] for item in _sc._construction_queue))
-            queue_noisy = float(np.clip(queue_raw + self._env_rng.normal(0, queue_sigma), 0.0, 1.0))
+            queue_noisy = float(np.clip(queue_raw + self._opponent_obs_rng.normal(0, queue_sigma), 0.0, 1.0))
             tnac_share = float(np.clip(self.holdings[_si] / max(_total_holdings, 1e-6), 0.0, 1.0))
             net_sec = float(np.clip(
                 (self._sec_bought[_si] - self._sec_sold[_si]) / need_i, -1.0, 1.0

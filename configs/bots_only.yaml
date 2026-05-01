@@ -1,0 +1,342 @@
+# ETS MARL — Bots-only baseline configuration.
+#
+# 8 heuristic bot agents, ZERO learning agents. Used to compare a pure
+# rule-based market against the PPO/HAPPO + Q-learning baselines.
+# Inherits the production calibration of `configs/default.yaml` (cap,
+# MSR, prices, budgets, ESG, treasury, …) and only overrides the
+# participant set and a few learning-related blocks that would be
+# silently dead under `n_agents=0`.
+
+version: "8.6.3"
+
+simulation:
+  n_years: 12
+  # Heuristic bots are fully deterministic-given-seed once the
+  # per-bot noise draw is fixed, so a few hundred episodes are enough
+  # to characterise the steady-state market — there is no learning.
+  n_episodes: 500
+  seeds: [42, 123, 456]
+
+device: auto
+
+technologies:
+  names: ["coal", "gas", "onshore_wind", "offshore_wind", "solar"]
+  emission_factors: [0.820, 0.490, 0.011, 0.012, 0.048]
+  capex: [3000, 1150, 1350, 3250, 750]
+  capacity_factors: [0.65, 0.60, 0.35, 0.47, 0.17]
+  deploy_delays: [0, 0, 4, 7, 2]
+  operational_costs: [72.0, 55.0, 17.0, 47.0, 10.0]
+  decommission_costs: [200, 100, 0, 0, 0]
+  is_green: [false, false, true, true, true]
+  is_buildable: [false, false, true, true, true]
+
+ets:
+  cap_year_0_override: null
+  initial_bank_fraction: 0.5
+  cap_overhead_pct: 0.10
+  lrf_phase1: 0.043
+  lrf_phase2: 0.044
+  lrf_phase_switch: 2
+  msr:
+    enabled: true
+    tnac_upper_ratio: 0.68
+    tnac_mid_ratio: null
+    tnac_lower_ratio: null
+    withhold_rate: 0.24
+    release_frac: 0.0638297872
+    activation_year: 1
+    price_containment_absolute: 175
+    price_release_absolute: 212
+    price_release_enabled: false
+    emergency_release_frac: 0.064
+    min_auction_frac: 0.10
+  banking: true
+  reserve_price: 45.0
+  reserve_price_mode: "static"
+  reserve_discount: 0.80
+  reserve_initial: 50.0
+  unsold_to_msr: true
+  max_rollover_multiplier: 1.5
+  price_history_anchor: "auction"
+
+# 8 heuristic bots, 0 learning agents.
+companies:
+  n_agents: 0
+  output_twh: 10.0
+  initial_mix: []
+  reward_weights: []
+
+  n_bot_agents: 8
+  bot_initial_mix:
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # B1: coal-heavy / financial
+    - [0.40, 0.40, 0.10, 0.05, 0.05]   # B2: coal-heavy / ESG
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # B3: gas-dominant / financial
+    - [0.15, 0.45, 0.20, 0.10, 0.10]   # B4: gas-dominant / ESG
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # B5: transitioner / financial
+    - [0.05, 0.25, 0.35, 0.20, 0.15]   # B6: transitioner / ESG
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # B7: green-leader / financial
+    - [0.00, 0.10, 0.30, 0.35, 0.25]   # B8: green-leader / ESG
+  bot_reward_weights:
+    - [1.0, 0.0]
+    - [0.5, 0.5]
+    - [1.0, 0.0]
+    - [0.5, 0.5]
+    - [1.0, 0.0]
+    - [0.5, 0.5]
+    - [1.0, 0.0]
+    - [0.5, 0.5]
+
+investment:
+  max_invest_frac: 0.20
+  convexity_alpha: 0.20
+  discount_rate: 0.05
+
+risk:
+  p_fail_min: 0.08
+  p_fail_max: 0.40
+  p_fail_alpha: 0.7
+  experience_discount: 0.10
+  experience_threshold: 2
+
+auction:
+  price_max: 250.0
+  price_min: 45.0
+  quantity_max: 3.0
+  bid_change_limit:
+    enabled: true
+    value: 75.0
+  qty_mult_low: 0.5
+  qty_mult_high: 2.0
+  max_agent_share: 1.0
+  pricing_rule: "uniform"
+  cancel_under_subscribed: false
+  lot_size: 0.0005
+  collateral:
+    enabled: true
+    collateral_rate: 0.15
+    hold_fraction: 0.02
+    collateral_fraction: 0.20
+    max_collateral_budget_share: 0.50
+    min_qty_floor_frac: 0.5
+  leverage_multiplier: 3.0
+  suspension_length: 0
+  budget_price_clip: true
+  budget_gate:
+    enabled: true
+    safety_mult: 1.2
+    notional_safety_mult: 5.0
+    protect_need_floor: true
+    inflation_aware_ma3: true
+    include_loan_headroom: false
+    treasury_fraction: 0.33
+    treasury_max_abs: 0.0
+    shock_aware_need_floor: false
+  carry_forward_defaults: true
+
+trading:
+  enabled: true
+  transaction_cost: 0.5
+  spread_tolerance: 0.12
+  sec_price_min: 45.0
+  sec_price_max_mult: 2.0
+
+secondary:
+  liquidity_pool:
+    enabled: false
+    floor_fraction_of_penalty: 0.25
+
+budget:
+  mode: "revenue_based"
+  # No learning-agent rows — the bot mirror arrays carry the only
+  # participants. Lengths must match `n_agents` (= 0) for these and
+  # `n_bot_agents` (= 8) for the bot-prefixed mirrors.
+  debt_headrooms: []
+  bot_debt_headrooms: [240.0, 240.0, 155.0, 155.0, 65.0, 65.0, -25.0, -25.0]
+  budget_ema_alpha: 0.3
+  annual_budgets: []
+  bot_annual_budgets: [880.0, 880.0, 800.0, 800.0, 820.0, 820.0, 780.0, 780.0]
+  dynamic_budget_ceiling_multiplier: 2.5
+  overspend_penalty_coef: 0.5
+  contingency_zone: 0.10
+  contingency_penalty_coef: 0.05
+  hard_cap_fraction: 1.15
+  soft_zone_start: 1.00
+  tiered_penalty_coef: 2.0
+  investment_hard_gate: true
+  capex_throughputs: []
+  bot_capex_throughputs: [130.0, 130.0, 130.0, 130.0, 160.0, 160.0, 120.0, 120.0]
+  capex_overspend_coef: 1.0
+  emergency_loan:
+    enabled: true
+    max_loan_fraction: 0.15
+    interest_rate: 0.08
+    repayment_years: 3
+    leverage_premium_coef: 0.25
+    leverage_premium_exp: 1.5
+    capex_squeeze_floor: 0.50
+    origination_sting_coef: 0.07
+  treasury_reserve:
+    enabled: true
+    retention_fraction: 0.60
+    cap_multiple: 1.5
+    decay_rate: 0.05
+    terminal_value_rate: 0.30
+  suspension_length: 1
+
+green_finance:
+  enabled: false
+  loan_budget_boost: 200.0
+  loan_interest_rate: 0.05
+  capex_throughput_boost: 80.0
+
+bots:
+  valuation_noise_std: 5.0
+  urgency_mult_low: 0.8
+  urgency_mult_high: 1.2
+  urgency_denominators: [1.3, 1.7, 1.3, 1.7, 1.3, 1.7, 1.3, 1.7]
+  max_compliance_share: 0.70
+  enhanced_noise:
+    enabled: true
+    valuation_noise_std: 15.0
+    urgency_mult_low: 0.6
+    urgency_mult_high: 1.5
+    budget_stress_prob: 0.15
+    budget_stress_qty_mult: 0.65
+  fade_schedule:
+    enabled: false
+    schedule: [[0, 8], [30000, 6], [60000, 4], [80000, 2]]
+
+penalty:
+  rate: 138.75
+  inflation_rate: 0.020
+  inflation_random_std: 0.015
+  carry_forward: true
+  carry_forward_cap: 0.0
+
+price:
+  initial_expected: 70.0
+  banking_premium_mult: 1.4
+  burnin_std: 10.0
+  ar1_persistence: 0.85
+  volatility_std: 0.15
+
+mac:
+  enabled: true
+  coal_to_gas_cost: 48.0
+  max_switch_frac: 0.20
+
+electricity:
+  enabled: true
+  base_price: 55.0
+  carbon_passthrough: 0.90
+
+reward:
+  normalizer_alpha: 0.02
+  gae_min_std: 0.15
+  opportunity_cost_rate: 0.0
+  clip_min: -10.0
+  clip_max: 10.0
+  shaping_beta: 7.0
+  shaping_gamma: 1.0
+  shaping_decay_episode: 0
+  shaping_decay_frac: 0.10
+  shaping_weight_floor: 0.0
+  terminal_bank_value: true
+  terminal_queue_value: true
+  terminal_payoff_years: 5
+  treasury_terminal_value: true
+  anchor_normalize_cost_only: true
+  budget_norm_anchor: "dynamic"
+  budget_norm_budget_0: 1000.0
+  opportunity_cost_shaping:
+    enabled: true
+    scale: 1.0
+  coverage_gap_shaping:
+    enabled: true
+    scale: 0.5
+  banking_signal:
+    enabled: true
+    w_banking: 0.3
+    w_imputed: 1.0
+    imputed_cap_factor: 5.0
+    initial_bank_cost_factor: 0.80
+  sec_proxy:
+    enabled: true
+    ema_alpha: 0.30
+    cap_mult: 1.5
+  compliance_gate_blend_threshold: 0.90
+  compliance_gate_blend_width: 0.30
+
+esg:
+  enabled: true
+  scale: 0.50
+  stock_weight: 1.0
+  flow_weight: 1.5
+  speed_coef: 0.3
+  speed_coef_late: 0.3
+
+opponent_modeling:
+  enabled: false   # no learners → no opponent encoding consumed
+
+opponent_obs:
+  mode: "lagged"
+  lag_years: 1
+  queue_noise_sigma: 0.15
+  dims_per_opponent: 7
+
+uncertainty:
+  enabled: true
+  sigma_demand: 0.07
+  corr_rho: 0.40
+
+construction_jitter:
+  enabled: true
+  poisson_lambdas: [1.0, 1.0, 2.0, 3.0, 1.5]
+  p_cancel_per_tech: [0.0, 0.0, 0.010, 0.006, 0.015]
+  p_cancel: 0.010
+  recovery_rate: 0.40
+  cf_sigma: [0.0, 0.0, 0.08, 0.08, 0.05]
+
+warm_start:
+  enabled: true
+  burnin_enabled: true
+  n_burnin_years: 4
+  burnin_price_seed_mean: 70.0
+  burnin_price_seed_std: 10.0
+  n_burnin_prices: 2
+  bank_seed_min: 0.15
+  bank_seed_max: 0.35
+  queue_mu_onshore: 1.5
+  queue_mu_offshore: 0.5
+  queue_mu_solar: 2.0
+  msr_initial_reserve_frac: 0.23
+
+logging:
+  log_interval: 50
+  results_dir: "results/"
+
+penalty_shock:
+  # placeholder block; not consumed by env. Kept here only so any future
+  # extension can be configured without touching code paths.
+
+phantom_bidder:
+  enabled: false
+  qty_frac_lo: 0.15
+  qty_frac_hi: 0.35
+  price_lognormal_sigma: 0.35
+  price_fundamental_frac: 0.60
+  price_min_above_reserve: 2.0
+  price_max_frac_penalty: 0.65
+  price_min_below_reserve_buffer: 5.0
+
+urgency_scalars:
+  enabled: true
+  lognormal_sigma: 0.30
+
+tabula_rasa:
+  enabled: false
+
+# Minimal ppo block — bots-only mode never updates a policy, but the env
+# reads `ppo.gamma` for terminal-value discounting.
+ppo:
+  gamma: 0.99

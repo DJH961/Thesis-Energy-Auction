@@ -3,7 +3,7 @@
 
 # Run version banner — printed at the top of training output. Bump in
 # lockstep with pyproject.toml `version`.
-version: "8.6.0"
+version: "8.6.3"
 
 simulation:
   n_years: 12

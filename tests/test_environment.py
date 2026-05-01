@@ -369,8 +369,21 @@ def test_year_log_keys():
                 "allocations", "penalties", "rewards", "green_fracs",
                 "tech_mixes", "holdings", "invest_costs",
                 "bank_start", "shortfalls", "delta_greens", "queue_sizes", "bid_prices",
-                "emission_shocks", "cf_shocks", "cancellations"]:  # P5/P6
+                "emission_shocks", "cf_shocks", "cancellations",  # P5/P6
+                # v8.6.1 expanded logging
+                "old_carry_forward", "new_carry_forward", "coverage_gaps",
+                "effective_penalty_rates", "common_emission_shock",
+                "secondary_n_buyers_intent", "secondary_n_sellers_intent",
+                "secondary_n_buyers_executed", "secondary_n_sellers_executed",
+                "treasury_reserves", "treasury_drawn", "loan_outstanding",
+                "auction_stats", "effective_reserve", "anchor_t"]:
         assert key in log, f"Missing key in year_log: {key}"
+
+    # auction_stats sub-dict scalars used by the year-level CSV.
+    astats = log["auction_stats"]
+    for k in ("total_demand", "unsold", "hhi", "max_agent_share_actual",
+             "auction_failed", "defaults", "defaulted_volume"):
+        assert k in astats, f"Missing key in auction_stats: {k}"
 
 
 # ---------------------------------------------------------------------------
@@ -1159,3 +1172,155 @@ def test_per_company_rng_independence():
     # The env-level rng must not be the same object as any company rng.
     assert id(env._env_rng) not in rng_ids
     assert id(env._auction_rng) not in rng_ids
+
+
+# ---------------------------------------------------------------------------
+# Cross-config seed stability: env stochasticity must NOT depend on config
+# knobs that don't directly drive a given stochastic source. Critical for
+# making LRF / inflation / MSR / reward-weight / company-profile
+# experiments comparable when run on the same seed.
+# ---------------------------------------------------------------------------
+
+def _run_episode_collect_streams(seed, config_mutator):
+    """Run a fixed-action episode on a config produced by ``config_mutator``
+    and collect the env stochasticity streams that must stay invariant
+    across non-stochastic config changes."""
+    with open(CONFIG_PATH) as f:
+        config = yaml.safe_load(f)
+    # Always-on stochasticity so every stream is exercised.
+    config.setdefault("uncertainty", {})["enabled"] = True
+    config["uncertainty"]["sigma_demand"] = 0.07
+    config["uncertainty"]["corr_rho"] = 0.40
+    config.setdefault("construction_jitter", {})["enabled"] = True
+    config["construction_jitter"].setdefault("cf_sigma", [0.0, 0.0, 0.08, 0.08, 0.05])
+    config_mutator(config)
+
+    env = ETSEnvironment(config, seed=seed)
+    env.reset(seed=seed)
+    n_agents = env.n_agents
+
+    inflation_rates = list(env._inflation_rates)
+    inflation_factors = list(env._inflation_factors)
+    emission_shocks_per_year = []
+    cf_noise_per_year = []
+
+    while not env.episode_done:
+        # Identical actions across mutator variants — only the *config*
+        # changes, so any drift in env streams is config-induced.
+        auc = np.tile(np.array([100.0, 1.0, 0.02, 0.0, 0.0, 0.0], dtype=np.float32),
+                      (n_agents, 1))
+        env.step_auction(auc)
+        emission_shocks_per_year.append(np.array(env._current_emission_shocks[:n_agents], copy=True))
+        cf_noise_per_year.append(np.array(env._current_cf_noise[:n_agents], copy=True))
+        sec = np.tile(np.array([env._phase1_clearing_price, 0.0], dtype=np.float32),
+                      (n_agents, 1))
+        env.step_secondary(sec)
+
+    return {
+        "inflation_rates": np.asarray(inflation_rates),
+        "inflation_factors": np.asarray(inflation_factors),
+        "emission_shocks": np.stack(emission_shocks_per_year),
+        "cf_noise": np.stack(cf_noise_per_year),
+    }
+
+
+def test_env_stochasticity_invariant_across_config_variants():
+    """For a fixed seed, varying LRF / MSR / reward weights / company
+    profiles & budgets / inflation must NOT shift the per-year emission
+    shocks or capacity-factor noise. The inflation path is allowed to
+    differ ONLY for variants that change the inflation parameters
+    themselves; otherwise it must match too."""
+    seed = 27
+
+    # Baseline: untouched config.
+    base = _run_episode_collect_streams(seed, lambda c: None)
+
+    # Variant 1: change LRF (cap trajectory only — must not touch RNG).
+    def mut_lrf(c):
+        c.setdefault("ets", {})["linear_reduction_factor"] = c["ets"].get(
+            "linear_reduction_factor", 0.05) + 0.02
+    v_lrf = _run_episode_collect_streams(seed, mut_lrf)
+
+    # Variant 2: disable MSR.
+    def mut_msr(c):
+        c.setdefault("ets", {}).setdefault("msr", {})["enabled"] = False
+    v_msr = _run_episode_collect_streams(seed, mut_msr)
+
+    # Variant 3: change reward weights for all agents.
+    def mut_rw(c):
+        n = c["companies"]["n_agents"]
+        c["companies"]["reward_weights"] = [[0.7, 0.3]] * n + (
+            c["companies"].get("reward_weights", [])[n:]
+        )
+    v_rw = _run_episode_collect_streams(seed, mut_rw)
+
+    # Variant 4: equalise company budgets (homogeneous profile).
+    def mut_budgets(c):
+        n = c["companies"]["n_agents"]
+        c.setdefault("budget", {})["annual_budgets"] = [1500.0] * n + (
+            c["budget"].get("annual_budgets", [])[n:]
+        )
+        c["budget"]["capex_throughputs"] = [150.0] * n + (
+            c["budget"].get("capex_throughputs", [])[n:]
+        )
+    v_budgets = _run_episode_collect_streams(seed, mut_budgets)
+
+    # Variant 5: equalise initial energy mix (homogeneous profile).
+    def mut_mix(c):
+        n = c["companies"]["n_agents"]
+        c["companies"]["initial_mix"] = [[0.3, 0.3, 0.15, 0.10, 0.15]] * n + (
+            c["companies"].get("initial_mix", [])[n:]
+        )
+    v_mix = _run_episode_collect_streams(seed, mut_mix)
+
+    # All five variants must yield identical inflation paths AND identical
+    # per-year emission shocks AND identical CF noise — none of these knobs
+    # touches the inflation/shock/CF-noise streams.
+    for name, v in [("lrf", v_lrf), ("msr_off", v_msr), ("reward_weights", v_rw),
+                    ("budgets", v_budgets), ("initial_mix", v_mix)]:
+        np.testing.assert_array_equal(
+            base["inflation_rates"], v["inflation_rates"],
+            err_msg=f"inflation_rates drifted under variant '{name}'",
+        )
+        np.testing.assert_array_equal(
+            base["inflation_factors"], v["inflation_factors"],
+            err_msg=f"inflation_factors drifted under variant '{name}'",
+        )
+        np.testing.assert_array_equal(
+            base["emission_shocks"], v["emission_shocks"],
+            err_msg=f"emission_shocks drifted under variant '{name}'",
+        )
+        np.testing.assert_array_equal(
+            base["cf_noise"], v["cf_noise"],
+            err_msg=f"cf_noise drifted under variant '{name}'",
+        )
+
+    # Variant 6: change inflation parameters (this SHOULD shift the
+    # inflation path, but must NOT shift emission shocks or CF noise —
+    # those live on a dedicated stream).
+    def mut_infl(c):
+        c.setdefault("penalty", {})["inflation_random_std"] = 0.005
+        c["penalty"]["inflation_rate"] = c["penalty"].get("inflation_rate", 0.02) + 0.01
+    v_infl = _run_episode_collect_streams(seed, mut_infl)
+    np.testing.assert_array_equal(
+        base["emission_shocks"], v_infl["emission_shocks"],
+        err_msg="emission_shocks drifted when only inflation knobs changed",
+    )
+    np.testing.assert_array_equal(
+        base["cf_noise"], v_infl["cf_noise"],
+        err_msg="cf_noise drifted when only inflation knobs changed",
+    )
+
+
+def test_env_named_streams_distinct_generators():
+    """The named purpose-built streams must be distinct generator
+    instances (so consuming one cannot move another)."""
+    env = load_env(seed=27)
+    env.reset(seed=27)
+    named = [
+        env._inflation_rng, env._shock_rng, env._price_rng,
+        env._bot_rng, env._urgency_rng, env._warmstart_rng,
+        env._opponent_obs_rng, env._auction_rng, env._phantom_rng,
+    ]
+    ids = {id(g) for g in named}
+    assert len(ids) == len(named), "Named env RNGs must be distinct generator instances"
