@@ -220,6 +220,9 @@ class ETSEnvironment(gym.Env):
         # Stores the shocked realized emissions and the shock values for obs/logging
         self._current_emissions = np.zeros(self.n_total)   # shocked
         self._current_emission_shocks = np.zeros(self.n_total)  # ε_it values
+        # Common (system-wide) component of the correlated emission shock,
+        # before idiosyncratic noise — exposed for year-log diagnostics.
+        self._last_common_emission_shock: float = 0.0
 
         # CF noise per agent per tech — computed per year in step_auction()
         self._current_cf_noise = np.zeros((self.n_total, 5))
@@ -507,6 +510,7 @@ class ETSEnvironment(gym.Env):
         self._fossil_frac_history = [[] for _ in range(self.n_total)]
         self._current_emissions = np.zeros(self.n_total)
         self._current_emission_shocks = np.zeros(self.n_total)
+        self._last_common_emission_shock = 0.0
         self._current_cf_noise = np.zeros((self.n_total, 5))
         self._p6_cancellations = np.zeros(self.n_total, dtype=int)
         self._last_terminal_bank_values = np.zeros(self.n_total)
@@ -1357,8 +1361,10 @@ class ETSEnvironment(gym.Env):
             idio = self.rng.normal(0, 1, self.n_total)  # idiosyncratic shocks
             epsilons = rho * eta_common + np.sqrt(max(0.0, 1.0 - rho ** 2)) * idio
             epsilons *= sigma
+            self._last_common_emission_shock = float(eta_common * sigma)
         else:
             epsilons = np.zeros(self.n_total)
+            self._last_common_emission_shock = 0.0
         self._current_emission_shocks = epsilons
 
         # 5. Generate capacity factor noise per tech per agent
@@ -2215,8 +2221,10 @@ class ETSEnvironment(gym.Env):
                 "compliance_norm":      float(compliance_norm),         # legacy diag (full auction_cost)
                 "compliance_norm_excess": float(compliance_norm_excess), # actual reward signal
                 "capital_norm":         float(capital_norm),
+                "coverage_gap":         float(coverage_gap),
                 "coverage_gap_penalty": float(gap_penalty),
                 "expected_remediation_rate_real": float(expected_remediation_rate_real),
+                "effective_penalty_rate_nom":     float(eff_pen_rate_nom),
                 "sec_price_ema":        float(sec_proxy_nom),
                 "r_bid":                float(r_auction_bid[i]),
                 "r_invest":             float(r_auction_invest[i]),
@@ -2507,6 +2515,29 @@ class ETSEnvironment(gym.Env):
             ],
             "investment_costs": invest_costs.tolist(),
             "old_carry_forward": old_carry_forward.tolist(),  # carry-forward debt at year start (pre-compliance)
+            # Carry-forward at end of year (post-compliance). Combined with
+            # `old_carry_forward` this gives a full debt-cascade trajectory
+            # without notebooks having to reconstruct it from holdings deltas.
+            "new_carry_forward": [float(c._carry_forward) for c in self.companies],
+            # Per-agent effective (inflation-adjusted) penalty rate this year
+            # — drives the gap-penalty term in the reward and the secondary
+            # price cap. Logged so reward decomposition is fully reproducible.
+            "effective_penalty_rates": [
+                float(c.effective_penalty_rate(self.current_year)) for c in self.companies
+            ],
+            # Per-agent pre-secondary coverage gap = max(0, need - alloc), in Mt.
+            "coverage_gaps": [
+                float(self._last_auction_reward_channels.get(i, {}).get("coverage_gap", 0.0))
+                for i in range(self.n_total)
+            ],
+            # Secondary-market participation counts (year-level scalars).
+            "secondary_n_buyers_intent":   int(np.sum(secondary_qtys >  1e-6)),
+            "secondary_n_sellers_intent":  int(np.sum(secondary_qtys < -1e-6)),
+            "secondary_n_buyers_executed": int(np.sum(trade_qtys >  1e-6)),
+            "secondary_n_sellers_executed":int(np.sum(trade_qtys < -1e-6)),
+            # System-wide common emission shock component (η_t × σ),
+            # before the idiosyncratic component is mixed in.
+            "common_emission_shock": float(self._last_common_emission_shock),
         })
 
         # ── Per-agent per-year diagnostics ───────────────────────────────────
