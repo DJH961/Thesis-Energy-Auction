@@ -1,14 +1,15 @@
 # Data Science Analysis Plan — ETS MARL Thesis (v3)
 
 Internal working doc for Daniel & Alessio.
+Purpose: define the analyses run on simulation outputs, aligned with CBS Data Science methodology expectations.
 
-**v3 changes from v2:** reorganized RQ-first instead of method-first. Every analysis is justified by what we'll actually claim in the thesis. Cut clearing-price prediction (didn't answer any RQ). Cut pathology / autoencoder analyses (didn't earn their place). Made strategy the centrepiece. Softened the "specialised methods" stance — we still lean curriculum-first, but specialised methods are welcome when they answer a specific question well.
+**v3 changes from v2:** reorganized RQ-first instead of method-first. Every analysis is justified by what we'll actually claim in the thesis. Cut clearing-price prediction (didn't answer any RQ). Cut pathology / autoencoder analyses (didn't earn their place). Made strategy the centerpiece. Softened the "specialized methods" stance — we still lean curriculum-first, but specialized methods are welcome when they answer a specific question well.
 
 ---
 
 ## 0. Core principle
 
-Every analysis in this plan exists to support a specific claim we want to make in the thesis. Method choice follows the question, not the other way around. We use ML curriculum methods by default because that's what we know best and what the rubric rewards, and we reach for specialised methods only when they materially help answer something.
+Every analysis in this plan exists to support a specific claim we want to make in the thesis. Method choice follows the question, not the other way around. We use ML curriculum methods by default because that's what we know best and what the rubric rewards, and we reach for specialized methods only when they materially help answer something.
 
 Strategy is the focus. RQ3 (how financial vs environmental objectives shape strategies, and how they aggregate) is the most distinctive thing this simulation produces and the part most worth analysing in depth. RQ2 (regulatory sensitivity) and RQ1 (simulation credibility) get lighter, more targeted treatment.
 
@@ -63,7 +64,7 @@ We have a sweep variant where all agents are set to `reward_weights = [1.0, 0.0]
 ---
 
 ### S3. Are strategies economically rational?
-**Supports claim RQ3.c.** Tier 2 — we ship S3 if S1 and S2 are clean. This is also where the surviving piece of the old "predict clearing price" analysis lives.
+**Supports claim RQ3.c.** Tier 2 — we ship S3 if S1 and S2 are clean. This section keeps only a compact anchor-alignment credibility check from the old clearing-price-prediction direction (not the removed prediction model).
 
 We have two specific predictions from theory in Ch. 3 plus one credibility check.
 
@@ -71,7 +72,7 @@ We have two specific predictions from theory in Ch. 3 plus one credibility check
 
 **H2 (heterogeneity).** "High-fossil agents transition faster." Label = 1 if agent invested meaningfully in green by year 6. Features: archetype dummies, initial mix vector, mean clearing price the agent saw. Same model setup. Coefficient sign on archetype dummies is the test.
 
-**Anchor check (mini, embedded here).** Does the converged-window mean clearing price track the fundamental anchor we computed in `src/utils/price_anchor.py`? Plot the two trajectories together over years 0–11 and report the correlation coefficient and mean absolute deviation. This is one figure and two numbers, not a full predictive model — that's the right scope. If they align, the simulation is producing economically grounded prices, which feeds RQ1 too.
+**Anchor check (mini, embedded here).** Does the converged-window mean clearing price track the fundamental anchor we computed in `src/utils/price_anchor.py`? Plot the two trajectories together over years 0–11 and report the correlation coefficient and mean absolute deviation. This is one figure and two numbers, not a full predictive model — that's the right scope. If they align, the simulation is producing economically grounded prices, which feeds RQ1 too (cross-referenced in C1/C2 as a credibility signal).
 
 **Thesis output.** One table summarising H1 and H2 (estimate, sign, evaluation metric), one partial-dependence plot for H1, one anchor-vs-realised figure. Section in Ch. 7.3.
 
@@ -121,7 +122,7 @@ These are short — they open Ch. 7 and establish that the rest of the analyses 
 
 **Method.** Two detectors on episode-level reward and `ep_mean_clearing_price`:
 - **Rolling-mean plateau check** (Lecture 2) — first episode where the rolling mean stays inside a tolerance band for K consecutive windows.
-- **PELT change-point detection** (specialised, `ruptures` library) — objective change-point.
+- **PELT change-point detection** (specialized, `ruptures` library) — objective change-point.
 
 Use both, report the convergence episode where they agree. The PELT result is what we use as the cutoff for everything in §2 and §3.
 
@@ -151,19 +152,19 @@ For Ch. 5 Methodology. Demonstrates every method is curriculum-grounded except w
 | S3 rationality tests | Logistic Regression (LASSO) + Random Forest | L4 + L5 + L8 |
 | R1 regulatory shifts | S1 pipeline per variant; descriptive comparison + IQR outlier check | L3 + L5 + L7 + L2 |
 | R2 UDBC pathways | Multinomial Logistic Regression + Random Forest + SMOTE/ADASYN; transition heatmaps | L4 + L5 + L7 + L2 |
-| C1 convergence | Rolling-mean plateau + PELT change-point | L2 + Specialised |
+| C1 convergence | Rolling-mean plateau + PELT change-point | L2 + Specialized |
 | C2 reproducibility | Cross-seed mean ± std, fan charts | L2 |
 | Cross-cutting | Standardisation, train/val/test, k-fold CV, F1 / AUC-ROC / R² / RMSE | L2 |
 
-Specialised method used: PELT change-point detection. Justified in Methodology.
+Specialized method used: PELT change-point detection. Justified in Methodology.
 
 ---
 
-## 6. On specialised methods
+## 6. On specialized methods
 
-We default to curriculum methods because that's what the rubric grades us on and what we can defend in oral. Specialised methods are not banned — they come in where (a) they answer a specific question better than what we know, and (b) we can explain them clearly.
+We default to curriculum methods because that's what the rubric grades us on and what we can defend in oral. Specialized methods are not banned — they come in where (a) they answer a specific question better than what we know, and (b) we can explain them clearly.
 
-Currently the only specialised method we plan to use is PELT for convergence detection (C1), and even then we pair it with a curriculum-native plateau check. If during the analysis we find a question where, say, a survival model genuinely fits better than a binary-classification reframe, we'll add it — but each addition needs an explicit defence in Methodology, not a smuggled-in citation.
+Currently the only specialized method we plan to use is PELT for convergence detection (C1), and even then we pair it with a curriculum-native plateau check. If during the analysis we find a question where, say, a survival model genuinely fits better than a binary-classification reframe, we'll add it — but each addition needs an explicit defense in Methodology, not a smuggled-in citation.
 
 This is a softer stance than v2's "what we are NOT doing" list. Keeping the door open is better than over-prescribing.
 
@@ -210,7 +211,7 @@ Tier 1 + Tier 2 = 7 analyses, every one producing one or two thesis figures and 
 
 ## 10. Where it all lands in the thesis
 
-- **Ch. 5 Methodology §5.x Data analysis methods:** §5 (curriculum mapping) + §6 (specialised methods) + §7 (multi-method robustness). One clean methodology section that demonstrably ticks the CBS rubric.
+- **Ch. 5 Methodology §5.x Data analysis methods:** §5 (curriculum mapping) + §6 (specialized methods) + §7 (multi-method robustness). One clean methodology section that demonstrably ticks the CBS rubric.
 - **Ch. 7 Results:**
   - 7.1 Convergence and reproducibility (C1 + C2)
   - 7.2 Strategic archetypes and how objectives shape them (S1 + S2)
