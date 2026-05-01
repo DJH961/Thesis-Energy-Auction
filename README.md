@@ -4,6 +4,37 @@ This is the **active, main version** of the carbon market simulation. It uses mo
 
 Recent changes and release-specific details are tracked in `docs/changelog.md`.
 
+## Research Questions
+
+The thesis is organised around one main research question and three
+sub-questions. They are reproduced here for orientation and discussed in
+more detail (with pointers to the notebooks that address each one) in
+[`docs/research_questions.md`](docs/research_questions.md).
+
+> **Main RQ.** How can multi-agent reinforcement learning be used to
+> simulate the EU Emissions Trading System, and what does the resulting
+> simulation reveal about the system's regulatory mechanisms and the
+> strategic behavior of power-sector participants balancing financial
+> and environmental objectives?
+
+> **Sub-RQ 1.** What environment and algorithm design choices are
+> required to build a stable and behaviorally credible simulation of a
+> carbon market?
+
+> **Sub-RQ 2.** How sensitive are market outcomes such as price
+> stability, compliance, and the pace of decarbonization to the
+> regulatory mechanisms of the EU ETS?
+
+> **Sub-RQ 3.** How do financial and environmental objectives shape the
+> strategies of power companies in this market, and how do these
+> individual strategies aggregate into market-level outcomes?
+
+The default-config analysis notebook
+(`notebooks/ets_marl - Default RQ Analysis.ipynb`) addresses RQ1 in full,
+RQ2 *descriptively* within a single config, and RQ3 in full. The
+cross-config sensitivity claims for RQ2 are deferred to a separate
+experiments notebook driven by the sweep specs under `configs/sweeps/`.
+
 ## What Does This Code Do?
 
 At a high level, this project:
