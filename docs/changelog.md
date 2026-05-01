@@ -16,12 +16,22 @@ credibility floor (cf. Q-learning at `[8.6.1]`):
 * `auction_action` now sizes its `available` cash buffer as
   `operating + treasury_fraction × treasury` to mirror the env-side
   joint budget gate (`auction.budget_gate.treasury_fraction`,
-  default `0.33`). Bots no longer ignore the corporate treasury
-  reserve when computing willingness-to-pay budget ceilings.
+  default `0.5` to match the env-side fallback). Bots no longer
+  ignore the corporate treasury reserve when computing willingness-
+  to-pay budget ceilings.
 * Capex throughput check now reads `company.effective_capex_throughput`
   (the property that already accounts for emergency-loan squeeze and
   realised-revenue modulation) when present, falling back to the raw
   attribute for backwards compatibility.
+* Green-vs-financial classification now reads `company.w_green` (the
+  configured reward weight) instead of inferring from `agent_id`
+  parity. Robust to arbitrary `bot_reward_weights` configurations.
+* Secondary-market sell-side pricing floor lowered from `0.3 ×
+  (penalty − anchor)` to `0.10 × (penalty − anchor)` for non-urgent
+  sellers. The previous floor produced a ~30% gap above market for
+  surplus holders even when fully covered, which is unrealistic and
+  suppressed secondary volume; the new floor lets surplus actually
+  clear at a modest spread above the market anchor.
 * `ETSEnvironment._generate_bot_auction_actions` and
   `_generate_bot_secondary_actions` now pass the per-bot
   `loan_outstanding_norm` through to the heuristic. The heuristic

@@ -135,7 +135,10 @@ def auction_action(
     inv = config["investment"]
     if reserve_price is None:
         reserve_price = config["ets"].get("reserve_price", 0.0)
-    is_green = (company.agent_id % 2) == 1  # odd indices = green-objective
+    # Green-vs-financial inferred from the configured reward weights, not
+    # an agent_id parity assumption — keeps the heuristic correct under
+    # arbitrary `bot_reward_weights` configurations.
+    is_green = float(getattr(company, "w_green", 0.0)) > 0.25
 
     # --- Penalty rate (valuation ceiling) ---
     pen_cfg = config.get("penalty", {})
@@ -156,7 +159,7 @@ def auction_action(
     coverage_ratio = max(bank / annual_need, 0.0)
     operating = max(0.0, float(company.annual_budget - company.budget_spent_this_year))
     gate_cfg = config.get("auction", {}).get("budget_gate", {})
-    treasury_fraction = float(gate_cfg.get("treasury_fraction", 0.33))
+    treasury_fraction = float(gate_cfg.get("treasury_fraction", 0.5))
     treasury_avail = 0.0
     try:
         treasury_avail = float(company.get_treasury_available())
@@ -417,7 +420,12 @@ def secondary_action(
     elif trade_target < -0.01:
         sell_qty = min(abs(trade_target), qty_max)
         sec_qty = float(-sell_qty)
-        price_frac = max(0.3, urgency) + 0.15 * min(severity, 1.0)
+        # Surplus holders ask a modest spread above market; large surplus
+        # (high `severity`) accepts a slightly tighter spread to clear.
+        # Previous floor of 0.3 produced a 30% gap toward penalty even
+        # for non-urgent sellers, which is unrealistic and suppressed
+        # secondary volume.
+        price_frac = max(0.10, urgency) + 0.15 * min(severity, 1.0)
         sec_price = market_anchor + price_frac * (penalty_rate - market_anchor)
     else:
         sec_qty = 0.0
