@@ -7,8 +7,82 @@ Version numbers reflect the `version` field in `pyproject.toml`
 
 ## [Unreleased]
 
-**Q-learning baseline — apples-to-apples with the main simulation.** The
-tabular Q-learning baseline (`src/train_qlearning.py`,
+---
+
+## [8.6.1]
+
+A logging-coverage release. The training pipeline now exposes a much richer
+set of per-year and per-episode diagnostics, and the four analysis notebooks
+have been extended to consume them (with backward-compatible fallbacks for
+pre-8.6.1 logs). Also bundles the previously-unreleased Q-learning
+re-alignment, signed `quality_score`, and end-of-run snapshot cleanup.
+
+### Expanded year-level logging (`year_log_*.csv`)
+
+New columns surfaced from data the env already had access to but that
+analysis notebooks were previously reconstructing or fabricating from
+holdings deltas:
+
+* **Auction internals** flattened from the `auction_stats` sub-dict —
+  `auction_total_demand`, `auction_unsold`, `auction_hhi`,
+  `auction_max_agent_share`, `auction_failed`, `auction_defaults`,
+  `auction_defaulted_volume`, `effective_reserve_price`.
+* **Secondary-market participation counts** —
+  `secondary_n_buyers_intent`, `secondary_n_sellers_intent`,
+  `secondary_n_buyers_executed`, `secondary_n_sellers_executed`.
+* **Exogenous state** — `common_emission_shock` (system-wide η_t × σ
+  before the idiosyncratic component is mixed in) and
+  `fundamental_anchor` (MAC-scarcity-penalty anchor used as AR(1) floor
+  and obs reference price).
+* **Per-agent compliance / debt cascade** — `carry_forward_start_A{i}`,
+  `carry_forward_end_A{i}`, `coverage_gap_A{i}`,
+  `effective_penalty_rate_A{i}`. The first two trace the full
+  debt-cascade trajectory without notebooks reconstructing it from
+  holdings deltas; the latter two close the gap-penalty reward decomposition.
+* **Per-agent credit state** — `treasury_reserve_A{i}`,
+  `treasury_drawn_A{i}`, `loan_outstanding_A{i}`. Previously available
+  only in `info["year_log"]` at the dict level but never in the CSV.
+
+### Expanded episode-level logging (`training_log_*.csv`)
+
+Episode-level reductions of the year series so sweep notebooks can run
+straight off the episode log:
+
+* `year0_tnac`, `yearT_tnac` — start/end TNAC for the episode.
+* `ep_total_unsold` — sum of `auction_unsold` across the episode (Mt).
+* `ep_auction_failures` — # years the primary auction failed.
+* `ep_total_defaults` — sum of post-clearing settlement defaults.
+* `peak_loan_outstanding_A{i}` — per-agent maximum emergency-loan
+  balance held during the episode (M€).
+* `peak_carry_forward_A{i}` — per-agent maximum end-of-year
+  carry-forward debt during the episode (Mt).
+* `final_treasury_reserve_A{i}` — per-agent treasury balance at the end
+  of the final year (M€).
+
+### Notebook updates (backward-compatible)
+
+* **`Full Run & Analysis.ipynb`** — new section §A8 plotting auction
+  concentration (HHI, max-agent share), supply/demand balance, per-agent
+  end-of-year carry-forward debt, system-aggregate treasury vs
+  outstanding-loan balance, and a per-agent coverage-gap × penalty-rate
+  table. Every column access uses `if col in df.columns`, so the cell
+  silently no-ops on logs from older versions.
+* **`Data Science Analysis.ipynb`** — `EPISODE_FEATURES` and
+  `YEAR_FEATURES` lists (consumed by `build_strategy_features`) extended
+  with the new columns. The aggregator's existing `if col in df.columns`
+  guard means older logs silently NaN-fill the new features.
+* **`Episode Viewer.ipynb`** — new section §16 surfacing per-year
+  carry-forward / coverage-gap / treasury / loan and the auction
+  internals for the focal episode. Defensive fallback when columns
+  are absent.
+* **`Q-Learning Baseline.ipynb`** — new section §13 contrasting
+  Q-learning vs PPO on system-aggregate peak loan and peak
+  carry-forward in the converged window — the credibility floor a
+  cross-algo comparison should look at next to `quality_score`.
+
+### Q-learning baseline re-aligned with the main simulation
+
+The tabular Q-learning baseline (`src/train_qlearning.py`,
 `scripts/evaluate_qlearning.py`) has been re-aligned with the PPO/HAPPO
 trainer's environment-interaction surface so the two algorithms can be
 compared on the same default config:
@@ -47,10 +121,11 @@ compared on the same default config:
   Q-learning baseline explicitly as the credibility floor — the gap to
   PPO is what tells us the simulation is non-trivial *and* solvable.
 
-**Quality score — signed `[-5, +5]` range.** The per-episode
-`quality_score` reported in console + `training_log_*.csv` and consumed
-by the sweep launcher is now a signed composite in `[-5, +5]` (was a
-near-flat `[0, 1]` band that empirically only spanned `≈ 0.4–0.7`,
+### Quality score — signed `[-5, +5]` range
+
+The per-episode `quality_score` reported in console + `training_log_*.csv`
+and consumed by the sweep launcher is now a signed composite in `[-5, +5]`
+(was a near-flat `[0, 1]` band that empirically only spanned `≈ 0.4–0.7`,
 making run-to-run progress hard to read). The five components
 (`Q_compliance`, `Q_price_realism`, `Q_saved_carbon`, `Q_cost_eff`,
 `Q_volatility`) keep their existing `[0, 1]` semantics for backwards
@@ -64,17 +139,26 @@ launcher format updated to `Q=+1.23` / `Q=-0.45`. The aggregation lives
 in the new `compute_quality_score(...)` helper in `scripts/train.py`
 and is unit-tested in `tests/test_quality_score.py`.
 
-**Snapshots auto-cleanup at end-of-run.** Mid-run snapshot CSV pairs in
-`results/snapshots/` are exact copies of the cumulative
-`training_log` / `year_log` taken every `snapshot_interval` episodes
-for partial-progress analysis. Once the seed finishes cleanly, the
-live cumulative log strictly supersedes any rolling snapshot, so the
-snapshot pair was pure duplication — it doubled per-seed log size
-locally and was uploaded a second time when Azure ML copied
-`results/` to its output store. `train_one_seed` now deletes this
-seed's snapshot pairs at clean end-of-run (and removes the
-`snapshots/` directory if empty); other seeds/tags are left
-untouched. Opt out via `logging.snapshot_delete_on_finish: false`.
+### Snapshots auto-cleanup at end-of-run
+
+Mid-run snapshot CSV pairs in `results/snapshots/` are exact copies of
+the cumulative `training_log` / `year_log` taken every
+`snapshot_interval` episodes for partial-progress analysis. Once the
+seed finishes cleanly, the live cumulative log strictly supersedes any
+rolling snapshot, so the snapshot pair was pure duplication — it
+doubled per-seed log size locally and was uploaded a second time when
+Azure ML copied `results/` to its output store. `train_one_seed` now
+deletes this seed's snapshot pairs at clean end-of-run (and removes the
+`snapshots/` directory if empty); other seeds/tags are left untouched.
+Opt out via `logging.snapshot_delete_on_finish: false`.
+
+### Migration notes
+
+* All new columns use safe defaults / `.get()` fallbacks downstream.
+  Older logs (pre-8.6.1) are still readable; analysis cells that
+  reference new columns gracefully no-op.
+* `data_dictionary.md` documents every new column.
+* No retraining required for this release.
 
 ---
 

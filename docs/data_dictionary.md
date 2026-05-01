@@ -160,6 +160,22 @@ single episode.
 | `actor_loss_invest_A{i}`, `critic_loss_invest_A{i}` | Split-head loss for the **investment** sub-head of the auction policy. |
 | `actor_loss_secondary_A{i}`, `critic_loss_secondary_A{i}` | Loss for the secondary-market policy. |
 
+### v8.6.1 — Episode-level credit / debt-cascade aggregates
+
+These columns are reductions over the per-year series in `year_log_*.csv`,
+so notebooks don't have to re-aggregate them:
+
+| Column | Meaning |
+|---|---|
+| `year0_tnac` | TNAC at end of the first year (Mt). |
+| `yearT_tnac` | TNAC at end of the final year (Mt). |
+| `ep_total_unsold` | Sum of `auction_unsold` across the episode (Mt). |
+| `ep_auction_failures` | Number of years for which the primary auction failed (`auction_failed=1`). |
+| `ep_total_defaults` | Sum of post-clearing settlement defaults (sum of `auction_defaults` across years). |
+| `peak_loan_outstanding_A{i}` | Maximum emergency-loan balance held by agent *i* during the episode (M€). |
+| `peak_carry_forward_A{i}` | Maximum end-of-year carry-forward debt for agent *i* during the episode (Mt). |
+| `final_treasury_reserve_A{i}` | Treasury balance held by agent *i* at the end of the final year (M€). |
+
 ---
 
 ## 3. `year_log_*.csv` — year-level log
@@ -185,6 +201,29 @@ the default 8-agent config.
 | `inflation_rate`, `inflation_factor` | Year-on-year and cumulative inflation factors. |
 | `phantom_bid_price`, `phantom_bid_qty`, `phantom_active` | Phantom-bidder injection state. |
 | `marginal_ef_used` | Average emission factor of the marginal MWh dispatched this year (system-wide). |
+
+#### v8.6.1 — Auction & secondary-market scalars (single value per year)
+
+These columns are added in v8.6.1 to surface fields that previously lived
+inside the `auction_stats` sub-dict in `info["year_log"]`, plus a few new
+exogenous-state diagnostics:
+
+| Column | Meaning |
+|---|---|
+| `auction_total_demand` | Total Mt of valid bid demand submitted (incl. agents and phantom) before clearing. |
+| `auction_unsold` | Mt offered but not allocated this year. |
+| `auction_hhi` | Herfindahl-Hirschman index of the *allocation* shares (`Σ (share×100)²`). |
+| `auction_max_agent_share` | Largest single-agent share of allocations this year. |
+| `auction_failed` | `1` if the auction failed (no valid bids / under-subscribed cancellation), else `0`. |
+| `auction_defaults` | Number of agents whose post-clearing settlement defaulted this year. |
+| `auction_defaulted_volume` | Mt that defaulted at settlement (rolled into next year's q_cap unless `carry_forward_defaults=false`). |
+| `effective_reserve_price` | Reserve price actually used by the clearer this year (€/tCO₂). |
+| `secondary_n_buyers_intent` | Number of agents that submitted a positive (buy) signed quantity to the secondary market. |
+| `secondary_n_sellers_intent` | Number of agents that submitted a negative (sell) signed quantity. |
+| `secondary_n_buyers_executed` | Number of agents that ended up with a positive realised secondary trade. |
+| `secondary_n_sellers_executed` | Number of agents that ended up with a negative realised secondary trade. |
+| `common_emission_shock` | System-wide common component of the correlated emission shock (`η_t × σ`). |
+| `fundamental_anchor` | MAC-scarcity-penalty fundamental anchor used as the AR(1) floor and observation reference (€/tCO₂, nominal). |
 
 ### Per-agent year-level state (`_A{i}`)
 
@@ -226,6 +265,18 @@ the default 8-agent config.
 | `invest_frac_pre_clip_A{i}`, `invest_frac_post_clip_A{i}` | Phase-1 action[2] before / after the budget hard-gate clip. |
 | `available_budget_A{i}` | Effective annual budget at start of year (M€). |
 | `compliance_share_of_available_A{i}` | (auction + secondary + MAC) / `available_budget`. |
+
+#### v8.6.1 — Per-agent compliance & credit state (year-level)
+
+| Column | Meaning |
+|---|---|
+| `carry_forward_start_A{i}` | Carry-forward debt inherited at the **start** of the year (Mt). Equal to `old_carry_forward[i]` in `info["year_log"]`. |
+| `carry_forward_end_A{i}` | Carry-forward debt rolling into the **next** year (Mt). After-compliance value of `company._carry_forward`. |
+| `coverage_gap_A{i}` | Pre-secondary `max(0, need − alloc)` for agent *i*, in Mt. Drives the gap-penalty term in the bid-head reward. |
+| `effective_penalty_rate_A{i}` | Inflation-adjusted nominal penalty rate the agent faces this year (€/tCO₂). |
+| `treasury_reserve_A{i}` | Treasury balance at end of year (M€). |
+| `treasury_drawn_A{i}` | M€ drawn from treasury this year (settlement waterfall stage B). |
+| `loan_outstanding_A{i}` | Outstanding emergency-loan balance at end of year (M€). |
 
 ---
 

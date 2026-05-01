@@ -54,12 +54,17 @@ def test_training_smoke_runs_10_episodes(tmp_path):
     assert int(float(rows[-1]["episode"])) == n_episodes - 1
 
     # v8.6.1 expanded episode-level logging — pin the new column names.
+    n_total = cfg["companies"]["n_agents"] + cfg["companies"].get("n_bot_agents", 0)
     expected_ep_cols = {
         "year0_tnac", "yearT_tnac", "ep_total_unsold",
         "ep_auction_failures", "ep_total_defaults",
-        "peak_loan_outstanding_A1", "peak_carry_forward_A1",
-        "final_treasury_reserve_A1",
     }
+    for i in range(n_total):
+        expected_ep_cols.update({
+            f"peak_loan_outstanding_A{i+1}",
+            f"peak_carry_forward_A{i+1}",
+            f"final_treasury_reserve_A{i+1}",
+        })
     assert expected_ep_cols.issubset(rows[0].keys()), \
         f"Missing v8.6.1 episode columns: {expected_ep_cols - set(rows[0].keys())}"
 
@@ -76,9 +81,16 @@ def test_training_smoke_runs_10_episodes(tmp_path):
         "secondary_n_buyers_intent", "secondary_n_sellers_intent",
         "secondary_n_buyers_executed", "secondary_n_sellers_executed",
         "common_emission_shock", "fundamental_anchor",
-        "carry_forward_start_A1", "carry_forward_end_A1",
-        "coverage_gap_A1", "effective_penalty_rate_A1",
-        "treasury_reserve_A1", "treasury_drawn_A1", "loan_outstanding_A1",
     }
+    for i in range(n_total):
+        expected_yr_cols.update({
+            f"carry_forward_start_A{i+1}",
+            f"carry_forward_end_A{i+1}",
+            f"coverage_gap_A{i+1}",
+            f"effective_penalty_rate_A{i+1}",
+            f"treasury_reserve_A{i+1}",
+            f"treasury_drawn_A{i+1}",
+            f"loan_outstanding_A{i+1}",
+        })
     assert expected_yr_cols.issubset(yr_rows[0].keys()), \
         f"Missing v8.6.1 year columns: {expected_yr_cols - set(yr_rows[0].keys())}"
