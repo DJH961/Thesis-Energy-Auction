@@ -45,8 +45,28 @@ if sys.stdout.encoding != "utf-8" and hasattr(sys.stdout, "buffer"):
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.environment.ets_environment import ETSEnvironment
-from src.agents.q_learning_agent import QLearningAgent, StateDiscretizer
+from src.agents.q_learning_agent import (
+    QLearningAgent, StateDiscretizer, ActionProfileMapper)
 from src.utils.quality_metric import compute_episode_quality
+
+
+# Short labels for the auction/secondary action profiles. Used in the
+# console table so that "a1/a2 = 1/0" reads as "Mod/Hold" — closer to
+# how a HAPPO column communicates strategy than bare profile indices.
+_A1_SHORT = ["Cons", "Mod", "Aggr", "Grn", "Fin", "Pnc"]
+_A2_SHORT = ["Hold", "Sell", "Buy", "BuyA"]
+
+
+def _a1_label(idx: int) -> str:
+    if idx < 0 or idx >= len(_A1_SHORT):
+        return "?"
+    return _A1_SHORT[idx]
+
+
+def _a2_label(idx: int) -> str:
+    if idx < 0 or idx >= len(_A2_SHORT):
+        return "?"
+    return _A2_SHORT[idx]
 
 
 def load_config(path: str) -> dict:
@@ -275,25 +295,35 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
     print(f"  States: {StateDiscretizer.N_STATES}  |  Actions: 6×4 profiles")
     print(f"  Console log every {log_interval} episodes")
     print(f"{'═'*70}")
-    print("  Console legend (HAPPO-mirrored, per log_interval episode):")
-    print("  │  Ep / elapsed / ETA   Episode number · wall-clock · estimated remaining")
-    print("  │  ε                    Current epsilon-greedy exploration rate")
-    print("  │  Q                    Anchor-invariant quality_score in [-5, +5]")
-    print("  │  Price/yr             Auction clearing price per simulated year (€/t)")
-    print("  │  Emiss/yr             Total system emissions per year (Mt)")
-    print("  │  Bid/yr               Total agent bid demand per year (Mt)")
-    print("  │  Auct/yr              Auction supply after cap+rollover+MSR (Mt)")
-    print("  │  Per-agent table:")
-    print("  │     Green             Green fraction at start → end of episode (Δpp)")
-    print("  │     Emiss/Alloc       Mean per-year emissions / allocations (Mt)")
-    print("  │     Sf                Shortfall years / total years")
-    print("  │     Why(B/C)          Compliant years (B) and non-compliant years (C)")
-    print("  │     yr1€/yrN€/avg€    First-year, last-year, qty-weighted average bid (€/t)")
-    print("  │     lo€/hi€           Lowest / highest bid price across the episode (€/t)")
-    print("  │     BidMt             Mean bid quantity per year (Mt)")
-    print("  │     Rew               Episode total reward (M€-equivalent)")
-    print("  │     a1/a2             Last-year auction / secondary profile chosen")
-    print("  │  Event Board          Defaults, treasury draws, emergency loans (years/peak)")
+    print(f"  Console legend (HAPPO-mirrored, per log_interval episode):")
+    print(f"  │  Ep / elapsed / ETA   Episode number · wall-clock · estimated remaining")
+    print(f"  │  ε                    Current epsilon-greedy exploration rate")
+    print(f"  │  Q                    Anchor-invariant quality_score in [-5, +5]")
+    print(f"  │  Price/yr             Auction clearing price per simulated year (€/t)")
+    print(f"  │  Emiss/yr             Total system emissions per year (Mt)")
+    print(f"  │  Bid/yr               Total agent bid demand per year (Mt)")
+    print(f"  │  Auct/yr              Auction supply after cap+rollover+MSR (Mt)")
+    print(f"  │  Per-agent table:")
+    print(f"  │     Green             Green fraction at start → end of episode (Δpp)")
+    print(f"  │     Emiss/Alloc       Mean per-year emissions / allocations (Mt)")
+    print(f"  │     Sf                Shortfall years / total years")
+    print(f"  │     Why(U/D/M/B/C)    Per-year compliance attribution (HAPPO-aligned):")
+    print(f"  │                       U=under-bid, D=debt-cascade, M=both,")
+    print(f"  │                       B=bank-rescued (compliant via bank), C=sec-buy-rescued")
+    print(f"  │     yr1€/yrN€/avg€    First-year, last-year, qty-weighted average bid (€/t)")
+    print(f"  │     lo€/hi€           Lowest / highest bid price across the episode (€/t)")
+    print(f"  │     BidMt             Mean bid quantity per year (Mt)")
+    print(f"  │     Rew               Episode total reward (M€-equivalent)")
+    print(f"  │     a1/a2             Last-year auction / secondary profile (short name)")
+    print(f"  │  Q-learning columns (replace HAPPO's policy-loss columns):")
+    print(f"  │     |TD|              Mean |Bellman residual| over this log window")
+    print(f"  │     maxQ              Mean of greedy Q-value across visited states")
+    print(f"  │     Cov%              Q-table state coverage (% of {StateDiscretizer.N_STATES} states)")
+    print(f"  │     ε%                Share of action picks taken from the ε-random branch")
+    print(f"  │  Q-Learning Board     Per-agent: states-visited, distinct greedy (a1,a2)")
+    print(f"  │                       pairs across visited states, top auction profile,")
+    print(f"  │                       mean |TD|, mean maxQ, # Bellman updates this window")
+    print(f"  │  Event Board          Defaults, treasury draws, emergency loans (years/peak)")
     print(f"{'═'*70}\n")
 
 
@@ -546,7 +576,7 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
                 yr_emiss_total.append(float(sum(emi[: n_total_agents])))
                 bqs = yl.get("bid_quantities", []) or []
                 yr_bid_total.append(float(sum(max(0.0, q) for q in bqs[: n_total_agents])))
-                yr_auct_vol.append(float(yl.get("auction_supply", 0.0) or 0.0))
+                yr_auct_vol.append(float(yl.get("auction_volume", yl.get("cap", 0.0)) or 0.0))
 
             # Per-agent bid trajectories (yr1/yrN/avg/lo/hi/BidMt) — same
             # structure HAPPO prints. Walk env.episode_log once per agent.
@@ -598,10 +628,25 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
                     ep_mean_alloc[i] = float(np.mean(allocs))
                 ep_shortfall_years[i] = sfy
 
-            # Secondary stats (per agent + system-level)
+            # Secondary stats (per agent + system-level) and compliance
+            # attribution. Buckets mirror HAPPO's per-agent attribution
+            # (Underbid / Debt-cascade / Mixed / sec-Buy-rescued /
+            # sec-non-Compliant) so the two consoles read identically:
+            #   U: alloc < emiss this year, no inherited carry-forward
+            #   D: alloc ≥ emiss this year, but inherited carry-forward
+            #      created a residual shortfall (debt cascade)
+            #   M: both — under-bid this year AND inherited debt
+            #   B: emiss + cf > alloc but settled compliant via secondary
+            #      *without* a net buy this year (used bank only)
+            #   C: emiss + cf > alloc, settled compliant via a net
+            #      secondary buy this year
             per_agent_sec = [
                 {"buy_y": 0, "buy_v": 0.0, "buy_px": 0.0,
                  "sell_y": 0, "sell_v": 0.0, "sell_px": 0.0}
+                for _ in range(n_total_agents)
+            ]
+            per_agent_attr = [
+                {"u": 0, "d": 0, "m": 0, "b": 0, "c": 0}
                 for _ in range(n_total_agents)
             ]
             total_sec_vol = 0.0
@@ -609,10 +654,13 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
             for yl in env.episode_log:
                 tq = yl.get("trade_qtys", []) or []
                 tc = yl.get("trade_costs", []) or []
-                spx = float(yl.get("secondary_clearing", 0.0) or 0.0)
+                allocs_yl = yl.get("allocations", []) or []
+                emiss_yl = yl.get("emissions", []) or []
+                cf_yl = yl.get("old_carry_forward", []) or []
+                shorts_yl = yl.get("shortfalls", []) or []
                 year_had_trade = False
-                for i in range(min(n_total_agents, len(tq))):
-                    q = float(tq[i])
+                for i in range(n_total_agents):
+                    q = float(tq[i]) if i < len(tq) else 0.0
                     c = float(tc[i]) if i < len(tc) else 0.0
                     if q > 1e-6:
                         per_agent_sec[i]["buy_y"] += 1
@@ -625,6 +673,33 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
                         per_agent_sec[i]["sell_v"] += -q
                         per_agent_sec[i]["sell_px"] += abs(c)
                         year_had_trade = True
+
+                    # Compliance attribution per (agent, year)
+                    if i < len(allocs_yl) and i < len(emiss_yl):
+                        alloc_i = float(allocs_yl[i])
+                        emiss_i = float(emiss_yl[i])
+                        cf_i = float(cf_yl[i]) if i < len(cf_yl) else 0.0
+                        short_i = float(shorts_yl[i]) if i < len(shorts_yl) else 0.0
+                        underbid = alloc_i + 1e-6 < emiss_i
+                        debt = cf_i > 1e-6
+                        gap = (emiss_i + cf_i) > alloc_i + 1e-6
+                        non_comp = short_i > 1e-6
+                        net_buy = q > 1e-6
+                        if non_comp:
+                            if underbid and not debt:
+                                per_agent_attr[i]["u"] += 1
+                            elif (not underbid) and debt:
+                                per_agent_attr[i]["d"] += 1
+                            elif underbid and debt:
+                                per_agent_attr[i]["m"] += 1
+                            # else: residual — skip (should not happen)
+                        else:
+                            if gap:
+                                if net_buy:
+                                    per_agent_attr[i]["c"] += 1
+                                else:
+                                    per_agent_attr[i]["b"] += 1
+                            # else: no obligation gap, compliant — quiet year
                 if year_had_trade:
                     years_with_trades += 1
             sec_match_rate = years_with_trades / max(len(env.episode_log), 1)
@@ -662,7 +737,7 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
                 float(np.mean(yr_emiss_total)) if yr_emiss_total else 0.0
             )
 
-            W = 155
+            W = 195
             sep = "═" * W
             thin = "─" * W
 
@@ -696,11 +771,19 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
                   f"  avg={avg_secp:.0f}€")
 
             # ── Per-agent table ──────────────────────────────────────────
+            # Mirrors HAPPO's table but the policy-internal columns
+            # (DiagPts/ALoss/CLoss in HAPPO) are replaced by Q-learning
+            # analogs: |TD| (mean absolute Bellman residual this window),
+            # maxQ (mean of greedy Q across visited states), Cov% (Q-table
+            # state coverage), and ε% (share of ε-random picks this
+            # window). a1/a2 are rendered as profile names.
             print(thin)
             print(f"  {'':4}  {'Green':>16}  {'Emiss':>5} {'Alloc':>5}"
-                  f" {'Sf':>5} {'Why(B/C)':>9}  "
+                  f" {'Sf':>5} {'Why(U/D/M/B/C)':>16}  "
                   f"{'yr1€':>5} {'yrN€':>5} {'avg€':>5} {'lo€':>5} {'hi€':>5} {'BidMt':>6}"
-                  f"  {'Rew':>8}  {'a1/a2':>5}  Secondary")
+                  f"  {'Rew':>8}  {'a1/a2':>11}"
+                  f"  {'|TD|':>7} {'maxQ':>7} {'Cov%':>5} {'ε%':>4}"
+                  f"  Secondary")
 
             for i in range(n_agents):
                 g0 = float(env.companies[i].prev_green_frac) * 100
@@ -710,8 +793,8 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
                 sfy = ep_shortfall_years[i]
                 ny = max(len(env.episode_log), 1)
                 sf_str = f"{int(sfy):2d}/{ny:<2d}"
-                b_years = ny - int(sfy)
-                why_str = f"{b_years:2d}/{int(sfy):2d}"
+                attr = per_agent_attr[i]
+                why_str = f"{attr['u']:2d}/{attr['d']:2d}/{attr['m']:2d}/{attr['b']:2d}/{attr['c']:2d}"
 
                 ss = per_agent_sec[i]
                 sec_parts = []
@@ -721,12 +804,22 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
                     sec_parts.append(f"S{ss['sell_y']}y/{ss['sell_v']:.1f}Mt@{ss['sell_px']:.0f}€")
                 sec_str = " ".join(sec_parts) if sec_parts else "HOLD"
 
+                # Q-learning diagnostics for this agent / window
+                td_abs = agents[i].window_td_mean_abs()
+                max_q = agents[i].mean_max_q()
+                cov_pct = agents[i].coverage_fraction() * 100.0
+                eps_pct = agents[i].window_explore_share() * 100.0
+                a1_lbl = _a1_label(int(last_a1_profiles[i]))
+                a2_lbl = _a2_label(int(last_a2_profiles[i]))
+                action_str = f"{a1_lbl:>4}/{a2_lbl:<4}"
+
                 print(f"  A{i+1} : {grn_str:>16}"
                       f"  {ep_mean_emiss[i]:5.2f} {ep_mean_alloc[i]:5.2f}"
-                      f" {sf_str:>5} {why_str:>9}  "
+                      f" {sf_str:>5} {why_str:>16}  "
                       f"{yr1_bid[i]:5.0f} {yrN_bid[i]:5.0f} {avg_bid[i]:5.0f} {min_bid[i]:5.0f} {max_bid[i]:5.0f} {avg_bidqty[i]:6.2f}"
                       f"  {avg_reward[i]:8.1f}"
-                      f"  {int(last_a1_profiles[i]):>2}/{int(last_a2_profiles[i]):<2}"
+                      f"  {action_str:>11}"
+                      f"  {td_abs:7.3f} {max_q:7.2f} {cov_pct:4.0f}% {eps_pct:3.0f}%"
                       f"  {sec_str}")
 
             # ── Bot rows (driven by heuristic policy) ────────────────────
@@ -741,7 +834,9 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
                     sfy = ep_shortfall_years[j]
                     ny = max(len(env.episode_log), 1)
                     sf_str = f"{int(sfy):2d}/{ny:<2d}"
-                    why_str = f"{ny - int(sfy):2d}/{int(sfy):2d}"
+                    attr_b = per_agent_attr[j]
+                    why_str = (f"{attr_b['u']:2d}/{attr_b['d']:2d}/"
+                               f"{attr_b['m']:2d}/{attr_b['b']:2d}/{attr_b['c']:2d}")
                     ss = per_agent_sec[j]
                     sec_parts = []
                     if ss["buy_y"] > 0:
@@ -749,13 +844,43 @@ def train_qlearning(config: dict, ql_config: dict, seed: int,
                     if ss["sell_y"] > 0:
                         sec_parts.append(f"S{ss['sell_y']}y/{ss['sell_v']:.1f}Mt@{ss['sell_px']:.0f}€")
                     sec_str = " ".join(sec_parts) if sec_parts else "HOLD"
+                    # Bots have no Q-table — pad the QL columns with dashes
+                    # so the table still aligns vertically.
                     print(f"  B{b+1} : {grn_str:>16}"
                           f"  {ep_mean_emiss[j]:5.2f} {ep_mean_alloc[j]:5.2f}"
-                          f" {sf_str:>5} {why_str:>9}  "
+                          f" {sf_str:>5} {why_str:>16}  "
                           f"{yr1_bid[j]:5.0f} {yrN_bid[j]:5.0f} {avg_bid[j]:5.0f} {min_bid[j]:5.0f} {max_bid[j]:5.0f} {avg_bidqty[j]:6.2f}"
                           f"  {total_rewards_total[j]:8.1f}"
-                          f"  {'   ':>5}"
+                          f"  {'  bot/bot':>11}"
+                          f"  {'    -':>7} {'    -':>7} {'  - ':>5} {' - ':>4}"
                           f"  {sec_str}")
+
+            # ── Q-Learning Board (sibling of HAPPO's Event Board) ────────
+            # Surfaces the per-agent learning state of the Q-tables so the
+            # "Q-learning-ness" is visible at a glance: state coverage,
+            # mean |TD|, mean max-Q, and how many distinct (a1,a2) pairs
+            # the greedy policy currently uses across visited states.
+            print(thin)
+            print("  Q-Learning Board:  α={:.3f}  γ={:.3f}  states={}  ε={:.3f}".format(
+                alpha, gamma, StateDiscretizer.N_STATES, epsilon))
+            for i in range(n_agents):
+                cov_states = agents[i].coverage_states()
+                cov_pct = 100.0 * cov_states / StateDiscretizer.N_STATES
+                td_abs = agents[i].window_td_mean_abs()
+                max_q = agents[i].mean_max_q()
+                diversity = agents[i].greedy_policy_diversity()
+                top_a1 = agents[i].top_auction_profile()
+                n_updates = agents[i].window_update_count()
+                print(f"    A{i+1}: states {cov_states:3d}/{StateDiscretizer.N_STATES} ({cov_pct:4.0f}%)"
+                      f"  greedy-pairs={diversity:2d}/{ActionProfileMapper.N_AUCTION_PROFILES * ActionProfileMapper.N_SECONDARY_PROFILES}"
+                      f"  top-a1={_a1_label(top_a1):<4}"
+                      f"  |TD|={td_abs:7.3f}"
+                      f"  maxQ={max_q:7.2f}"
+                      f"  updates={n_updates:5d}")
+
+            # Reset rolling Q-learning diagnostics for the next window
+            for ag in agents:
+                ag.reset_window_stats()
 
             # ── Event board ──────────────────────────────────────────────
             print(thin)
