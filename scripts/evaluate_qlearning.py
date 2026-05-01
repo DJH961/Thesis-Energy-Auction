@@ -52,6 +52,8 @@ def main():
                         help="Path to Q-table pickle file")
     parser.add_argument("--n-episodes", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--run-tag", type=str, default=None,
+                        help="Filename infix used during training (e.g. sweep variant name)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Directory for eval results (default: same as qtable dir)")
     args = parser.parse_args()
@@ -84,9 +86,10 @@ def main():
     # Output directory
     output_dir = args.output_dir or os.path.dirname(args.qtable_path)
     os.makedirs(output_dir, exist_ok=True)
+    tag_part = f"_{args.run_tag}" if args.run_tag else ""
 
     # CSV for eval results (PPO-compatible format)
-    eval_path = os.path.join(output_dir, f"ql_eval_results_s{args.seed}.csv")
+    eval_path = os.path.join(output_dir, f"ql_eval_results{tag_part}_s{args.seed}.csv")
     eval_fields = ["episode", "clearing_price_last", "cap_last", "tnac"]
     for i in range(n_agents):
         eval_fields += [f"reward_A{i+1}", f"green_frac_A{i+1}",
@@ -98,7 +101,7 @@ def main():
     eval_writer.writeheader()
 
     # Year-level CSV for detailed analysis
-    yr_path = os.path.join(output_dir, f"ql_eval_year_log_s{args.seed}.csv")
+    yr_path = os.path.join(output_dir, f"ql_eval_year_log{tag_part}_s{args.seed}.csv")
     yr_fields = ["episode", "year", "cap", "auction_volume", "tnac",
                  "clearing_price", "secondary_price", "msr_reserve"]
     for i in range(n_agents):
