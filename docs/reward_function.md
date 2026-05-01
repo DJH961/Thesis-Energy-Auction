@@ -7,12 +7,11 @@ short reference appendix; it complements `docs/esg_reward_design.md`
 (which is the long-form design document for the ESG term) and
 `docs/config_dictionary.md` § `reward` and § `esg`.
 
-Notation
-:   `t` = current year (0…11). `i` = agent index. `infl_t` = cumulative
-    inflation factor at year `t`. `anchor_t` = fundamental price anchor
-    (MAC-scarcity-penalty mix); `anchor_real_t = anchor_t / infl_t`.
-    `budget_real_t = annual_budget_i / infl_t`. `need_t` =
-    deterministic compliance need estimate at obs time.
+**Notation.** `t` = current year (0…11). `i` = agent index. `infl_t` =
+cumulative inflation factor at year `t`. `anchor_t` = fundamental
+price anchor (MAC-scarcity-penalty mix); `anchor_real_t = anchor_t /
+infl_t`. `budget_real_t = annual_budget_i / infl_t`. `need_t` =
+deterministic compliance need estimate at obs time.
 
 ---
 
