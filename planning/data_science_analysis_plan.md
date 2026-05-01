@@ -2,7 +2,7 @@
 
 Internal working doc for Daniel & Alessio.
 
-**v3 changes from v2:** reorganised RQ-first instead of method-first. Every analysis is justified by what we'll actually claim in the thesis. Cut clearing-price prediction (didn't answer any RQ). Cut pathology / autoencoder analyses (didn't earn their place). Made strategy the centrepiece. Softened the "specialised methods" stance — we still lean curriculum-first, but specialised methods are welcome when they answer a specific question well.
+**v3 changes from v2:** reorganized RQ-first instead of method-first. Every analysis is justified by what we'll actually claim in the thesis. Cut clearing-price prediction (didn't answer any RQ). Cut pathology / autoencoder analyses (didn't earn their place). Made strategy the centrepiece. Softened the "specialised methods" stance — we still lean curriculum-first, but specialised methods are welcome when they answer a specific question well.
 
 ---
 
@@ -37,7 +37,7 @@ Seven claims, seven analyses. Each analysis below is the work needed to defend o
 
 What strategies emerge once training has converged? Are they distinguishable, and do they map onto the agent archetypes we designed?
 
-**Method.** Per-agent feature vectors over the converged window: mean `bid_price_A{i}`, mean `avg_bid_mult_A{i}`, mean `avg_sec_qty_A{i}`, `inv_onshore_share_A{i}`, `inv_offshore_share_A{i}`, `inv_solar_share_A{i}`, terminal `green_frac_A{i}`, mean `udbc_*_total_A{i}` shares. Standardise (Lecture 2). Cluster with **K-means** with k chosen via **Silhouette + Elbow** (Lecture 3) and confirm with **hierarchical clustering** (dendrogram, Lecture 3). Visualise in 2D with **PCA** (Lecture 5).
+**Method.** Per-agent feature vectors over the converged window: mean `bid_price_A{i}`, mean `avg_bid_mult_A{i}`, mean `avg_sec_qty_A{i}`, `inv_onshore_share_A{i}`, `inv_offshore_share_A{i}`, `inv_solar_share_A{i}`, terminal `green_frac_A{i}`, mean `udbc_*_total_A{i}` shares. Standardize (Lecture 2). Cluster with **K-means** with k chosen via **Silhouette + Elbow** (Lecture 3) and confirm with **hierarchical clustering** (dendrogram, Lecture 3). Visualize in 2D with **PCA** (Lecture 5).
 
 **The actual analytical work, not just running the methods:** compare emergent clusters against the designed archetypes (coal-heavy / balanced / green-heavy). If the clustering recovers the archetypes, the simulation is producing differentiated strategies. If it collapses them or mixes them, that's a finding too — and we need to explain why.
 
@@ -140,7 +140,7 @@ This also serves as the validity floor for R1: if cross-seed std on the default 
 
 ---
 
-## 5. Methods inventory & curriculum mapping
+## 5. Method inventory & curriculum mapping
 
 For Ch. 5 Methodology. Demonstrates every method is curriculum-grounded except where we explicitly justify otherwise.
 
