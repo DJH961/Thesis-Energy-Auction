@@ -2,7 +2,7 @@
 
 A presentation-ready snapshot of the size, depth, and complexity of the
 **ETS MARL** thesis codebase: a multi-agent reinforcement-learning
-simulation of the EU Emissions Trading System (v8.5.3).
+simulation of the EU Emissions Trading System (v8.6.0).
 
 > Numbers are measured directly from the repository. **The `archive/`
 > directory (legacy code from prior versions) is excluded from every
@@ -15,15 +15,15 @@ simulation of the EU Emissions Trading System (v8.5.3).
 
 | | |
 |---|---:|
-| **Tracked source/config/test/doc files** (excl. `archive/`, notebooks, lockfile) | **67** |
-| **Lines of authored content** (Python + YAML + Markdown + Toml + Txt, excl. `archive/`) | **26,048** |
-| **Python files** (current code) | **47** |
-| **Python LOC** (current code) | **20,897** |
-| **Python LOC in `src/`** (production simulation + agents) | **9,667** |
-| **Python LOC in `tests/`** | **8,371** |
-| **Python LOC in `scripts/`** (training & evaluation) | **2,859** |
-| **Markdown documentation** | **9,022 lines** across 22 files |
-| **YAML config files** | **5** active configs — 995 lines total |
+| **Tracked source/config/test/doc files** (excl. `archive/`, notebooks, lockfile) | **79** |
+| **Lines of authored content** (Python + YAML + Markdown + Toml + Txt, excl. `archive/`) | **32,599** |
+| **Python files** (current code) | **56** |
+| **Python LOC** (current code) | **25,425** |
+| **Python LOC in `src/`** (production simulation + agents) | **10,596** |
+| **Python LOC in `tests/`** | **10,440** |
+| **Python LOC in `scripts/`** (training, evaluation, sweep launcher) | **4,389** |
+| **Markdown documentation** | **5,943 lines** across 13 files |
+| **YAML config files** | **8** total — 1,204 lines (3 root + 2 scenarios + 3 sweep specs) |
 | **TODO / FIXME / HACK comments** | **0** ✨ |
 
 ---
@@ -34,11 +34,11 @@ simulation of the EU Emissions Trading System (v8.5.3).
 
 | | |
 |---|---:|
-| Lines of code | **3,311** |
-| Top contender (`scripts/train.py`) | 2,450 LOC |
-| Third place (`src/agents/ppo_agent.py`) | 1,490 LOC |
+| Lines of code | **3,509** |
+| Top contender (`scripts/train.py`) | 3,109 LOC |
+| Third place (`src/agents/ppo_agent.py`) | 1,586 LOC |
 
-Together, the **top three files alone are 7,251 lines** of simulation
+Together, the **top three files alone are 8,204 lines** of simulation
 and learning logic.
 
 ---
@@ -48,26 +48,26 @@ and learning logic.
 | Metric | Count |
 |---|---:|
 | Sub-packages | 5 (`agents`, `auction`, `environment`, `analysis`, `utils`) |
-| Classes | **16** |
-| Top-level functions | **41** |
-| Methods | **159** |
-| **Total callables in `src/`** | **216** |
-| Distinct top-level imported packages | **19** |
+| Classes | **17** |
+| Top-level functions | **54** |
+| Methods | **167** |
+| **Total callables in `src/`** | **238** |
+| Distinct top-level imported packages | **22** |
 
 ### Largest production files
 
 | File | LOC |
 |---|---:|
-| `src/environment/ets_environment.py` | 3,311 |
-| `src/agents/ppo_agent.py` | 1,490 |
-| `src/environment/company.py` | 1,118 |
+| `src/environment/ets_environment.py` | 3,509 |
+| `src/agents/ppo_agent.py` | 1,586 |
+| `src/environment/company.py` | 1,131 |
 | `src/environment/cap_schedule.py` | 586 |
 | `src/train_qlearning.py` | 519 |
 | `src/analysis/qlearning_analysis.py` | 454 |
 | `src/agents/q_learning_agent.py` | 440 |
 | `src/agents/heuristic_policy.py` | 407 |
 | `src/auction/market_clearing_ets.py` | 352 |
-| `src/agents/actor_critic.py` | 261 |
+| `src/utils/sweep.py` | 349 |
 
 ---
 
@@ -75,11 +75,11 @@ and learning logic.
 
 | | |
 |---|---:|
-| Test files | **22** |
-| Test functions | **382** |
-| Assertion calls | **587** |
-| Total test LOC | **8,371** |
-| Test-to-production LOC ratio | **0.87 : 1** |
+| Test files | **28** |
+| Test functions | **300** |
+| Assertion calls | **790** |
+| Total test LOC | **10,440** |
+| Test-to-production LOC ratio | **0.99 : 1** |
 
 Test files cover *every* major active subsystem: market clearing, cap
 schedule, PPO numerics (incl. dual-clip), HAPPO updates, bid-change
@@ -100,8 +100,8 @@ A single training run with the **default config** (`configs/default.yaml`):
 | Decision phases per year | **2** (auction + secondary market) |
 | Learning agents | **8** |
 | Continuous action dims per agent per year | **6 + 2 = 8** |
-| Observation dim, phase 1 (8 agents) | **43 + 7×7 = 92** |
-| Observation dim, phase 2 (8 agents) | **92 + 12 = 104** |
+| Observation dim, phase 1 (8 agents) | **44 + 7×7 = 93** |
+| Observation dim, phase 2 (8 agents) | **93 + 12 = 105** |
 
 ### Derived "crazy" figures per training run
 
@@ -124,10 +124,10 @@ inside **2.88 million market clearings**.
 
 | | |
 |---|---:|
-| Lines | **481** |
+| Lines | **576** |
 | Top-level subsystems present | **38** |
 | **Active subsystems** (after stripping `enabled: false` blocks) | **31** |
-| Tunable parameters (`key: value` lines) | **330** |
+| Tunable parameters (`key: value` lines) | **331** |
 
 The 31 active subsystems include the ETS cap schedule, MSR, MAC curve,
 auction & secondary-market mechanics, HAPPO/PPO learner, ESG signal,
@@ -141,19 +141,22 @@ block.
 ## 7. Reward function complexity
 
 The reward computation in `ets_environment.py` aggregates **dozens** of
-named shaping channels into a single per-agent scalar reward. The
-config block alone defines:
+named shaping channels into a single per-agent scalar reward. See
+**`docs/reward_function.md`** for the full mathematical statement;
+the high-level inventory is:
 
 - Phase-wise auction / secondary reward normalisation with EMA
 - GAE std floor (per-phase)
-- Opportunity-cost shaping
-- Coverage-gap shaping
-- Banking signal (with imputed bank value, decaying)
-- ESG signal with **compliance gating** (`(coverage_frac)²` multiplier)
+- Opportunity-cost shaping (decaying)
+- Coverage-gap shaping (decaying)
+- Banking signal (with imputed bank value, drawdown-priced at clearing)
+- ESG **saved-carbon hybrid** (stock + flow + speed) with
+  compliance-gate exponent `(coverage_frac)^(1+blend)`
 - `sec_proxy` EMA smoother for the bid-head gap-penalty rate
 - Per-agent **lognormal urgency scalar** (privately sampled each
-  episode, σ = 0.30)
-- Terminal payoffs: bank value, queue NPV, treasury value
+  episode, σ = 0.30) folded into the penalty term
+- Terminal payoffs: discounted bank value, queue-NPV, treasury value,
+  carry-forward debt penalty
 - Compliance-gate blend with configurable threshold and width
 
 ---
@@ -217,12 +220,12 @@ The two notebooks that constitute the actual experimental record:
 ### Versions / releases
 
 The `docs/changelog.md` documents the recent **v8.x line in detail —
-13 versions** (v8.1.0 → v8.5.3) across **2,186 lines** of release
+17 versions** (v8.1.0 → v8.6.0) across **2,703 lines** of release
 notes.
 
 But the changelog only captures the latest major series. Counting the
 naming evidence elsewhere in the repo, the project has been through
-**roughly 25+ release iterations**:
+**roughly 30+ release iterations**:
 
 - **10 major version generations** visible as branches:
   `second_version`, `third-version`, `version_four`, `fifth_version`,
@@ -232,12 +235,12 @@ naming evidence elsewhere in the repo, the project has been through
 - **11 HAPPO experiment branches** (`HAPPO_1` … `HAPPO_8`,
   `HAPPO_BEST`, `HAPPO_LSTM`, `HAPPO_compliant`) representing
   algorithm-level iterations.
-- **13 documented sub-versions** within v8.x (the changelog).
+- **17 documented sub-versions** within v8.x (the changelog).
 - **3 superseded codebases** preserved under `archive/legacy/`
   (`ets_marl_happo_auction`, `ets_marl_legacy_ppo`,
   `ets_marl_legacy_test`) — evidence of three prior full rewrites.
 
-So the **conservative best estimate is ≥ 25 development iterations
+So the **conservative best estimate is ≥ 30 development iterations
 shipped to a "release" branch**, on top of countless feature branches.
 
 ### Other footprint metrics
@@ -246,23 +249,23 @@ shipped to a "release" branch**, on top of countless feature branches.
 |---|---:|
 | Direct dependencies (`requirements.txt`) | 8 (numpy, pandas, torch, gymnasium, matplotlib, seaborn, pytest, pyyaml) |
 | Total transitive packages locked in `uv.lock` | **48** |
-| Documentation pages | 4 in `docs/`: BUGS_AND_ISSUES, changelog (**2,186 lines**), changes_v83_to_v85, design |
+| Documentation pages | 13 in `docs/`: BUGS_AND_ISSUES, changelog (**2,703 lines**), changes_v83_to_v85, design, esg_reward_design, **PROJECT_SCALE_AND_STATS**, **data_dictionary**, **action_space**, **config_dictionary**, **reward_function**, plus repo-root README and CLAUDE |
 
 ---
 
 ## 11. The "wow" one-liners (for slides)
 
-- **3,311 lines** in a single environment file — and it's all one
+- **3,509 lines** in a single environment file — and it's all one
   coherent simulator.
 - **23 million** agent decisions across **2.88 million** market clearings
   in a *single* default training run.
-- **587 assertions** across **382 tests** — almost as much test code as
-  production code (**8.4k vs 9.7k LOC**).
-- **31 active mechanism subsystems** in `default.yaml`, exposing **330
+- **790 assertions** across **300 tests** — almost as much test code as
+  production code (**10.4k vs 10.6k LOC**, ratio 0.99 : 1).
+- **31 active mechanism subsystems** in `default.yaml`, exposing **331
   tunable parameters** to the experimenter.
 - A privately sampled **lognormal urgency scalar** (σ = 0.30) is drawn
   per agent per episode and folded into every reward computation.
-- **≥ 25 development iterations** estimated from branches, tags, and
+- **≥ 30 development iterations** estimated from branches, tags, and
   the changelog — including three *full rewrites* preserved in
   `archive/legacy/`.
 - **Zero** TODO / FIXME / HACK comments in the production codebase.
