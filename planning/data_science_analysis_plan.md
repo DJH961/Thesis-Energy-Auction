@@ -1,320 +1,219 @@
-# Data Science Analysis Plan — ETS MARL Thesis (v2)
+# Data Science Analysis Plan — ETS MARL Thesis (v3)
 
 Internal working doc for Daniel & Alessio.
-Purpose: pin down DS analyses we run on simulation output, **anchored explicitly in the CBS Machine Learning curriculum** so nothing in Ch. 7 looks pulled from nowhere.
 
-**v2 changes from v1:** every analysis now maps to a specific lecture in our ML class. Specialized methods (change-point detection) are explicitly flagged and justified rather than smuggled in. Inferential statistics that we never covered (Cox PH, Granger, GAMs, cluster-robust SEs, ICC, bootstrap CIs as the *primary* tool) have been replaced with curriculum-native equivalents.
-
----
-
-## 0. Why this plan exists
-
-CBS's master-thesis learning objectives explicitly require us to *"apply relevant Data Science methods"* and to *"document the analysis through the selection and processing of data sources"*. The presentation deck is more pointed: **"Don't go for the simple methods and mediocre analysis. Try to use different methods to do a robust analysis."**
-
-The MARL system itself is a Data Science method — it *is* the artifact in our DSR framing — but the assessor will also want to see classical DS analysis applied to the data the simulation produces. This plan is how we deliver that, **using methods we actually learned**, which keeps the argument tight under examiner questions.
-
-We exploit two facts about our setup:
-
-1. The `training_log_*.csv` and `year_log_*.csv` files form a panel dataset: ~270 + ~300 columns, ~10M rows over all seeds. That's a real DS-grade dataset.
-2. We have ≥4 default seeds plus several sweep variants, which gives enough comparative leverage for descriptive comparison, supervised classification of variants, and feature importance work.
+**v3 changes from v2:** reorganised RQ-first instead of method-first. Every analysis is justified by what we'll actually claim in the thesis. Cut clearing-price prediction (didn't answer any RQ). Cut pathology / autoencoder analyses (didn't earn their place). Made strategy the centrepiece. Softened the "specialised methods" stance — we still lean curriculum-first, but specialised methods are welcome when they answer a specific question well.
 
 ---
 
-## 1. Two analytic tracks
+## 0. Core principle
 
-### Track A — In-training behaviour (transient dynamics)
+Every analysis in this plan exists to support a specific claim we want to make in the thesis. Method choice follows the question, not the other way around. We use ML curriculum methods by default because that's what we know best and what the rubric rewards, and we reach for specialised methods only when they materially help answer something.
 
-Treats episode index as the time axis. Asks: *how does the policy/market evolve as agents learn?* Output: convergence diagnostics, training-stability evidence.
-
-Primarily serves **Sub-RQ 1**.
-
-### Track B — Converged behaviour (steady-state)
-
-Restricts to the last X% of episodes (X calibrated by Track A). Asks: *what equilibrium has the market reached, and what does it tell us about the EU ETS?*
-
-Primarily serves **Sub-RQ 2** and **Sub-RQ 3**.
+Strategy is the focus. RQ3 (how financial vs environmental objectives shape strategies, and how they aggregate) is the most distinctive thing this simulation produces and the part most worth analysing in depth. RQ2 (regulatory sensitivity) and RQ1 (simulation credibility) get lighter, more targeted treatment.
 
 ---
 
-## 2. Track A: in-training analyses
+## 1. The thesis claims we want to support
 
-### A1. Convergence detection
-**Lecture mapping:** Specialized (flagged); validated against Lecture 2 (rolling-mean / plateau check).
+| RQ | Claim we want to make in Ch. 7/8 |
+|---|---|
+| **RQ3.a** | "Distinguishable strategic archetypes emerge in the converged market." |
+| **RQ3.b** | "Removing the environmental objective from agents' rewards visibly changes the strategy space — agents converge to a narrower, more uniform financial play." |
+| **RQ3.c** | "Agents respond rationally to economic incentives: green-investment timing tracks the LCOE crossover, and high-fossil agents transition faster than low-fossil ones." |
+| **RQ2.a** | "Regulatory levers (LRF, MSR, cap level) shift both strategies and aggregate outcomes — and they do so through identifiable channels." |
+| **RQ2.b** | "Stricter regulation changes the *type* of compliance failure, not just the amount." |
+| **RQ1.a** | "Agents converge to stable policies within X episodes." |
+| **RQ1.b** | "Findings replicate across seeds; observed cross-variant differences exceed cross-seed noise." |
 
-**Method:** Run two parallel detectors on episode-level reward trajectories per agent and on `ep_mean_clearing_price`:
-
-1. **Change-point detection (PELT)** via the `ruptures` library — the specialized method.
-2. **Plateau check using rolling mean + std** — the curriculum-native sanity check. Define convergence as the first episode where `rolling_mean(±5%)` stays inside a tolerance band for K consecutive windows.
-
-We use both and report the convergence episode where they agree. This dual-method framing is exactly the multi-method robustness the CBS deck asks for.
-
-**Why the specialized method:** PELT is the standard objective tool for this in time-series. It's the one place in the thesis we step outside the syllabus, and we justify it explicitly in Methodology: rolling-mean plateau detection is intuitive but threshold-dependent, while PELT gives a reproducible cutoff. We're transparent that this is beyond the standard curriculum.
-
-**Columns:** `reward_A{i}`, `quality_score`, `ep_mean_clearing_price`, `actor_loss_A{i}`.
-
-**Output:** convergence episode per (seed, agent), median + range across seeds. Two figures, one table.
-
-**Maps to:** Sub-RQ 1; provides the cutoff used everywhere downstream.
+Seven claims, seven analyses. Each analysis below is the work needed to defend one claim.
 
 ---
 
-### A2. Cross-seed reproducibility
-**Lecture mapping:** Lecture 2 (descriptive statistics, EDA, train/test split philosophy applied to seeds-as-runs).
+## 2. Strategy analyses (RQ3 — primary focus)
 
-**Method:** For each headline metric, compute mean and std across seeds within episode bins. Visualize as fan charts (median line + ± 1 std shaded band). For the converged window, report `mean(metric) ± std(metric)` across seeds for ~6 metrics.
+### S1. Strategy archetypes in the converged market
+**Supports claim RQ3.a.**
 
-We do **not** introduce inferential statistics we didn't cover (no ICC, no bootstrap CI as the primary tool). We frame this as **descriptive cross-run stability** — exactly how a Lecture 2 EDA-style analysis would treat repeated runs.
+What strategies emerge once training has converged? Are they distinguishable, and do they map onto the agent archetypes we designed?
 
-**Why this matters for CBS:** Directly addresses the rubric *"discuss the quality of the analyzed sources or solutions, including their suitability and validity"*. If between-seed std is large relative to between-variant differences in B3, our findings don't generalize and we say so.
+**Method.** Per-agent feature vectors over the converged window: mean `bid_price_A{i}`, mean `avg_bid_mult_A{i}`, mean `avg_sec_qty_A{i}`, `inv_onshore_share_A{i}`, `inv_offshore_share_A{i}`, `inv_solar_share_A{i}`, terminal `green_frac_A{i}`, mean `udbc_*_total_A{i}` shares. Standardise (Lecture 2). Cluster with **K-means** with k chosen via **Silhouette + Elbow** (Lecture 3) and confirm with **hierarchical clustering** (dendrogram, Lecture 3). Visualise in 2D with **PCA** (Lecture 5).
 
-**Columns:** `clearing_price_last`, `quality_score`, `ep_mean_clearing_price`, mean `green_frac_A{i}`, mean `penalty_A{i}`, `secondary_volume`.
+**The actual analytical work, not just running the methods:** compare emergent clusters against the designed archetypes (coal-heavy / balanced / green-heavy). If the clustering recovers the archetypes, the simulation is producing differentiated strategies. If it collapses them or mixes them, that's a finding too — and we need to explain why.
 
-**Output:** Fan-chart figure (one per metric), seed-stability summary table.
-
-**Maps to:** Sub-RQ 1; the validity gate for every other Track-B claim.
+**Thesis output.** One PCA scatter plot coloured by cluster, one dendrogram, one table cross-tabulating designed archetype × emergent cluster. Section in Ch. 7.2.
 
 ---
 
-### A3. Pathological-episode detection (anomaly detection)
-**Lecture mapping:** Lecture 7 (Isolation Forest, LOF, IQR), Lecture 12 (Autoencoders for anomaly detection), Lecture 5 (PCA for visualization).
+### S2. How the financial-vs-environmental objective shapes strategy
+**Supports claim RQ3.b.** This is the cleanest direct hit on RQ3.
 
-**Method:** Treat each episode as a point in a feature space defined by per-episode aggregates (clearing price, mean reward, mean penalty, mean green frac, warning counts, default counts). Detect anomalous episodes with three complementary methods:
+We have a sweep variant where all agents are set to `reward_weights = [1.0, 0.0]` (pure financial — ESG component zeroed out). Compare the strategy space under that variant against the default (mixed reward weights).
 
-1. **IQR rule** on each feature individually — the simple baseline (Lecture 7).
-2. **Isolation Forest** for multivariate anomaly detection (Lecture 7).
-3. **Undercomplete autoencoder** trained on the bulk of episodes; reconstruction error flags anomalies (Lecture 12).
+**Method.** Run S1's clustering pipeline on the all-financial variant separately. Then compare:
 
-Visualize the anomalies with **PCA** projected to 2D (Lecture 5) so the reader can see the structure.
+- **Number and shape of clusters.** Does the strategy space collapse (fewer clusters, tighter spread within clusters) when the green objective is removed? Silhouette score and PCA spread give us the comparison.
+- **Cluster centroids.** What do the all-financial centroids look like vs. the default centroids in the same feature space? Project both sets of centroids into the same PCA space (fit PCA on default, transform all-financial) so the comparison is visually direct.
+- **Aggregate outcomes by cluster.** Compute mean `green_frac`, `clearing_price`, `penalty` per cluster in each variant. Does removing ESG weighting flatten green investment across the board, or does it just flatten it for the agents who would have been green-leaning?
 
-**Why three methods:** This is the textbook multi-method comparison that Lecture 7 actually motivated — different outlier detectors flag different things. The autoencoder is a slightly more advanced choice that uses Lecture 12 directly and gives us a deep-learning method without overreaching.
+**Why this is the headline RQ3 analysis.** It directly tests the causal story we want to tell: the environmental component of the reward is what produces strategic heterogeneity. If the strategy space collapses when we remove it, that's evidence. If it doesn't collapse much, that's also a finding — agents found other reasons to differentiate (e.g. cost-structure heterogeneity, urgency scalars).
 
-**Practical note on imbalance:** If we want to *classify* "did this episode trigger a pathological warning?" rather than just detect outliers, the warning class is rare. We apply **SMOTE or ADASYN** (Lecture 7) before training a Random Forest classifier (Lecture 5) to predict warning triggers from earlier-episode features. Performance: F1, AUC-ROC, confusion matrix (Lecture 2). Feature importance from Random Forest (Lecture 5) tells us which early signals predict pathological convergence.
-
-**Columns:** `warn_*`, `streak_*_A{i}` (target candidates), all per-agent episode aggregates as features.
-
-**Maps to:** Sub-RQ 1.
+**Thesis output.** Two-panel PCA figure (default vs all-financial) on the same axes. Cluster summary table with side-by-side mean outcomes. Section in Ch. 7.2 — likely the most-cited figure in the thesis.
 
 ---
 
-## 3. Track B: converged-behaviour analyses
+### S3. Are strategies economically rational?
+**Supports claim RQ3.c.** Tier 2 — we ship S3 if S1 and S2 are clean. This is also where the surviving piece of the old "predict clearing price" analysis lives.
 
-All Track B analyses use the converged window from A1, pooled across seeds.
+We have two specific predictions from theory in Ch. 3 plus one credibility check.
 
-### B1. Strategy clustering (agent taxonomy)
-**Lecture mapping:** Lecture 3 (K-means, Hierarchical, Silhouette/Elbow), Lecture 5 (PCA for visualization).
+**H1 (LCOE crossover).** "Agents invest in green when carbon price exceeds ~50 €/t." Per (agent, year), label = 1 if `invest_cost_A{i} > threshold`. Features: lagged `clearing_price`, agent archetype, `bank_start_A{i}`, year. Fit **logistic regression** with L1/LASSO (Lectures 4 + 8) and a **Random Forest** (Lecture 5) for non-linear effects. We're looking for: (i) positive significant coefficient on lagged clearing price in the logistic, and (ii) a step-up in RF partial-dependence around the 50 €/t mark.
 
-**Method:** Per-agent feature vectors aggregated over the converged window. Cluster with two complementary algorithms from Lecture 3:
+**H2 (heterogeneity).** "High-fossil agents transition faster." Label = 1 if agent invested meaningfully in green by year 6. Features: archetype dummies, initial mix vector, mean clearing price the agent saw. Same model setup. Coefficient sign on archetype dummies is the test.
 
-1. **K-means** with optimal k selected via **Silhouette Score and Elbow Method** in tandem (the comparison the lecture explicitly calls for).
-2. **Hierarchical clustering** with dendrogram and lifetime analysis (Lecture 3 again — the dendrogram lets us visually identify natural cluster cuts).
+**Anchor check (mini, embedded here).** Does the converged-window mean clearing price track the fundamental anchor we computed in `src/utils/price_anchor.py`? Plot the two trajectories together over years 0–11 and report the correlation coefficient and mean absolute deviation. This is one figure and two numbers, not a full predictive model — that's the right scope. If they align, the simulation is producing economically grounded prices, which feeds RQ1 too.
 
-**DBSCAN** as a third pass if k-means and hierarchical disagree, since DBSCAN handles arbitrary shapes (Lecture 3).
-
-Visualize cluster structure in 2D with **PCA** (Lecture 5). Compare emergent clusters against the *designed* archetypes (coal-heavy, balanced, green-heavy) — does each policy converge into its archetype's expected role?
-
-**Standardize features first** (Lecture 2 — explicitly called out as required before clustering).
-
-**Feature vector per (seed, agent):** mean `bid_price_A{i}`, mean `avg_bid_mult_A{i}`, mean `avg_sec_qty_A{i}`, `inv_onshore_share_A{i}`, `inv_offshore_share_A{i}`, `inv_solar_share_A{i}`, terminal `green_frac_A{i}`, mean of `udbc_*_total_A{i}` shares.
-
-**Why this many methods:** Lecture 3 explicitly compares K-means, hierarchical, and DBSCAN as alternatives. Using all three with proper k-selection (Silhouette + Elbow) is exactly the multi-method robustness pattern from the lectures.
-
-**Maps to:** Sub-RQ 3.
+**Thesis output.** One table summarising H1 and H2 (estimate, sign, evaluation metric), one partial-dependence plot for H1, one anchor-vs-realised figure. Section in Ch. 7.3.
 
 ---
 
-### B2. Predictive model of clearing price
-**Lecture mapping:** Lecture 4 (Linear Regression), Lecture 5 (Random Forest + feature importance), Lecture 6 (Gradient Boosting / XGBoost / LightGBM), Lecture 2 (cross-validation, R² / RMSE / MAE), Lecture 8 (L1/L2 regularization).
+## 3. Regulatory analyses (RQ2)
 
-**Method:** Predict year-level `clearing_price` from market state. Three nested models:
+### R1. Do regulatory levers shift strategies and outcomes?
+**Supports claim RQ2.a.**
 
-1. **Linear Regression** with L2 (Ridge) regularization (Lectures 4 + 8) — interpretable baseline.
-2. **Random Forest** (Lecture 5) — handles non-linearity, gives feature importance.
-3. **Gradient Boosting** with XGBoost or LightGBM (Lecture 6) — strongest predictive performance.
+This is where most of the sweep variants pay off (LRF 2.2 / 4.3 / 6.0, MSR on/off, cap levels). The question is: do these regulatory dials change agent strategies, or do agents just absorb the change without restructuring how they play?
 
-Standard ML pipeline (Lecture 2): standardize features → 80/10/10 train/val/test split → cross-validation (k=5) for hyperparameter selection → final eval on held-out test. Report R², RMSE, MAE for each model (all Lecture 2). Compare model accuracy: does the GBM beat linear by a margin that justifies the complexity? — that's the **bias/variance tradeoff** discussion (Lecture 9 + Lecture 2 model performance).
+**Method.** Two angles, both at the strategy and outcome level.
 
-**Feature importance:** From Random Forest (Lecture 5) and from the gradient boosting model (Lecture 6). This is the *curriculum-native* substitute for SHAP — the lectures explicitly cover RF feature importance, and it's interpretable.
+**Strategy angle.** Re-run S1's clustering on each variant. Track how cluster structure changes: does tighter LRF push agents into a "more aggressive green investor" cluster? Does MSR-off let a "free-rider" cluster emerge? Project all variants' agents into the default-fitted PCA space and visualise where each variant's agents land.
 
-**Theory test:** Compute the fundamental anchor offline (we already have the formula) and add it as a feature. If RF feature importance ranks anchor highly, the simulation reproduces auction theory — that's a finding.
+**Outcome angle.** Mean ± std across seeds for headline outcomes (clearing price, green frac final, penalty total, secondary volume), per variant. Boxplots side-by-side, with IQR-based outlier flagging (Lecture 7) so a single rogue seed doesn't drive conclusions.
 
-**Features:** `tnac`, `cap`, `auction_volume`, `msr_reserve`, lagged mean `bid_price_A*`, mean `bank_start_A*`, year, fundamental anchor.
+**Why both.** We claim regulation matters when *both* outcomes shift *and* the underlying strategies shift. If outcomes shift but strategies don't, agents are just being squeezed — boring. If strategies shift, agents are *adapting* — that's the interesting story, and it's exactly what RQ2 is asking about.
 
-**Maps to:** Sub-RQ 1 + Sub-RQ 3.
+**Thesis output.** Multi-panel PCA figure (one panel per variant in the same projected space). Outcome comparison table. Section in Ch. 7.4.
 
 ---
 
-### B3. Sensitivity analysis across sweep variants
-**Lecture mapping:** Lecture 2 (descriptive comparison + EDA), Lecture 5 (Random Forest), Lecture 6 (Gradient Boosting), Lecture 7 (outlier handling).
+### R2. UDBC compliance pathways
+**Supports claim RQ2.b.**
 
-**Method:** Two complementary angles.
+The `udbc_*` columns already classify each (agent, year) into {U, D, M, B, C} — five compliance failure/success modes. We exploit this directly.
 
-**B3a — Descriptive comparison.** For each sweep variant (LRF 2.2 / 4.3 / 6.0%, MSR on/off, cap levels, all-financial reward weights), compute mean ± std across seeds for the headline outcomes from A2. Display as a comparison table and as boxplots side-by-side. Boxplots also flag outlier seeds via the IQR rule (Lecture 7) so we don't get fooled by one bad seed.
+**Method.** Two analyses, both pre-existing in v2.
 
-This is a Lecture-2-style EDA comparison. We do **not** invoke causal inference language we didn't cover. We say "variant X shows higher mean clearing price than the default, with non-overlapping IQR boxes" rather than "treatment effect is statistically significant."
+- **Multinomial logistic regression** (Lecture 4 explicitly covers this) predicting UDBC class from agent + market features (`bank_start_A{i}`, `cap`, `clearing_price`, archetype, year, variant). Coefficients tell us which conditions push toward each failure mode. **Random Forest** (Lecture 5) as the non-linear robustness check.
+- **Transition heatmaps** per variant showing year-t → year-t+1 UDBC transitions. Descriptive (frequency tables, Lecture 2). The interesting comparison: does tighter LRF produce more U-state recoveries, or more cascades into D?
 
-**B3b — Variant classification (creative reframe).** Train a Random Forest (Lecture 5) and Gradient Boosting model (Lecture 6) to **predict the variant label from outcome features**. If the classifier achieves high F1 (Lecture 2), the variants produce distinguishable outcomes — that's our evidence the regulatory mechanism matters. Feature importance tells us *which* outcomes differ most across variants.
+**Class imbalance.** Compliant (C) dominates. Apply **SMOTE or ADASYN** (Lecture 7) before fitting the multinomial, report results with and without — the comparison is itself informative (if SMOTE results differ a lot, the model was being driven by the majority class, which is honest to acknowledge).
 
-**Why this is good:** B3b turns sensitivity analysis into a supervised classification problem, which is exactly Lecture 5/6 territory. It gives us a clean, defensible quantification ("the regulator's choice of LRF is detectable from market outcomes with F1 = X") without inventing statistical machinery we didn't learn.
-
-**Maps to:** Sub-RQ 2 — direct hit. Likely the headline analysis.
-
----
-
-### B4. Theory-prediction tests (reframed as supervised classification)
-**Lecture mapping:** Lecture 4 (Logistic Regression — binary AND multinomial), Lecture 5 (Random Forest), Lecture 2 (F1, AUC-ROC, confusion matrix).
-
-**Method:** We have two theoretical predictions from Ch. 3. We turn each into a binary or multinomial classification problem.
-
-**H1 (LCOE crossover):** *"Agents invest in green when carbon price exceeds ~50 €/t."*
-- Binary classification: per (agent, year), label = 1 if `invest_cost_A{i} > threshold`, 0 otherwise.
-- Features: lagged `clearing_price`, agent archetype, `bank_start_A{i}`, `year`.
-- Models: **Logistic Regression** (Lecture 4) with L1 (LASSO) for interpretable coefficients, plus **Random Forest** for non-linear effect detection.
-- If logistic regression's coefficient on `clearing_price` is positive and the RF confirms a step-up around 50 €/t (visible in partial dependence plots, which fall under Lecture 5 RF interpretability), H1 is supported.
-
-**H2 (heterogeneity):** *"High-fossil agents transition to green faster than low-fossil ones."*
-- Binary classification: label = 1 if agent invested meaningfully in green by year 6 (mid-episode), 0 otherwise.
-- Features: agent archetype (one-hot), initial mix vector, mean clearing price.
-- Same model setup.
-- Coefficient sign on archetype dummies tests H2 directly.
-
-**Why this is curriculum-native:** Lecture 4 covers binary logistic regression explicitly. We're not inventing survival analysis — we're discretizing the question into a year-6 cutoff and using methods we learned. The cutoff choice is documented as a robustness check (Lecture 2 — cross-validation across cutoff years).
-
-**Performance:** F1, AUC-ROC, confusion matrix (Lecture 2).
-
-**Maps to:** Sub-RQ 3 + theory chapter.
+**Thesis output.** One coefficient table from the multinomial logit, one transition-heatmap figure with one panel per variant. Section in Ch. 7.4 alongside R1.
 
 ---
 
-### B5. UDBC compliance-pathway analysis
-**Lecture mapping:** Lecture 4 (Multinomial Logistic Regression — explicitly covered), Lecture 5 (Random Forest), Lecture 2 (descriptive transitions).
+## 4. Credibility analyses (RQ1)
 
-**Method:** The `udbc_*` columns classify each (agent, year) into {U, D, M, B, C}. Two analyses.
+These are short — they open Ch. 7 and establish that the rest of the analyses sit on a stable foundation. We don't want to spend too much page count here, but we can't skip them.
 
-**B5a — Multinomial logistic regression.** Predict the UDBC class from agent and market features (`bank_start_A{i}`, `cap`, `clearing_price`, agent archetype, year). Lecture 4 explicitly covers multinomial logistic for unordered multi-class problems. Coefficients tell us which features push toward each compliance failure mode. Compare against **Random Forest** as the non-linear alternative for robustness, with feature importance.
+### C1. Convergence
+**Supports claim RQ1.a.**
 
-**B5b — Descriptive transition tables.** Per variant, count (UDBC class at year t) → (UDBC class at year t+1) transitions and display as heatmaps. This is descriptive — no Markov-chain formalism, just frequency tables, fully Lecture-2 EDA territory. The interesting question is whether high-LRF variants show more U → recovery transitions vs default.
+**Method.** Two detectors on episode-level reward and `ep_mean_clearing_price`:
+- **Rolling-mean plateau check** (Lecture 2) — first episode where the rolling mean stays inside a tolerance band for K consecutive windows.
+- **PELT change-point detection** (specialised, `ruptures` library) — objective change-point.
 
-**Class imbalance:** UDBC classes are imbalanced (most agent-years are compliant). Apply **SMOTE or ADASYN** (Lecture 7) before training the multinomial logit / RF if needed. We compare results with and without resampling — Lecture 7 makes a point of warning about ambiguous synthetic samples, so showing both is honest.
+Use both, report the convergence episode where they agree. The PELT result is what we use as the cutoff for everything in §2 and §3.
 
-**Why this is good:** UDBC is a categorical labelling system already in our logs. Multinomial logit is in Lecture 4. RF is in Lecture 5. SMOTE is in Lecture 7. Three distinct curriculum touchpoints.
-
-**Maps to:** Sub-RQ 2 + Sub-RQ 3.
+**Thesis output.** Two figures (reward and price trajectories with marked convergence point) and a short paragraph. Maybe 1.5 pages in Ch. 7.1.
 
 ---
 
-## 4. Curriculum-mapping table
+### C2. Reproducibility across seeds
+**Supports claim RQ1.b.**
 
-For Methodology Ch. 5, this is the table we put in the methods section to demonstrate every analytic choice traces to a course we took.
+**Method.** For ~6 headline metrics, compute mean ± std across seeds within episode bins. Fan charts (median + ± 1 std band). For the converged window, a small table of (metric, mean across seeds, std across seeds). Lecture-2-style EDA on the seed dimension.
 
-| Analysis | Primary method | Lecture |
+This also serves as the validity floor for R1: if cross-seed std on the default config is comparable to cross-variant differences, we have to caveat R1 heavily. Reporting both side-by-side is the honest move.
+
+**Thesis output.** One fan-chart figure, one summary table. ~1 page in Ch. 7.1.
+
+---
+
+## 5. Methods inventory & curriculum mapping
+
+For Ch. 5 Methodology. Demonstrates every method is curriculum-grounded except where we explicitly justify otherwise.
+
+| Analysis | Methods | Lecture |
 |---|---|---|
-| A1 convergence | PELT change-point + rolling-mean plateau | Specialized + L2 |
-| A2 reproducibility | mean ± std across seeds, fan charts | L2 |
-| A3 pathology | IQR + Isolation Forest + Autoencoder; SMOTE if classifying | L7 + L12 + L7 |
-| B1 clustering | K-means + Hierarchical + Silhouette/Elbow + PCA viz | L3 + L5 |
-| B2 price prediction | Linear (Ridge) + RF + Gradient Boosting + R²/RMSE/MAE | L4 + L5 + L6 + L8 + L2 |
-| B3 sensitivity | Descriptive comparison + RF/GBM variant classifier | L2 + L5 + L6 |
-| B4 theory tests | Binary Logistic Regression (LASSO) + RF | L4 + L5 + L8 |
-| B5 UDBC | Multinomial Logistic Regression + RF + SMOTE/ADASYN | L4 + L5 + L7 |
-| Cross-cutting | Cross-validation, F1, AUC-ROC, confusion matrix, R²/RMSE | L2 |
+| S1 strategy clustering | K-means + Hierarchical + Silhouette/Elbow + PCA | L3 + L5 |
+| S2 reward-weight effect on strategy | S1 pipeline applied to the variant; centroid comparison | L3 + L5 + L2 |
+| S3 rationality tests | Logistic Regression (LASSO) + Random Forest | L4 + L5 + L8 |
+| R1 regulatory shifts | S1 pipeline per variant; descriptive comparison + IQR outlier check | L3 + L5 + L7 + L2 |
+| R2 UDBC pathways | Multinomial Logistic Regression + Random Forest + SMOTE/ADASYN; transition heatmaps | L4 + L5 + L7 + L2 |
+| C1 convergence | Rolling-mean plateau + PELT change-point | L2 + Specialised |
+| C2 reproducibility | Cross-seed mean ± std, fan charts | L2 |
+| Cross-cutting | Standardisation, train/val/test, k-fold CV, F1 / AUC-ROC / R² / RMSE | L2 |
 
-Specialized (non-curriculum) methods used: **PELT change-point detection only.** Justified explicitly in Methodology with reference to its standard role in time-series segmentation.
+Specialised method used: PELT change-point detection. Justified in Methodology.
 
 ---
 
-## 5. Cross-cutting methodological notes
+## 6. On specialised methods
 
-### 5.1 Validation philosophy
+We default to curriculum methods because that's what the rubric grades us on and what we can defend in oral. Specialised methods are not banned — they come in where (a) they answer a specific question better than what we know, and (b) we can explain them clearly.
 
-Standard ML pipeline from Lecture 2 applied throughout: **standardize → train/val/test split → cross-validation for hyperparameters → final test set used once.** Where the unit of analysis is the seed (A2, B3a), we report mean ± std across seeds and avoid pretending we have inferential power we don't. Where it's per (agent, year) row (B2, B4, B5), proper k-fold CV with the seed as a grouping variable to prevent leakage.
+Currently the only specialised method we plan to use is PELT for convergence detection (C1), and even then we pair it with a curriculum-native plateau check. If during the analysis we find a question where, say, a survival model genuinely fits better than a binary-classification reframe, we'll add it — but each addition needs an explicit defence in Methodology, not a smuggled-in citation.
 
-### 5.2 Multi-method robustness
+This is a softer stance than v2's "what we are NOT doing" list. Keeping the door open is better than over-prescribing.
 
-For each headline claim, support with at least two methods from the curriculum.
+---
+
+## 7. Multi-method robustness on key claims
+
+For the headline claims, supported by ≥2 methods:
 
 | Claim | Method 1 | Method 2 |
 |---|---|---|
-| "Agents converge by episode N" | PELT change-point (specialized) | Rolling-mean plateau (L2) |
-| "Strategies cluster into K archetypes" | K-means + Silhouette/Elbow (L3) | Hierarchical clustering with dendrogram (L3) |
-| "Carbon price drives green investment" | Logistic Regression coefficient sign (L4) | Random Forest + feature importance (L5) |
-| "Regulatory variants produce distinguishable markets" | Descriptive boxplot comparison (L2) | RF/GBM variant classifier F1 (L5/L6) |
-| "Agent type predicts compliance pathway" | Multinomial logit (L4) | Random Forest feature importance (L5) |
-| "Fundamental anchor predicts clearing price" | Linear regression coefficient (L4) | RF feature importance ranking (L5) |
+| "Strategies cluster into K archetypes" | K-means + Silhouette/Elbow | Hierarchical with dendrogram |
+| "Removing ESG weight collapses strategies" | Cluster count comparison | PCA spread comparison |
+| "Carbon price drives green investment" | Logistic regression coefficient | RF partial dependence |
+| "Variants produce distinguishable markets" | Boxplot comparison + IQR | Strategy cluster shifts (S1 on each variant) |
+| "Compliance pathway depends on archetype" | Multinomial logit | RF feature importance |
+| "Agents converge by episode N" | PELT change-point | Rolling-mean plateau |
 
-Goes in Methodology as a concrete table.
-
-### 5.3 Tooling
-
-Standard scientific-Python stack — every package corresponds to methods from the curriculum:
-
-- `pandas`, `numpy`, `matplotlib`, `seaborn` (L2 EDA)
-- `scikit-learn` for K-means, hierarchical, DBSCAN, PCA, LDA, Linear/Logistic Regression, Decision Tree, Random Forest, Isolation Forest, LOF, train/test split, cross-validation, all metrics (L2–L7)
-- `xgboost` and `lightgbm` (L6)
-- `imbalanced-learn` for SMOTE/ADASYN (L7)
-- `tensorflow.keras` or `pytorch` for the autoencoder (L12)
-- `ruptures` for PELT change-point (specialized; one place in the thesis)
-
-Notebooks under `notebooks/`. Each Track B subsection gets its own notebook to keep them reviewable.
-
-### 5.4 What we are NOT doing
-
-Stating explicitly to avoid scope creep:
-
-- **No exotic statistics we didn't cover** — no Cox PH, no Granger causality, no GAMs, no cluster-robust SEs, no ICC, no permutation tests, no Markov-chain formalism. Where the underlying question is interesting, we reframe it into a supervised classification or descriptive comparison.
-- **No deep learning beyond MARL itself + the autoencoder.** No CNN, no LSTM for prediction (we have it as a curriculum tool but no good use case here), no GAN.
-- **No NLP / text analysis.** No text data.
-- **No network analysis.** No clean curriculum hook.
-- **No real-EU-ETS empirical validation** beyond the qualitative price-range check already in Ch. 6.
-
-Each absence is named in §5.1 of Methodology as a deliberate scope decision.
+Goes in Ch. 5.
 
 ---
 
-## 6. Mapping to Research Questions
+## 8. Priority
 
-| RQ | Primary | Supporting |
-|---|---|---|
-| **Sub-RQ 1** (env. & algorithm) | A1, A2, A3 | B2 (price-anchor recovery) |
-| **Sub-RQ 2** (regulatory sensitivity) | B3 | B5 |
-| **Sub-RQ 3** (strategies & aggregation) | B1, B4 | B5 |
+**Tier 1 — required for thesis quality:** S1, S2, R1, R2, C1, C2. Six analyses, every one tied to a specific claim above. This is the floor.
 
----
+**Tier 2 — strongly preferred, ship if Tier 1 is clean:** S3 (rationality tests + anchor check). Adds the theory-coherence story that the CBS rubric explicitly rewards.
 
-## 7. Priority tiers
+**Tier 3 — only if there's spare time at the end:** Anything else. Pathology classification, autoencoder anomaly detection, network analysis of secondary trades — all have been considered and dropped from the active plan. If a sweep run produces something genuinely surprising, we revisit.
 
-If time is tight, drop bottom-up.
-
-**Tier 1 — must ship (these alone clear the CBS bar):**
-A1, A2, B1, B3, B5. Five analyses across nine lectures' worth of methods (L2, L3, L4, L5, L6, L7, L12 + specialized).
-
-**Tier 2 — strongly preferred:**
-B2 (predictive model), B4 (theory tests), A3 (pathology / anomaly).
-
-**Tier 3 — stretch:**
-DBSCAN as third clustering pass in B1, autoencoder in A3 if Isolation Forest already gives clean results, SVM (L6) as additional classifier in B3b.
-
-Tier 1 + Tier 2 = 8 analyses spanning lectures 2–7 plus 12 plus the one specialized method. That's the full breadth of the ML curriculum applied, which is exactly what the rubric asks for.
+Tier 1 + Tier 2 = 7 analyses, every one producing one or two thesis figures and a paragraph that maps to a specific claim. That's enough.
 
 ---
 
-## 8. Sequencing
+## 9. Sequencing
 
-1. **Now (before final runs finish):** prototype A1 + A2 on existing seeds. Establishes converged-window cutoff.
-2. **Default seeds finalised:** B1, B5 first.
-3. **First sweep variant in:** B3 on that variant. Iterate per variant.
-4. **Last 2 weeks:** B2, B4. Highest-effort, highest-payoff.
-5. **Final week:** Tier 3 only if time permits.
+1. **Now (before final runs finish):** prototype C1 + C2 on the default seeds we already have. Establishes the converged-window cutoff for everything else and gets the credibility scaffolding in place.
+2. **Default seeds finalised:** S1 first. The clustering pipeline becomes the reusable engine for S2 and R1.
+3. **Reward-weight variant available:** S2. This is the highest-value single analysis in the plan.
+4. **Other sweep variants available:** R1, R2, iteratively.
+5. **Last 2 weeks:** S3. The rationality tests benefit from settled converged data.
 
 ---
 
-## 9. Ch. 7 / Ch. 5 mapping
+## 10. Where it all lands in the thesis
 
-Ch. 5 (Methodology) §5.x: Data Analysis Methods. Direct lift of §4 (curriculum-mapping table) plus §5 here. This is the section that demonstrably ticks the CBS box on "applied Data Science methods".
-
-Ch. 7 (Results):
-- 7.1 Training dynamics → Track A
-- 7.2 Converged market behaviour → B1, B2, B5
-- 7.3 Strategic behaviour and theory tests → B4
-- 7.4 Sensitivity to regulation → B3
-
-Ch. 8 (Discussion) leans on §5.2 multi-method robustness table when claiming any non-trivial finding.
+- **Ch. 5 Methodology §5.x Data analysis methods:** §5 (curriculum mapping) + §6 (specialised methods) + §7 (multi-method robustness). One clean methodology section that demonstrably ticks the CBS rubric.
+- **Ch. 7 Results:**
+  - 7.1 Convergence and reproducibility (C1 + C2)
+  - 7.2 Strategic archetypes and how objectives shape them (S1 + S2)
+  - 7.3 Rationality of emergent strategies (S3)
+  - 7.4 Sensitivity to regulation (R1 + R2)
+- **Ch. 8 Discussion:** weaves the seven claims into the larger argument, drawing on the multi-method robustness table for any non-trivial claim.
