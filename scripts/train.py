@@ -690,6 +690,123 @@ def enforce_snapshot_retention(
     return deleted
 
 
+def cleanup_snapshots_on_finish(
+    snap_dir: str,
+    tag_part: str,
+    seed: int,
+) -> int:
+    """Remove this seed's snapshot CSV pairs at clean end-of-run.
+
+    Mid-run snapshots in ``results/snapshots/`` are *exact copies* of the
+    cumulative ``training_log`` / ``year_log`` taken every
+    ``snapshot_interval`` episodes for partial-progress analysis. Once
+    ``train_one_seed`` exits cleanly, the live cumulative log is strictly
+    newer than (and supersedes) any rolling snapshot, so keeping the
+    snapshot pair on disk is pure duplication — it doubles the per-seed
+    log footprint locally and is then re-uploaded a second time when
+    Azure ML copies ``results/`` to its output store.
+
+    This helper deletes every ``training_log{tag_part}_s{seed}_ep<N>.csv``
+    and ``year_log{tag_part}_s{seed}_ep<N>.csv`` pair in ``snap_dir`` for
+    the given seed/tag, leaving snapshots from other seeds/tags alone.
+    If the directory ends up empty, it is also removed so a successful
+    run leaves no empty ``snapshots/`` folder behind.
+
+    Returns the number of files deleted.
+    """
+    import re
+
+    if not os.path.isdir(snap_dir):
+        return 0
+
+    ep_pat = re.compile(
+        rf"^(training_log|year_log){re.escape(tag_part)}_s{seed}_ep(\d+)\.csv$"
+    )
+    deleted = 0
+    for f in os.listdir(snap_dir):
+        if ep_pat.match(f):
+            try:
+                os.remove(os.path.join(snap_dir, f))
+                deleted += 1
+            except OSError:
+                pass
+
+    # If we emptied the directory, remove it too. Only succeeds when no
+    # other seeds/tags left files behind, which is the common single-seed
+    # case where the user otherwise sees a stray empty ``snapshots/``.
+    try:
+        if not os.listdir(snap_dir):
+            os.rmdir(snap_dir)
+    except OSError:
+        pass
+
+    return deleted
+
+
+def compute_quality_score(
+    Q_compliance: float,
+    Q_price_realism: float,
+    Q_saved_carbon: float,
+    Q_cost_eff: float,
+    Q_volatility: float,
+) -> float:
+    """Aggregate the per-episode quality components into a signed score.
+
+    Each input ``Q_*`` is expected in ``[0, 1]`` (or NaN when the
+    component cannot be computed for an episode):
+
+      • ``Q_compliance``     1 → all agent-years compliant
+      • ``Q_price_realism``  1 → clearing perfectly tracks the anchor
+      • ``Q_saved_carbon``   1 → all year-0 emissions abated
+      • ``Q_cost_eff``       1 → free abatement (cost ≪ counterfactual)
+      • ``Q_volatility``     0 → clearing/anchor ratio is constant
+
+    The composite is a weighted sum of *signed* versions (so the result
+    is naturally centred at 0 and negative for poor trajectories),
+    rescaled to ``[-5, +5]``:
+
+      • positive components: signed = ``2·x − 1``  ∈ [-1, 1]
+      • volatility (penalty): signed = ``1 − 2·v`` ∈ [-1, 1]
+
+    Weights ``{compliance: 0.30, price_realism: 0.25, saved_carbon: 0.25,
+    cost_eff: 0.10, volatility: 0.10}`` sum to 1.0, so the un-rescaled
+    weighted sum stays in ``[-1, 1]``. Multiplying by 5 yields the
+    reported ``[-5, +5]`` range. NaN inputs are dropped and the
+    remaining weights are renormalised so missing components do not
+    bias the score.
+
+    Returns ``float('nan')`` if every component is NaN.
+    """
+    weights = {
+        "compliance": 0.30, "price_realism": 0.25, "saved_carbon": 0.25,
+        "cost_eff": 0.10, "volatility": 0.10,
+    }
+    parts = {
+        "compliance": Q_compliance, "price_realism": Q_price_realism,
+        "saved_carbon": Q_saved_carbon, "cost_eff": Q_cost_eff,
+        "volatility": Q_volatility,
+    }
+    w_used = 0.0
+    signed_sum = 0.0
+    for k, v in parts.items():
+        if v is None:
+            continue
+        v = float(v)
+        if np.isnan(v):
+            continue
+        w = weights[k]
+        if k == "volatility":
+            signed = 1.0 - 2.0 * v
+        else:
+            signed = 2.0 * v - 1.0
+        signed_sum += w * signed
+        w_used += w
+    if w_used <= 0:
+        return float("nan")
+    signed_norm = signed_sum / w_used  # back into [-1, 1]
+    return float(np.clip(5.0 * signed_norm, -5.0, 5.0))
+
+
 def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = None):
     # Isolate per-run auto-resolved schedule values (e.g. shaping decay)
     # so earlier short runs do not mutate config used by later long runs.
@@ -1145,6 +1262,14 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
     # O(N²) into O(N).
     _snapshot_keep_recent = max(
         1, int(config["logging"].get("snapshot_keep_recent", 1))
+    )
+    # When True (default), delete this seed's snapshot CSV pairs at clean
+    # end-of-run. The live cumulative training/year logs supersede any
+    # rolling snapshot once the run finishes, so keeping snapshots on disk
+    # past that point is pure duplication — it doubles per-seed log size
+    # locally and is then uploaded a second time by Azure ML.
+    _snapshot_delete_on_finish = bool(
+        config["logging"].get("snapshot_delete_on_finish", True)
     )
     # Pre-resolve checkpoint-pruning config so the periodic-save loop avoids
     # nested ``.get()`` lookups every save_interval episodes.
@@ -2180,15 +2305,25 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
 
         # ──────────────────────────────────────────────────────────────────
         # Convergence Quality Metric (per-episode, written to CSV and
-        # printed in console). Mirrors notebook §5.8 logic. Anchor-
-        # invariant composite of compliance, price-realism, saved-carbon
-        # at anchor, cost efficiency vs counterfactual, and volatility.
-        # Analysis-only — never feeds back into training/PPO.
+        # printed in console). Anchor-invariant composite of compliance,
+        # price-realism, saved-carbon at anchor, cost efficiency vs
+        # counterfactual, and volatility. Analysis-only — never feeds
+        # back into training/PPO.
         #
-        # Q = 0.30·compliance + 0.25·price_realism + 0.25·saved_carbon
-        #   + 0.10·cost_eff   − 0.10·volatility
-        # Any single missing component is reweighted out so the score
-        # remains comparable.
+        # Components Q_* are kept in [0, 1] for backwards compatibility
+        # with notebooks. The top-level ``quality_score`` is reported on
+        # a signed [-5, +5] scale for readability:
+        #
+        #     +5 ≈ best possible trajectory
+        #      0 ≈ neutral / mediocre
+        #     -5 ≈ worst possible trajectory
+        #
+        # Built from "signed" versions of each component (positive parts
+        # mapped 2·x−1; volatility penalty mapped 1−2·v) weighted by
+        #     0.30 compliance + 0.25 price_realism + 0.25 saved_carbon
+        #   + 0.10 cost_eff   + 0.10 volatility   (sum = 1.0)
+        # then rescaled by ×5. Missing components are dropped and the
+        # remaining weights renormalised so the score stays comparable.
         # ──────────────────────────────────────────────────────────────────
         try:
             # Anchor cache (per year-of-episode)
@@ -2305,30 +2440,15 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             else:
                 Q_volatility = float("nan")
 
-            _Q_W = {
-                "compliance": 0.30, "price_realism": 0.25, "saved_carbon": 0.25,
-                "cost_eff": 0.10, "volatility": 0.10,
-            }
-            _parts = {
-                "compliance": Q_compliance, "price_realism": Q_price_realism,
-                "saved_carbon": Q_saved_carbon, "cost_eff": Q_cost_eff,
-                "volatility": Q_volatility,
-            }
-            _composite = 0.0
-            _w_pos_used = 0.0
-            for _k, _v in _parts.items():
-                if _v is None or (isinstance(_v, float) and np.isnan(_v)):
-                    continue
-                _w = _Q_W[_k]
-                if _k == "volatility":
-                    _composite -= _w * _v
-                else:
-                    _composite += _w * _v
-                    _w_pos_used += _w
-            if _w_pos_used > 0:
-                _w_pos_total = sum(w for k, w in _Q_W.items() if k != "volatility")
-                _composite = _composite / _w_pos_used * _w_pos_total
-            quality_score = float(_composite)
+            # Aggregate the five components into a signed [-5, +5] score.
+            # See ``compute_quality_score`` for the formula and weights.
+            quality_score = compute_quality_score(
+                Q_compliance=Q_compliance,
+                Q_price_realism=Q_price_realism,
+                Q_saved_carbon=Q_saved_carbon,
+                Q_cost_eff=Q_cost_eff,
+                Q_volatility=Q_volatility,
+            )
         except Exception:
             # Defensive: never crash training on a metric calc failure.
             Q_compliance = Q_price_realism = Q_saved_carbon = float("nan")
@@ -2357,7 +2477,7 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             "ep_mean_bid_qty_mult": round(ep_mean_bid_qty_mult, 4) if not np.isnan(ep_mean_bid_qty_mult) else None,
             "ep_mean_coal_budget_headroom": round(ep_mean_coal_budget_headroom, 2) if not np.isnan(ep_mean_coal_budget_headroom) else None,
             # Anchor-invariant convergence quality (analysis-only).
-            "quality_score":      round(quality_score, 4) if not np.isnan(quality_score) else None,
+            "quality_score":      round(quality_score, 3) if not np.isnan(quality_score) else None,
             "Q_compliance":       round(Q_compliance, 4) if not np.isnan(Q_compliance) else None,
             "Q_price_realism":    round(Q_price_realism, 4) if not np.isnan(Q_price_realism) else None,
             "Q_saved_carbon":     round(Q_saved_carbon, 4) if not np.isnan(Q_saved_carbon) else None,
@@ -2608,10 +2728,11 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             # ── Control plane ──────────────────────────────────────────
             _q_str = ""
             if not (isinstance(quality_score, float) and np.isnan(quality_score)):
-                # Top-level Q only on console. Per-component breakdown lives
-                # in the CSV (Q_compliance, Q_price_realism, Q_saved_carbon,
-                # Q_cost_eff, Q_volatility) and the analysis notebooks.
-                _q_str = f" │ Q={quality_score:.3f}"
+                # Top-level Q only on console, on a signed [-5, +5] scale
+                # (+5 best, 0 neutral, -5 worst). Per-component breakdown
+                # in CSV (Q_compliance, Q_price_realism, Q_saved_carbon,
+                # Q_cost_eff, Q_volatility, each in [0, 1]).
+                _q_str = f" │ Q={quality_score:+.2f}"
             print(f"  Ep {episode:5d} │ {_format_hms(elapsed_s)} elapsed  ETA {_format_hms(eta_s)}"
                   f"  ({avg_ep_s:.2f} s/ep)"
                   f" │ ent={entropy_coef:.4f}  shp={env.shaping_weight:.3f}"
@@ -2869,6 +2990,16 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
     _yr_flush_buffer()
     ep_csv.close()
     yr_csv.close()
+
+    # Delete this seed's mid-run snapshot copies — the cumulative live logs
+    # supersede them once the run completes, so retaining them only wastes
+    # local disk and doubles the Azure ML upload footprint.
+    if _snapshot_delete_on_finish:
+        snap_dir = os.path.join(results_dir, "snapshots")
+        cleanup_snapshots_on_finish(
+            snap_dir=snap_dir, tag_part=_tag_part, seed=seed,
+        )
+
     print(f"\nDone — seed {seed}. Logs: {ep_path}, {yr_path}")
 
 

@@ -464,6 +464,14 @@ logging:
   # snapshot pair per seed (linear footprint). Set higher only if you
   # specifically need mid-run snapshots beyond the latest.
   snapshot_keep_recent: 1
+  # When true (default), delete this seed's mid-run snapshot CSV pairs at
+  # clean end-of-run. The live cumulative training/year logs supersede any
+  # rolling snapshot once the run completes, so keeping snapshots on disk
+  # past that point is pure duplication — it doubles per-seed log size
+  # locally and is then uploaded a second time by Azure ML when results/
+  # is copied to the output store. Set false to keep the final snapshot
+  # pair (e.g. for offline diff against the live log).
+  snapshot_delete_on_finish: true
   results_dir: "results/"
   checkpoint_pruning:
     enabled: true

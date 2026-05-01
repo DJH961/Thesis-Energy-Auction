@@ -290,7 +290,8 @@ class TestSummarizeCsv:
                               quality_score=lambda ep: 0.532)
         line, _ = sweep_module._summarize_csv(str(yr), training_csv=str(tr))
         assert line is not None
-        assert "Q=0.532" in line
+        # Quality score is reported on a signed [-5, +5] scale with 2dp.
+        assert "Q=+0.53" in line
 
     def test_quality_score_absent_when_missing(self, sweep_module, tmp_path):
         yr = tmp_path / "year.csv"

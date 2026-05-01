@@ -5,6 +5,39 @@ Version numbers reflect the `version` field in `pyproject.toml`
 
 ---
 
+## [Unreleased]
+
+**Quality score — signed `[-5, +5]` range.** The per-episode
+`quality_score` reported in console + `training_log_*.csv` and consumed
+by the sweep launcher is now a signed composite in `[-5, +5]` (was a
+near-flat `[0, 1]` band that empirically only spanned `≈ 0.4–0.7`,
+making run-to-run progress hard to read). The five components
+(`Q_compliance`, `Q_price_realism`, `Q_saved_carbon`, `Q_cost_eff`,
+`Q_volatility`) keep their existing `[0, 1]` semantics for backwards
+compatibility with notebooks; the top-level score is built from
+*signed* versions of each component (positive parts mapped `2·x − 1`;
+volatility penalty mapped `1 − 2·v`) weighted by
+`{compliance: 0.30, price_realism: 0.25, saved_carbon: 0.25,
+cost_eff: 0.10, volatility: 0.10}` (sum 1.0) and rescaled by `× 5`.
+Reading: `+5` ≈ best, `0` ≈ neutral, `−5` ≈ worst. Console and sweep
+launcher format updated to `Q=+1.23` / `Q=-0.45`. The aggregation lives
+in the new `compute_quality_score(...)` helper in `scripts/train.py`
+and is unit-tested in `tests/test_quality_score.py`.
+
+**Snapshots auto-cleanup at end-of-run.** Mid-run snapshot CSV pairs in
+`results/snapshots/` are exact copies of the cumulative
+`training_log` / `year_log` taken every `snapshot_interval` episodes
+for partial-progress analysis. Once the seed finishes cleanly, the
+live cumulative log strictly supersedes any rolling snapshot, so the
+snapshot pair was pure duplication — it doubled per-seed log size
+locally and was uploaded a second time when Azure ML copied
+`results/` to its output store. `train_one_seed` now deletes this
+seed's snapshot pairs at clean end-of-run (and removes the
+`snapshots/` directory if empty); other seeds/tags are left
+untouched. Opt out via `logging.snapshot_delete_on_finish: false`.
+
+---
+
 ## [8.6.0]
 
 ESG saved-carbon hybrid, two-stage joint budget gate (loan- and shock-
