@@ -36,13 +36,13 @@ threads_per_worker: null
 
 variants:
   # --- 1. Lower LRF — what the EU ETS used to do (pre-Fit-for-55, ~2.2 %). ---
-  - name: lrf_low_22pct
+  - name: lrf_low
     overrides:
       ets.lrf_phase1: 0.022
       ets.lrf_phase2: 0.022
 
   # --- 2. Higher LRF — a plausible aggressive future trajectory (~6 %). -----
-  - name: lrf_high_6pct
+  - name: lrf_high
     overrides:
       ets.lrf_phase1: 0.060
       ets.lrf_phase2: 0.063
@@ -50,13 +50,13 @@ variants:
   # --- 3. No market-stability mechanism at all. ------------------------------
   # Both the MSR and the unsold-to-MSR rerouting are switched off, so the
   # cap trajectory is the *only* supply-side stabiliser left.
-  - name: no_market_stability
+  - name: no_msr
     overrides:
       ets.msr.enabled: false
       ets.unsold_to_msr: false
 
   # --- 4. All learning agents are pure financial (no ESG signal). -----------
-  - name: all_financial_objectives
+  - name: all_fin
     overrides:
       companies.reward_weights:
         - [1.0, 0.0]   # A1
@@ -73,7 +73,7 @@ variants:
   # mix and identical budgets / capex throughput / debt headrooms (means of
   # the default arrays). Reward weights are split 4 financial / 4 balanced
   # ESG so the sole experimental axis is preference, not endowment.
-  - name: balanced_identical
+  - name: balanced
     overrides:
       companies.initial_mix:
         - [0.15, 0.35, 0.25, 0.15, 0.10]   # A1
@@ -101,8 +101,8 @@ variants:
   # Default penalty.inflation_rate=0.020, inflation_random_std=0.015. Triple
   # the drift and roughly triple the std to stress the inflation-aware MA3
   # budget gate and the real-anchor ESG flow term.
-  - name: high_inflation
+  - name: high_inf
     overrides:
-      penalty.inflation_rate: 0.060
-      penalty.inflation_random_std: 0.045
+      penalty.inflation_rate: 0.040
+      penalty.inflation_random_std: 0.02
     seeds: [1729]
