@@ -31,7 +31,7 @@ output_dir: results/sweeps/thesis_experiments
 # 5041 is intentionally excluded (reserved for the default-config sweep).
 seeds: [1729, 8191, 6561]
 
-parallel_workers: 4
+parallel_workers: 16
 # Per-process intra-op thread count. ``null`` => auto = physical_cores // workers,
 # computed at launch from the host architecture (see src/utils/compute_setup.py).
 #
