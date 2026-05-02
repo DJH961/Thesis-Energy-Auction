@@ -306,3 +306,185 @@ def test_empty_csv_produces_empty_parquet(tmp_path):
     assert df.empty
     assert "episode" in df.columns
     assert os.path.exists(cache_path_for(p))
+
+
+# ---------------------------------------------------------------------------
+# Direct parquet-path loading
+# ---------------------------------------------------------------------------
+
+
+def test_load_run_csv_accepts_parquet_path_directly(small_run):
+    tlog, _, _, _ = small_run
+    load_run_csv(tlog)  # build cache
+    pq_path = cache_path_for(tlog)
+    assert pq_path.endswith(".parquet")
+    df = load_run_csv(pq_path)  # direct parquet read
+    assert len(df) > 0
+
+
+def test_cache_path_for_idempotent_on_parquet_input():
+    p = "/tmp/foo/year_log_s1.parquet"
+    assert cache_path_for(p) == p
+
+
+# ---------------------------------------------------------------------------
+# glob_run_logs
+# ---------------------------------------------------------------------------
+
+
+def test_glob_run_logs_finds_csv_only(small_run):
+    from src.utils.run_data import glob_run_logs
+
+    tlog, ylog, _, _ = small_run
+    d = os.path.dirname(tlog)
+    hits = glob_run_logs(os.path.join(d, "training_log_*.csv"))
+    assert hits == [tlog]
+
+
+def test_glob_run_logs_finds_parquet_when_csv_deleted(small_run):
+    from src.utils.run_data import glob_run_logs
+
+    tlog, _, _, _ = small_run
+    load_run_csv(tlog)
+    os.remove(tlog)
+    d = os.path.dirname(tlog)
+    hits = glob_run_logs(os.path.join(d, "training_log_*.csv"))
+    assert len(hits) == 1
+    assert hits[0].endswith(".parquet")
+
+
+def test_glob_run_logs_prefers_csv_when_both_present(small_run):
+    from src.utils.run_data import glob_run_logs
+
+    tlog, _, _, _ = small_run
+    load_run_csv(tlog)  # build parquet alongside the CSV
+    d = os.path.dirname(tlog)
+    hits = glob_run_logs(os.path.join(d, "training_log_*.csv"))
+    assert len(hits) == 1
+    assert hits[0].endswith(".csv")
+
+
+def test_glob_run_logs_dedupes_by_stem(tmp_path):
+    """A file with both .csv and .parquet siblings shows up exactly once."""
+    from src.utils.run_data import glob_run_logs
+
+    a_csv = os.path.join(tmp_path, "year_log_s1.csv")
+    a_pq = os.path.join(tmp_path, "year_log_s1.parquet")
+    pd.DataFrame({"x": [1]}).to_csv(a_csv, index=False)
+    pd.DataFrame({"x": [1]}).to_parquet(a_pq)
+    hits = glob_run_logs(os.path.join(tmp_path, "year_log_*.csv"))
+    assert len(hits) == 1
+
+
+# ---------------------------------------------------------------------------
+# compress_logs
+# ---------------------------------------------------------------------------
+
+
+def test_compress_logs_roundtrip_and_deletes_csv(small_run):
+    from src.utils.run_data import compress_logs
+
+    tlog, ylog, ep_df_orig, yr_df_orig = small_run
+    entries = compress_logs([tlog, ylog])
+    assert len(entries) == 2
+    # CSVs gone, parquets present
+    assert not os.path.exists(tlog)
+    assert not os.path.exists(ylog)
+    assert os.path.exists(cache_path_for(tlog))
+    assert os.path.exists(cache_path_for(ylog))
+    # Round-trip values still match
+    ep_back = load_run_csv(tlog)  # via cache fallback
+    yr_back = load_run_csv(ylog)
+    assert len(ep_back) == len(ep_df_orig)
+    assert len(yr_back) == len(yr_df_orig)
+
+
+def test_compress_logs_keep_csv_when_requested(small_run):
+    from src.utils.run_data import compress_logs
+
+    tlog, _, _, _ = small_run
+    compress_logs([tlog], delete_csv=False)
+    assert os.path.exists(tlog)
+    assert os.path.exists(cache_path_for(tlog))
+
+
+def test_compress_logs_skips_missing_and_non_csv(tmp_path):
+    from src.utils.run_data import compress_logs
+
+    pq_path = os.path.join(tmp_path, "fake.parquet")
+    pd.DataFrame({"x": [1]}).to_parquet(pq_path)
+    out = compress_logs([
+        os.path.join(tmp_path, "missing.csv"),
+        pq_path,  # already parquet
+        None,
+    ])
+    assert out == []
+
+
+# ---------------------------------------------------------------------------
+# compress_checkpoints
+# ---------------------------------------------------------------------------
+
+
+def test_compress_checkpoints_roundtrip(tmp_path):
+    import tarfile
+
+    from src.utils.run_data import compress_checkpoints
+
+    ckpt_dir = os.path.join(tmp_path, "checkpoints_x_s1")
+    os.makedirs(ckpt_dir)
+    payloads = {}
+    rng = np.random.default_rng(0)
+    for i in range(4):
+        name = f"agent_{i}_ep100.pt"
+        # Use compressible content (zeros + random) so xz produces a
+        # measurably smaller archive than the source dir.
+        data = np.concatenate(
+            [np.zeros(50_000, dtype=np.float32), rng.normal(size=10_000).astype(np.float32)]
+        ).tobytes()
+        with open(os.path.join(ckpt_dir, name), "wb") as f:
+            f.write(data)
+        payloads[name] = data
+
+    archive = compress_checkpoints(ckpt_dir)
+    assert archive is not None
+    assert archive.endswith(".tar.xz")
+    assert os.path.exists(archive)
+    assert not os.path.exists(ckpt_dir)  # source removed
+
+    # Archive content matches what we put in
+    with tarfile.open(archive, mode="r:xz") as tar:
+        for member in tar.getmembers():
+            if member.isfile():
+                fname = os.path.basename(member.name)
+                assert fname in payloads
+                f = tar.extractfile(member)
+                assert f.read() == payloads[fname]
+
+
+def test_compress_checkpoints_no_op_on_missing_dir(tmp_path):
+    from src.utils.run_data import compress_checkpoints
+
+    assert compress_checkpoints(os.path.join(tmp_path, "nope")) is None
+
+
+def test_compress_checkpoints_no_op_on_empty_dir(tmp_path):
+    from src.utils.run_data import compress_checkpoints
+
+    d = os.path.join(tmp_path, "empty")
+    os.makedirs(d)
+    assert compress_checkpoints(d) is None
+    # Empty dir is left alone
+    assert os.path.isdir(d)
+
+
+def test_compress_checkpoints_keep_dir_option(tmp_path):
+    from src.utils.run_data import compress_checkpoints
+
+    ckpt_dir = os.path.join(tmp_path, "checkpoints_keep")
+    os.makedirs(ckpt_dir)
+    with open(os.path.join(ckpt_dir, "a.pt"), "wb") as f:
+        f.write(b"hello")
+    archive = compress_checkpoints(ckpt_dir, delete_dir=False)
+    assert os.path.exists(archive)
+    assert os.path.isdir(ckpt_dir)

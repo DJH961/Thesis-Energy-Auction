@@ -43,6 +43,10 @@ from src.utils.run_data import load_run
 ep_df, yr_df = load_run(training_log_path, year_log_path)
 ```
 
+`load_run_csv` accepts either a `.csv` or a `.parquet` path
+interchangeably, so notebook code that points at the CSV keeps working
+even after the source CSV has been deleted to free disk.
+
 For column-selective loads (huge speed-up on the year log):
 
 ```python
@@ -52,6 +56,16 @@ yr_df = load_run_csv(
     year_log_path,
     columns=["episode", "year", "clearing_price", "tnac"],
 )
+```
+
+For glob-based discovery that survives CSV deletion:
+
+```python
+from src.utils.run_data import glob_run_logs
+
+ppo_paths = glob_run_logs("results/sweep/*/training_log_s*.csv")
+# Returns CSV paths if present, parquet paths otherwise — every run is
+# discoverable either way.
 ```
 
 For an entire sweep at once:
@@ -69,6 +83,58 @@ for (variant, seed), r in runs.items():
 notebook's existing `runs` dict (`ep_df`, `yr_df`, `training_log`,
 `year_log`, `config`, `results_dir`).
 
+## End-of-training compression (cloud workers)
+
+Long sweeps run on Azure / cloud workers and ship results back to your
+laptop. To keep that download small, `scripts/train.py` runs two
+lossless compression steps at clean end-of-run:
+
+1. `training_log_*.csv` and `year_log_*.csv` are converted to zstd
+   parquet via `compress_logs(...)` and the source CSVs are deleted.
+2. The `checkpoints_<tag>_s<seed>/` directory is bundled into a single
+   `checkpoints_<tag>_s<seed>.tar.xz` via `compress_checkpoints(...)` and
+   the source dir is deleted.
+
+Both steps round-trip losslessly modulo the documented float64→float32 /
+int64→int32 downcast in the parquet writer. The behaviour is controlled
+by `logging.compress_on_finish` in the YAML config:
+
+```yaml
+logging:
+  compress_on_finish:
+    logs: true                # CSV → parquet
+    checkpoints: true         # checkpoints_*/ → tar.xz
+    delete_csv: true          # remove the source CSV after verify
+    delete_checkpoint_dir: true
+```
+
+Set any of these to `false` to keep the originals alongside the
+compressed copies.
+
+## Migrating existing results
+
+Run-once script for the data you've already produced:
+
+```bash
+# Dry-run (lists what would happen, no writes)
+python scripts/compress_results.py results --dry-run
+
+# Migrate the whole results tree
+python scripts/compress_results.py results
+
+# Migrate a single sweep
+python scripts/compress_results.py results/sweeps/thesis_experiments
+
+# Keep the originals (e.g. while you spot-check the parquets)
+python scripts/compress_results.py results --keep-source
+```
+
+The script walks the directory recursively, converts every `training_log_*` /
+`year_log_*` / `ql_training_log_*` CSV to parquet (verifying row counts
+before deleting the CSV) and bundles every `checkpoints_*/` directory
+into a `tar.xz` archive. It is idempotent — re-running it skips runs
+whose archives already exist.
+
 ## Warming the cache once
 
 The first conversion of a 5 GB year-log CSV is still IO-bound. Run
@@ -82,7 +148,9 @@ rebuild_cache([
 ```
 
 once at the top of any notebook (or in a small script) and every later
-notebook restart hits the parquet cache directly.
+notebook restart hits the parquet cache directly. (If you've already run
+`scripts/compress_results.py`, the cache is fully populated and no
+warm-up is needed.)
 
 ## Disk-space sketch
 
@@ -93,8 +161,7 @@ year log is ~5 GB CSV per seed. Empirically:
 | ---------------- | ------------- | ------------------------ |
 | `year_log_*.csv` | ~5 GB         | ~0.5–1.0 GB              |
 | `training_log_*.csv` | ~30 MB    | ~5–10 MB                 |
+| `checkpoints_*/` | ~2.5 GB       | ~0.5–1.5 GB tar.xz       |
 
-So a 4-seed sweep drops from ~20 GB to ~3–4 GB on disk, and a 16-seed
+A 4-seed sweep drops from ~22 GB on disk to ~3–5 GB; a 16-cell
 thesis-experiments sweep stays well under one disk's worth of headroom.
-If disk pressure remains an issue after caching, deleting the source
-CSVs (the loader keeps reading the parquets) reclaims the rest.

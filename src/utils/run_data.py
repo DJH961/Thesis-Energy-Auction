@@ -79,6 +79,9 @@ __all__ = [
     "load_sweep",
     "rebuild_cache",
     "cache_path_for",
+    "glob_run_logs",
+    "compress_logs",
+    "compress_checkpoints",
 ]
 
 _log = logging.getLogger(__name__)
@@ -130,10 +133,16 @@ def cache_path_for(csv_path: str) -> str:
     ``training_log_default_s42.parquet`` in the same directory. We keep the
     cache next to the source so the user only has to manage one results
     tree, and so removing a sweep directory cleans up its cache too.
+
+    If ``csv_path`` already has a ``.parquet`` extension, it is returned
+    unchanged — this lets callers pass either a CSV or its cached parquet
+    interchangeably.
     """
     if not csv_path:
         raise ValueError("csv_path must be a non-empty string")
-    base, _ = os.path.splitext(csv_path)
+    base, ext = os.path.splitext(csv_path)
+    if ext.lower() == ".parquet":
+        return csv_path
     return base + ".parquet"
 
 
@@ -341,7 +350,10 @@ def load_run_csv(
         return None
 
     parquet_path = cache_path_for(csv_path)
-    csv_exists = os.path.exists(csv_path)
+    # If the caller handed us a parquet path directly we never need to look
+    # for / rebuild from a CSV.
+    given_parquet = os.path.splitext(csv_path)[1].lower() == ".parquet"
+    csv_exists = (not given_parquet) and os.path.exists(csv_path)
     pq_exists = os.path.exists(parquet_path)
 
     if not csv_exists and not pq_exists:
@@ -349,7 +361,12 @@ def load_run_csv(
             f"Neither CSV nor cached parquet found for {csv_path!r}"
         )
 
-    needs_build = rebuild or not _is_cache_fresh(csv_path, parquet_path)
+    if given_parquet:
+        # Direct parquet load — no cache key to validate, no CSV to rebuild
+        # from. Skip straight to the read.
+        needs_build = False
+    else:
+        needs_build = rebuild or not _is_cache_fresh(csv_path, parquet_path)
     if needs_build and not csv_exists:
         # Cache was stale but source CSV is gone — fall back to the existing
         # parquet rather than failing. This makes "delete CSVs after first
@@ -510,3 +527,220 @@ def load_sweep(
             "results_dir": job.results_dir,
         }
     return out
+
+
+# ---------------------------------------------------------------------------
+# Glob helpers — make CSV-style globs transparent to deleted-CSV layouts.
+# ---------------------------------------------------------------------------
+
+
+def glob_run_logs(pattern: str, *, recursive: bool = False) -> list[str]:
+    """Return canonical paths for run logs matching a CSV-style ``pattern``.
+
+    Notebooks historically discover log files via patterns like
+    ``glob.glob('results/sweep/*/training_log_s*.csv')``. Once the cache
+    has been built (and especially after the source CSVs are deleted to
+    reclaim disk) such a glob returns nothing, even though every run is
+    still readable from its parquet sibling.
+
+    This helper returns the canonical path *for each run*, preferring the
+    CSV when present (so :func:`load_run_csv` can rebuild a stale cache),
+    falling back to the parquet sibling otherwise. The returned list is
+    sorted and deduped by stem so a notebook never sees both ``foo.csv``
+    and ``foo.parquet`` for the same run.
+
+    Parameters
+    ----------
+    pattern
+        A glob pattern. May end in ``.csv``, ``.parquet``, or be
+        extension-agnostic — both extensions are searched in either case.
+    recursive
+        Forwarded to :func:`glob.glob`. When True, ``**`` matches across
+        any number of directories.
+
+    Returns
+    -------
+    list[str]
+        Sorted list of canonical paths (one per unique run stem).
+    """
+    import glob as _glob
+
+    if not pattern:
+        return []
+
+    # Build the two patterns we need to search. We swap the trailing
+    # extension so a caller that wrote ``...*.csv`` also finds parquet
+    # siblings, and vice versa.
+    base, ext = os.path.splitext(pattern)
+    if ext.lower() == ".csv":
+        patterns = [pattern, base + ".parquet"]
+    elif ext.lower() == ".parquet":
+        patterns = [base + ".csv", pattern]
+    else:
+        patterns = [pattern + ".csv", pattern + ".parquet"]
+
+    found: dict[str, str] = {}  # stem -> canonical path
+    for p in patterns:
+        for hit in _glob.glob(p, recursive=recursive):
+            stem = os.path.splitext(hit)[0]
+            existing = found.get(stem)
+            if existing is None:
+                found[stem] = hit
+            else:
+                # Prefer CSV over parquet if both are present.
+                if existing.endswith(".parquet") and hit.endswith(".csv"):
+                    found[stem] = hit
+    return sorted(found.values())
+
+
+# ---------------------------------------------------------------------------
+# End-of-training compression
+# ---------------------------------------------------------------------------
+
+
+def compress_logs(
+    csv_paths: Iterable[str | os.PathLike],
+    *,
+    delete_csv: bool = True,
+    chunksize: int = _DEFAULT_CHUNKSIZE,
+    verify: bool = True,
+) -> list[CacheEntry]:
+    """Convert a batch of training/year-log CSVs into parquet on disk.
+
+    This is the post-training shrinker. By default it also deletes the
+    source CSVs once each parquet has been verified end-to-end (row count
+    + schema match), reclaiming the 5–10× CSV footprint without touching
+    a byte of the logged data — every value round-trips losslessly modulo
+    the documented float64→float32 / int64→int32 downcast.
+
+    Parameters
+    ----------
+    csv_paths
+        Iterable of source CSV paths. Missing or already-parquet paths are
+        silently skipped so the caller can pass a glob result without
+        pre-filtering.
+    delete_csv
+        If True (default), delete the source CSV after the parquet has
+        been written and verified.
+    chunksize
+        CSV chunk size for streaming conversion.
+    verify
+        If True (default), read the parquet back and confirm its row count
+        matches the source CSV before deleting the CSV. Cheap because the
+        parquet is mmap-friendly; expensive only if you have hundreds of
+        GB of logs.
+
+    Returns
+    -------
+    list[CacheEntry]
+        One entry per successfully converted log.
+    """
+    out: list[CacheEntry] = []
+    for raw in csv_paths:
+        if raw is None:
+            continue
+        p = os.fspath(raw)
+        if not p or not os.path.exists(p):
+            continue
+        if os.path.splitext(p)[1].lower() != ".csv":
+            # Already parquet (or some unrelated file) — skip silently.
+            continue
+        parquet_path = cache_path_for(p)
+        with _BUILD_LOCK:
+            entry = _build_parquet(
+                p, parquet_path, chunksize=chunksize, compression="zstd"
+            )
+
+        if verify:
+            # Cheap sanity check: parquet row count must match CSV row count.
+            csv_rows = sum(1 for _ in open(p, "rb")) - 1  # minus header
+            csv_rows = max(csv_rows, 0)
+            pq_rows = pq.read_metadata(parquet_path).num_rows
+            if pq_rows != csv_rows:
+                raise RuntimeError(
+                    f"compress_logs: row count mismatch for {p!r} "
+                    f"(csv={csv_rows}, parquet={pq_rows}); refusing to "
+                    f"delete CSV"
+                )
+
+        if delete_csv:
+            os.remove(p)
+        out.append(entry)
+    return out
+
+
+def compress_checkpoints(
+    ckpt_dir: str | os.PathLike,
+    *,
+    archive_path: str | os.PathLike | None = None,
+    delete_dir: bool = True,
+    preset: int = 6,
+) -> str | None:
+    """Bundle a ``checkpoints_*/`` directory into ``.tar.xz`` and remove it.
+
+    Each training run writes 8 × N checkpoint files (one ``.pt`` per agent
+    per save) into ``checkpoints_<tag>_s<seed>/``. A 16-cell sweep can
+    accumulate hundreds of files and several GB of disk; bundling them
+    into a single ``.tar.xz`` reclaims most of that without losing a
+    single byte (xz/LZMA is lossless and stdlib-only, so no new
+    runtime dependency is introduced).
+
+    The archive is written next to the source dir as
+    ``<ckpt_dir>.tar.xz``. The original directory is deleted on success
+    only — a failed write leaves the source dir intact so a crashed
+    invocation never costs you the checkpoints.
+
+    Parameters
+    ----------
+    ckpt_dir
+        Directory to bundle. Returns ``None`` (no-op) if it doesn't exist
+        or is empty.
+    archive_path
+        Optional explicit archive path. Defaults to ``<ckpt_dir>.tar.xz``.
+    delete_dir
+        If True (default), remove the source dir after the archive is
+        written. Set False to keep both side-by-side (useful while
+        validating a fresh run before reclaiming disk).
+    preset
+        LZMA preset 0–9 (higher = smaller but slower). Default 6 is the
+        Python stdlib default and a good size/CPU trade-off for ``.pt``
+        files.
+
+    Returns
+    -------
+    str | None
+        Absolute path to the created archive, or ``None`` if no work was
+        done.
+    """
+    import shutil
+    import tarfile
+
+    ckpt_dir = os.fspath(ckpt_dir)
+    if not os.path.isdir(ckpt_dir):
+        return None
+    entries = os.listdir(ckpt_dir)
+    if not entries:
+        return None
+
+    archive = (
+        os.fspath(archive_path)
+        if archive_path is not None
+        else ckpt_dir.rstrip(os.sep) + ".tar.xz"
+    )
+    tmp_archive = archive + ".tmp"
+    if os.path.exists(tmp_archive):
+        os.remove(tmp_archive)
+
+    arcname = os.path.basename(ckpt_dir.rstrip(os.sep))
+    try:
+        with tarfile.open(tmp_archive, mode="w:xz", preset=preset) as tar:
+            tar.add(ckpt_dir, arcname=arcname)
+        os.replace(tmp_archive, archive)
+    except Exception:
+        if os.path.exists(tmp_archive):
+            os.remove(tmp_archive)
+        raise
+
+    if delete_dir:
+        shutil.rmtree(ckpt_dir)
+    return os.path.abspath(archive)

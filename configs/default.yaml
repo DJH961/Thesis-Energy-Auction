@@ -472,6 +472,20 @@ logging:
   # is copied to the output store. Set false to keep the final snapshot
   # pair (e.g. for offline diff against the live log).
   snapshot_delete_on_finish: true
+  # End-of-run lossless compression. Both steps run on the worker that
+  # finished training, so the artefacts uploaded back from cloud runs are
+  # already small.
+  #   logs       : convert training_log_*.csv / year_log_*.csv to zstd
+  #                parquet (5–10× smaller); delete the source CSV.
+  #   checkpoints: bundle checkpoints_*/ into a single tar.xz; delete
+  #                the source dir.
+  # Round-trip is lossless modulo the float64→float32 / int64→int32
+  # downcast in the parquet writer.
+  compress_on_finish:
+    logs: true
+    checkpoints: true
+    delete_csv: true
+    delete_checkpoint_dir: true
   results_dir: "results/"
   checkpoint_pruning:
     enabled: true

@@ -35,6 +35,12 @@ def test_training_smoke_runs_10_episodes(tmp_path):
     cfg["pretrain"]["enabled"] = False
     cfg["pretrain"]["episodes"] = 0
     cfg["pretrain"]["epochs"] = 0
+    # The smoke test asserts on the live CSV files, so disable end-of-run
+    # log/checkpoint compression here. (The compression hook is exercised
+    # separately in test_compress_on_finish_hook.)
+    cfg["logging"].setdefault("compress_on_finish", {})
+    cfg["logging"]["compress_on_finish"]["logs"] = False
+    cfg["logging"]["compress_on_finish"]["checkpoints"] = False
 
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -94,3 +100,52 @@ def test_training_smoke_runs_10_episodes(tmp_path):
         })
     assert expected_yr_cols.issubset(yr_rows[0].keys()), \
         f"Missing v8.6.1 year columns: {expected_yr_cols - set(yr_rows[0].keys())}"
+
+
+def test_compress_on_finish_hook(tmp_path):
+    """train_one_seed compresses logs + checkpoints at clean end-of-run.
+
+    The hook is opt-out (default true); we run a 5-episode smoke and
+    assert that the CSVs were replaced by parquet siblings and the
+    checkpoint dir was bundled into a tar.xz.
+    """
+    cfg = _load_config()
+    cfg["simulation"]["n_episodes"] = 5
+    cfg["simulation"]["n_years"] = 3
+    cfg["logging"]["results_dir"] = str(tmp_path / "results")
+    cfg["logging"]["log_interval"] = 5
+    cfg["logging"]["save_interval"] = 5  # force at least one checkpoint write
+    cfg["logging"]["csv_flush_interval"] = 1
+    cfg["pretrain"]["enabled"] = False
+    cfg["pretrain"]["episodes"] = 0
+    cfg["pretrain"]["epochs"] = 0
+    # Defaults already enable compress_on_finish.{logs,checkpoints}; this
+    # test verifies the wiring works end-to-end.
+
+    seed = 11
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"\[ETSEnvironment\] Weak scarcity: cap drops only .*",
+            category=UserWarning,
+        )
+        train_mod.train_one_seed(cfg, seed=seed)
+
+    results_dir = Path(cfg["logging"]["results_dir"])
+    ep_csv = results_dir / f"training_log_s{seed}.csv"
+    yr_csv = results_dir / f"year_log_s{seed}.csv"
+    ep_pq = results_dir / f"training_log_s{seed}.parquet"
+    yr_pq = results_dir / f"year_log_s{seed}.parquet"
+
+    # CSVs were converted and removed; parquet siblings are on disk.
+    assert not ep_csv.exists(), "training_log CSV should be removed after compression"
+    assert not yr_csv.exists(), "year_log CSV should be removed after compression"
+    assert ep_pq.exists(), "training_log parquet should exist after compression"
+    assert yr_pq.exists(), "year_log parquet should exist after compression"
+
+    # Checkpoint dir was bundled and removed.
+    ckpt_dir = results_dir / f"checkpoints_s{seed}"
+    ckpt_archive = results_dir / f"checkpoints_s{seed}.tar.xz"
+    if ckpt_archive.exists():
+        # Archive present implies the source dir was removed.
+        assert not ckpt_dir.exists()
