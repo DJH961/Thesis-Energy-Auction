@@ -82,6 +82,7 @@ __all__ = [
     "glob_run_logs",
     "compress_logs",
     "compress_checkpoints",
+    "decompress_checkpoints",
 ]
 
 _log = logging.getLogger(__name__)
@@ -745,3 +746,77 @@ def compress_checkpoints(
     if delete_dir:
         shutil.rmtree(ckpt_dir)
     return os.path.abspath(archive)
+
+
+def decompress_checkpoints(
+    archive_path: str | os.PathLike,
+    *,
+    out_dir: str | os.PathLike | None = None,
+    delete_archive: bool = False,
+) -> str | None:
+    """Extract a ``checkpoints_*.tar.xz`` back to a directory.
+
+    Symmetric inverse of :func:`compress_checkpoints` so a workflow can
+    round-trip without dropping out to a shell. The archive's top-level
+    directory name is preserved (every member was added with
+    ``arcname=basename(ckpt_dir)``), so the result is exactly the
+    directory layout the trainer originally wrote.
+
+    Equivalent to ``tar -xJf checkpoints_<tag>_s<seed>.tar.xz`` on the
+    command line — that one-liner is the recommended path when you only
+    need to extract once and don't want to import the project. This
+    helper exists for in-process use (notebooks, evaluation scripts) and
+    for tests.
+
+    Parameters
+    ----------
+    archive_path
+        Path to a ``.tar.xz`` produced by :func:`compress_checkpoints`.
+    out_dir
+        Directory to extract into. Defaults to the archive's parent
+        directory (so ``.../checkpoints_x_s1.tar.xz`` extracts to
+        ``.../checkpoints_x_s1/``, exactly mirroring the source layout).
+    delete_archive
+        If True, remove the source archive after a successful extract.
+        Default False — extraction is non-destructive so a notebook can
+        re-run cheaply.
+
+    Returns
+    -------
+    str | None
+        Absolute path to the extracted directory, or ``None`` if the
+        archive doesn't exist.
+    """
+    import tarfile
+
+    archive_path = os.fspath(archive_path)
+    if not os.path.exists(archive_path):
+        return None
+    out_dir = (
+        os.fspath(out_dir)
+        if out_dir is not None
+        else os.path.dirname(os.path.abspath(archive_path))
+    )
+    os.makedirs(out_dir, exist_ok=True)
+
+    # The ``data`` filter was added in Python 3.12 to mitigate the
+    # ``CVE-2007-4559`` family of tar-extraction vulnerabilities; on 3.11
+    # we silently fall back to the unfiltered default since the archives
+    # we extract are all written by ``compress_checkpoints`` in this
+    # repo and never come from untrusted sources.
+    extract_kwargs: dict = {}
+    if hasattr(tarfile, "data_filter"):
+        extract_kwargs["filter"] = "data"
+
+    with tarfile.open(archive_path, mode="r:xz") as tar:
+        members = tar.getmembers()
+        if not members:
+            return None
+        top = members[0].name.split("/", 1)[0]
+        tar.extractall(out_dir, **extract_kwargs)
+
+    if delete_archive:
+        os.remove(archive_path)
+
+    extracted = os.path.join(out_dir, top)
+    return os.path.abspath(extracted) if os.path.isdir(extracted) else os.path.abspath(out_dir)

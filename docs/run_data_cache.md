@@ -111,6 +111,45 @@ logging:
 Set any of these to `false` to keep the originals alongside the
 compressed copies.
 
+### Memory profile
+
+Both compression steps stream end-to-end:
+
+* `compress_logs` reads the source CSV in 250k-row chunks (configurable
+  via `chunksize=`) and writes each chunk as a parquet row group, so
+  peak heap is bounded by `chunksize × n_columns × 8 bytes` — a few
+  hundred MB even on a 5 GB year-log. Safe on Azure ML's standard
+  D16ds_v5 (64 GB RAM).
+* `compress_checkpoints` uses `tarfile`'s incremental writer; each
+  ``.pt`` is read once into LZMA's encoder buffer and never fully
+  materialised in Python.
+
+### Re-opening a compressed run
+
+Logs are read transparently — `load_run_csv` accepts either the
+original CSV path (auto-falls-back to the parquet sibling) or the
+parquet path directly.
+
+Checkpoints are extracted with either the stdlib `tar` command or the
+symmetric in-process helper:
+
+```bash
+# Shell — recommended for one-off use
+tar -xJf results/sweeps/.../checkpoints_lrf_low_s1729.tar.xz -C results/sweeps/.../
+
+# In-process — useful in evaluation scripts / notebooks
+from src.utils.run_data import decompress_checkpoints
+ckpt_dir = decompress_checkpoints(
+    "results/sweeps/.../checkpoints_lrf_low_s1729.tar.xz"
+)
+# `ckpt_dir` now holds the same agent_*.pt layout the trainer wrote;
+# pass it straight to scripts/evaluate.py --checkpoint <ckpt_dir>/agent_0_best.pt
+```
+
+`decompress_checkpoints` is non-destructive by default (it leaves the
+archive on disk); pass `delete_archive=True` to reclaim the space once
+you've extracted.
+
 ## Migrating existing results
 
 Run-once script for the data you've already produced:

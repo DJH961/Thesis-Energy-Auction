@@ -32,6 +32,11 @@ output_dir: results/sweeps/thesis_experiments
 seeds: [1729, 8191, 6561]
 
 parallel_workers: 4
+# Per-process intra-op thread count. ``null`` => auto = total_cores // workers,
+# computed at launch from the host architecture (see src/utils/compute_setup.py).
+# On the standard 16-core Azure ML compute (D16ds_v5) this gives 4 workers ×
+# 4 BLAS threads = 16 cores fully saturated. Override here if you launch on
+# a different core count.
 threads_per_worker: null
 
 variants:

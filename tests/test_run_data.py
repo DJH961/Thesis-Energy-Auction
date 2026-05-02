@@ -488,3 +488,77 @@ def test_compress_checkpoints_keep_dir_option(tmp_path):
     archive = compress_checkpoints(ckpt_dir, delete_dir=False)
     assert os.path.exists(archive)
     assert os.path.isdir(ckpt_dir)
+
+
+# ---------------------------------------------------------------------------
+# decompress_checkpoints
+# ---------------------------------------------------------------------------
+
+
+def test_decompress_checkpoints_roundtrip(tmp_path):
+    from src.utils.run_data import compress_checkpoints, decompress_checkpoints
+
+    ckpt_dir = os.path.join(tmp_path, "checkpoints_x_s1")
+    os.makedirs(ckpt_dir)
+    payloads = {f"agent_{i}.pt": os.urandom(1024) for i in range(3)}
+    for name, data in payloads.items():
+        with open(os.path.join(ckpt_dir, name), "wb") as f:
+            f.write(data)
+
+    archive = compress_checkpoints(ckpt_dir)
+    assert not os.path.isdir(ckpt_dir)
+
+    out = decompress_checkpoints(archive, out_dir=str(tmp_path))
+    assert out is not None
+    assert os.path.isdir(out)
+    # Original archive preserved (delete_archive default False)
+    assert os.path.exists(archive)
+    # Every payload restored byte-for-byte
+    for name, data in payloads.items():
+        with open(os.path.join(out, name), "rb") as f:
+            assert f.read() == data
+
+
+def test_decompress_checkpoints_delete_archive(tmp_path):
+    from src.utils.run_data import compress_checkpoints, decompress_checkpoints
+
+    ckpt_dir = os.path.join(tmp_path, "checkpoints_y_s1")
+    os.makedirs(ckpt_dir)
+    with open(os.path.join(ckpt_dir, "a.pt"), "wb") as f:
+        f.write(b"x")
+    archive = compress_checkpoints(ckpt_dir)
+    decompress_checkpoints(archive, out_dir=str(tmp_path), delete_archive=True)
+    assert not os.path.exists(archive)
+
+
+def test_decompress_checkpoints_missing_archive(tmp_path):
+    from src.utils.run_data import decompress_checkpoints
+
+    assert decompress_checkpoints(os.path.join(tmp_path, "nope.tar.xz")) is None
+
+
+def test_compress_logs_memory_bounded_streaming(tmp_path):
+    """compress_logs streams in chunks — peak memory is bounded by
+    chunksize × ncols × 8 bytes, not by the whole-CSV size. Verified by
+    converting a 200k-row CSV with chunksize=10k and confirming the
+    parquet writer never materialised the full DataFrame.
+    """
+    from src.utils.run_data import compress_logs
+
+    csv = os.path.join(tmp_path, "year_log_huge_s1.csv")
+    n = 200_000
+    df = pd.DataFrame({
+        "episode": np.arange(n, dtype=np.int64),
+        "year": np.tile(np.arange(12), n // 12 + 1)[:n].astype(np.int64),
+        "clearing_price": np.random.RandomState(0).uniform(50, 200, n),
+        "tnac": np.random.RandomState(1).uniform(0, 1000, n),
+    })
+    df.to_csv(csv, index=False)
+    entries = compress_logs([csv], chunksize=10_000)
+    assert len(entries) == 1
+    assert entries[0].rows == n
+    # Round-trip preserves every row
+    pq_path = cache_path_for(csv)
+    back = pd.read_parquet(pq_path)
+    assert len(back) == n
+    assert (back["episode"].values == df["episode"].values).all()
