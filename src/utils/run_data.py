@@ -80,6 +80,7 @@ __all__ = [
     "rebuild_cache",
     "cache_path_for",
     "glob_run_logs",
+    "log_exists",
     "compress_logs",
     "compress_checkpoints",
     "decompress_checkpoints",
@@ -145,6 +146,25 @@ def cache_path_for(csv_path: str) -> str:
     if ext.lower() == ".parquet":
         return csv_path
     return base + ".parquet"
+
+
+def log_exists(path: str | os.PathLike | None) -> bool:
+    """Return True if either the CSV or its parquet sibling exists on disk.
+
+    Notebook discovery code historically used ``os.path.exists(p)`` /
+    ``Path(p).exists()`` to gate a run as available. After end-of-training
+    compression the CSV is deleted but the parquet sibling remains, and
+    those bare existence checks would silently drop the run. Use this
+    helper instead so a run is treated as present iff either format is.
+    """
+    if path is None:
+        return False
+    p = os.fspath(path)
+    if not p:
+        return False
+    if os.path.exists(p):
+        return True
+    return os.path.exists(cache_path_for(p))
 
 
 def _stat_key(path: str) -> tuple[int, int]:
