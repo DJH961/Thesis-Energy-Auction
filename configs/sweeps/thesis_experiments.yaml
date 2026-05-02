@@ -32,11 +32,27 @@ output_dir: results/sweeps/thesis_experiments
 seeds: [1729, 8191, 6561]
 
 parallel_workers: 4
-# Per-process intra-op thread count. ``null`` => auto = total_cores // workers,
+# Per-process intra-op thread count. ``null`` => auto = physical_cores // workers,
 # computed at launch from the host architecture (see src/utils/compute_setup.py).
-# On the standard 16-core Azure ML compute (D16ds_v5) this gives 4 workers ×
-# 4 BLAS threads = 16 cores fully saturated. Override here if you launch on
-# a different core count.
+#
+# Sizing guide (this sweep is 16 jobs of ~120 k episodes each; each job is
+# ~4–6 GB resident at peak, dominated by opponent-obs queues + gradients):
+#
+#   Azure VM       physical / logical / RAM   recommended parallel_workers
+#   --------       ------------------------   ----------------------------
+#   D8ds_v5        4  /  8 / 32 GB            2   (auto threads = 2)
+#   D16ds_v5       8  / 16 / 64 GB            4   (auto threads = 2; default)
+#   D32ds_v5       16 / 32 /128 GB            8   (auto threads = 2)
+#   D64ds_v5       32 / 64 /256 GB           16   (auto threads = 2 — all 16 jobs in parallel)
+#
+# The small-MLP BLAS throughput in this project plateaus at ≤ 4 threads, so
+# the right policy is "more workers, fewer threads each" up to the physical-
+# core count. Going past one-worker-per-physical-core hurts (BLAS over-
+# subscription); going past ~6 GB-per-worker hurts (RAM pressure).
+#
+# For a 16-job sweep on D64 (or larger) you can fit every job in parallel
+# (parallel_workers: 16) and finish in roughly the wall time of a single
+# training run.
 threads_per_worker: null
 
 variants:
