@@ -211,6 +211,7 @@ __marimo__/
 *.parquet
 *.parquet.tmp
 *.tar.xz
+*.tar.xz.tmp
 *.pt
 *.pkl
 *.npz
