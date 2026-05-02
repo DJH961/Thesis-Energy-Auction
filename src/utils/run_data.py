@@ -653,7 +653,8 @@ def compress_logs(
 
         if verify:
             # Cheap sanity check: parquet row count must match CSV row count.
-            csv_rows = sum(1 for _ in open(p, "rb")) - 1  # minus header
+            with open(p, "rb") as f:
+                csv_rows = sum(1 for _ in f) - 1  # minus header
             csv_rows = max(csv_rows, 0)
             pq_rows = pq.read_metadata(parquet_path).num_rows
             if pq_rows != csv_rows:
