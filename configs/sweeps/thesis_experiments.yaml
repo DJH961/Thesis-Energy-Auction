@@ -59,13 +59,11 @@ variants:
   # --- 1. Lower LRF — what the EU ETS used to do (pre-Fit-for-55, ~2.2 %). ---
   - name: lrf_low
     overrides:
-      ets.lrf_phase1: 0.022
       ets.lrf_phase2: 0.022
 
   # --- 2. Higher LRF — a plausible aggressive future trajectory (~6 %). -----
   - name: lrf_high
     overrides:
-      ets.lrf_phase1: 0.060
       ets.lrf_phase2: 0.063
 
   # --- 3. No market-stability mechanism at all. ------------------------------
@@ -105,15 +103,7 @@ variants:
         - [0.15, 0.35, 0.25, 0.15, 0.10]   # A6
         - [0.15, 0.35, 0.25, 0.15, 0.10]   # A7
         - [0.15, 0.35, 0.25, 0.15, 0.10]   # A8
-      companies.reward_weights:
-        - [1.0, 0.0]   # A1: financial
-        - [1.0, 0.0]   # A2: financial
-        - [1.0, 0.0]   # A3: financial
-        - [1.0, 0.0]   # A4: financial
-        - [0.5, 0.5]   # A5: balanced ESG
-        - [0.5, 0.5]   # A6: balanced ESG
-        - [0.5, 0.5]   # A7: balanced ESG
-        - [0.5, 0.5]   # A8: balanced ESG
+
       companies.annual_budgets: [820.0, 820.0, 820.0, 820.0, 820.0, 820.0, 820.0, 820.0]   # mean of default annual_budgets
       companies.capex_throughputs: [135.0, 135.0, 135.0, 135.0, 135.0, 135.0, 135.0, 135.0]   # mean of default capex_throughputs
       companies.debt_headrooms: [108.75, 108.75, 108.75, 108.75, 108.75, 108.75, 108.75, 108.75]   # mean of default debt_headrooms
