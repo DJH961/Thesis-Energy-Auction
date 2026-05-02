@@ -3104,6 +3104,56 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             snap_dir=snap_dir, tag_part=_tag_part, seed=seed,
         )
 
+    # End-of-run lossless compression: shrink the (training_log, year_log)
+    # CSVs into zstd-compressed parquet and bundle the checkpoint dir into
+    # a single tar.xz. Both steps are lossless modulo the documented
+    # float64→float32 / int64→int32 downcast in the parquet writer.
+    # Designed to run on cloud workers so the artefacts uploaded back to
+    # the user's machine are already small.
+    _compress_cfg = config.get("logging", {}).get("compress_on_finish", {}) or {}
+    _compress_logs_enabled = bool(_compress_cfg.get("logs", True))
+    _compress_checkpoints_enabled = bool(_compress_cfg.get("checkpoints", True))
+    _delete_csv = bool(_compress_cfg.get("delete_csv", True))
+    _delete_ckpt_dir = bool(_compress_cfg.get("delete_checkpoint_dir", True))
+
+    if _compress_logs_enabled:
+        try:
+            from src.utils.run_data import compress_logs as _compress_logs
+
+            entries = _compress_logs(
+                [ep_path, yr_path], delete_csv=_delete_csv
+            )
+            if entries:
+                total_csv = sum(e.source_size for e in entries)
+                total_pq = sum(
+                    os.path.getsize(e.parquet_path)
+                    for e in entries
+                    if os.path.exists(e.parquet_path)
+                )
+                if total_csv > 0:
+                    print(
+                        f"Compressed logs for seed {seed}: "
+                        f"{total_csv/1e6:.1f} MB CSV → "
+                        f"{total_pq/1e6:.1f} MB parquet "
+                        f"({total_pq/max(total_csv,1)*100:.1f}% of original)"
+                    )
+        except Exception as e:  # pragma: no cover - never block end-of-run
+            print(f"WARN: log compression failed for seed {seed}: {e}")
+
+    if _compress_checkpoints_enabled:
+        try:
+            from src.utils.run_data import compress_checkpoints as _compress_ckpts
+
+            ckpt_dir = os.path.join(results_dir, f"checkpoints{_tag_part}_s{seed}")
+            archive = _compress_ckpts(ckpt_dir, delete_dir=_delete_ckpt_dir)
+            if archive:
+                print(
+                    f"Compressed checkpoints for seed {seed}: "
+                    f"{ckpt_dir} → {archive}"
+                )
+        except Exception as e:  # pragma: no cover
+            print(f"WARN: checkpoint compression failed for seed {seed}: {e}")
+
     print(f"\nDone — seed {seed}. Logs: {ep_path}, {yr_path}")
 
 

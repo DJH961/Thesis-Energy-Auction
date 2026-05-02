@@ -45,6 +45,20 @@ def main():
     # Build agents and load weights
     agents = build_agents(env, config, args.seed)
 
+    # If the user passes a tar.xz produced by ``compress_checkpoints``,
+    # extract it next to the archive on demand so the rest of this
+    # function can keep treating ``args.checkpoint`` as a directory.
+    if os.path.isfile(args.checkpoint) and args.checkpoint.endswith(".tar.xz"):
+        from src.utils.run_data import decompress_checkpoints
+
+        extracted = decompress_checkpoints(args.checkpoint)
+        if extracted is None or not os.path.isdir(extracted):
+            raise FileNotFoundError(
+                f"Failed to extract checkpoint archive {args.checkpoint!r}"
+            )
+        print(f"Extracted {args.checkpoint} → {extracted}")
+        args.checkpoint = extracted
+
     # Save config alongside checkpoint for reproducibility
     import shutil
     config_save_path = os.path.join(args.checkpoint, "config.yaml")

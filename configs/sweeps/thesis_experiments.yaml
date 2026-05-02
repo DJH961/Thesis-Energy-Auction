@@ -1,0 +1,129 @@
+# =============================================================================
+# Thesis experiment sweep — 5 structural variants × 3 seeds + 1 inflation cell
+# =============================================================================
+# 16 (variant, seed) jobs total.
+#
+# Seed pool reuses the default-sweep seeds *minus* 5041 (which is reserved for
+# other default-config repeats), giving 3 independent draws per main variant.
+# The 16th job pins seed 1729 to the high-inflation cell so a paired
+# comparison against `default/s1729` from `default_seeds.yaml` is possible.
+#
+# Variants
+# --------
+#   1. lrf_low_22pct            — pre-FF55 LRF (2.2 %), realistic historical
+#   2. lrf_high_6pct            — aggressive future LRF (~6 %)
+#   3. no_market_stability      — MSR off + unsold-to-MSR off
+#   4. all_financial_objectives — every learning agent is pure financial
+#   5. balanced_identical       — identical starting conditions across the 8
+#                                 agents; reward weights split 4 ESG / 4 fin
+#   6. high_inflation           — elevated penalty inflation drift + variance
+#                                 (single seed)
+#
+# Run with:
+#     python scripts/sweep.py --spec configs/sweeps/thesis_experiments.yaml
+# =============================================================================
+
+base_config: configs/default.yaml
+output_dir: results/sweeps/thesis_experiments
+
+# 3 seeds applied to every main variant. high_inflation overrides this list.
+# 1729 = 7·13·19 (Hardy–Ramanujan); 8191 = M_13 Mersenne prime; 6561 = 3^8.
+# 5041 is intentionally excluded (reserved for the default-config sweep).
+seeds: [1729, 8191, 6561]
+
+parallel_workers: 16
+# Per-process intra-op thread count. ``null`` => auto = physical_cores // workers,
+# computed at launch from the host architecture (see src/utils/compute_setup.py).
+#
+# Sizing guide (this sweep is 16 jobs of ~120 k episodes each; each job is
+# ~4–6 GB resident at peak, dominated by opponent-obs queues + gradients):
+#
+#   Azure VM       physical / logical / RAM   recommended parallel_workers
+#   --------       ------------------------   ----------------------------
+#   D8ds_v5        4  /  8 / 32 GB            2   (auto threads = 2)
+#   D16ds_v5       8  / 16 / 64 GB            4   (auto threads = 2; default)
+#   D32ds_v5       16 / 32 /128 GB            8   (auto threads = 2)
+#   D64ds_v5       32 / 64 /256 GB           16   (auto threads = 2 — all 16 jobs in parallel)
+#
+# The small-MLP BLAS throughput in this project plateaus at ≤ 4 threads, so
+# the right policy is "more workers, fewer threads each" up to the physical-
+# core count. Going past one-worker-per-physical-core hurts (BLAS over-
+# subscription); going past ~6 GB-per-worker hurts (RAM pressure).
+#
+# For a 16-job sweep on D64 (or larger) you can fit every job in parallel
+# (parallel_workers: 16) and finish in roughly the wall time of a single
+# training run.
+threads_per_worker: null
+
+variants:
+  # --- 1. Lower LRF — what the EU ETS used to do (pre-Fit-for-55, ~2.2 %). ---
+  - name: lrf_low
+    overrides:
+      ets.lrf_phase1: 0.022
+      ets.lrf_phase2: 0.022
+
+  # --- 2. Higher LRF — a plausible aggressive future trajectory (~6 %). -----
+  - name: lrf_high
+    overrides:
+      ets.lrf_phase1: 0.060
+      ets.lrf_phase2: 0.063
+
+  # --- 3. No market-stability mechanism at all. ------------------------------
+  # Both the MSR and the unsold-to-MSR rerouting are switched off, so the
+  # cap trajectory is the *only* supply-side stabiliser left.
+  - name: no_msr
+    overrides:
+      ets.msr.enabled: false
+      ets.unsold_to_msr: false
+
+  # --- 4. All learning agents are pure financial (no ESG signal). -----------
+  - name: all_fin
+    overrides:
+      companies.reward_weights:
+        - [1.0, 0.0]   # A1
+        - [1.0, 0.0]   # A2
+        - [1.0, 0.0]   # A3
+        - [1.0, 0.0]   # A4
+        - [1.0, 0.0]   # A5
+        - [1.0, 0.0]   # A6
+        - [1.0, 0.0]   # A7
+        - [1.0, 0.0]   # A8
+
+  # --- 5. Identical starting conditions; only ESG vs. financial differs. ----
+  # All 8 agents use the same mid-archetype (A3-style 50 %-green) initial
+  # mix and identical budgets / capex throughput / debt headrooms (means of
+  # the default arrays). Reward weights are split 4 financial / 4 balanced
+  # ESG so the sole experimental axis is preference, not endowment.
+  - name: balanced
+    overrides:
+      companies.initial_mix:
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A1
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A2
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A3
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A4
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A5
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A6
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A7
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A8
+      companies.reward_weights:
+        - [1.0, 0.0]   # A1: financial
+        - [1.0, 0.0]   # A2: financial
+        - [1.0, 0.0]   # A3: financial
+        - [1.0, 0.0]   # A4: financial
+        - [0.5, 0.5]   # A5: balanced ESG
+        - [0.5, 0.5]   # A6: balanced ESG
+        - [0.5, 0.5]   # A7: balanced ESG
+        - [0.5, 0.5]   # A8: balanced ESG
+      companies.annual_budgets: [820.0, 820.0, 820.0, 820.0, 820.0, 820.0, 820.0, 820.0]   # mean of default annual_budgets
+      companies.capex_throughputs: [135.0, 135.0, 135.0, 135.0, 135.0, 135.0, 135.0, 135.0]   # mean of default capex_throughputs
+      companies.debt_headrooms: [108.75, 108.75, 108.75, 108.75, 108.75, 108.75, 108.75, 108.75]   # mean of default debt_headrooms
+
+  # --- 6. High inflation drift + high variance (single-seed cell). ----------
+  # Default penalty.inflation_rate=0.020, inflation_random_std=0.015. Triple
+  # the drift and roughly triple the std to stress the inflation-aware MA3
+  # budget gate and the real-anchor ESG flow term.
+  - name: high_inf
+    overrides:
+      penalty.inflation_rate: 0.040
+      penalty.inflation_random_std: 0.02
+    seeds: [1729]

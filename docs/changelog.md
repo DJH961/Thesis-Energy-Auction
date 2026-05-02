@@ -5,6 +5,46 @@ Version numbers reflect the `version` field in `pyproject.toml`
 
 ---
 
+## [8.6.4]
+
+**Lossless end-of-training compression + parquet log cache.** Logs and
+checkpoints now shrink ~5–10× on disk without changing a single value
+beyond the documented float64→float32 / int64→int32 downcast in the
+parquet writer.
+
+* `src/utils/run_data.py` — persistent parquet cache for training/year
+  logs. Streaming CSV→parquet build (chunked at 250k rows so memory
+  stays bounded even on 5+ GB year-logs), zstd compression,
+  `(size, mtime_ns)` cache key, atomic `tmp`→`rename` build. Notebooks
+  use `load_run_csv` / `glob_run_logs`; both transparently fall back to
+  the parquet sibling once the CSV is deleted.
+* `scripts/train.py` — clean end-of-`train_one_seed` now calls
+  `compress_logs(...)` and `compress_checkpoints(...)`. Logs become
+  zstd parquet (row-count verified before CSV deletion); the
+  `checkpoints_<tag>_s<seed>/` directory becomes a single
+  `checkpoints_<tag>_s<seed>.tar.xz` (stdlib LZMA, no new deps). Knobs:
+  `logging.compress_on_finish.{logs, checkpoints, delete_csv,
+  delete_checkpoint_dir}`, all default `true`.
+* `scripts/compress_results.py` — one-shot migration script that walks
+  an existing results tree and applies the same compression to every
+  log + checkpoint dir. Idempotent; supports `--dry-run`,
+  `--keep-source`, `--logs-only`, `--checkpoints-only`.
+* `decompress_checkpoints(archive)` — symmetric helper that extracts a
+  checkpoints `.tar.xz` back to a directory of `.pt` files. Equivalent
+  to `tar -xJf checkpoints_<tag>_s<seed>.tar.xz`.
+* All 6 notebooks that read training/year logs migrated to the new
+  loader (15 `pd.read_csv` → `load_run_csv`, 6 `glob.glob('…*.csv')` →
+  `glob_run_logs`).
+* `configs/sweeps/thesis_experiments.yaml` — 16-job thesis sweep
+  (5 structural variants × 3 seeds + 1 high-inflation cell on seed
+  1729).
+
+Disk-footprint impact (per seed): ~5 GB year-log → ~0.5–1 GB parquet;
+~2.5 GB checkpoint dir → ~0.5–1.5 GB tar.xz. A 4-seed sweep drops from
+~22 GB to ~3–5 GB on disk.
+
+---
+
 ## [8.6.3]
 
 **Seed stability — environment stochasticity is now invariant to agent
