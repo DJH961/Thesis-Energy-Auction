@@ -1,0 +1,71 @@
+# =============================================================================
+# Thesis experiment sweep — PART 1 of 2 (8 jobs)
+# =============================================================================
+# Half of the 16-job thesis sweep, sized for one D16ds_v5 (8 physical cores)
+# running ``parallel_workers: 8, threads_per_worker: 1``. Combined with
+# ``thesis_experiments_part2.yaml`` on a second D16ds_v5, the full 16-job
+# sweep finishes in roughly the wall time of a single training run.
+#
+# Jobs in this part (8 total)
+# ---------------------------
+#   lrf_low      — seeds [1729, 8191, 6561]   (3)
+#   lrf_high     — seeds [1729, 8191, 6561]   (3)
+#   no_msr       — seed  [1729]               (1)   ← part 2 runs the other 2 seeds
+#   high_inf     — seed  [1729]               (1)
+#
+# Rationale
+# ---------
+# * The LRF pair (lrf_low / lrf_high) is the cap-trajectory axis and stays
+#   whole on one machine for direct comparison.
+# * Both single-seed cells (high_inf and no_msr's first seed) are pinned to
+#   1729 here, so the paired comparison high_inf vs default/s1729 lives on
+#   one box.
+# * Output dir is shared with part 2 so the two halves' CSVs / checkpoints
+#   land in the same `results/sweeps/thesis_experiments/<variant>/` tree
+#   when copied back — the analysis notebooks see one logical sweep.
+#
+# Run with:
+#     python scripts/sweep.py --spec configs/sweeps/thesis_experiments_part1.yaml
+# =============================================================================
+
+base_config: configs/default.yaml
+output_dir: results/sweeps/thesis_experiments
+
+# Default seeds for variants that don't override (lrf_low, lrf_high here).
+seeds: [1729, 8191, 6561]
+
+parallel_workers: 8
+# One thread per worker: 8 workers × 1 thread = 8 cores, exactly matches
+# the physical core count of D16ds_v5. Avoids BLAS over-subscription.
+threads_per_worker: 1
+
+variants:
+  # --- 1. Lower LRF — what the EU ETS used to do (pre-Fit-for-55, ~2.2 %). ---
+  - name: lrf_low
+    overrides:
+      ets.lrf_phase2: 0.022
+
+  # --- 2. Higher LRF — a plausible aggressive future trajectory (~6 %). -----
+  - name: lrf_high
+    overrides:
+      ets.lrf_phase2: 0.063
+
+  # --- 3a. No market-stability mechanism — first seed only on this VM. ------
+  # MSR + unsold-to-MSR rerouting both off; cap trajectory is the only
+  # supply-side stabiliser left. The other two seeds (8191, 6561) run in
+  # part 2 so the full 3-seed set is recoverable by combining results.
+  - name: no_msr
+    overrides:
+      ets.msr.enabled: false
+      ets.unsold_to_msr: false
+    seeds: [1729]
+
+  # --- 6. High inflation drift + variance (single-seed cell). ---------------
+  # Default penalty.inflation_rate=0.020, inflation_random_std=0.015. Triple
+  # the drift and roughly triple the std to stress the inflation-aware MA3
+  # budget gate and the real-anchor ESG flow term.
+  - name: high_inf
+    overrides:
+      penalty.inflation_rate: 0.040
+      penalty.inflation_random_std: 0.02
+    seeds: [1729]

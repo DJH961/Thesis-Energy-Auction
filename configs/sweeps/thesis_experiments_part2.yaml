@@ -1,0 +1,85 @@
+# =============================================================================
+# Thesis experiment sweep — PART 2 of 2 (8 jobs)
+# =============================================================================
+# Half of the 16-job thesis sweep, sized for one D16ds_v5 (8 physical cores)
+# running ``parallel_workers: 8, threads_per_worker: 1``. Pair with
+# ``thesis_experiments_part1.yaml`` on a second D16ds_v5 to run the full
+# 16-job sweep in roughly the wall time of a single training run.
+#
+# Jobs in this part (8 total)
+# ---------------------------
+#   no_msr       — seeds [8191, 6561]         (2)   ← part 1 runs seed 1729
+#   all_fin      — seeds [1729, 8191, 6561]   (3)
+#   balanced     — seeds [1729, 8191, 6561]   (3)
+#
+# Rationale
+# ---------
+# * The reward-side variants (all_fin, balanced) are kept whole on one
+#   machine — they share the same default cap trajectory and only differ
+#   in agent preferences/endowments, so co-locating their seeds simplifies
+#   pairwise analysis.
+# * The remaining two no_msr seeds live here; combined with part 1's
+#   no_msr[1729] this gives the full 3-seed no_msr cell after both VMs
+#   finish.
+# * Output dir is shared with part 1 so the two halves' CSVs / checkpoints
+#   land in the same `results/sweeps/thesis_experiments/<variant>/` tree
+#   when copied back — the analysis notebooks see one logical sweep.
+#
+# Run with:
+#     python scripts/sweep.py --spec configs/sweeps/thesis_experiments_part2.yaml
+# =============================================================================
+
+base_config: configs/default.yaml
+output_dir: results/sweeps/thesis_experiments
+
+# Default seeds for variants that don't override (all_fin, balanced).
+seeds: [1729, 8191, 6561]
+
+parallel_workers: 8
+# One thread per worker: 8 workers × 1 thread = 8 cores, exactly matches
+# the physical core count of D16ds_v5. Avoids BLAS over-subscription.
+threads_per_worker: 1
+
+variants:
+  # --- 3b. No market-stability mechanism — remaining two seeds. -------------
+  # Seed 1729 is run by part 1; the 8191 and 6561 seeds run here. Combining
+  # both parts' outputs reconstructs the full 3-seed no_msr cell.
+  - name: no_msr
+    overrides:
+      ets.msr.enabled: false
+      ets.unsold_to_msr: false
+    seeds: [8191, 6561]
+
+  # --- 4. All learning agents are pure financial (no ESG signal). -----------
+  - name: all_fin
+    overrides:
+      companies.reward_weights:
+        - [1.0, 0.0]   # A1
+        - [1.0, 0.0]   # A2
+        - [1.0, 0.0]   # A3
+        - [1.0, 0.0]   # A4
+        - [1.0, 0.0]   # A5
+        - [1.0, 0.0]   # A6
+        - [1.0, 0.0]   # A7
+        - [1.0, 0.0]   # A8
+
+  # --- 5. Identical starting conditions; only ESG vs. financial differs. ----
+  # All 8 agents use the same mid-archetype (A3-style 50 %-green) initial
+  # mix and identical budgets / capex throughput / debt headrooms (means of
+  # the default arrays). Reward weights are split 4 financial / 4 balanced
+  # ESG so the sole experimental axis is preference, not endowment.
+  - name: balanced
+    overrides:
+      companies.initial_mix:
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A1
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A2
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A3
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A4
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A5
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A6
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A7
+        - [0.15, 0.35, 0.25, 0.15, 0.10]   # A8
+
+      companies.annual_budgets: [820.0, 820.0, 820.0, 820.0, 820.0, 820.0, 820.0, 820.0]   # mean of default annual_budgets
+      companies.capex_throughputs: [135.0, 135.0, 135.0, 135.0, 135.0, 135.0, 135.0, 135.0]   # mean of default capex_throughputs
+      companies.debt_headrooms: [108.75, 108.75, 108.75, 108.75, 108.75, 108.75, 108.75, 108.75]   # mean of default debt_headrooms
