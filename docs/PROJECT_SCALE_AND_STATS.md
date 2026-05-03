@@ -2,7 +2,9 @@
 
 A presentation-ready snapshot of the size, depth, and complexity of the
 **ETS MARL** thesis codebase: a multi-agent reinforcement-learning
-simulation of the EU Emissions Trading System (v8.6.0).
+simulation of the EU Emissions Trading System. The current release
+version is the `version` field in `pyproject.toml` and
+`configs/default.yaml`.
 
 > Numbers are measured directly from the repository. **The `archive/`
 > directory (legacy code from prior versions) is excluded from every
@@ -15,15 +17,12 @@ simulation of the EU Emissions Trading System (v8.6.0).
 
 | | |
 |---|---:|
-| **Tracked source/config/test/doc files** (excl. `archive/`, notebooks, lockfile) | **79** |
-| **Lines of authored content** (Python + YAML + Markdown + Toml + Txt, excl. `archive/`) | **32,599** |
-| **Python files** (current code) | **56** |
-| **Python LOC** (current code) | **25,425** |
-| **Python LOC in `src/`** (production simulation + agents) | **10,596** |
-| **Python LOC in `tests/`** | **10,440** |
-| **Python LOC in `scripts/`** (training, evaluation, sweep launcher) | **4,389** |
-| **Markdown documentation** | **5,943 lines** across 13 files |
-| **YAML config files** | **8** total — 1,204 lines (3 root + 2 scenarios + 3 sweep specs) |
+| **Python files** (current code) | **65** |
+| **Python LOC in `src/`** (production simulation + agents) | **12,640** |
+| **Python LOC in `tests/`** | **12,044** |
+| **Python LOC in `scripts/`** (training, evaluation, sweep launcher) | **5,496** |
+| **Markdown documentation** | **5,734 lines** across 11 files |
+| **YAML config files** | **14** total — 1,924 lines (root + scenarios + sweep specs) |
 | **TODO / FIXME / HACK comments** | **0** ✨ |
 
 ---
@@ -34,11 +33,11 @@ simulation of the EU Emissions Trading System (v8.6.0).
 
 | | |
 |---|---:|
-| Lines of code | **3,509** |
-| Top contender (`scripts/train.py`) | 3,109 LOC |
+| Lines of code | **3,648** |
+| Top contender (`scripts/train.py`) | 3,340 LOC |
 | Third place (`src/agents/ppo_agent.py`) | 1,586 LOC |
 
-Together, the **top three files alone are 8,204 lines** of simulation
+Together, the **top three files alone are ~8,500 lines** of simulation
 and learning logic.
 
 ---
@@ -48,26 +47,21 @@ and learning logic.
 | Metric | Count |
 |---|---:|
 | Sub-packages | 5 (`agents`, `auction`, `environment`, `analysis`, `utils`) |
-| Classes | **17** |
-| Top-level functions | **54** |
-| Methods | **167** |
-| **Total callables in `src/`** | **238** |
-| Distinct top-level imported packages | **22** |
+| Largest file | `src/environment/ets_environment.py` (3,648 LOC) |
 
 ### Largest production files
 
 | File | LOC |
 |---|---:|
-| `src/environment/ets_environment.py` | 3,509 |
+| `src/environment/ets_environment.py` | 3,648 |
 | `src/agents/ppo_agent.py` | 1,586 |
 | `src/environment/company.py` | 1,131 |
-| `src/environment/cap_schedule.py` | 586 |
-| `src/train_qlearning.py` | 519 |
-| `src/analysis/qlearning_analysis.py` | 454 |
-| `src/agents/q_learning_agent.py` | 440 |
-| `src/agents/heuristic_policy.py` | 407 |
-| `src/auction/market_clearing_ets.py` | 352 |
-| `src/utils/sweep.py` | 349 |
+| `src/environment/cap_schedule.py` | ~590 |
+| `src/train_qlearning.py` | ~520 |
+| `src/agents/q_learning_agent.py` | ~440 |
+| `src/agents/heuristic_policy.py` | ~410 |
+| `src/auction/market_clearing_ets.py` | ~350 |
+| `src/utils/sweep.py` | ~350 |
 
 ---
 
@@ -75,17 +69,16 @@ and learning logic.
 
 | | |
 |---|---:|
-| Test files | **28** |
-| Test functions | **300** |
-| Assertion calls | **790** |
-| Total test LOC | **10,440** |
-| Test-to-production LOC ratio | **0.99 : 1** |
+| Test files | **31** |
+| Test functions | **344** |
+| Total test LOC | **12,044** |
+| Test-to-production LOC ratio | **~0.95 : 1** |
 
 Test files cover *every* major active subsystem: market clearing, cap
 schedule, PPO numerics (incl. dual-clip), HAPPO updates, bid-change
 limits, banking signal, green finance, opponent modelling, MAC curve
-calibration, preflight validation, behavioural rewards, and end-to-end
-smoke runs.
+calibration, preflight validation, behavioural rewards, run-data
+loader / compression, sweep launcher, and end-to-end smoke runs.
 
 ---
 
@@ -103,7 +96,7 @@ A single training run with the **default config** (`configs/default.yaml`):
 | Observation dim, phase 1 (8 agents) | **44 + 7×7 = 93** |
 | Observation dim, phase 2 (8 agents) | **93 + 12 = 105** |
 
-### Derived "crazy" figures per training run
+### Derived figures per training run
 
 | | |
 |---|---:|
@@ -113,8 +106,8 @@ A single training run with the **default config** (`configs/default.yaml`):
 | Secondary-market clearings | another **1,440,000** double-auction rounds |
 | Compliance checks | 120,000 × 12 × 8 = **11,520,000** |
 
-A single training run therefore makes **23 million policy decisions**
-inside **2.88 million market clearings**.
+A single training run therefore makes **~23 million policy decisions**
+inside **~2.88 million market clearings**.
 
 ---
 
@@ -124,17 +117,16 @@ inside **2.88 million market clearings**.
 
 | | |
 |---|---:|
-| Lines | **576** |
+| Lines | **~590** |
 | Top-level subsystems present | **38** |
-| **Active subsystems** (after stripping `enabled: false` blocks) | **31** |
-| Tunable parameters (`key: value` lines) | **331** |
+| Tunable parameters | **several hundred** |
 
-The 31 active subsystems include the ETS cap schedule, MSR, MAC curve,
+Active subsystems include the ETS cap schedule, MSR, MAC curve,
 auction & secondary-market mechanics, HAPPO/PPO learner, ESG signal,
 opponent modelling, urgency scalars, banking signal, warm-start
 burn-in, HPP (Historical Policy Pool), exploration schedule,
-construction jitter, and reward shaping — each with its own parameter
-block.
+construction jitter, joint budget gate, emergency loans, treasury
+reserve, and reward shaping — each with its own parameter block.
 
 ---
 
@@ -209,47 +201,26 @@ Implemented from scratch in PyTorch:
 
 ### Notebooks (authored content only — no execution outputs counted)
 
-The two notebooks that constitute the actual experimental record:
+The eight active analysis notebooks under `notebooks/`. Two
+representative ones:
 
-| Notebook | Cells | Code cells | Code lines | Markdown lines | Source-only size |
-|---|---:|---:|---:|---:|---:|
-| `ets_marl - Full Run & Analysis.ipynb` | 63 | 32 | **2,588** | 174 | 141 KB |
-| `ets_marl - Q-Learning Baseline.ipynb` | 37 | 24 | **476** | 35 | 25 KB |
-| **Total** | **100** | **56** | **3,064** | **209** | **166 KB** |
+| Notebook | Cells | Code cells | Code lines | Markdown lines |
+|---|---:|---:|---:|---:|
+| `ets_marl - Full Run & Analysis.ipynb` | 55 | 28 | **1,764** | 175 |
+| `ets_marl - Q-Learning Baseline.ipynb` | 56 | 36 | **1,121** | 85 |
 
-### Versions / releases
+The remaining notebooks cover sweep analysis, default-config RQ
+analysis, the cross-config thesis experiments, the data-science
+methodology, episode-level deep dives, and a heuristic-bots-only
+baseline.
 
-The `docs/changelog.md` documents the recent **v8.x line in detail —
-17 versions** (v8.1.0 → v8.6.0) across **2,703 lines** of release
-notes.
-
-But the changelog only captures the latest major series. Counting the
-naming evidence elsewhere in the repo, the project has been through
-**roughly 30+ release iterations**:
-
-- **10 major version generations** visible as branches:
-  `second_version`, `third-version`, `version_four`, `fifth_version`,
-  `Version_six`, `Version_seven`, `Version_eight`, `Version_nine`,
-  `Version_ten` (and the v1 baseline).
-- **1 git tag** preserving an older release: `v7.2`.
-- **11 HAPPO experiment branches** (`HAPPO_1` … `HAPPO_8`,
-  `HAPPO_BEST`, `HAPPO_LSTM`, `HAPPO_compliant`) representing
-  algorithm-level iterations.
-- **17 documented sub-versions** within v8.x (the changelog).
-- **3 superseded codebases** preserved under `archive/legacy/`
-  (`ets_marl_happo_auction`, `ets_marl_legacy_ppo`,
-  `ets_marl_legacy_test`) — evidence of three prior full rewrites.
-
-So the **conservative best estimate is ≥ 30 development iterations
-shipped to a "release" branch**, on top of countless feature branches.
-
-### Other footprint metrics
+### Engineering footprint
 
 | | |
 |---|---:|
-| Direct dependencies (`requirements.txt`) | 8 (numpy, pandas, torch, gymnasium, matplotlib, seaborn, pytest, pyyaml) |
-| Total transitive packages locked in `uv.lock` | **48** |
-| Documentation pages | 13 in `docs/`: BUGS_AND_ISSUES, changelog (**2,703 lines**), changes_v83_to_v85, design, esg_reward_design, **PROJECT_SCALE_AND_STATS**, **data_dictionary**, **action_space**, **config_dictionary**, **reward_function**, plus repo-root README and CLAUDE |
+| Direct dependencies (`requirements.txt`) | numpy, pandas, torch, gymnasium, matplotlib, seaborn, pytest, pyyaml, pyarrow, zstandard |
+| Total transitive packages locked in `uv.lock` | ~50 |
+| Documentation pages | 11 in `docs/` (changelog, design, esg_reward_design, PROJECT_SCALE_AND_STATS, data_dictionary, action_space, config_dictionary, reward_function, research_questions, run_data_cache, data_science_analysis), plus repo-root README and CLAUDE |
 
 ---
 

@@ -1,7 +1,7 @@
 # ETS MARL — Configuration Dictionary
 
-`configs/default.yaml` exposes **38 top-level subsystems** and **~330
-tunable parameters** in 576 lines. This document is a one-stop
+`configs/default.yaml` exposes **38 top-level subsystems** and several
+hundred tunable parameters in ~590 lines. This document is a one-stop
 reference: each subsystem gets a one-line purpose plus the handful of
 knobs that materially change behaviour. For the full parameter list
 read the YAML directly — it is heavily commented.
@@ -24,7 +24,7 @@ read the YAML directly — it is heavily commented.
 
 ## `simulation` — episode shape
 
-`n_years=12`, `n_episodes=120000`, `seeds=[42, 123, 456]`. A
+`n_years=12`, `n_episodes=120000`, `seeds=[1729, 8191, 6561, 5041]`. A
 12-year episode mirrors EU-ETS Phase 4 (2025 → 2036).
 
 ## `technologies` — 5 generation techs
