@@ -97,6 +97,9 @@ __all__ = [
     "decompress_checkpoints",
     "checkpoint_archive_suffixes",
     "resolve_checkpoint_codec",
+    "default_ep_columns",
+    "default_yr_columns",
+    "default_analysis_columns",
 ]
 
 _log = logging.getLogger(__name__)
@@ -344,6 +347,212 @@ def _build_parquet(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Canonical analysis-column projection
+# ---------------------------------------------------------------------------
+#
+# The year_log is the dominant memory cost in sweep-loading notebooks: each
+# run holds n_episodes × n_years rows × ~270–414 columns. A 16-cell sweep
+# loaded in full pegs ~30 GB even after float32 downcast. Almost no notebook
+# cell actually reads more than a few dozen of those columns; the rest is
+# diagnostic detail produced by the trainer for offline forensics.
+#
+# These helpers return the canonical superset of columns the analysis
+# notebooks consume. Passed through ``columns=`` to :func:`load_run_csv`,
+# they push the filter into the parquet reader so unused columns are never
+# decompressed — typical reduction is 5–10× on the year_log.
+#
+# Unknown column names are silently dropped by ``load_run_csv``, so it is
+# safe to ask for a superset across runs whose schemas have diverged.
+
+# Per-episode (training_log) scalar columns referenced by the analysis
+# notebooks. Add new entries here, not in individual notebooks.
+_EP_SCALAR_COLUMNS: tuple[str, ...] = (
+    "episode",
+    "clearing_price_last",
+    "cap_last",
+    "entropy_coef",
+    "shaping_weight",
+    "epsilon",
+    "ep_mean_clearing_price",
+    "ep_default_count",
+    "quality_score",
+    "Q_compliance",
+    "Q_price_realism",
+    "Q_saved_carbon",
+    "Q_cost_eff",
+    "Q_volatility",
+    "secondary_volume",
+    "secondary_avg_price",
+    "secondary_match_rate",
+    "secondary_price",
+    "price_start",
+    "price_peak",
+    "price_std",
+    "warn_priceFloor",
+    "warn_priceCeil",
+    "warn_noInvest",
+    "warn_debtSpiral",
+    "warn_overBank",
+    "warn_auctFail",
+    "year0_tnac",
+    "yearT_tnac",
+    "ep_total_unsold",
+    "ep_auction_failures",
+    "ep_total_defaults",
+)
+
+# Per-agent prefixes in the training_log: column name is f"{prefix}_A{i}".
+_EP_AGENT_PREFIXES: tuple[str, ...] = (
+    "reward",
+    "reward_base",
+    "reward_shaping",
+    "green_frac",
+    "delta_green",
+    "penalty",
+    "shortfall",
+    "bid_price",
+    "sec_buy_vol",
+    "sec_sell_vol",
+    "sec_buy_years",
+    "sec_sell_years",
+    "avg_sec_qty",
+    "avg_bid_mult",
+    "avg_bid_coverage",
+    "sec_buy_intent_share",
+    "sec_sell_intent_share",
+    "inv_onshore_share",
+    "inv_offshore_share",
+    "inv_solar_share",
+    "udbc_U_total",
+    "udbc_D_total",
+    "udbc_M_total",
+    "udbc_B_total",
+    "udbc_C_total",
+    "ep_start_bank",
+    "mean_alloc",
+    "invest_cost",
+    "total_mac_reduction",
+    "esg_vs_penalty_ratio",
+    "compliance_gate",
+    "peak_loan_outstanding",
+    "peak_carry_forward",
+    "final_treasury_reserve",
+    "actor_loss",
+    "critic_loss",
+)
+
+# Per-(episode, year) (year_log) scalar columns referenced by the analysis
+# notebooks.
+_YR_SCALAR_COLUMNS: tuple[str, ...] = (
+    "episode",
+    "year",
+    "cap",
+    "auction_volume",
+    "tnac",
+    "clearing_price",
+    "secondary_price",
+    "msr_reserve",
+    "msr_total_cancelled",
+    "msr_withhold_this_year",
+    "msr_release_this_year",
+    "inflation_rate",
+    "inflation_factor",
+    "auction_total_demand",
+    "auction_unsold",
+    "auction_hhi",
+    "auction_max_agent_share",
+    "auction_failed",
+    "auction_defaults",
+    "auction_defaulted_volume",
+    "effective_reserve_price",
+    "secondary_n_buyers_intent",
+    "secondary_n_sellers_intent",
+    "secondary_n_buyers_executed",
+    "secondary_n_sellers_executed",
+    "fundamental_anchor",
+)
+
+# Per-agent prefixes in the year_log: column name is f"{prefix}_A{i}".
+_YR_AGENT_PREFIXES: tuple[str, ...] = (
+    "bank_start",
+    "bank_end",
+    "alloc",
+    "emissions",
+    "trade_qty",
+    "trade_cost",
+    "green_frac",
+    "delta_green",
+    "shortfall",
+    "penalty",
+    "reward",
+    "reward_base",
+    "reward_shaping",
+    "holdings",
+    "invest_cost",
+    "collateral_cost",
+    "bid_price",
+    "auction_cost",
+    "secondary_net",
+    "compliance_surplus",
+    "mac_reduction",
+    "mac_cost",
+    "sec_qty_action",
+    "sec_action_side",
+    "bid_qty_mult",
+    "estimate_need",
+    "bid_coverage",
+    "invest_frac_pre_clip",
+    "invest_frac_post_clip",
+    "available_budget",
+    "compliance_share_of_available",
+    "carry_forward_start",
+    "carry_forward_end",
+    "coverage_gap",
+    "effective_penalty_rate",
+    "treasury_reserve",
+    "treasury_drawn",
+    "loan_outstanding",
+)
+
+
+def _expand_with_agents(
+    scalars: Sequence[str], prefixes: Sequence[str], n_max_agents: int
+) -> list[str]:
+    out = list(scalars)
+    for i in range(1, n_max_agents + 1):
+        out.extend(f"{p}_A{i}" for p in prefixes)
+    # Preserve order, drop duplicates.
+    return list(dict.fromkeys(out))
+
+
+def default_ep_columns(n_max_agents: int = 16) -> list[str]:
+    """Canonical training_log column projection for analysis notebooks.
+
+    Returns scalar episode-level columns plus ``<prefix>_A{i}`` for each
+    per-agent prefix and ``i in 1..n_max_agents``. ``n_max_agents`` is a
+    superset bound — the trainer logs only the agents that exist in the
+    config and ``load_run_csv`` silently drops unknown column names, so
+    asking for ``A1..A16`` works fine for an 8-agent run.
+    """
+    return _expand_with_agents(_EP_SCALAR_COLUMNS, _EP_AGENT_PREFIXES, n_max_agents)
+
+
+def default_yr_columns(n_max_agents: int = 16) -> list[str]:
+    """Canonical year_log column projection for analysis notebooks.
+
+    See :func:`default_ep_columns`. The year_log is the dominant memory
+    cost in full-sweep loads; the projection returned here typically cuts
+    in-RAM size by 5–10×.
+    """
+    return _expand_with_agents(_YR_SCALAR_COLUMNS, _YR_AGENT_PREFIXES, n_max_agents)
+
+
+def default_analysis_columns(n_max_agents: int = 16) -> tuple[list[str], list[str]]:
+    """Convenience: return ``(ep_columns, yr_columns)`` together."""
+    return default_ep_columns(n_max_agents), default_yr_columns(n_max_agents)
+
+
 def load_run_csv(
     csv_path: str | os.PathLike | None,
     *,
@@ -351,6 +560,8 @@ def load_run_csv(
     chunksize: int = _DEFAULT_CHUNKSIZE,
     compression: str = "zstd",
     rebuild: bool = False,
+    tail_episodes: int | None = None,
+    episode_column: str = "episode",
 ) -> pd.DataFrame | None:
     """Load one training-log / year-log CSV via a persistent parquet cache.
 
@@ -371,6 +582,17 @@ def load_run_csv(
         for these logs).
     rebuild
         Force rebuilding the parquet even if the cache key matches.
+    tail_episodes
+        If set, only rows with ``episode_column >= max(episode_column) -
+        tail_episodes + 1`` are returned. Implemented as a parquet
+        row-filter so only the relevant row groups are decompressed —
+        loading 16+ runs of a 100k-episode sweep otherwise blows out
+        notebook RAM. Use for analyses that only consume the converged
+        tail.
+    episode_column
+        Column name used by ``tail_episodes`` to identify episodes.
+        Defaults to ``"episode"`` (matches both the training_log and
+        year_log schemas).
 
     Returns
     -------
@@ -424,12 +646,13 @@ def load_run_csv(
                     compression=compression,
                 )
 
+    _, pq = _require_pyarrow()
+
     cols = list(columns) if columns is not None else None
     if cols is not None:
         # Filter to columns that actually exist; silently drop unknowns so
         # notebooks can ask for a superset across heterogeneous schemas
         # (e.g. older runs that pre-date a new diagnostic column).
-        _, pq = _require_pyarrow()
         available = set(pq.read_schema(parquet_path).names)
         cols = [c for c in cols if c in available]
         if not cols:
@@ -437,9 +660,41 @@ def load_run_csv(
             # empty frame rather than crashing pyarrow.
             return pd.DataFrame()
 
-    _, pq = _require_pyarrow()
-    table = pq.read_table(parquet_path, columns=cols)
-    return table.to_pandas()
+    # Tail-episode filter. We need the episode column even if the caller
+    # didn't ask for it, so we can compute the cutoff. After filtering we
+    # drop it again to keep the projection contract.
+    pq_filters = None
+    cutoff: int | None = None
+    drop_episode_after_filter = False
+    if tail_episodes is not None and tail_episodes > 0:
+        schema_names = set(pq.read_schema(parquet_path).names)
+        if episode_column not in schema_names:
+            # Tail filter requested but the file has no episode column —
+            # nothing to filter on. Return all rows rather than crashing.
+            _log.info(
+                "tail_episodes requested for %s but column %r not in schema; "
+                "ignoring filter",
+                csv_path, episode_column,
+            )
+        else:
+            ep_col_table = pq.read_table(parquet_path, columns=[episode_column])
+            ep_series = ep_col_table.column(episode_column)
+            if len(ep_series) == 0:
+                pass  # empty file — nothing to filter
+            else:
+                ep_max = ep_series.to_pandas().max()
+                if pd.notna(ep_max):
+                    cutoff = int(ep_max) - int(tail_episodes) + 1
+                    pq_filters = [(episode_column, ">=", cutoff)]
+                    if cols is not None and episode_column not in cols:
+                        cols = list(cols) + [episode_column]
+                        drop_episode_after_filter = True
+
+    table = pq.read_table(parquet_path, columns=cols, filters=pq_filters)
+    df = table.to_pandas()
+    if drop_episode_after_filter and episode_column in df.columns:
+        df = df.drop(columns=[episode_column])
+    return df
 
 
 def load_run(
@@ -450,18 +705,23 @@ def load_run(
     yr_columns: Sequence[str] | None = None,
     chunksize: int = _DEFAULT_CHUNKSIZE,
     rebuild: bool = False,
+    tail_episodes: int | None = None,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """Load the (training_log, year_log) pair for a single run.
 
     Convenience wrapper around :func:`load_run_csv` that mirrors the
     ``(ep_df, yr_df)`` tuple returned by the notebook helpers. Either path
     may be ``None`` to indicate that file is unavailable for this run.
+    ``tail_episodes`` is forwarded to both reads — see
+    :func:`load_run_csv`.
     """
     ep_df = load_run_csv(
-        training_log, columns=ep_columns, chunksize=chunksize, rebuild=rebuild
+        training_log, columns=ep_columns, chunksize=chunksize, rebuild=rebuild,
+        tail_episodes=tail_episodes,
     )
     yr_df = load_run_csv(
-        year_log, columns=yr_columns, chunksize=chunksize, rebuild=rebuild
+        year_log, columns=yr_columns, chunksize=chunksize, rebuild=rebuild,
+        tail_episodes=tail_episodes,
     )
     return ep_df, yr_df
 

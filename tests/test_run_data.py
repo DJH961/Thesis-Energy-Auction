@@ -13,6 +13,9 @@ import pytest
 from src.utils.run_data import (
     CacheEntry,
     cache_path_for,
+    default_analysis_columns,
+    default_ep_columns,
+    default_yr_columns,
     load_run,
     load_run_csv,
     rebuild_cache,
@@ -836,3 +839,166 @@ def test_run_data_module_imports_without_pyarrow(tmp_path):
         f"stdout={res.stdout!r} stderr={res.stderr!r}"
     )
     assert "imported" in res.stdout
+
+
+# ---------------------------------------------------------------------------
+# default_ep_columns / default_yr_columns — the analysis-projection helpers.
+# ---------------------------------------------------------------------------
+
+
+def test_default_columns_basic_membership():
+    ep = default_ep_columns()
+    yr = default_yr_columns()
+    # Episode-level scalars present in both training-log analyses.
+    assert "episode" in ep
+    assert "quality_score" in ep
+    assert "ep_mean_clearing_price" in ep
+    # Year-level scalars present in every sweep notebook.
+    assert "episode" in yr
+    assert "year" in yr
+    assert "clearing_price" in yr
+    assert "cap" in yr
+    assert "fundamental_anchor" in yr
+    # No duplicates — order-preserving uniqueness is the contract.
+    assert len(ep) == len(set(ep))
+    assert len(yr) == len(set(yr))
+
+
+def test_default_columns_per_agent_expansion():
+    yr = default_yr_columns(n_max_agents=8)
+    # Per-agent columns are produced for every prefix.
+    for i in range(1, 9):
+        assert f"reward_A{i}" in yr
+        assert f"bank_end_A{i}" in yr
+        assert f"emissions_A{i}" in yr
+    # n_max_agents bounds the expansion.
+    assert "reward_A9" not in yr
+    yr16 = default_yr_columns(n_max_agents=16)
+    assert "reward_A16" in yr16
+    assert "reward_A17" not in yr16
+
+
+def test_default_columns_projection_drops_unused(tmp_path):
+    # A year_log that mixes wanted, per-agent, and unused diagnostic columns.
+    df = pd.DataFrame(
+        {
+            "episode": [0, 0, 1, 1],
+            "year": [0, 1, 0, 1],
+            "clearing_price": [50.0, 51.0, 52.0, 53.0],
+            "reward_A1": [1.0, 2.0, 3.0, 4.0],
+            "reward_A8": [10.0, 20.0, 30.0, 40.0],
+            "obscure_diagnostic_col": [9, 9, 9, 9],
+            "another_unused": ["a", "b", "c", "d"],
+        }
+    )
+    csv = _write_csv(tmp_path, "year_log_proj_s1.csv", df)
+    out = load_run_csv(csv, columns=default_yr_columns(n_max_agents=8))
+    # Asked-for columns kept...
+    assert set(out.columns) >= {
+        "episode",
+        "year",
+        "clearing_price",
+        "reward_A1",
+        "reward_A8",
+    }
+    # ...and unwanted diagnostic columns are silently dropped.
+    assert "obscure_diagnostic_col" not in out.columns
+    assert "another_unused" not in out.columns
+    # Float64 was downcast to float32 by load_run_csv.
+    assert out["clearing_price"].dtype == np.float32
+
+
+def test_default_analysis_columns_returns_pair():
+    ep, yr = default_analysis_columns(8)
+    assert ep == default_ep_columns(8)
+    assert yr == default_yr_columns(8)
+
+
+# ---------------------------------------------------------------------------
+# tail_episodes — converged-tail row filter pushed into parquet.
+# ---------------------------------------------------------------------------
+
+
+def _write_year_log(tmp_path, n_episodes=100, n_years=12, name="year_log_tail_s1.csv"):
+    rows = []
+    for ep in range(n_episodes):
+        for yr in range(n_years):
+            rows.append({
+                "episode": ep,
+                "year": yr,
+                "cap": 1.0,
+                "clearing_price": 50.0 + ep * 0.1,
+                "reward_A1": float(ep),
+                "unused_diag": 999.0,
+            })
+    df = pd.DataFrame(rows)
+    return _write_csv(tmp_path, name, df), df
+
+
+def test_tail_episodes_filters_to_last_n(tmp_path):
+    csv, _ = _write_year_log(tmp_path, n_episodes=100, n_years=12)
+    full = load_run_csv(csv)
+    tail = load_run_csv(csv, tail_episodes=10)
+    assert len(full) == 100 * 12
+    assert len(tail) == 10 * 12
+    assert int(tail["episode"].min()) == 90
+    assert int(tail["episode"].max()) == 99
+
+
+def test_tail_episodes_combined_with_columns_drops_episode_when_unrequested(tmp_path):
+    # When the caller doesn't ask for the episode column, tail_episodes
+    # must not leak it into the result — the column is borrowed only for
+    # the row filter and must be removed afterwards.
+    csv, _ = _write_year_log(tmp_path, n_episodes=50, n_years=12)
+    out = load_run_csv(
+        csv, columns=["cap", "clearing_price"], tail_episodes=10
+    )
+    assert set(out.columns) == {"cap", "clearing_price"}
+    assert len(out) == 10 * 12
+
+
+def test_tail_episodes_keeps_episode_when_requested(tmp_path):
+    csv, _ = _write_year_log(tmp_path, n_episodes=50, n_years=12)
+    out = load_run_csv(
+        csv, columns=["episode", "cap"], tail_episodes=10
+    )
+    assert set(out.columns) == {"episode", "cap"}
+    assert int(out["episode"].min()) == 40
+
+
+def test_tail_episodes_larger_than_data_returns_all(tmp_path):
+    csv, _ = _write_year_log(tmp_path, n_episodes=20, n_years=12)
+    out = load_run_csv(csv, tail_episodes=10_000)
+    assert len(out) == 20 * 12
+
+
+def test_tail_episodes_zero_or_none_is_noop(tmp_path):
+    csv, _ = _write_year_log(tmp_path, n_episodes=20, n_years=12)
+    full = load_run_csv(csv)
+    assert len(load_run_csv(csv, tail_episodes=None)) == len(full)
+    assert len(load_run_csv(csv, tail_episodes=0)) == len(full)
+
+
+def test_tail_episodes_preserves_dtype_downcast(tmp_path):
+    csv, _ = _write_year_log(tmp_path, n_episodes=30, n_years=12)
+    out = load_run_csv(csv, tail_episodes=5)
+    assert out["cap"].dtype == np.float32
+    assert out["reward_A1"].dtype == np.float32
+
+
+def test_tail_episodes_missing_column_is_silent_passthrough(tmp_path, caplog):
+    # A schema with no 'episode' column (e.g. if a future log family lacks
+    # one). tail_episodes should log + return all rows rather than crash.
+    df = pd.DataFrame({"year": [0, 1, 2], "cap": [1.0, 2.0, 3.0]})
+    csv = _write_csv(tmp_path, "year_log_no_episode_s1.csv", df)
+    out = load_run_csv(csv, tail_episodes=5)
+    assert len(out) == 3
+
+
+def test_tail_episodes_on_empty_log(tmp_path):
+    df = pd.DataFrame({"episode": pd.Series(dtype="int64"),
+                       "year": pd.Series(dtype="int64"),
+                       "cap": pd.Series(dtype="float64")})
+    csv = _write_csv(tmp_path, "year_log_empty_s1.csv", df)
+    out = load_run_csv(csv, tail_episodes=10)
+    assert out.empty
