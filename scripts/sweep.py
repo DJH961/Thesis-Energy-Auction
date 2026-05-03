@@ -17,23 +17,22 @@ subprocess via ``ProcessPoolExecutor``. Each subprocess:
 
 The parent terminal only shows short, structured progress lines:
 
-    [sweep] [ETA total ≈ 9h30m] (rough first guess @ 0.40s/ep, 800,000 eps / 4 workers; refined by heartbeats once episodes start logging)
     [sweep] [START 1/17] reference s=1  → results/.../reference/run_reference_s1.log
-    [sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | und 2/12 | sec 60→78 (μ70, m41%) | comp 95% | green 31→44% | R̄ -1.8 | ETA 4h12m
-    [sweep] [ETA total ≈ 9h33m, elapsed 0h45m] (3/17 done, 4 running, 10 queued)
+    [sweep] [LIVE  reference s=1] Ep 200/100000 (0.2%) | px 75→142 (μ128) | und 2/12 | sec 60→78 (μ70, m41%) | comp 95% | green 31→44% | R̄ -1.8 | ETA 4h12m
+    [sweep] [ETA total ≈ 9h33m, elapsed 0h02m] (0/17 done, 4 running, 13 queued)
     [sweep] [DONE  1/17 OK ] reference s=1
 
-A "rough first guess" aggregate ETA is printed *immediately* after the
-plan summary — before any worker has forked — so the user gets a
-ballpark wall-time within seconds of launch instead of waiting through
-the (~5 min) setup phase plus the first heartbeat tick. It uses
-``--initial-sec-per-ep`` (default 0.4) as a per-episode prior and is
-replaced by data-driven heartbeat ETAs once episodes begin logging.
+Heartbeats poll *fast* (every ``first_interval`` seconds, default ~30s)
+until at least one running job has produced enough episode samples to
+compute a real-data ETA, then settle into the configured (longer)
+``--heartbeat-interval``. This means the user sees a data-driven ETA
+"as soon as possible" — typically within a couple of fast-tick cycles
+after the first episode is logged — instead of waiting the full
+``interval`` between the first and second heartbeats. There is no
+flat / prior-based guess printed before any episode has run, since
+that would lock in a value before the setup phase even completes.
 
-Heartbeats are printed every ``--heartbeat-interval`` seconds (default
-300s = 5 min). The very first tick fires early (~60s) so the user gets
-a quick confirmation things are running, then the loop settles into
-the configured interval. Each heartbeat parses the per-year CSV
+Each heartbeat parses the per-year CSV
 (``year_log_<variant>_s<seed>.csv``) to produce a single-line summary
 of the **last completed episode** — year-1 vs year-N (clearing price,
 secondary price, compliance, green share) plus that episode's
@@ -689,12 +688,20 @@ class _Heartbeat:
             self._thread.join(timeout=2.0)
 
     def _loop(self) -> None:
-        # Use a short ``first_interval`` for the very first tick so the user
-        # gets a quick "things are running" confirmation, then settle into
-        # the (longer) ``interval`` for subsequent heartbeats.
+        # Adaptive polling: tick fast (``first_interval``) until at least
+        # one running job has produced enough samples to compute an ETA,
+        # then settle into the configured ``interval``. This means the
+        # user sees a real-data ETA "as soon as possible" — typically
+        # within a couple of fast-tick cycles — instead of waiting the
+        # full ``interval`` for the second heartbeat.
         wait = self.first_interval
+        eta_ever_emitted = False
         while not self._stop.wait(wait):
-            wait = self.interval
+            # Stay in fast-poll mode until we've actually emitted a
+            # data-driven ETA at least once. After that, drop down to
+            # the configured (longer) ``interval`` so we don't spam the
+            # terminal during long-running steady-state phases.
+            wait = self.interval if eta_ever_emitted else self.first_interval
             with self._lock:
                 snapshot = [(key, dict(meta)) for key, meta in self._jobs.items()]
                 completed = self._completed_jobs
@@ -769,6 +776,8 @@ class _Heartbeat:
                             eta_running.append(remaining)
                             full_job_estimates.append(n_eps * sec_per_ep)
                             eta_str = f" | ETA {_format_eta(remaining)}"
+                            # Real-data ETA emitted — drop fast-poll mode.
+                            eta_ever_emitted = True
 
                 if line:
                     line = line + eta_str
@@ -858,20 +867,6 @@ def main() -> int:
         help="Suppress heartbeat lines (start/finish lines are always printed).",
     )
     parser.add_argument(
-        "--initial-sec-per-ep", type=float, default=0.4,
-        help=(
-            "Seed value (seconds per training episode, per worker) used for "
-            "the rough first-guess aggregate ETA banner that is printed "
-            "immediately after the plan summary — *before* the first "
-            "heartbeat fires, so you get a number within seconds of launch "
-            "instead of waiting for setup + first tick. The default (0.4) "
-            "matches recent empirical wall-times on this codebase; tune via "
-            "this flag if your hardware is faster/slower. The banner is "
-            "labelled 'rough first guess' and is replaced by data-driven "
-            "ETAs as soon as the heartbeat starts seeing episode progress."
-        ),
-    )
-    parser.add_argument(
         "--dry-run", action="store_true",
         help="Validate spec, write resolved variant YAMLs, print the job plan, and exit.",
     )
@@ -959,35 +954,6 @@ def main() -> int:
             ne = None
         _n_eps_cache[yaml_path] = ne
         return ne
-
-    # Rough first-guess ETA, printed *immediately* — before any subprocess
-    # has even forked — so the user sees a ballpark wall-time estimate
-    # within seconds of launch instead of waiting for setup (~5min) plus
-    # the first heartbeat tick (~1min). Uses ``--initial-sec-per-ep`` as
-    # the per-episode wall-time prior; the banner is replaced by
-    # data-driven heartbeats once episode progress is observable.
-    if not args.quiet and args.initial_sec_per_ep > 0 and n_jobs > 0:
-        total_eps = 0
-        unknown = 0
-        for _v, yaml_path, _seed, _r in jobs:
-            ne = _get_n_episodes(yaml_path)
-            if ne is None:
-                unknown += 1
-            else:
-                total_eps += ne
-        if total_eps > 0:
-            rough_wall = (total_eps * args.initial_sec_per_ep) / max(1, n_workers)
-            note = ""
-            if unknown:
-                note = f" — {unknown}/{n_jobs} jobs have unknown n_episodes"
-            print(
-                f"[sweep] [ETA total ≈ {_format_eta(rough_wall)}] "
-                f"(rough first guess @ {args.initial_sec_per_ep:.2f}s/ep, "
-                f"{total_eps:,} eps / {n_workers} worker{'s' if n_workers != 1 else ''}; "
-                f"refined by heartbeats once episodes start logging{note})",
-                file=sys.stderr,
-                flush=True,
-            )
 
     # Launch.
     heartbeat = None

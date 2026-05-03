@@ -80,3 +80,36 @@ class TestMainPrintsTimings:
         assert rc == 0
         out = capsys.readouterr().out
         assert "Total reclaimed" not in out
+
+    def test_prints_upfront_eta_when_logs_present(
+        self, cr_module, tmp_path, capsys, monkeypatch
+    ):
+        """An upfront ETA is printed before any item is processed."""
+        import csv as _csv
+
+        log_path = tmp_path / "training_log_s1.csv"
+        with open(log_path, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["episode", "reward"])
+            for i in range(500):
+                w.writerow([i, -1.0])
+
+        monkeypatch.setattr(sys, "argv", ["compress_results.py", str(tmp_path)])
+        rc = cr_module.main()
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Upfront ETA banner present; per-item ETA suffix on each LOG line.
+        assert "Estimated total time" in out
+        assert "ETA " in out  # either remaining or "0s (done)"
+
+    def test_pre_walked_size_in_scan_summary(
+        self, cr_module, tmp_path, capsys, monkeypatch
+    ):
+        """Scan summary lines now report total bytes per category."""
+        monkeypatch.setattr(sys, "argv", ["compress_results.py", str(tmp_path)])
+        rc = cr_module.main()
+        assert rc == 0
+        out = capsys.readouterr().out
+        # ``log CSVs to compress    : 0 (0.0 B)`` etc.
+        assert "log CSVs to compress" in out and "(0.0 B)" in out
+        assert "checkpoint dirs to bundle" in out

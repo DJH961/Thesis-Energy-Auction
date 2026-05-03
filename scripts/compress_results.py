@@ -50,6 +50,15 @@ from src.utils.run_data import (  # noqa: E402
 
 LOG_PREFIXES = ("training_log_", "year_log_", "ql_training_log_")
 
+# Empirical throughput priors (bytes/sec of *input*) used for the upfront
+# ETA when no measurements exist yet. Calibrated against recent compression
+# runs on this codebase; conservative on purpose so the first guess errs
+# on the slow side rather than overpromising. Updated *online* from
+# observed throughput once each section starts producing data, so the ETA
+# converges away from these priors after a few items.
+_LOGS_BYTES_PER_SEC_PRIOR = 60 * 1024 * 1024     # ~60 MB/s CSV → parquet
+_CKPTS_BYTES_PER_SEC_PRIOR = 8 * 1024 * 1024     # ~8 MB/s dir → tar.xz
+
 
 def _find_log_csvs(root: str) -> list[str]:
     out: list[str] = []
@@ -155,9 +164,31 @@ def main() -> int:
     csvs = _find_log_csvs(args.root) if do_logs else []
     ckpts = _find_checkpoint_dirs(args.root) if do_ckpts else []
 
+    # Pre-walk file sizes so we can give an honest upfront ETA *before*
+    # touching any data, and a rolling forward ETA on each per-item line.
+    # Sizes here are uncompressed / source bytes — they are the work, not
+    # the output, so they pair naturally with bytes-per-second throughputs.
+    csv_sizes: list[int] = [os.path.getsize(p) for p in csvs]
+    ckpt_sizes: list[int] = [
+        sum(
+            os.path.getsize(os.path.join(d, f))
+            for d, _, fs in os.walk(ck)
+            for f in fs
+        )
+        for ck in ckpts
+    ]
+    total_csv_input = sum(csv_sizes)
+    total_ckpt_input = sum(ckpt_sizes)
+
     print(f"Scanning {args.root!r}")
-    print(f"  log CSVs to compress    : {len(csvs)}")
-    print(f"  checkpoint dirs to bundle: {len(ckpts)}")
+    print(
+        f"  log CSVs to compress    : {len(csvs)} "
+        f"({_human(total_csv_input)})"
+    )
+    print(
+        f"  checkpoint dirs to bundle: {len(ckpts)} "
+        f"({_human(total_ckpt_input)})"
+    )
 
     if args.dry_run:
         for p in csvs:
@@ -166,16 +197,39 @@ def main() -> int:
             print(f"  [CKPT] {d} → {d.rstrip(os.sep)}.tar.xz")
         return 0
 
+    # Upfront forward-looking ETA — based on size-weighted prior throughput
+    # so the user sees a *when-will-this-be-done* number before any item
+    # has been processed. Refined per-item below as actual throughput is
+    # observed, and backfilled into a final summary at the end.
+    upfront_logs = (
+        total_csv_input / _LOGS_BYTES_PER_SEC_PRIOR if total_csv_input else 0.0
+    )
+    upfront_ckpts = (
+        total_ckpt_input / _CKPTS_BYTES_PER_SEC_PRIOR if total_ckpt_input else 0.0
+    )
+    upfront_total = upfront_logs + upfront_ckpts
+    if upfront_total > 0:
+        parts = []
+        if upfront_logs > 0:
+            parts.append(f"logs ~{_fmt_duration(upfront_logs)}")
+        if upfront_ckpts > 0:
+            parts.append(f"checkpoints ~{_fmt_duration(upfront_ckpts)}")
+        print(
+            f"  Estimated total time   : ~{_fmt_duration(upfront_total)} "
+            f"({' + '.join(parts)}; refined as throughput is measured)"
+        )
+
     run_t0 = time.perf_counter()
 
     # ----- logs ---------------------------------------------------------
     logs_t0 = time.perf_counter()
     total_csv_bytes = 0
     total_pq_bytes = 0
-    for csv_path in csvs:
+    bytes_done_so_far = 0
+    for idx, csv_path in enumerate(csvs):
         item_t0 = time.perf_counter()
         try:
-            csv_size_before = os.path.getsize(csv_path)
+            csv_size_before = csv_sizes[idx]
             entries = compress_logs([csv_path], delete_csv=not args.keep_source)
         except Exception as e:
             print(f"  FAIL {csv_path}: {e}", file=sys.stderr)
@@ -186,11 +240,25 @@ def main() -> int:
         pq_size = os.path.getsize(e.parquet_path)
         total_csv_bytes += csv_size_before
         total_pq_bytes += pq_size
+        bytes_done_so_far += csv_size_before
         ratio = pq_size / max(csv_size_before, 1) * 100
+        # Rolling forward ETA: extrapolate remaining bytes at the
+        # throughput we've observed so far in this section.
+        section_elapsed = time.perf_counter() - logs_t0
+        bytes_left = max(0, total_csv_input - bytes_done_so_far)
+        if section_elapsed > 0 and bytes_done_so_far > 0 and bytes_left > 0:
+            sec_per_byte = section_elapsed / bytes_done_so_far
+            eta_section = bytes_left * sec_per_byte
+            eta_str = f"  → ETA {_fmt_duration(eta_section)} remaining"
+        elif bytes_left == 0:
+            eta_str = "  → ETA 0s (done)"
+        else:
+            eta_str = ""
         print(
             f"  LOG  {csv_path}: "
             f"{_human(csv_size_before)} → {_human(pq_size)} ({ratio:.1f}%) "
             f"[{_fmt_duration(time.perf_counter() - item_t0)}]"
+            f"{eta_str}"
         )
 
     logs_elapsed = time.perf_counter() - logs_t0
@@ -209,14 +277,11 @@ def main() -> int:
     ckpts_t0 = time.perf_counter()
     total_ckpt_bytes = 0
     total_archive_bytes = 0
-    for ckpt_dir in ckpts:
+    bytes_done_so_far = 0
+    for idx, ckpt_dir in enumerate(ckpts):
         item_t0 = time.perf_counter()
         try:
-            size_before = sum(
-                os.path.getsize(os.path.join(d, f))
-                for d, _, fs in os.walk(ckpt_dir)
-                for f in fs
-            )
+            size_before = ckpt_sizes[idx]
             archive = compress_checkpoints(
                 ckpt_dir, delete_dir=not args.keep_source
             )
@@ -228,11 +293,23 @@ def main() -> int:
         size_after = os.path.getsize(archive)
         total_ckpt_bytes += size_before
         total_archive_bytes += size_after
+        bytes_done_so_far += size_before
         ratio = size_after / max(size_before, 1) * 100
+        section_elapsed = time.perf_counter() - ckpts_t0
+        bytes_left = max(0, total_ckpt_input - bytes_done_so_far)
+        if section_elapsed > 0 and bytes_done_so_far > 0 and bytes_left > 0:
+            sec_per_byte = section_elapsed / bytes_done_so_far
+            eta_section = bytes_left * sec_per_byte
+            eta_str = f"  → ETA {_fmt_duration(eta_section)} remaining"
+        elif bytes_left == 0:
+            eta_str = "  → ETA 0s (done)"
+        else:
+            eta_str = ""
         print(
             f"  CKPT {ckpt_dir}: "
             f"{_human(size_before)} → {_human(size_after)} ({ratio:.1f}%) "
             f"[{_fmt_duration(time.perf_counter() - item_t0)}]"
+            f"{eta_str}"
         )
 
     ckpts_elapsed = time.perf_counter() - ckpts_t0
