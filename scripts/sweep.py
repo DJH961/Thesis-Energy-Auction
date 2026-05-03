@@ -83,6 +83,104 @@ def _job_log_path(results_dir: str, variant_name: str, seed: int) -> str:
     return os.path.join(results_dir, f"run_{variant_name}_s{seed}.log")
 
 
+def _compress_job_artifacts(
+    config_path: str,
+    results_dir: str,
+    variant_name: str,
+    seed: int,
+    log_f,
+) -> None:
+    """Sweep-side fallback compression for one (variant, seed) job.
+
+    ``train.py`` already compresses logs and checkpoints at clean
+    end-of-run, but that block is skipped whenever the child exits
+    abnormally (crash, OOM, SIGKILL, KeyboardInterrupt to the parent
+    sweep, etc.) — leaving the multi-GB ``training_log_*.csv`` /
+    ``year_log_*.csv`` files and the ``checkpoints_*/`` directory on
+    disk. This helper runs after every subprocess returns, regardless
+    of return code, so the artefacts are always reclaimed before the
+    next job starts. It is a no-op when the inline compression already
+    succeeded (the source CSVs / checkpoint dir are gone), or when the
+    resolved config disables compression.
+
+    All failures are swallowed: post-job compression must never escalate
+    a successful job into a sweep-level failure or block subsequent
+    jobs.
+    """
+    try:
+        import yaml  # local import to keep top-level lean
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception as e:
+        log_f.write(f"# post-job compression: cannot read config: {e}\n")
+        return
+
+    cc = (cfg.get("logging", {}) or {}).get("compress_on_finish", {}) or {}
+    do_logs = bool(cc.get("logs", True))
+    do_ckpts = bool(cc.get("checkpoints", True))
+    delete_csv = bool(cc.get("delete_csv", True))
+    delete_dir = bool(cc.get("delete_checkpoint_dir", True))
+    if not (do_logs or do_ckpts):
+        return
+
+    try:
+        from src.utils.run_data import (
+            compress_checkpoints as _compress_ckpts,
+            compress_logs as _compress_logs,
+        )
+    except Exception as e:
+        log_f.write(f"# post-job compression: import failed: {e}\n")
+        return
+
+    tag = variant_name
+    candidates = [
+        os.path.join(results_dir, f"training_log_{tag}_s{seed}.csv"),
+        os.path.join(results_dir, f"year_log_{tag}_s{seed}.csv"),
+        os.path.join(results_dir, f"ql_training_log_{tag}_s{seed}.csv"),
+    ]
+    csvs = [p for p in candidates if os.path.exists(p)]
+    ckpt_dir = os.path.join(results_dir, f"checkpoints_{tag}_s{seed}")
+
+    if do_logs and csvs:
+        try:
+            entries = _compress_logs(csvs, delete_csv=delete_csv)
+            if entries:
+                total_csv = sum(e.source_size for e in entries)
+                total_pq = sum(
+                    os.path.getsize(e.parquet_path)
+                    for e in entries
+                    if os.path.exists(e.parquet_path)
+                )
+                ratio = total_pq / max(total_csv, 1) * 100
+                msg = (
+                    f"[sweep] post-job compressed logs for {tag} s={seed}: "
+                    f"{total_csv/1e6:.1f} MB → {total_pq/1e6:.1f} MB "
+                    f"({ratio:.1f}%)"
+                )
+                log_f.write(msg + "\n")
+                print(msg, file=sys.stderr)
+        except Exception as e:
+            log_f.write(
+                f"# post-job log compression failed for {tag} s={seed}: {e}\n"
+            )
+
+    if do_ckpts and os.path.isdir(ckpt_dir):
+        try:
+            archive = _compress_ckpts(ckpt_dir, delete_dir=delete_dir)
+            if archive:
+                msg = (
+                    f"[sweep] post-job compressed checkpoints for {tag} "
+                    f"s={seed}: {ckpt_dir} → {archive}"
+                )
+                log_f.write(msg + "\n")
+                print(msg, file=sys.stderr)
+        except Exception as e:
+            log_f.write(
+                f"# post-job checkpoint compression failed for {tag} "
+                f"s={seed}: {e}\n"
+            )
+
+
 def _run_job(
     train_py: str,
     config_path: str,
@@ -96,6 +194,13 @@ def _run_job(
     The child's stdout+stderr are redirected to a per-job log file inside
     ``results_dir`` so the parent terminal stays clean. The full output
     is preserved on disk for later inspection.
+
+    After the subprocess returns — whether it succeeded, crashed, or was
+    killed — a sweep-side compression pass converts any leftover
+    ``training_log_*.csv`` / ``year_log_*.csv`` to parquet and bundles
+    ``checkpoints_*/`` into ``.tar.xz``. This is the parent-side safety
+    net for the inline ``train.py`` end-of-run compression, which is
+    skipped whenever the child exits abnormally.
 
     Returns ``(variant_name, seed, returncode, log_path)``.
     """
@@ -120,7 +225,20 @@ def _run_job(
             f"# threads={threads}  started={time.strftime('%Y-%m-%dT%H:%M:%S')}\n"
         )
         log_f.flush()
-        rc = subprocess.call(cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT)
+        try:
+            rc = subprocess.call(
+                cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT
+            )
+        finally:
+            # Always run the parent-side compression — even on rc != 0,
+            # KeyboardInterrupt, or any other exception path.
+            _compress_job_artifacts(
+                config_path=config_path,
+                results_dir=results_dir,
+                variant_name=variant_name,
+                seed=seed,
+                log_f=log_f,
+            )
     return variant_name, seed, rc, log_path
 
 
