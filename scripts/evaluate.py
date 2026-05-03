@@ -45,10 +45,18 @@ def main():
     # Build agents and load weights
     agents = build_agents(env, config, args.seed)
 
-    # If the user passes a tar.xz produced by ``compress_checkpoints``,
-    # extract it next to the archive on demand so the rest of this
-    # function can keep treating ``args.checkpoint`` as a directory.
-    if os.path.isfile(args.checkpoint) and args.checkpoint.endswith(".tar.xz"):
+    # If the user passes a checkpoint archive produced by
+    # ``compress_checkpoints``, extract it next to the archive on demand
+    # so the rest of this function can keep treating ``args.checkpoint``
+    # as a directory. All supported archive suffixes (zst, gz, xz) are
+    # accepted; ``decompress_checkpoints`` sniffs the codec.
+    from src.utils.run_data import (
+        checkpoint_archive_suffixes as _ckpt_suffixes,
+    )
+
+    if os.path.isfile(args.checkpoint) and args.checkpoint.endswith(
+        _ckpt_suffixes()
+    ):
         from src.utils.run_data import decompress_checkpoints
 
         extracted = decompress_checkpoints(args.checkpoint)

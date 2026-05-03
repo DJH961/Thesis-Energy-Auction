@@ -446,7 +446,10 @@ def test_compress_checkpoints_roundtrip(tmp_path):
             f.write(data)
         payloads[name] = data
 
-    archive = compress_checkpoints(ckpt_dir)
+    # Pin to xz to keep this as a back-compat regression: legacy archives
+    # on disk are .tar.xz and must remain readable forever, even though
+    # 'auto' now resolves to zst.
+    archive = compress_checkpoints(ckpt_dir, codec="xz")
     assert archive is not None
     assert archive.endswith(".tar.xz")
     assert os.path.exists(archive)
@@ -617,6 +620,195 @@ def test_compress_checkpoints_does_not_require_pyarrow(tmp_path):
         f"stdout={res.stdout!r} stderr={res.stderr!r}"
     )
     assert "OK" in res.stdout
+
+
+# ---------------------------------------------------------------------------
+# Multi-codec checkpoint compression (zst / gz / xz)
+# ---------------------------------------------------------------------------
+
+
+def _make_ckpt_dir(tmp_path, name: str, payload: dict[str, bytes]) -> str:
+    d = os.path.join(tmp_path, name)
+    os.makedirs(d, exist_ok=True)
+    for fname, data in payload.items():
+        with open(os.path.join(d, fname), "wb") as f:
+            f.write(data)
+    return d
+
+
+@pytest.mark.parametrize("codec,suffix", [
+    ("zst", ".tar.zst"),
+    ("gz", ".tar.gz"),
+    ("xz", ".tar.xz"),
+])
+def test_compress_checkpoints_codec_roundtrip(tmp_path, codec, suffix):
+    """Each supported codec round-trips byte-for-byte and writes the
+    expected suffix. Verifies the codec dispatch in
+    ``compress_checkpoints`` and the symmetric sniff in
+    ``decompress_checkpoints``.
+    """
+    from src.utils.run_data import compress_checkpoints, decompress_checkpoints
+
+    if codec == "zst":
+        pytest.importorskip("zstandard")
+
+    payload = {
+        f"agent_{i}.pt": (np.zeros(2000, dtype=np.float32).tobytes()
+                          + os.urandom(1024))
+        for i in range(3)
+    }
+    ckpt_dir = _make_ckpt_dir(tmp_path, f"checkpoints_x_{codec}_s1", payload)
+
+    archive = compress_checkpoints(ckpt_dir, codec=codec)
+    assert archive is not None
+    assert archive.endswith(suffix), archive
+    assert os.path.exists(archive)
+    assert not os.path.exists(ckpt_dir)  # source removed by default
+
+    out = decompress_checkpoints(archive, out_dir=str(tmp_path / f"out_{codec}"))
+    assert out is not None
+    assert os.path.isdir(out)
+    for fname, data in payload.items():
+        with open(os.path.join(out, fname), "rb") as f:
+            assert f.read() == data
+
+
+def test_compress_checkpoints_auto_picks_zst_when_available(tmp_path):
+    """``codec='auto'`` resolves to ``'zst'`` when the ``zstandard``
+    package is importable. Ensures real runs get the fast codec by
+    default without any config tweak.
+    """
+    pytest.importorskip("zstandard")
+    from src.utils.run_data import compress_checkpoints
+
+    d = _make_ckpt_dir(tmp_path, "checkpoints_auto_s1", {"a.pt": b"hello"})
+    archive = compress_checkpoints(d, codec="auto")
+    assert archive.endswith(".tar.zst"), archive
+
+
+class _ZstandardImportBlocker:
+    """Meta-path finder that raises ImportError for ``zstandard``.
+
+    Used by tests below to simulate hosts where the optional
+    ``zstandard`` dependency is not installed (e.g. minimal Azure ML
+    curated environments) so we can verify the auto-fallback path and
+    the explicit-codec hard-fail path both behave correctly.
+    """
+
+    def find_spec(self, name, path=None, target=None):  # noqa: D401
+        if name == "zstandard":
+            raise ImportError("blocked for test")
+        return None
+
+
+def _with_zstandard_blocked():
+    """Context manager that hides ``zstandard`` from imports.
+
+    Reloads ``src.utils.run_data`` inside the block so its
+    ``_zstandard_available`` cache is rebuilt against the patched
+    meta_path, and again on exit so the rest of the test session sees
+    the real environment.
+    """
+    import contextlib
+    import importlib
+    import sys
+
+    @contextlib.contextmanager
+    def _ctx():
+        import src.utils.run_data as rd
+
+        saved = sys.modules.pop("zstandard", None)
+        blocker = _ZstandardImportBlocker()
+        sys.meta_path.insert(0, blocker)
+        try:
+            importlib.reload(rd)
+            yield rd
+        finally:
+            sys.meta_path.remove(blocker)
+            if saved is not None:
+                sys.modules["zstandard"] = saved
+            importlib.reload(rd)
+
+    return _ctx()
+
+
+def test_compress_checkpoints_auto_falls_back_to_gz_without_zstandard(tmp_path):
+    """When ``zstandard`` is missing, ``codec='auto'`` silently falls back
+    to gzip — the stdlib codec — so a curated environment that never
+    installs the optional dep still gets working compression.
+    """
+    with _with_zstandard_blocked() as rd:
+        d = _make_ckpt_dir(tmp_path, "checkpoints_fallback_s1", {"a.pt": b"x"})
+        archive = rd.compress_checkpoints(d, codec="auto")
+        assert archive.endswith(".tar.gz"), archive
+
+
+def test_compress_checkpoints_zst_raises_when_zstandard_missing(tmp_path):
+    """Explicit ``codec='zst'`` must raise a clear, actionable error
+    when ``zstandard`` is not importable — silent fallback would mask a
+    misconfigured pinned-codec deployment.
+    """
+    with _with_zstandard_blocked() as rd:
+        d = _make_ckpt_dir(tmp_path, "checkpoints_strict_s1", {"a.pt": b"x"})
+        with pytest.raises(RuntimeError, match="zstandard"):
+            rd.compress_checkpoints(d, codec="zst")
+
+
+def test_decompress_checkpoints_unrecognised_suffix_raises(tmp_path):
+    """A non-archive path with an unknown suffix must raise — silent
+    None would let a typo propagate as a "no checkpoint loaded" warning
+    far from the source of the bug.
+    """
+    from src.utils.run_data import decompress_checkpoints
+
+    bogus = os.path.join(tmp_path, "checkpoints_x_s1.tar.bz2")
+    with open(bogus, "wb") as f:
+        f.write(b"\x00")
+    with pytest.raises(ValueError, match="suffix"):
+        decompress_checkpoints(bogus)
+
+
+def test_compress_results_finder_skips_existing_archives(tmp_path):
+    """The migration-script finder ``_find_checkpoint_dirs`` must skip a
+    checkpoints dir whenever **any** archive variant (zst/gz/xz) already
+    sits next to it. This makes re-running ``compress_results.py`` on a
+    partially migrated tree a clean no-op regardless of which codec
+    produced the existing archive.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "compress_results_mod",
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "scripts", "compress_results.py",
+        ),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # Three checkpoint dirs, each next to a pre-existing archive in a
+    # different codec; finder should skip all three.
+    for tag, suffix in [
+        ("zst", ".tar.zst"),
+        ("gz", ".tar.gz"),
+        ("xz", ".tar.xz"),
+    ]:
+        d = os.path.join(tmp_path, f"checkpoints_{tag}_s1")
+        os.makedirs(d)
+        with open(os.path.join(d, "a.pt"), "wb") as f:
+            f.write(b"x")
+        with open(d + suffix, "wb") as f:
+            f.write(b"\x00\x01")
+
+    # And one with no archive — finder should pick this up.
+    d_new = os.path.join(tmp_path, "checkpoints_new_s1")
+    os.makedirs(d_new)
+    with open(os.path.join(d_new, "a.pt"), "wb") as f:
+        f.write(b"x")
+
+    found = mod._find_checkpoint_dirs(str(tmp_path))
+    assert found == [d_new]
 
 
 def test_run_data_module_imports_without_pyarrow(tmp_path):
