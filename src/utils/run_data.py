@@ -95,6 +95,8 @@ __all__ = [
     "compress_logs",
     "compress_checkpoints",
     "decompress_checkpoints",
+    "checkpoint_archive_suffixes",
+    "resolve_checkpoint_codec",
 ]
 
 _log = logging.getLogger(__name__)
@@ -707,26 +709,117 @@ def compress_logs(
     return out
 
 
+# Supported tar codecs for checkpoint archives. zst is the default
+# (fast, good ratio on dense float weights); gz is a stdlib-only fallback
+# for hosts without ``zstandard``; xz is retained for cold-archival use
+# where read-time is irrelevant. All three suffixes are accepted as
+# inputs to :func:`decompress_checkpoints` so old archives keep working.
+_CKPT_CODEC_SUFFIX = {
+    "zst": ".tar.zst",
+    "gz": ".tar.gz",
+    "xz": ".tar.xz",
+}
+_CKPT_DEFAULT_LEVEL = {"zst": 3, "gz": 1, "xz": 6}
+_CKPT_ARCHIVE_SUFFIXES = (".tar.zst", ".tar.gz", ".tar.xz")
+
+
+def checkpoint_archive_suffixes() -> tuple[str, ...]:
+    """Return the tuple of suffixes recognised as checkpoint archives.
+
+    Used by external callers (e.g. ``scripts/compress_results.py``,
+    ``scripts/evaluate.py``) to sniff archives without hardcoding the
+    list, so adding a new codec only requires touching this module.
+    """
+    return _CKPT_ARCHIVE_SUFFIXES
+
+
+def _zstandard_available() -> bool:
+    try:
+        import zstandard  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def resolve_checkpoint_codec(codec: str) -> str:
+    """Resolve ``codec='auto'`` to ``'zst'`` or ``'gz'`` based on availability.
+
+    Public so external callers (e.g. ``scripts/compress_results.py``)
+    can print the codec they will actually use without re-implementing
+    the same fallback rule.
+
+    * ``'auto'`` → ``'zst'`` if ``zstandard`` is importable, else ``'gz'``.
+    * Explicit ``'zst'`` raises ``RuntimeError`` if ``zstandard`` is missing.
+    * ``'gz'`` and ``'xz'`` always work via the Python stdlib.
+    """
+    c = (codec or "auto").lower()
+    if c == "auto":
+        return "zst" if _zstandard_available() else "gz"
+    if c == "zst" and not _zstandard_available():
+        raise RuntimeError(
+            "compress_checkpoints(codec='zst') requires the 'zstandard' "
+            "package. Install via `pip install zstandard` (>=0.22.0) or "
+            "use codec='gz' / 'auto' for a stdlib gzip fallback."
+        )
+    if c not in _CKPT_CODEC_SUFFIX:
+        raise ValueError(
+            f"Unknown checkpoint codec {codec!r}; expected one of "
+            f"{sorted(_CKPT_CODEC_SUFFIX)} or 'auto'."
+        )
+    return c
+
+
+# Internal alias kept for in-module call sites.
+_resolve_codec = resolve_checkpoint_codec
+
+
+def _sniff_ckpt_codec(archive_path: str) -> str | None:
+    """Return ``'zst' | 'gz' | 'xz'`` for a known checkpoint archive suffix.
+
+    Returns ``None`` for unrecognised paths so callers can choose to
+    raise or fall back. Suffix-based (no magic-byte sniff) because the
+    archives are always written by :func:`compress_checkpoints` and so
+    have a known, stable extension.
+    """
+    p = archive_path.lower()
+    for codec, suffix in _CKPT_CODEC_SUFFIX.items():
+        if p.endswith(suffix):
+            return codec
+    return None
+
+
 def compress_checkpoints(
     ckpt_dir: str | os.PathLike,
     *,
     archive_path: str | os.PathLike | None = None,
     delete_dir: bool = True,
-    preset: int = 6,
+    codec: str = "auto",
+    level: int | None = None,
+    preset: int | None = None,
 ) -> str | None:
-    """Bundle a ``checkpoints_*/`` directory into ``.tar.xz`` and remove it.
+    """Bundle a ``checkpoints_*/`` directory into a tar archive and remove it.
 
     Each training run writes 8 × N checkpoint files (one ``.pt`` per agent
     per save) into ``checkpoints_<tag>_s<seed>/``. A 16-cell sweep can
     accumulate hundreds of files and several GB of disk; bundling them
-    into a single ``.tar.xz`` reclaims most of that without losing a
-    single byte (xz/LZMA is lossless and stdlib-only, so no new
-    runtime dependency is introduced).
+    into a single tar archive reclaims most of that without losing a
+    single byte.
+
+    Three codecs are supported:
+
+    * ``zst`` — zstd via the optional ``zstandard`` dependency. Fast
+      (multi-threaded) with a good ratio on dense float weights.
+      The default when available.
+    * ``gz``  — stdlib gzip. Slower compression ratio but always
+      available; the automatic fallback when ``zstandard`` is missing.
+    * ``xz``  — stdlib LZMA. Best ratio but ~20–30× slower than zstd.
+      Useful for cold-archival uploads.
 
     The archive is written next to the source dir as
-    ``<ckpt_dir>.tar.xz``. The original directory is deleted on success
-    only — a failed write leaves the source dir intact so a crashed
-    invocation never costs you the checkpoints.
+    ``<ckpt_dir>.tar.<ext>`` (extension picked from ``codec``). The
+    original directory is deleted on success only — a failed write leaves
+    the source dir intact so a crashed invocation never costs you the
+    checkpoints.
 
     Parameters
     ----------
@@ -734,15 +827,21 @@ def compress_checkpoints(
         Directory to bundle. Returns ``None`` (no-op) if it doesn't exist
         or is empty.
     archive_path
-        Optional explicit archive path. Defaults to ``<ckpt_dir>.tar.xz``.
+        Optional explicit archive path. Defaults to ``<ckpt_dir>.tar.<ext>``.
     delete_dir
         If True (default), remove the source dir after the archive is
         written. Set False to keep both side-by-side (useful while
         validating a fresh run before reclaiming disk).
+    codec
+        One of ``"auto"`` (default; zst if available, else gz),
+        ``"zst"``, ``"gz"``, ``"xz"``.
+    level
+        Codec-specific compression level. ``None`` picks a sensible
+        default (zst=3, gz=1, xz=6) tuned for the speed/size trade-off
+        on float weights.
     preset
-        LZMA preset 0–9 (higher = smaller but slower). Default 6 is the
-        Python stdlib default and a good size/CPU trade-off for ``.pt``
-        files.
+        Deprecated alias for ``level``, retained for backward compatibility
+        with callers that passed ``preset=...`` to the xz-only API.
 
     Returns
     -------
@@ -760,10 +859,15 @@ def compress_checkpoints(
     if not entries:
         return None
 
+    resolved = _resolve_codec(codec)
+    if level is None:
+        level = preset if preset is not None else _CKPT_DEFAULT_LEVEL[resolved]
+
+    suffix = _CKPT_CODEC_SUFFIX[resolved]
     archive = (
         os.fspath(archive_path)
         if archive_path is not None
-        else ckpt_dir.rstrip(os.sep) + ".tar.xz"
+        else ckpt_dir.rstrip(os.sep) + suffix
     )
     tmp_archive = archive + ".tmp"
     if os.path.exists(tmp_archive):
@@ -771,8 +875,28 @@ def compress_checkpoints(
 
     arcname = os.path.basename(ckpt_dir.rstrip(os.sep))
     try:
-        with tarfile.open(tmp_archive, mode="w:xz", preset=preset) as tar:
-            tar.add(ckpt_dir, arcname=arcname)
+        if resolved == "zst":
+            import zstandard
+
+            # ``threads=-1`` tells libzstd to use all available CPU
+            # cores for the compression workers (the default is 0,
+            # i.e. single-threaded). zstd's worker pool is the main
+            # reason this codec is ~30× faster than xz on the same
+            # input — leaving it enabled unconditionally is the right
+            # default for a checkpoint dir that's only ever a few
+            # hundred MB to a few GB.
+            cctx = zstandard.ZstdCompressor(level=int(level), threads=-1)
+            with open(tmp_archive, "wb") as raw, cctx.stream_writer(raw) as zw:
+                with tarfile.open(fileobj=zw, mode="w|") as tar:
+                    tar.add(ckpt_dir, arcname=arcname)
+        elif resolved == "gz":
+            with tarfile.open(
+                tmp_archive, mode="w:gz", compresslevel=int(level)
+            ) as tar:
+                tar.add(ckpt_dir, arcname=arcname)
+        else:  # xz
+            with tarfile.open(tmp_archive, mode="w:xz", preset=int(level)) as tar:
+                tar.add(ckpt_dir, arcname=arcname)
         os.replace(tmp_archive, archive)
     except Exception:
         if os.path.exists(tmp_archive):
@@ -790,27 +914,26 @@ def decompress_checkpoints(
     out_dir: str | os.PathLike | None = None,
     delete_archive: bool = False,
 ) -> str | None:
-    """Extract a ``checkpoints_*.tar.xz`` back to a directory.
+    """Extract a ``checkpoints_*.tar.{zst,gz,xz}`` back to a directory.
 
     Symmetric inverse of :func:`compress_checkpoints` so a workflow can
-    round-trip without dropping out to a shell. The archive's top-level
-    directory name is preserved (every member was added with
-    ``arcname=basename(ckpt_dir)``), so the result is exactly the
-    directory layout the trainer originally wrote.
+    round-trip without dropping out to a shell. The codec is sniffed from
+    the archive's suffix; all three formats produced by
+    :func:`compress_checkpoints` (and the legacy ``.tar.xz`` archives
+    already on disk) are accepted.
 
-    Equivalent to ``tar -xJf checkpoints_<tag>_s<seed>.tar.xz`` on the
-    command line — that one-liner is the recommended path when you only
-    need to extract once and don't want to import the project. This
-    helper exists for in-process use (notebooks, evaluation scripts) and
-    for tests.
+    Equivalent to ``tar -xf checkpoints_<tag>_s<seed>.tar.<ext>`` on the
+    command line. This helper exists for in-process use (notebooks,
+    evaluation scripts) and for tests.
 
     Parameters
     ----------
     archive_path
-        Path to a ``.tar.xz`` produced by :func:`compress_checkpoints`.
+        Path to a ``.tar.zst``, ``.tar.gz`` or ``.tar.xz`` produced by
+        :func:`compress_checkpoints`.
     out_dir
         Directory to extract into. Defaults to the archive's parent
-        directory (so ``.../checkpoints_x_s1.tar.xz`` extracts to
+        directory (so ``.../checkpoints_x_s1.tar.zst`` extracts to
         ``.../checkpoints_x_s1/``, exactly mirroring the source layout).
     delete_archive
         If True, remove the source archive after a successful extract.
@@ -844,12 +967,47 @@ def decompress_checkpoints(
     if hasattr(tarfile, "data_filter"):
         extract_kwargs["filter"] = "data"
 
-    with tarfile.open(archive_path, mode="r:xz") as tar:
-        members = tar.getmembers()
-        if not members:
+    codec = _sniff_ckpt_codec(archive_path)
+    if codec is None:
+        raise ValueError(
+            f"Unrecognised checkpoint archive suffix: {archive_path!r}. "
+            f"Expected one of {_CKPT_ARCHIVE_SUFFIXES}."
+        )
+
+    from contextlib import ExitStack
+
+    # ExitStack ties the lifetime of every helper file/stream to the
+    # tar reader so a stray exception doesn't leak file handles.
+    # zstd archives need an explicit raw-file + stream_reader pair
+    # underneath the tarfile; gz / xz are handled natively by tarfile.
+    with ExitStack() as stack:
+        if codec == "zst":
+            import zstandard
+
+            raw = stack.enter_context(open(archive_path, "rb"))
+            dctx = zstandard.ZstdDecompressor()
+            reader = stack.enter_context(dctx.stream_reader(raw))
+            # Stream mode (``r|``) reads sequentially — the only mode
+            # compatible with zstd's stream_reader, which is not
+            # seekable.
+            tar = stack.enter_context(
+                tarfile.open(fileobj=reader, mode="r|")
+            )
+        elif codec == "gz":
+            tar = stack.enter_context(tarfile.open(archive_path, mode="r:gz"))
+        else:  # xz
+            tar = stack.enter_context(tarfile.open(archive_path, mode="r:xz"))
+
+        # Streaming tarfiles (``r|`` mode used for zstd) iterate
+        # members once; eagerly extract while we read so we capture
+        # both the top name and the contents in a single pass.
+        top: str | None = None
+        for member in tar:
+            if top is None:
+                top = member.name.split("/", 1)[0]
+            tar.extract(member, out_dir, **extract_kwargs)
+        if top is None:
             return None
-        top = members[0].name.split("/", 1)[0]
-        tar.extractall(out_dir, **extract_kwargs)
 
     if delete_archive:
         os.remove(archive_path)

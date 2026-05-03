@@ -132,6 +132,7 @@ def _compress_job_artifacts(
     do_ckpts = bool(cc.get("checkpoints", True))
     delete_csv = bool(cc.get("delete_csv", True))
     delete_dir = bool(cc.get("delete_checkpoint_dir", True))
+    codec = str(cc.get("checkpoints_codec", "auto"))
     if not (do_logs or do_ckpts):
         return
 
@@ -179,7 +180,7 @@ def _compress_job_artifacts(
             from src.utils.run_data import (
                 compress_checkpoints as _compress_ckpts,
             )
-            archive = _compress_ckpts(ckpt_dir, delete_dir=delete_dir)
+            archive = _compress_ckpts(ckpt_dir, delete_dir=delete_dir, codec=codec)
             if archive:
                 msg = (
                     f"[sweep] post-job compressed checkpoints for {tag} "
