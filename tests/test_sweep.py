@@ -323,3 +323,144 @@ class TestIterVariantYamlPaths:
                 assert cfg["ets"]["msr"]["enabled"] is False
             else:
                 assert cfg["ets"]["msr"]["enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# scripts/sweep.py: parent-side post-job compression fallback
+# ---------------------------------------------------------------------------
+
+class TestPostJobCompression:
+    """The parent sweep must compress logs/checkpoints even when the child
+    train.py subprocess exits abnormally and never reaches its inline
+    end-of-run compression block. Without this the user is left with multi-GB
+    CSVs and checkpoint dirs after every crashed/interrupted sweep job."""
+
+    def _setup_artifacts(self, tmp_path, *, with_compress_cfg=True):
+        results_dir = tmp_path / "v"
+        results_dir.mkdir()
+
+        cfg = {}
+        if with_compress_cfg:
+            cfg = {"logging": {"compress_on_finish": {
+                "logs": True, "checkpoints": True,
+                "delete_csv": True, "delete_checkpoint_dir": True,
+            }}}
+        cfg_path = tmp_path / "cfg.yaml"
+        with open(cfg_path, "w") as f:
+            yaml.safe_dump(cfg, f)
+
+        for name in ("training_log_v_s7.csv", "year_log_v_s7.csv"):
+            with open(results_dir / name, "w") as f:
+                f.write("episode,reward\n")
+                for i in range(50):
+                    f.write(f"{i},{i*0.5}\n")
+
+        ck = results_dir / "checkpoints_v_s7"
+        ck.mkdir()
+        for i in range(2):
+            (ck / f"agent{i}.pt").write_bytes(b"x" * 256)
+
+        return cfg_path, results_dir, ck
+
+    def test_compresses_leftover_csvs_and_checkpoints(self, tmp_path):
+        from scripts.sweep import _compress_job_artifacts
+
+        cfg_path, results_dir, ck = self._setup_artifacts(tmp_path)
+        log_f = open(results_dir / "run_v_s7.log", "w")
+        try:
+            _compress_job_artifacts(
+                config_path=str(cfg_path),
+                results_dir=str(results_dir),
+                variant_name="v", seed=7, log_f=log_f,
+            )
+        finally:
+            log_f.close()
+
+        # CSVs and checkpoint dir replaced by parquet + tar.xz.
+        assert not (results_dir / "training_log_v_s7.csv").exists()
+        assert not (results_dir / "year_log_v_s7.csv").exists()
+        assert not ck.exists()
+        assert (results_dir / "training_log_v_s7.parquet").exists()
+        assert (results_dir / "year_log_v_s7.parquet").exists()
+        assert (results_dir / "checkpoints_v_s7.tar.xz").exists()
+
+    def test_noop_when_no_artifacts_left(self, tmp_path):
+        """Happy path: train.py already compressed everything; the
+        parent-side fallback should be a silent no-op rather than error."""
+        from scripts.sweep import _compress_job_artifacts
+
+        cfg_path = tmp_path / "cfg.yaml"
+        with open(cfg_path, "w") as f:
+            yaml.safe_dump({"logging": {"compress_on_finish": {
+                "logs": True, "checkpoints": True,
+            }}}, f)
+        results_dir = tmp_path / "v"
+        results_dir.mkdir()
+        log_path = results_dir / "run_v_s7.log"
+        with open(log_path, "w") as log_f:
+            _compress_job_artifacts(
+                config_path=str(cfg_path),
+                results_dir=str(results_dir),
+                variant_name="v", seed=7, log_f=log_f,
+            )
+        # No new artefacts and no errors.
+        assert sorted(p.name for p in results_dir.iterdir()) == ["run_v_s7.log"]
+
+    def test_respects_disabled_compression(self, tmp_path):
+        """When compress_on_finish.logs/checkpoints are both false the
+        helper must not touch any files."""
+        from scripts.sweep import _compress_job_artifacts
+
+        results_dir = tmp_path / "v"
+        results_dir.mkdir()
+        cfg_path = tmp_path / "cfg.yaml"
+        with open(cfg_path, "w") as f:
+            yaml.safe_dump({"logging": {"compress_on_finish": {
+                "logs": False, "checkpoints": False,
+            }}}, f)
+        csv_path = results_dir / "training_log_v_s7.csv"
+        csv_path.write_text("episode,reward\n0,0.0\n")
+        ck = results_dir / "checkpoints_v_s7"
+        ck.mkdir()
+        (ck / "a.pt").write_bytes(b"x")
+
+        with open(results_dir / "run_v_s7.log", "w") as log_f:
+            _compress_job_artifacts(
+                config_path=str(cfg_path),
+                results_dir=str(results_dir),
+                variant_name="v", seed=7, log_f=log_f,
+            )
+        assert csv_path.exists()
+        assert ck.is_dir()
+        assert not (results_dir / "training_log_v_s7.parquet").exists()
+        assert not (results_dir / "checkpoints_v_s7.tar.xz").exists()
+
+    def test_keeps_sources_when_delete_flags_false(self, tmp_path):
+        """delete_csv=False / delete_checkpoint_dir=False must leave the
+        originals on disk alongside the compressed copies."""
+        from scripts.sweep import _compress_job_artifacts
+
+        results_dir = tmp_path / "v"
+        results_dir.mkdir()
+        cfg_path = tmp_path / "cfg.yaml"
+        with open(cfg_path, "w") as f:
+            yaml.safe_dump({"logging": {"compress_on_finish": {
+                "logs": True, "checkpoints": True,
+                "delete_csv": False, "delete_checkpoint_dir": False,
+            }}}, f)
+        csv_path = results_dir / "training_log_v_s7.csv"
+        csv_path.write_text("episode,reward\n0,0.0\n1,1.0\n")
+        ck = results_dir / "checkpoints_v_s7"
+        ck.mkdir()
+        (ck / "a.pt").write_bytes(b"x" * 64)
+
+        with open(results_dir / "run_v_s7.log", "w") as log_f:
+            _compress_job_artifacts(
+                config_path=str(cfg_path),
+                results_dir=str(results_dir),
+                variant_name="v", seed=7, log_f=log_f,
+            )
+        assert csv_path.exists()
+        assert ck.is_dir()
+        assert (results_dir / "training_log_v_s7.parquet").exists()
+        assert (results_dir / "checkpoints_v_s7.tar.xz").exists()

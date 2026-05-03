@@ -562,3 +562,85 @@ def test_compress_logs_memory_bounded_streaming(tmp_path):
     back = pd.read_parquet(pq_path)
     assert len(back) == n
     assert (back["episode"].values == df["episode"].values).all()
+
+
+# ---------------------------------------------------------------------------
+# Lazy pyarrow import — ensures end-of-run checkpoint compression on Azure
+# ML workers where pyarrow may be missing from the curated env still works.
+# ---------------------------------------------------------------------------
+
+def test_compress_checkpoints_does_not_require_pyarrow(tmp_path):
+    """Reproduces the silent-failure scenario hit on Azure ML curated envs:
+    when ``pyarrow`` is missing, the *whole* ``run_data`` module used to
+    fail to import, taking the stdlib-only ``compress_checkpoints`` path
+    down with it. After the fix the module imports cleanly without
+    pyarrow and ``compress_checkpoints`` keeps working on its own.
+    """
+    import importlib
+    import subprocess
+    import sys
+
+    # Run in a child so the meta-path block doesn't pollute our session.
+    script = (
+        "import sys\n"
+        "class _Block:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name == 'pyarrow' or name.startswith('pyarrow.'):\n"
+        "            raise ImportError('blocked')\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, _Block())\n"
+        "for m in list(sys.modules):\n"
+        "    if m.startswith('pyarrow') or m.startswith('src.utils.run_data'):\n"
+        "        del sys.modules[m]\n"
+        "from src.utils.run_data import compress_checkpoints, compress_logs\n"
+        "import os\n"
+        f"ck = r'{tmp_path}/checkpoints_x_s1'\n"        "os.makedirs(ck, exist_ok=True)\n"
+        "open(os.path.join(ck, 'a.pt'), 'wb').write(b'hi')\n"
+        "arch = compress_checkpoints(ck)\n"
+        "assert arch and os.path.exists(arch), arch\n"
+        # compress_logs should now raise the actionable ImportError.
+        f"csv = r'{tmp_path}/training_log_x_s1.csv'\n"
+        "open(csv, 'w').write('a,b\\n1,2\\n')\n"
+        "try:\n"
+        "    compress_logs([csv])\n"
+        "    raise SystemExit('compress_logs should have raised ImportError')\n"
+        "except ImportError as e:\n"
+        "    assert 'pyarrow' in str(e), str(e)\n"
+        "print('OK')\n"
+    )
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    res = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo, capture_output=True, text=True, timeout=60,
+    )
+    assert res.returncode == 0, (
+        f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    )
+    assert "OK" in res.stdout
+
+
+def test_run_data_module_imports_without_pyarrow(tmp_path):
+    """Module-level import must not require pyarrow."""
+    import subprocess
+    import sys
+
+    script = (
+        "import sys\n"
+        "class _Block:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name == 'pyarrow' or name.startswith('pyarrow.'):\n"
+        "            raise ImportError('blocked')\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, _Block())\n"
+        "import src.utils.run_data\n"
+        "print('imported')\n"
+    )
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    res = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo, capture_output=True, text=True, timeout=30,
+    )
+    assert res.returncode == 0, (
+        f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    )
+    assert "imported" in res.stdout

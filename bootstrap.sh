@@ -17,8 +17,12 @@
 #              can upload bootstrap.sh + my_new_sweep.yaml together without
 #              touching the repo);
 #        (iii) configs/sweeps/default_vs_unsold_to_msr.yaml (repo default).
-#   3. Skips `pip install` by default (Azure ML environments come with deps
-#      pre-installed). Set INSTALL_DEPS=1 if you need a fresh install.
+#   3. Auto-installs `pip install -r requirements.txt` only when one of the
+#      critical Python modules (numpy, pandas, pyarrow, yaml, torch,
+#      gymnasium) is missing from the worker's environment, so a curated
+#      Azure ML env that lacks pyarrow doesn't silently strand the
+#      end-of-run CSV→parquet compression. Set INSTALL_DEPS=1 to force a
+#      fresh install.
 #   4. Copies the produced results/ tree into the Azure ML output directory.
 #
 # Optional env vars (set in the Azure ML "environment variables" panel; never
@@ -124,12 +128,35 @@ fi
 echo "[bootstrap] Using sweep spec: ${SPEC_TO_RUN}"
 
 # ----- 3. Optional dependency install ----------------------------------------
+# Self-heal: even with INSTALL_DEPS=0, a curated Azure ML environment may be
+# missing one or more of the heavy deps the trainer + lossless end-of-run
+# compression need (pyarrow in particular is the silent failure that strands
+# multi-GB CSVs / checkpoint dirs uncompressed). Probe for the critical
+# imports and install requirements.txt if any are absent.
+_NEEDED_PY_MODS=(numpy pandas pyarrow yaml torch gymnasium)
+# Keep this list aligned with requirements.txt / pyproject.toml. It only
+# needs to cover modules whose absence would silently degrade a run
+# (e.g. pyarrow for the end-of-run lossless log compression). Other deps
+# get pulled in transitively when pip install -r requirements.txt runs.
+_MISSING_MODS=""
+for _mod in "${_NEEDED_PY_MODS[@]}"; do
+    if ! python -c "import ${_mod}" >/dev/null 2>&1; then
+        _MISSING_MODS="${_MISSING_MODS} ${_mod}"
+    fi
+done
+
 if [ "${INSTALL_DEPS}" = "1" ]; then
     echo "[bootstrap] INSTALL_DEPS=1 -> installing requirements.txt"
     python -m pip install --upgrade pip -q
     python -m pip install -r requirements.txt -q
+elif [ -n "${_MISSING_MODS}" ]; then
+    echo "[bootstrap] Missing Python modules detected:${_MISSING_MODS}"
+    echo "[bootstrap] Auto-installing requirements.txt so end-of-run lossless"
+    echo "[bootstrap] CSV->parquet / checkpoint->tar.xz compression can run."
+    python -m pip install --upgrade pip -q
+    python -m pip install -r requirements.txt -q
 else
-    echo "[bootstrap] Skipping pip install (INSTALL_DEPS!=1; assuming Azure ML env has deps)."
+    echo "[bootstrap] Skipping pip install (INSTALL_DEPS!=1 and key modules already present)."
 fi
 
 # ----- 4. Run the sweep -------------------------------------------------------

@@ -61,15 +61,26 @@ from typing import Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-try:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-except ImportError as e:  # pragma: no cover - import-time guard
-    raise ImportError(
-        "src.utils.run_data requires pyarrow. Install via "
-        "`pip install pyarrow` or `uv sync` (it is listed as a project "
-        "dependency)."
-    ) from e
+
+def _require_pyarrow():
+    """Import pyarrow on demand.
+
+    Top-level import is deferred so that the rest of this module — most
+    importantly :func:`compress_checkpoints`, which only needs the stdlib
+    — remains usable on hosts without pyarrow installed (e.g. minimal
+    Azure ML curated environments). Parquet helpers call this and re-raise
+    a clear, actionable error if the dependency is missing.
+    """
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as e:  # pragma: no cover - import-time guard
+        raise ImportError(
+            "src.utils.run_data parquet support requires pyarrow. Install "
+            "via `pip install pyarrow` or `uv sync` (it is listed as a "
+            "project dependency)."
+        ) from e
+    return pa, pq
 
 
 __all__ = [
@@ -175,6 +186,7 @@ def _stat_key(path: str) -> tuple[int, int]:
 
 def _read_metadata(parquet_path: str) -> dict[bytes, bytes]:
     """Return the user-defined parquet metadata as a {bytes: bytes} dict."""
+    _, pq = _require_pyarrow()
     meta = pq.read_metadata(parquet_path)
     kv = meta.metadata or {}
     return dict(kv)
@@ -263,7 +275,8 @@ def _build_parquet(
     if os.path.exists(tmp_path):
         os.remove(tmp_path)
 
-    writer: pq.ParquetWriter | None = None
+    pa, pq = _require_pyarrow()
+    writer: "pq.ParquetWriter | None" = None
     rows = 0
     n_cols = 0
     try:
@@ -414,6 +427,7 @@ def load_run_csv(
         # Filter to columns that actually exist; silently drop unknowns so
         # notebooks can ask for a superset across heterogeneous schemas
         # (e.g. older runs that pre-date a new diagnostic column).
+        _, pq = _require_pyarrow()
         available = set(pq.read_schema(parquet_path).names)
         cols = [c for c in cols if c in available]
         if not cols:
@@ -421,6 +435,7 @@ def load_run_csv(
             # empty frame rather than crashing pyarrow.
             return pd.DataFrame()
 
+    _, pq = _require_pyarrow()
     table = pq.read_table(parquet_path, columns=cols)
     return table.to_pandas()
 
@@ -677,6 +692,7 @@ def compress_logs(
             with open(p, "rb") as f:
                 csv_rows = sum(1 for _ in f) - 1  # minus header
             csv_rows = max(csv_rows, 0)
+            _, pq = _require_pyarrow()
             pq_rows = pq.read_metadata(parquet_path).num_rows
             if pq_rows != csv_rows:
                 raise RuntimeError(

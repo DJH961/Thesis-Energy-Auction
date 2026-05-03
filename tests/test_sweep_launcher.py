@@ -585,3 +585,94 @@ class TestHeartbeat:
         assert "ETA total" in out
         # The done/running/queued breakdown must reflect set_completed=0.
         assert "running" in out and "queued" in out
+
+
+class TestSlidingWindowEta:
+    """Per-job ETA uses a sliding window so warmup-phase rates fade."""
+
+    def test_recent_samples_drive_rate(self, sweep_module, tmp_path, monkeypatch):
+        """A slow first sample should be discarded once the window slides past it."""
+        import csv as _csv
+        import io
+        from collections import deque
+
+        # Construct a heartbeat with a tiny window so the test runs fast.
+        # Use monkeypatch so the original ETA_WINDOW is restored after the
+        # test, keeping isolation from any other test that reads the value.
+        monkeypatch.setattr(sweep_module._Heartbeat, "ETA_WINDOW", 4)
+
+        headers = ["episode", "year", "clearing_price", "secondary_price",
+                   "reward_A1", "green_frac_A1", "shortfall_A1"]
+        year_path = tmp_path / "year_log_v_s1.csv"
+        log_path = tmp_path / "run_v_s1.log"
+        log_path.write_text("\n")
+
+        def _write(eps):
+            with open(year_path, "w", newline="") as f:
+                w = _csv.DictWriter(f, fieldnames=headers)
+                w.writeheader()
+                for ep in eps:
+                    for yr in range(1, 13):
+                        w.writerow({
+                            "episode": ep, "year": yr,
+                            "clearing_price": 80, "secondary_price": 70,
+                            "reward_A1": -3, "green_frac_A1": 0.3,
+                            "shortfall_A1": 0.0,
+                        })
+
+        _write([100])
+
+        buf = io.StringIO()
+        hb = sweep_module._Heartbeat(
+            interval=0.05, stream=buf, n_workers=1, total_jobs=1,
+            first_interval=0.05,
+        )
+        # Hand-construct the samples deque to simulate a slow warmup
+        # (first 2 samples taken 1s apart for 1 episode each = 1s/ep)
+        # followed by a fast steady-state (later samples advance many
+        # episodes per tick). After enough fast ticks, the slow warmup
+        # samples should fall out of the window.
+        hb.add("v", 1, str(log_path), csv_year=str(year_path), n_episodes=1000)
+        with hb._lock:
+            entry = hb._jobs[("v", 1)]
+            samples = entry["samples"]
+            assert isinstance(samples, deque)
+            # Old, slow samples (warmup phase): 1s for 1 ep → 1.0 s/ep
+            samples.append((1000.0, 100))
+            samples.append((1001.0, 101))
+            # Recent fast samples: 0.1s for 10 eps → 0.01 s/ep
+            samples.append((1001.1, 111))
+            samples.append((1001.2, 121))
+
+            # Sliding-window rate should be computed from oldest-in-window
+            # to newest. With ETA_WINDOW=4, all four samples are in the
+            # window: (1001.2 - 1000.0) / (121 - 100) ≈ 0.057 s/ep.
+            t0, e0 = samples[0]
+            t1, e1 = samples[-1]
+            rate_with_warmup = (t1 - t0) / (e1 - e0)
+
+            # Push two more fast samples; the slow ones now fall out.
+            samples.append((1001.3, 131))
+            samples.append((1001.4, 141))
+            t0b, e0b = samples[0]
+            t1b, e1b = samples[-1]
+            rate_steady = (t1b - t0b) / (e1b - e0b)
+
+        # Steady-state rate (post-warmup) is much faster than the
+        # window-bridged rate that still includes the slow samples.
+        assert rate_steady < rate_with_warmup
+        assert rate_steady < 0.1
+        hb.stop()
+
+    def test_add_seeds_samples_deque(self, sweep_module, tmp_path):
+        """``_Heartbeat.add`` should attach a samples deque to each job."""
+        from collections import deque
+        log_path = tmp_path / "run.log"
+        log_path.write_text("\n")
+        hb = sweep_module._Heartbeat(interval=0.05)
+        hb.add("v", 1, str(log_path), n_episodes=100)
+        entry = hb._jobs[("v", 1)]
+        assert "samples" in entry
+        assert isinstance(entry["samples"], deque)
+        assert entry["samples"].maxlen == sweep_module._Heartbeat.ETA_WINDOW
+        hb.stop()
