@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 # Make the src/ package importable when this script is run directly.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
@@ -82,6 +83,25 @@ def _human(n: float) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format a wall-clock duration as a short human-readable string.
+
+    Sub-second durations are rendered in milliseconds; otherwise the output
+    is ``XmYY.Zs`` or ``HhMMmSSs`` so that per-section and total timings are
+    easy to scan at a glance.
+    """
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    if seconds < 3600.0:
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}m{int(s):02d}s"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{int(h)}h{int(m):02d}m{int(s):02d}s"
 
 
 def main() -> int:
@@ -146,10 +166,14 @@ def main() -> int:
             print(f"  [CKPT] {d} → {d.rstrip(os.sep)}.tar.xz")
         return 0
 
+    run_t0 = time.perf_counter()
+
     # ----- logs ---------------------------------------------------------
+    logs_t0 = time.perf_counter()
     total_csv_bytes = 0
     total_pq_bytes = 0
     for csv_path in csvs:
+        item_t0 = time.perf_counter()
         try:
             csv_size_before = os.path.getsize(csv_path)
             entries = compress_logs([csv_path], delete_csv=not args.keep_source)
@@ -165,20 +189,28 @@ def main() -> int:
         ratio = pq_size / max(csv_size_before, 1) * 100
         print(
             f"  LOG  {csv_path}: "
-            f"{_human(csv_size_before)} → {_human(pq_size)} ({ratio:.1f}%)"
+            f"{_human(csv_size_before)} → {_human(pq_size)} ({ratio:.1f}%) "
+            f"[{_fmt_duration(time.perf_counter() - item_t0)}]"
         )
 
+    logs_elapsed = time.perf_counter() - logs_t0
     if csvs:
         ratio = total_pq_bytes / max(total_csv_bytes, 1) * 100
         print(
             f"  → logs total: {_human(total_csv_bytes)} → "
-            f"{_human(total_pq_bytes)} ({ratio:.1f}%)"
+            f"{_human(total_pq_bytes)} ({ratio:.1f}%) "
+            f"in {_fmt_duration(logs_elapsed)} "
+            f"({len(csvs)} file{'s' if len(csvs) != 1 else ''})"
         )
+    elif do_logs:
+        print(f"  → logs total: nothing to do [{_fmt_duration(logs_elapsed)}]")
 
     # ----- checkpoints --------------------------------------------------
+    ckpts_t0 = time.perf_counter()
     total_ckpt_bytes = 0
     total_archive_bytes = 0
     for ckpt_dir in ckpts:
+        item_t0 = time.perf_counter()
         try:
             size_before = sum(
                 os.path.getsize(os.path.join(d, f))
@@ -199,20 +231,35 @@ def main() -> int:
         ratio = size_after / max(size_before, 1) * 100
         print(
             f"  CKPT {ckpt_dir}: "
-            f"{_human(size_before)} → {_human(size_after)} ({ratio:.1f}%)"
+            f"{_human(size_before)} → {_human(size_after)} ({ratio:.1f}%) "
+            f"[{_fmt_duration(time.perf_counter() - item_t0)}]"
         )
 
+    ckpts_elapsed = time.perf_counter() - ckpts_t0
     if ckpts:
         ratio = total_archive_bytes / max(total_ckpt_bytes, 1) * 100
         print(
             f"  → checkpoints total: {_human(total_ckpt_bytes)} → "
-            f"{_human(total_archive_bytes)} ({ratio:.1f}%)"
+            f"{_human(total_archive_bytes)} ({ratio:.1f}%) "
+            f"in {_fmt_duration(ckpts_elapsed)} "
+            f"({len(ckpts)} dir{'s' if len(ckpts) != 1 else ''})"
+        )
+    elif do_ckpts:
+        print(
+            f"  → checkpoints total: nothing to do "
+            f"[{_fmt_duration(ckpts_elapsed)}]"
         )
 
     saved = (total_csv_bytes - total_pq_bytes) + (
         total_ckpt_bytes - total_archive_bytes
     )
-    print(f"Total reclaimed: {_human(saved)}")
+    total_elapsed = time.perf_counter() - run_t0
+    print(
+        f"Total reclaimed: {_human(saved)} "
+        f"(logs {_fmt_duration(logs_elapsed)} + "
+        f"checkpoints {_fmt_duration(ckpts_elapsed)} = "
+        f"total {_fmt_duration(total_elapsed)})"
+    )
     return 0
 
 

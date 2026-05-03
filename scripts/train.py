@@ -1335,6 +1335,24 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
         "withdrawal_suppressed": 0,
     }
 
+    # Rough first-guess wall-time prior, printed *immediately* — before the
+    # first ``log_interval``-tick ETA so the user has a ballpark estimate
+    # within seconds of launch instead of waiting for setup + the first
+    # log row. Configurable via ``logging.initial_sec_per_ep`` (default 0.4
+    # matches recent empirical wall-times); replaced by the data-driven
+    # rolling-window estimate (``recent_ep_durations``, maxlen=200) once
+    # episodes start completing.
+    initial_sec_per_ep = float(
+        config.get("logging", {}).get("initial_sec_per_ep", 0.4)
+    )
+    if initial_sec_per_ep > 0 and n_episodes > 0:
+        rough_eta = initial_sec_per_ep * n_episodes
+        print(
+            f"  Initial ETA:      ~{_format_hms(rough_eta)} "
+            f"(rough first guess @ {initial_sec_per_ep:.2f} s/ep × "
+            f"{n_episodes:,} eps; refined as episodes complete)"
+        )
+
     def _flush_csv_logs(current_episode: int, force: bool = False) -> None:
         if force or ((current_episode + 1) % csv_flush_interval == 0):
             _yr_flush_buffer()
