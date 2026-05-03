@@ -2,7 +2,7 @@
 
 The questions below frame the thesis. They are reproduced verbatim in the
 top-level `README.md`; this document keeps them alongside the other
-methodological notes (`data_dictionary.md`, `planning/data_science_analysis_plan.md`,
+methodological notes (`data_dictionary.md`, `data_science_analysis.md`,
 `reward_function.md`) and points the reader at the artefacts that address
 each one.
 
@@ -38,7 +38,7 @@ warning regimes dominating the converged window).
 |---|---|
 | Default-config training dynamics & seed stability | `notebooks/ets_marl - Default RQ Analysis.ipynb`, §RQ1 |
 | Per-seed deep dives (single-run sanity) | `notebooks/ets_marl - Full Run & Analysis.ipynb` |
-| Methodology mapping (PELT, plateau detection, fan charts) | `planning/data_science_analysis_plan.md` §A1, §A2, §A3 |
+| Methodology mapping (PELT, plateau detection, fan charts) | `data_science_analysis.md` §C1, §C2 |
 
 ---
 
@@ -60,8 +60,8 @@ default-only analysis).
 | Where it is addressed | Artefact |
 |---|---|
 | Within-default regulatory behaviour (descriptive baseline) | `notebooks/ets_marl - Default RQ Analysis.ipynb`, §RQ2 |
-| Cross-variant sensitivity (LRF / MSR / penalty sweeps) | *experiments notebook — TBD*; sweep configs under `configs/sweeps/` |
-| Methodology mapping (descriptive comparison + RF/GBM variant classification) | `planning/data_science_analysis_plan.md` §B3, §B5 |
+| Cross-variant sensitivity (LRF / MSR / penalty sweeps) | `notebooks/ets_marl - Thesis Experiments Analysis.ipynb`; sweep configs under `configs/sweeps/` |
+| Methodology mapping (descriptive comparison + cluster shifts + UDBC pathways) | `data_science_analysis.md` §R1, §R2 |
 
 ---
 
@@ -81,13 +81,15 @@ financial-vs-environmental contrast directly inside one config.
 | Where it is addressed | Artefact |
 |---|---|
 | Per-archetype bidding, investment, secondary-market role, UDBC pathway, reward decomposition | `notebooks/ets_marl - Default RQ Analysis.ipynb`, §RQ3 |
-| Strategy clustering & theory tests (LCOE crossover, archetype heterogeneity) | `planning/data_science_analysis_plan.md` §B1, §B4 |
+| Strategy clustering & theory tests (LCOE crossover, archetype heterogeneity) | `data_science_analysis.md` §S1, §S2, §S3 |
 
 ---
 
 ## Notebook layout summary
 
 * `ets_marl - Default RQ Analysis.ipynb` — **default-config only**, multi-sweep loader; addresses RQ1 in full, RQ2 descriptively, RQ3 in full.
+* `ets_marl - Thesis Experiments Analysis.ipynb` — cross-config sweep analysis; the home of the actual RQ2 sensitivity claims.
 * `ets_marl - Sweep Analysis.ipynb` — single-sweep operational diagnostics (convergence dashboards, deep-dive picker).
 * `ets_marl - Full Run & Analysis.ipynb` — single-seed deep dive on a fully-trained run.
-* *Experiments / cross-config notebook* — TBD; this is where the actual RQ2 sensitivity claims will be evidenced.
+* `ets_marl - Data Science Analysis.ipynb` — methodology home (clustering, regression, change-point detection); maps every method back to a thesis claim per `data_science_analysis.md`.
+* `ets_marl - Q-Learning Baseline.ipynb` and `ets_marl - Bots-Only Baseline.ipynb` — credibility floors used in RQ1 cross-algorithm comparisons.

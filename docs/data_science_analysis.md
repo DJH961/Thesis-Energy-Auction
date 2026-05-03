@@ -1,9 +1,8 @@
-# Data Science Analysis Plan — ETS MARL Thesis (v3)
+# Data Science Analysis — ETS MARL Thesis
 
-Internal working doc for Daniel & Alessio.
-Purpose: define the analyses run on simulation outputs, aligned with CBS Data Science methodology expectations.
+This document describes the analyses we run on simulation outputs and where each one is implemented. It is organised RQ-first: every analysis is tied to a specific thesis claim and to the notebook section that produces the figures/tables behind it. We default to curriculum methods (CBS Data Science) and reach for specialised methods only when they answer a question better.
 
-**v3 changes from v2:** reorganized RQ-first instead of method-first. Every analysis is justified by what we'll actually claim in the thesis. Cut clearing-price prediction (didn't answer any RQ). Cut pathology / autoencoder analyses (didn't earn their place). Made strategy the centerpiece. Softened the "specialized methods" stance — we still lean curriculum-first, but specialized methods are welcome when they answer a specific question well.
+The single home for the implementation is **`notebooks/ets_marl - Data Science Analysis.ipynb`**, with cross-references to the operational/RQ notebooks where helpful (`ets_marl - Default RQ Analysis.ipynb`, `ets_marl - Sweep Analysis.ipynb`, `ets_marl - Thesis Experiments Analysis.ipynb`).
 
 ---
 
@@ -143,18 +142,18 @@ This also serves as the validity floor for R1: if cross-seed std on the default 
 
 ## 5. Method inventory & curriculum mapping
 
-For Ch. 5 Methodology. Demonstrates every method is curriculum-grounded except where we explicitly justify otherwise.
+For Ch. 5 Methodology. Demonstrates every method is curriculum-grounded except where we explicitly justify otherwise. The "Implemented in" column points at the notebook section that produces the figures and tables.
 
-| Analysis | Methods | Lecture |
-|---|---|---|
-| S1 strategy clustering | K-means + Hierarchical + Silhouette/Elbow + PCA | L3 + L5 |
-| S2 reward-weight effect on strategy | S1 pipeline applied to the variant; centroid comparison | L3 + L5 + L2 |
-| S3 rationality tests | Logistic Regression (LASSO) + Random Forest | L4 + L5 + L8 |
-| R1 regulatory shifts | S1 pipeline per variant; descriptive comparison + IQR outlier check | L3 + L5 + L7 + L2 |
-| R2 UDBC pathways | Multinomial Logistic Regression + Random Forest + SMOTE/ADASYN; transition heatmaps | L4 + L5 + L7 + L2 |
-| C1 convergence | Rolling-mean plateau + PELT change-point | L2 + Specialized |
-| C2 reproducibility | Cross-seed mean ± std, fan charts | L2 |
-| Cross-cutting | Standardisation, train/val/test, k-fold CV, F1 / AUC-ROC / R² / RMSE | L2 |
+| Analysis | Methods | Lecture | Implemented in |
+|---|---|---|---|
+| S1 strategy clustering | K-means + Hierarchical + Silhouette/Elbow + PCA | L3 + L5 | `Data Science Analysis.ipynb` §S1 |
+| S2 reward-weight effect on strategy | S1 pipeline applied to the variant; centroid comparison | L3 + L5 + L2 | `Data Science Analysis.ipynb` §S2 (variant logs from `configs/sweeps/thesis_experiments.yaml` `all_fin` / `balanced`) |
+| S3 rationality tests | Logistic Regression (LASSO) + Random Forest | L4 + L5 + L8 | `Data Science Analysis.ipynb` §S3; anchor check cross-referenced from `Default RQ Analysis.ipynb` |
+| R1 regulatory shifts | S1 pipeline per variant; descriptive comparison + IQR outlier check | L3 + L5 + L7 + L2 | `Thesis Experiments Analysis.ipynb` (cross-config) + `Sweep Analysis.ipynb` §5 (per-variant cluster shifts) |
+| R2 UDBC pathways | Multinomial Logistic Regression + Random Forest + SMOTE/ADASYN; transition heatmaps | L4 + L5 + L7 + L2 | `Data Science Analysis.ipynb` §R2 (UDBC columns produced by `scripts/train.py`) |
+| C1 convergence | Rolling-mean plateau + PELT change-point | L2 + Specialized | `Data Science Analysis.ipynb` §C1 |
+| C2 reproducibility | Cross-seed mean ± std, fan charts | L2 | `Data Science Analysis.ipynb` §C2; cross-checked in `Default RQ Analysis.ipynb` |
+| Cross-cutting | Standardisation, train/val/test, k-fold CV, F1 / AUC-ROC / R² / RMSE | L2 | helpers in `src/utils/` (e.g. `quality_metric.py`); features built in-notebook |
 
 Specialized method used: PELT change-point detection. Justified in Methodology.
 
