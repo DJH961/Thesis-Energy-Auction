@@ -119,12 +119,23 @@ def _compress_job_artifacts(
     a successful job into a sweep-level failure or block subsequent
     jobs.
     """
+    def _safe_log(line: str) -> None:
+        """Write ``line`` to ``log_f`` even if the stream encoding (e.g.
+        Windows cp1252) cannot represent every glyph. The helper must
+        never raise UnicodeEncodeError back to the sweep loop because
+        that would silently abort post-job compression mid-flight."""
+        try:
+            log_f.write(line)
+        except UnicodeEncodeError:
+            enc = getattr(log_f, "encoding", None) or "ascii"
+            log_f.write(line.encode(enc, errors="replace").decode(enc))
+
     try:
         import yaml  # local import to keep top-level lean
         with open(config_path) as f:
             cfg = yaml.safe_load(f) or {}
     except Exception as e:
-        log_f.write(f"# post-job compression: cannot read config: {e}\n")
+        _safe_log(f"# post-job compression: cannot read config: {e}\n")
         return
 
     cc = (cfg.get("logging", {}) or {}).get("compress_on_finish", {}) or {}
@@ -165,14 +176,14 @@ def _compress_job_artifacts(
                     f"{total_csv/1e6:.1f} MB → {total_pq/1e6:.1f} MB "
                     f"({ratio:.1f}%)"
                 )
-                log_f.write(msg + "\n")
+                _safe_log(msg + "\n")
                 print(msg, file=sys.stderr)
         except Exception as e:
             msg = (
                 f"[sweep] WARN: post-job log compression failed for "
                 f"{tag} s={seed}: {type(e).__name__}: {e}"
             )
-            log_f.write(msg + "\n")
+            _safe_log(msg + "\n")
             print(msg, file=sys.stderr)
 
     if do_ckpts and os.path.isdir(ckpt_dir):
@@ -186,14 +197,14 @@ def _compress_job_artifacts(
                     f"[sweep] post-job compressed checkpoints for {tag} "
                     f"s={seed}: {ckpt_dir} → {archive}"
                 )
-                log_f.write(msg + "\n")
+                _safe_log(msg + "\n")
                 print(msg, file=sys.stderr)
         except Exception as e:
             msg = (
                 f"[sweep] WARN: post-job checkpoint compression failed "
                 f"for {tag} s={seed}: {type(e).__name__}: {e}"
             )
-            log_f.write(msg + "\n")
+            _safe_log(msg + "\n")
             print(msg, file=sys.stderr)
 
 
@@ -235,7 +246,10 @@ def _run_job(
 
     os.makedirs(results_dir, exist_ok=True)
     log_path = _job_log_path(results_dir, variant_name, seed)
-    with open(log_path, "w", buffering=1) as log_f:
+    # UTF-8 so post-job compression messages with arrow glyphs ("→") and
+    # other non-ASCII characters survive on Windows (default cp1252 would
+    # raise UnicodeEncodeError and silently abort compression).
+    with open(log_path, "w", buffering=1, encoding="utf-8") as log_f:
         log_f.write(
             f"# {variant_name} s={seed}  cmd: {' '.join(cmd)}\n"
             f"# threads={threads}  started={time.strftime('%Y-%m-%dT%H:%M:%S')}\n"
