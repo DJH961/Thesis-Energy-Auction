@@ -54,8 +54,9 @@ class CapSchedule:
         self.withhold_rate = msr["withhold_rate"]         # fraction
         self.release_amount = msr["release_amount"]       # Mt/year (≈6.4% of cap)
         self.min_auction_frac = msr.get("min_auction_frac", 0.10)
-        # activation_year retained for backward-compat reading but no longer
-        # drives MSR gate; 1-year TNAC lag is enforced via _prev_tnac instead.
+        # ``activation_year`` is read from config for compatibility with
+        # external callers and notebooks but no longer gates the MSR; the
+        # 1-year TNAC lag is enforced via ``_prev_tnac`` instead.
         self.msr_activation_year = msr.get("activation_year", msr.get("msr_activation_year", 1))
         # Maximum rollover multiplier: caps unsold-rollover so a single year's
         # auction volume cannot exceed cap_t × max_rollover_multiplier.

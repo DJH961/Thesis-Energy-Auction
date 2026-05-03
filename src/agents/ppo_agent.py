@@ -1216,12 +1216,12 @@ class PPOAgent:
 
         total_a_loss = 0.0
         total_v_loss = 0.0
-        # Split-head loss accumulators (v8.5 logging additions). When the bid
-        # and invest heads share the auction policy these are the per-block
-        # PPO clipped policy losses; secondary is the dedicated head; the
-        # invest critic is the second value-network when split_invest_head.
-        # Populated unconditionally so the return dict carries usable
-        # diagnostics regardless of the split_invest_head flag.
+        # Split-head loss accumulators. When the bid and invest heads share
+        # the auction policy these hold the per-block PPO clipped policy
+        # losses; secondary is the dedicated head; the invest critic is the
+        # second value network when ``split_invest_head`` is enabled.
+        # Populated unconditionally so the return dict always carries usable
+        # diagnostics regardless of the split flag.
         total_bid_loss = 0.0
         total_inv_loss = 0.0
         total_sec_loss = 0.0

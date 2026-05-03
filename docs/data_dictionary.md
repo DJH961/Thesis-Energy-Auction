@@ -42,6 +42,15 @@ For a sweep variant `tight_cap` with seeds `[1, 2, 3]`:
 A single-config run (no `--run-tag`) drops the `_<tag>` infix and writes
 `training_log_s<seed>.csv`, `year_log_s<seed>.csv`, `checkpoints_s<seed>/`.
 
+> **End-of-run compression.** When `logging.compress_on_finish` is on
+> (the default), `training_log_*.csv` and `year_log_*.csv` are converted
+> to zstd-compressed parquet siblings and the source CSVs are deleted,
+> while `checkpoints_*/` is bundled into a single
+> `checkpoints_*_<seed>.tar.xz`. Notebooks load runs through
+> `src.utils.run_data.load_run_csv` / `glob_run_logs`, which transparently
+> fall back to the parquet sibling once the CSV is gone — see
+> `docs/run_data_cache.md`.
+
 ---
 
 ## 2. `training_log_*.csv` — episode-level log
@@ -111,8 +120,8 @@ i.e. learning agents first, then bots):
 | `ep_default_count` | # (agent, year) defaults this episode. |
 | `ep_mean_bid_qty_mult` | Mean Phase-1 qty multiplier across all agent-years. |
 | `ep_mean_coal_budget_headroom` | Mean budget headroom for coal-heavy agents (M€). |
-| `quality_score` | Aggregate anchor-invariant quality metric (notebook §5.8). Higher = better. |
-| `Q_compliance`, `Q_price_realism`, `Q_saved_carbon`, `Q_cost_eff`, `Q_volatility` | Five subscores in [0, 1] composing `quality_score`. |
+| `quality_score` | Aggregate anchor-invariant quality metric, signed in `[-5, +5]`. Higher = better; computed by `src/utils/quality_metric.compute_quality_score`. |
+| `Q_compliance`, `Q_price_realism`, `Q_saved_carbon`, `Q_cost_eff`, `Q_volatility` | Five subscores each in `[0, 1]` (volatility enters with a negative sign in the composite). |
 | `price_start`, `price_peak`, `price_std` | Year-0 clearing, episode-max clearing, std of clearings across years. |
 | `secondary_price` | Episode-mean secondary clearing price (alias for the year-log column). |
 
@@ -333,7 +342,7 @@ truncated at episode `N` rather than at the final episode.
 A sweep launcher tees the entire stdout/stderr of each `train.py`
 subprocess into this file. Useful for debugging crashed seeds without
 re-running. Format is whatever `train.py` printed: header banner,
-config summary, periodic episode lines (`Ep 1200/100000 …`), warning
+config summary, periodic episode lines (`Ep 1200/120000 …`), warning
 detector messages, and the final summary block.
 
 ---
@@ -353,3 +362,99 @@ The notebooks in `notebooks/` consume these files as follows:
 The CSVs are append-only during a run and committed on close — no
 cross-process locking is needed; sweep workers each own their own
 output directory.
+
+---
+
+## 8. Score definitions
+
+The training log carries a number of composite scores that are
+computed from raw per-year data and frequently consumed by analysis
+notebooks. Their calculation bases are documented here so notebook
+readers (and external thesis readers) do not need to reverse-engineer
+them from the code.
+
+### 8.1 `quality_score` and the five `Q_*` components
+
+Source: `src/utils/quality_metric.py` (`compute_episode_quality`,
+`compute_quality_score`). Computed once per episode from the env's
+year-log dicts; **never fed back into training**.
+
+Each component lives in `[0, 1]` (or `NaN` if the underlying data is
+missing); `quality_score` itself is a signed aggregate in `[-5, +5]`.
+
+#### Components
+
+| Column | Formula | Notes |
+|---|---|---|
+| `Q_compliance` | `compliant_agent_years / total_agent_years` | An (agent, year) is compliant if `shortfall ≤ 1e-6 Mt`. `1.0` ⇒ all agents compliant in every year of the episode. |
+| `Q_price_realism` | `clip(1 − mean( |clearing_t − anchor_t| / anchor_t ), 0, 1)` | Mean absolute relative error of the auction clearing against the per-year fundamental anchor. The relative error is clipped at 5.0 per year before averaging, so a single blow-out year cannot dominate. `1.0` ⇒ clearing tracks the anchor exactly. |
+| `Q_saved_carbon` | `Σ_(i,t) max(0, E_i^0 − E_i^t) · anchor_t  ÷  Σ_(i,t) E_i^0 · anchor_t` | Saved tonnes (vs each agent's year-0 emissions) monetised at the per-year fundamental anchor (the social shadow price). `1.0` ⇒ the entire year-0 emission baseline has been abated. |
+| `Q_cost_eff` | `0.5 · ( clip(1 − total_realised_cost / counterfactual, −1, 1) + 1 )` | `total_realised_cost` sums per-agent `payments + trade_costs + invest_costs + penalties + collateral_costs + mac_costs` across the episode. `counterfactual` is the same `Σ E_i^0 · anchor_t` from `Q_saved_carbon`. The signed `[-1, 1]` raw is rescaled to `[0, 1]` so it can be combined with the other components. |
+| `Q_volatility` | `clip( std(clearing_t / anchor_t) / mean(clearing_t / anchor_t), 0, 1 )` | Coefficient of variation of the **anchor ratio** (not nominal clearing). The anchor encodes both inflation and cap-scarcity, so a trajectory that perfectly tracks the fundamental scores `Q_volatility ≈ 0`. Lower is better; `Q_volatility` is the only component that enters the composite with a negative sign. |
+
+#### Composite
+
+```
+weights = {compliance: 0.30, price_realism: 0.25, saved_carbon: 0.25,
+           cost_eff: 0.10, volatility: 0.10}
+
+signed(x)        = 2·x − 1                ∈ [−1, +1]   (positive components)
+signed_volatility = 1 − 2·v                ∈ [−1, +1]   (volatility, sign flipped)
+
+quality_score    = clip( 5 · Σ_k weights[k] · signed(Q_k) / Σ_k weights[k], -5, +5 )
+```
+
+Any component returning `NaN` is dropped and the remaining weights are
+renormalised. If every component is `NaN`, `quality_score` is also
+`NaN`. The `[-5, +5]` range gives a roughly Gaussian-looking signal
+across runs (the earlier `[0, 1]` aggregate empirically only spanned
+≈ `0.4–0.7` and was hard to read).
+
+### 8.2 `diag_S_*` per-agent diagnostic scores
+
+Source: `ETSEnvironment.compute_diagnostic_score`. Three per-agent,
+per-step diagnostics; the values written to the episode CSV are the
+episode mean of the per-step values.
+
+| Column | Formula | Notes |
+|---|---|---|
+| `diag_S_financial_A{i}` | `clip(1 − budget_spent_this_year_i / mean_annual_budget, 0, 1)` | Cost efficiency. `1.0` ⇒ agent has spent nothing this year. `mean_annual_budget` is the cross-learning-agent mean of `annual_budget`, so the metric is comparable across heterogeneous archetypes. |
+| `diag_S_green_A{i}` | `max(0, EF_i^0 − EF_i^t) / EF_i^0` | Emission-factor improvement vs the agent's year-0 mix. `1.0` ⇒ fully decarbonised; `0` ⇒ unchanged or worsened. Agents starting at `EF^0 ≈ 0` (pure-renewable initial mix) score `1.0` by convention. |
+| `diag_S_composite_A{i}` | `w_cost · diag_S_financial + w_green · diag_S_green + 0.3 · S_penalty` | Reward-weight-aware blend, with a fixed `0.3` weight on `S_penalty`. `S_penalty` is `1 − normalised_penalty_paid` (with a conservative default of `1.0` when no penalty has been incurred yet). |
+
+### 8.3 UDBC compliance attribution
+
+Source: `scripts/train.py:per_agent_compliance_attr`. Per-(agent, year)
+classification of compliance state, summed into per-episode counts.
+Identity: `U + D + M = #non-compliant agent-years` and `U + D + M + B + C
++ #fully-compliant-without-stress = n_years`.
+
+| Column | Definition | Why it matters |
+|---|---|---|
+| `udbc_U_total_A{i}` | Pure under-bid: `alloc < emiss` AND **no** inherited carry-forward. | The agent failed compliance *this year* by under-bidding. |
+| `udbc_D_total_A{i}` | Pure debt cascade: `alloc ≥ emiss` AND `cf > 0`. | The agent under-bought in a previous year and could not catch up. |
+| `udbc_M_total_A{i}` | Mixed: `alloc < emiss` AND `cf > 0`. | Both an active under-bid and inherited debt. |
+| `udbc_B_total_A{i}` | Compliant under stress, covered from own bank. | Bank drawdown saved compliance. |
+| `udbc_C_total_A{i}` | Compliant under stress, covered via a secondary purchase. | Liquidity from peers saved compliance. |
+
+### 8.4 Reward decomposition
+
+Per-agent reward columns (`reward_A{i}`, `reward_base_A{i}`,
+`reward_shaping_A{i}`) and the per-year reward channels logged via
+`info["year_log"]` are derived in `_compute_rewards` in
+`src/environment/ets_environment.py`. The full mathematical
+statement — cost buckets, normalisation, financial coverage gate, ESG
+hybrid, banking signal, decaying shaping channels, and terminal
+payoffs — lives in [`docs/reward_function.md`](reward_function.md).
+Per-channel diagnostics (`compliance_norm`, `capital_norm`, `cost_norm`,
+`esg_signal`, `esg_stock_term`, `esg_flow_term`, `compliance_gate`,
+`gate_activation`, `banking_signal`, `penalty_realized`,
+`remediation_cost`, …) are documented at the end of
+`docs/reward_function.md` § 12.
+
+### 8.5 ESG-balance and gate diagnostics
+
+| Column | Formula | Notes |
+|---|---|---|
+| `esg_vs_penalty_ratio_A{i}` | Year-mean of `(w_green · esg_signal) / max(penalty_norm, ε)` | Tracks whether the ESG carrot is large enough to offset the compliance stick for this agent. Values around 1 indicate ESG and penalty are dimensionally comparable. |
+| `compliance_gate_A{i}` | Year-mean of `coverage_frac^(1 + gate_blend)` | The smooth gate that attenuates positive ESG when `coverage_frac < 1`. `1.0` ⇒ ESG fully paid; `0.0` ⇒ ESG fully gated. The exponent uses `gate_blend = clip01((threshold − coverage_frac) / width)`, with `threshold = compliance_gate_blend_threshold` (default 0.90) and `width = compliance_gate_blend_width` (default 0.30). |
