@@ -18,14 +18,21 @@ subprocess via ``ProcessPoolExecutor``. Each subprocess:
 The parent terminal only shows short, structured progress lines:
 
     [sweep] [START 1/17] reference s=1  → results/.../reference/run_reference_s1.log
-    [sweep] [LIVE  reference s=1] Ep 1200/100000 (1.2%) | px 75→142 (μ128) | und 2/12 | sec 60→78 (μ70, m41%) | comp 95% | green 31→44% | R̄ -1.8 | ETA 4h12m
-    [sweep] [ETA total ≈ 18h33m, elapsed 0h45m] (3/17 done, 4 running, 10 queued)
+    [sweep] [LIVE  reference s=1] Ep 200/100000 (0.2%) | px 75→142 (μ128) | und 2/12 | sec 60→78 (μ70, m41%) | comp 95% | green 31→44% | R̄ -1.8 | ETA 4h12m
+    [sweep] [ETA total ≈ 9h33m, elapsed 0h02m] (0/17 done, 4 running, 13 queued)
     [sweep] [DONE  1/17 OK ] reference s=1
 
-Heartbeats are printed every ``--heartbeat-interval`` seconds (default
-300s = 5 min). The very first tick fires early (~60s) so the user gets
-a quick confirmation things are running, then the loop settles into
-the configured interval. Each heartbeat parses the per-year CSV
+Heartbeats poll *fast* (every ``first_interval`` seconds, default ~30s)
+until at least one running job has produced enough episode samples to
+compute a real-data ETA, then settle into the configured (longer)
+``--heartbeat-interval``. This means the user sees a data-driven ETA
+"as soon as possible" — typically within a couple of fast-tick cycles
+after the first episode is logged — instead of waiting the full
+``interval`` between the first and second heartbeats. There is no
+flat / prior-based guess printed before any episode has run, since
+that would lock in a value before the setup phase even completes.
+
+Each heartbeat parses the per-year CSV
 (``year_log_<variant>_s<seed>.csv``) to produce a single-line summary
 of the **last completed episode** — year-1 vs year-N (clearing price,
 secondary price, compliance, green share) plus that episode's
@@ -34,12 +41,16 @@ from ``training_log_<variant>_s<seed>.csv``. Field order — episode,
 price, secondary, compliance, greening, reward — is intentional:
 physical / market signals first, learning-quality reward last. A
 per-job ``ETA`` is appended once enough episodes have elapsed to
-estimate a rate; in multi-job sweeps an aggregate ``ETA total`` banner
-(with sweep-wide elapsed wall time) is printed once per tick combining
-the slowest running job with the queued backlog at the configured
-worker count. When the year CSV does not exist yet (e.g. during
-behavioural-cloning pretraining), the heartbeat falls back to the last
-informative line of the captured log file.
+estimate a rate; the rate uses a sliding window over the most recent
+samples so the estimate doesn't get permanently biased by warmup-phase
+episodes (BC pretraining, JIT compile, GPU caches priming) and instead
+converges to the steady-state per-episode wall time. In multi-job
+sweeps an aggregate ``ETA total`` banner (with sweep-wide elapsed wall
+time) is printed once per tick combining the slowest running job with
+the queued backlog at the configured worker count. When the year CSV
+does not exist yet (e.g. during behavioural-cloning pretraining), the
+heartbeat falls back to the last informative line of the captured log
+file.
 
 Use ``--quiet`` to suppress heartbeats entirely.
 
@@ -58,6 +69,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Make ``src`` importable when this script is run directly.
@@ -569,7 +581,21 @@ class _Heartbeat:
     pretraining, before the trainer's CSV writer has emitted its first
     row), we fall back to the last informative line of the captured
     stdout/stderr log.
+
+    Per-job ETA uses a sliding window over the most recent ``ETA_WINDOW``
+    (time, episode) samples so that early-warmup episodes (BC pretraining,
+    JIT/torch.compile, GPU caches priming) don't permanently bias the
+    estimate upward. Once enough samples exist, the rate is computed from
+    the oldest sample in the window to the most recent — which converges
+    to the steady-state per-episode wall time.
     """
+
+    # How many recent (time, episode) samples to retain per job for
+    # rate estimation. With heartbeats every ~5 minutes, 12 samples covers
+    # the last hour of progress — long enough to be stable, short enough
+    # that the warmup phase (typically the first 10–20 minutes) is rolled
+    # out within the first hour of training.
+    ETA_WINDOW = 12
 
     def __init__(
         self,
@@ -635,9 +661,17 @@ class _Heartbeat:
                 "csv": csv_path,
                 "csv_year": csv_year,
                 "n_eps": n_episodes,
+                # Anchor sample (kept for back-compat / debugging): the very
+                # first (time, episode) tick we observed for this job.
                 "first_seen_t": None,
                 "first_seen_ep": None,
                 "last_ep": None,
+                # Sliding window of recent (time, episode) samples used to
+                # estimate the per-episode wall time. Old samples (which
+                # include the warmup phase) get pushed out automatically as
+                # the run progresses, so the ETA converges to the
+                # steady-state rate instead of staying biased high.
+                "samples": deque(maxlen=self.ETA_WINDOW),
             }
 
     def remove(self, variant: str, seed: int) -> None:
@@ -654,12 +688,20 @@ class _Heartbeat:
             self._thread.join(timeout=2.0)
 
     def _loop(self) -> None:
-        # Use a short ``first_interval`` for the very first tick so the user
-        # gets a quick "things are running" confirmation, then settle into
-        # the (longer) ``interval`` for subsequent heartbeats.
+        # Adaptive polling: tick fast (``first_interval``) until at least
+        # one running job has produced enough samples to compute an ETA,
+        # then settle into the configured ``interval``. This means the
+        # user sees a real-data ETA "as soon as possible" — typically
+        # within a couple of fast-tick cycles — instead of waiting the
+        # full ``interval`` for the second heartbeat.
         wait = self.first_interval
+        eta_ever_emitted = False
         while not self._stop.wait(wait):
-            wait = self.interval
+            # Stay in fast-poll mode until we've actually emitted a
+            # data-driven ETA at least once. After that, drop down to
+            # the configured (longer) ``interval`` so we don't spam the
+            # terminal during long-running steady-state phases.
+            wait = self.interval if eta_ever_emitted else self.first_interval
             with self._lock:
                 snapshot = [(key, dict(meta)) for key, meta in self._jobs.items()]
                 completed = self._completed_jobs
@@ -703,8 +745,8 @@ class _Heartbeat:
                 eta_str = ""
                 if last_ep is not None and last_ep > 0:
                     n_eps = meta.get("n_eps")
-                    first_t: float | None = None
-                    first_ep: int | None = None
+                    window_t0: float | None = None
+                    window_ep0: int | None = None
                     with self._lock:
                         entry = self._jobs.get((variant, seed))
                         if entry is not None:
@@ -712,20 +754,30 @@ class _Heartbeat:
                                 entry["first_seen_t"] = now
                                 entry["first_seen_ep"] = last_ep
                             entry["last_ep"] = last_ep
-                            first_t = entry["first_seen_t"]
-                            first_ep = entry["first_seen_ep"]
+                            samples: deque = entry.setdefault(
+                                "samples", deque(maxlen=self.ETA_WINDOW)
+                            )
+                            # Append only when episode count actually advanced
+                            # (avoid bogus zero-delta samples between ticks
+                            # that observed the same CSV row).
+                            if not samples or samples[-1][1] != last_ep:
+                                samples.append((now, last_ep))
+                            if samples:
+                                window_t0, window_ep0 = samples[0]
                     # ``entry`` may be None if the job was removed concurrently
                     # by the launcher between the snapshot read and now; in
                     # that case skip the ETA update (the job is already done).
-                    if first_t is not None and first_ep is not None:
-                        elapsed = now - first_t
-                        delta_eps = last_ep - first_ep
+                    if window_t0 is not None and window_ep0 is not None:
+                        elapsed = now - window_t0
+                        delta_eps = last_ep - window_ep0
                         if delta_eps > 0 and elapsed > 0 and n_eps:
                             sec_per_ep = elapsed / delta_eps
                             remaining = max(0, n_eps - last_ep) * sec_per_ep
                             eta_running.append(remaining)
                             full_job_estimates.append(n_eps * sec_per_ep)
                             eta_str = f" | ETA {_format_eta(remaining)}"
+                            # Real-data ETA emitted — drop fast-poll mode.
+                            eta_ever_emitted = True
 
                 if line:
                     line = line + eta_str
@@ -887,18 +939,9 @@ def main() -> int:
         print("[sweep] --dry-run: exiting without launching jobs", file=sys.stderr)
         return 0
 
-    # Launch.
-    heartbeat = None
-    if not args.quiet:
-        heartbeat = _Heartbeat(
-            args.heartbeat_interval,
-            n_workers=n_workers,
-            total_jobs=n_jobs,
-        )
-        heartbeat.start()
-
     # Cache n_episodes per resolved variant YAML (one read per variant) so
-    # the heartbeat can show "Ep N/total (XX%)".
+    # the heartbeat can show "Ep N/total (XX%)" — and so we can compute the
+    # rough first-guess ETA banner below before any worker has started.
     _n_eps_cache: dict[str, int | None] = {}
 
     def _get_n_episodes(yaml_path: str) -> int | None:
@@ -911,6 +954,16 @@ def main() -> int:
             ne = None
         _n_eps_cache[yaml_path] = ne
         return ne
+
+    # Launch.
+    heartbeat = None
+    if not args.quiet:
+        heartbeat = _Heartbeat(
+            args.heartbeat_interval,
+            n_workers=n_workers,
+            total_jobs=n_jobs,
+        )
+        heartbeat.start()
 
     failures: list[tuple[str, int, int, str]] = []
     completed = 0

@@ -1328,12 +1328,33 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
     _last_adv_yr1_mean_per_agent: list = [0.0] * n_agents
 
     train_t0 = time.time()
-    recent_ep_durations = collections.deque(maxlen=200)
+    # Per-episode wall-time samples used for the steady-state ETA. Median
+    # rather than mean is used downstream so occasional spikes (PPO update
+    # episodes, periodic checkpoint writes, GC pauses) don't permanently
+    # bias the estimate upward. ``maxlen=100`` is short enough that the
+    # warmup phase (BC pretrain, JIT compile, GPU caches priming) rolls
+    # out within the first few hundred episodes — keeping the estimate
+    # locked to the steady-state rate the user actually cares about.
+    recent_ep_durations = collections.deque(maxlen=100)
     msr_event_totals = {
         "emergency_release": 0,
         "containment_release": 0,
         "withdrawal_suppressed": 0,
     }
+    # Episodes at which a one-line early ETA is printed *outside* the
+    # regular ``log_interval`` block. Default 50/100/150 so the user sees
+    # a real-data estimate in seconds-to-minutes rather than waiting for
+    # the first full diagnostic dump. Override in YAML via
+    # ``logging.early_eta_episodes: [50, 100, 150]`` (any list of 1-based
+    # episode counts; an empty list disables the feature). Each is
+    # fired at most once.
+    _DEFAULT_EARLY_ETA_EPISODES = (50, 100, 150)
+    _early_eta_episodes: set[int] = set(
+        config.get("logging", {}).get(
+            "early_eta_episodes", _DEFAULT_EARLY_ETA_EPISODES
+        )
+    )
+    _early_eta_fired: set[int] = set()
 
     def _flush_csv_logs(current_episode: int, force: bool = False) -> None:
         if force or ((current_episode + 1) % csv_flush_interval == 0):
@@ -2747,13 +2768,57 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
         recent_ep_durations.append(time.time() - episode_t0)
         _flush_csv_logs(episode)
 
+        # Early ETA prints — fire once each at episodes 50/100/150 (or
+        # whatever ``logging.early_eta_episodes`` is configured to) so
+        # the user sees a real-data estimate before the first
+        # ``log_interval`` diagnostic block. We use median of recent
+        # samples (robust to PPO-update / checkpoint spikes) and apply a
+        # mild warmup discount that fades out by episode ``log_interval``
+        # — the assumption being that very-early episodes overstate the
+        # steady-state rate by ~20–40%.
+        completed = episode + 1
+        if (
+            completed in _early_eta_episodes
+            and completed not in _early_eta_fired
+            and recent_ep_durations
+        ):
+            _early_eta_fired.add(completed)
+            med_ep_s = float(np.median(recent_ep_durations))
+            # Linear warmup discount: at completed=50 use 0.7×, at 100 use
+            # 0.85×, at 150 use 0.95× (assuming the default 50/100/150
+            # schedule). The "largest configured early checkpoint" anchors
+            # the schedule so a custom ``logging.early_eta_episodes`` list
+            # discounts proportionally without hard-coding 150 again.
+            largest_early = (
+                max(_early_eta_episodes)
+                if _early_eta_episodes
+                else max(_DEFAULT_EARLY_ETA_EPISODES)
+            )
+            warmup_frac = min(1.0, completed / max(1, largest_early))
+            discount = 0.7 + 0.3 * warmup_frac
+            est_sec_per_ep = med_ep_s * discount
+            est_eta = est_sec_per_ep * max(0, n_episodes - completed)
+            print(
+                f"  [Ep {completed:5d}/{n_episodes}] early ETA: "
+                f"~{_format_hms(est_eta)} "
+                f"({est_sec_per_ep:.2f} s/ep median, "
+                f"warmup-discounted ×{discount:.2f}; refined further "
+                f"by the next {max(1, log_interval - completed % log_interval)} "
+                f"episodes)"
+            )
+
         # Console diagnostics
         if episode % log_interval == 0:
             cap    = last_log.get("cap", 0)
             tnac   = last_log.get("tnac", 0)
             sec_p  = last_log.get("secondary_clearing", 0)
             elapsed_s = time.time() - train_t0
-            avg_ep_s = float(np.mean(recent_ep_durations)) if recent_ep_durations else 0.0
+            # Median (rather than mean) over the recent-durations window
+            # is robust to occasional spikes — PPO update episodes,
+            # periodic checkpoint writes, GC pauses — that would
+            # otherwise bias the ETA upward. Keep ``avg_ep_s`` as the
+            # variable name for back-compat with the print line below.
+            avg_ep_s = float(np.median(recent_ep_durations)) if recent_ep_durations else 0.0
             episodes_left = max(0, n_episodes - (episode + 1))
             eta_s = avg_ep_s * episodes_left
 
