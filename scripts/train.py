@@ -3138,7 +3138,15 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                         f"({total_pq/max(total_csv,1)*100:.1f}% of original)"
                     )
         except Exception as e:  # pragma: no cover - never block end-of-run
-            print(f"WARN: log compression failed for seed {seed}: {e}")
+            # Surface to stderr so the failure is visible in cloud
+            # workers' captured logs (Azure ML, etc.) where stdout WARNs
+            # are easy to miss. Checkpoint compression below is
+            # independent and still runs.
+            print(
+                f"WARN: log compression failed for seed {seed}: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
 
     if _compress_checkpoints_enabled:
         try:
@@ -3152,7 +3160,11 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
                     f"{ckpt_dir} → {archive}"
                 )
         except Exception as e:  # pragma: no cover
-            print(f"WARN: checkpoint compression failed for seed {seed}: {e}")
+            print(
+                f"WARN: checkpoint compression failed for seed {seed}: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
 
     print(f"\nDone — seed {seed}. Logs: {ep_path}, {yr_path}")
 

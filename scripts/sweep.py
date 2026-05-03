@@ -123,15 +123,6 @@ def _compress_job_artifacts(
     if not (do_logs or do_ckpts):
         return
 
-    try:
-        from src.utils.run_data import (
-            compress_checkpoints as _compress_ckpts,
-            compress_logs as _compress_logs,
-        )
-    except Exception as e:
-        log_f.write(f"# post-job compression: import failed: {e}\n")
-        return
-
     tag = variant_name
     candidates = [
         os.path.join(results_dir, f"training_log_{tag}_s{seed}.csv"),
@@ -143,6 +134,10 @@ def _compress_job_artifacts(
 
     if do_logs and csvs:
         try:
+            # Import inside the guard: the parquet path requires pyarrow,
+            # and we want a missing-pyarrow worker to still get the
+            # stdlib-only checkpoint compression below.
+            from src.utils.run_data import compress_logs as _compress_logs
             entries = _compress_logs(csvs, delete_csv=delete_csv)
             if entries:
                 total_csv = sum(e.source_size for e in entries)
@@ -160,12 +155,18 @@ def _compress_job_artifacts(
                 log_f.write(msg + "\n")
                 print(msg, file=sys.stderr)
         except Exception as e:
-            log_f.write(
-                f"# post-job log compression failed for {tag} s={seed}: {e}\n"
+            msg = (
+                f"[sweep] WARN: post-job log compression failed for "
+                f"{tag} s={seed}: {type(e).__name__}: {e}"
             )
+            log_f.write(msg + "\n")
+            print(msg, file=sys.stderr)
 
     if do_ckpts and os.path.isdir(ckpt_dir):
         try:
+            from src.utils.run_data import (
+                compress_checkpoints as _compress_ckpts,
+            )
             archive = _compress_ckpts(ckpt_dir, delete_dir=delete_dir)
             if archive:
                 msg = (
@@ -175,10 +176,12 @@ def _compress_job_artifacts(
                 log_f.write(msg + "\n")
                 print(msg, file=sys.stderr)
         except Exception as e:
-            log_f.write(
-                f"# post-job checkpoint compression failed for {tag} "
-                f"s={seed}: {e}\n"
+            msg = (
+                f"[sweep] WARN: post-job checkpoint compression failed "
+                f"for {tag} s={seed}: {type(e).__name__}: {e}"
             )
+            log_f.write(msg + "\n")
+            print(msg, file=sys.stderr)
 
 
 def _run_job(
