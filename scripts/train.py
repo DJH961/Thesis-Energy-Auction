@@ -3180,7 +3180,6 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
     _compress_checkpoints_enabled = bool(_compress_cfg.get("checkpoints", True))
     _delete_csv = bool(_compress_cfg.get("delete_csv", True))
     _delete_ckpt_dir = bool(_compress_cfg.get("delete_checkpoint_dir", True))
-    _ckpt_codec = str(_compress_cfg.get("checkpoints_codec", "auto"))
 
     if _compress_logs_enabled:
         try:
@@ -3219,9 +3218,7 @@ def train_one_seed(config: dict, seed: int, on_log=None, run_tag: str | None = N
             from src.utils.run_data import compress_checkpoints as _compress_ckpts
 
             ckpt_dir = os.path.join(results_dir, f"checkpoints{_tag_part}_s{seed}")
-            archive = _compress_ckpts(
-                ckpt_dir, delete_dir=_delete_ckpt_dir, codec=_ckpt_codec
-            )
+            archive = _compress_ckpts(ckpt_dir, delete_dir=_delete_ckpt_dir)
             if archive:
                 print(
                     f"Compressed checkpoints for seed {seed}: "
