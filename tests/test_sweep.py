@@ -364,6 +364,7 @@ class TestPostJobCompression:
 
     def test_compresses_leftover_csvs_and_checkpoints(self, tmp_path):
         from scripts.sweep import _compress_job_artifacts
+        from src.utils.run_data import resolve_checkpoint_codec
 
         cfg_path, results_dir, ck = self._setup_artifacts(tmp_path)
         log_f = open(results_dir / "run_v_s7.log", "w", encoding="utf-8")
@@ -376,13 +377,18 @@ class TestPostJobCompression:
         finally:
             log_f.close()
 
-        # CSVs and checkpoint dir replaced by parquet + tar.xz.
+        # CSVs and checkpoint dir replaced by parquet + tar archive in
+        # whichever codec the environment can actually produce (zst when
+        # zstandard is installed, gz fallback otherwise).
         assert not (results_dir / "training_log_v_s7.csv").exists()
         assert not (results_dir / "year_log_v_s7.csv").exists()
         assert not ck.exists()
         assert (results_dir / "training_log_v_s7.parquet").exists()
         assert (results_dir / "year_log_v_s7.parquet").exists()
-        assert (results_dir / "checkpoints_v_s7.tar.xz").exists()
+        archive_suffix = {"zst": ".tar.zst", "gz": ".tar.gz", "xz": ".tar.xz"}[
+            resolve_checkpoint_codec("auto")
+        ]
+        assert (results_dir / f"checkpoints_v_s7{archive_suffix}").exists()
 
     def test_noop_when_no_artifacts_left(self, tmp_path):
         """Happy path: train.py already compressed everything; the
@@ -433,12 +439,15 @@ class TestPostJobCompression:
         assert csv_path.exists()
         assert ck.is_dir()
         assert not (results_dir / "training_log_v_s7.parquet").exists()
-        assert not (results_dir / "checkpoints_v_s7.tar.xz").exists()
+        # No archive of any supported codec should have been produced.
+        for suffix in (".tar.zst", ".tar.gz", ".tar.xz"):
+            assert not (results_dir / f"checkpoints_v_s7{suffix}").exists()
 
     def test_keeps_sources_when_delete_flags_false(self, tmp_path):
         """delete_csv=False / delete_checkpoint_dir=False must leave the
         originals on disk alongside the compressed copies."""
         from scripts.sweep import _compress_job_artifacts
+        from src.utils.run_data import resolve_checkpoint_codec
 
         results_dir = tmp_path / "v"
         results_dir.mkdir()
@@ -454,7 +463,7 @@ class TestPostJobCompression:
         ck.mkdir()
         (ck / "a.pt").write_bytes(b"x" * 64)
 
-        with open(results_dir / "run_v_s7.log", "w") as log_f:
+        with open(results_dir / "run_v_s7.log", "w", encoding="utf-8") as log_f:
             _compress_job_artifacts(
                 config_path=str(cfg_path),
                 results_dir=str(results_dir),
@@ -463,4 +472,7 @@ class TestPostJobCompression:
         assert csv_path.exists()
         assert ck.is_dir()
         assert (results_dir / "training_log_v_s7.parquet").exists()
-        assert (results_dir / "checkpoints_v_s7.tar.xz").exists()
+        archive_suffix = {"zst": ".tar.zst", "gz": ".tar.gz", "xz": ".tar.xz"}[
+            resolve_checkpoint_codec("auto")
+        ]
+        assert (results_dir / f"checkpoints_v_s7{archive_suffix}").exists()
