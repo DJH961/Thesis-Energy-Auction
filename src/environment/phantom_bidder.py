@@ -76,9 +76,9 @@ class PhantomBidder:
         ----------
         price_ma3 : float
             3-year moving average of auction clearing prices (EUR/t).
-            Deprecated and ignored for anchor computation (kept only for
-            backward-compatible call sites/logging; planned for removal in
-            a future release.
+            Accepted but ignored for anchor computation; kept in the
+            signature so existing call sites and logs do not need to
+            change.
         reserve_price : float
             Effective reserve price for this year (EUR/t).
         penalty_rate : float
@@ -93,12 +93,12 @@ class PhantomBidder:
         bid_qty : float
             Drawn bid quantity (Mt).
         """
-        # Explicitly ignore MA3 in anchor construction (deprecated arg retained).
+        # MA3 is accepted but intentionally ignored: phantom pricing is
+        # decoupled from MA3 so floor stickiness in the learning
+        # population does not suppress phantom demand pressure.
         _ = price_ma3
 
         # Anchor: max(fundamental_fraction * penalty_rate, reserve + min_above).
-        # This decouples phantom pricing from MA3 so floor stickiness in the
-        # learning population does not suppress phantom demand pressure.
         # Note: np.lognormal(mean=log(anchor), sigma) gives median=anchor.
         anchor = max(
             self.price_fundamental_frac * max(penalty_rate, 1.0),
