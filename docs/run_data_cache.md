@@ -92,9 +92,8 @@ lossless compression steps at clean end-of-run:
 1. `training_log_*.csv` and `year_log_*.csv` are converted to zstd
    parquet via `compress_logs(...)` and the source CSVs are deleted.
 2. The `checkpoints_<tag>_s<seed>/` directory is bundled into a single
-   tar archive via `compress_checkpoints(...)` and the source dir is
-   deleted. The codec is chosen by `logging.compress_on_finish.checkpoints_codec`
-   (default `"auto"` — zstd when available, gzip fallback).
+   `checkpoints_<tag>_s<seed>.tar.xz` via `compress_checkpoints(...)` and
+   the source dir is deleted.
 
 Both steps round-trip losslessly modulo the documented float64→float32 /
 int64→int32 downcast in the parquet writer. The behaviour is controlled
@@ -103,33 +102,14 @@ by `logging.compress_on_finish` in the YAML config:
 ```yaml
 logging:
   compress_on_finish:
-    logs: true                      # CSV → parquet
-    checkpoints: true               # checkpoints_*/ → tar archive
-    delete_csv: true                # remove the source CSV after verify
+    logs: true                # CSV → parquet
+    checkpoints: true         # checkpoints_*/ → tar.xz
+    delete_csv: true          # remove the source CSV after verify
     delete_checkpoint_dir: true
-    checkpoints_codec: "auto"       # auto | zst | gz | xz
 ```
 
 Set any of these to `false` to keep the originals alongside the
 compressed copies.
-
-### Codec choice
-
-| codec | suffix      | compression speed     | ratio (typical, on `.pt` weights) | reader |
-| ----- | ----------- | --------------------- | --------------------------------- | ------ |
-| `zst` | `.tar.zst`  | **~30s @ 50 MB/s** (multi-threaded) | ~65–70% of source | needs `zstandard` (project dep) |
-| `gz`  | `.tar.gz`   | ~3–4 min @ 7 MB/s     | ~75–80% of source                 | stdlib |
-| `xz`  | `.tar.xz`   | ~15+ min @ ~2 MB/s    | ~60–65% of source                 | stdlib |
-
-`"auto"` (the default) picks `zst` when the optional `zstandard`
-package is importable and silently falls back to `gz` otherwise. Pin
-to `"xz"` only for cold-archival uploads where read time is irrelevant
-and you want the absolute smallest footprint.
-
-**Existing `.tar.xz` archives on disk remain fully supported by
-`decompress_checkpoints` and `scripts/evaluate.py` without any
-migration step.** The reader sniffs the suffix and dispatches to the
-right decoder, so swapping the writer codec is a transparent change.
 
 ### Memory profile
 
@@ -141,7 +121,7 @@ Both compression steps stream end-to-end:
   hundred MB even on a 5 GB year-log. Safe on Azure ML's standard
   D16ds_v5 (64 GB RAM).
 * `compress_checkpoints` uses `tarfile`'s incremental writer; each
-  ``.pt`` is read once into the codec's encoder buffer and never fully
+  ``.pt`` is read once into LZMA's encoder buffer and never fully
   materialised in Python.
 
 ### Re-opening a compressed run
@@ -150,19 +130,19 @@ Logs are read transparently — `load_run_csv` accepts either the
 original CSV path (auto-falls-back to the parquet sibling) or the
 parquet path directly.
 
-Checkpoints are extracted with the symmetric in-process helper, which
-auto-sniffs the suffix:
+Checkpoints are extracted with either the stdlib `tar` command or the
+symmetric in-process helper:
 
 ```bash
-# Shell — recommended for one-off use (pick the right flag for the codec)
-tar -xf results/sweeps/.../checkpoints_lrf_low_s1729.tar.zst -C results/sweeps/.../
+# Shell — recommended for one-off use
+tar -xJf results/sweeps/.../checkpoints_lrf_low_s1729.tar.xz -C results/sweeps/.../
 
-# In-process — handles all three suffixes uniformly
+# In-process — useful in evaluation scripts / notebooks
 from src.utils.run_data import decompress_checkpoints
 ckpt_dir = decompress_checkpoints(
-    "results/sweeps/.../checkpoints_lrf_low_s1729.tar.zst"
+    "results/sweeps/.../checkpoints_lrf_low_s1729.tar.xz"
 )
-# ckpt_dir now holds the same agent_*.pt layout the trainer wrote;
+# `ckpt_dir` now holds the same agent_*.pt layout the trainer wrote;
 # pass it straight to scripts/evaluate.py --checkpoint <ckpt_dir>/agent_0_best.pt
 ```
 
@@ -216,16 +196,11 @@ warm-up is needed.)
 For the current default-config sweep (4 seeds × 120 000 episodes) the
 year log is ~5 GB CSV per seed. Empirically:
 
-| File             | CSV (float64) | Compressed                        |
-| ---------------- | ------------- | --------------------------------- |
-| `year_log_*.csv` | ~5 GB         | ~0.5–1.0 GB parquet (zstd)        |
-| `training_log_*.csv` | ~30 MB    | ~5–10 MB parquet (zstd)           |
-| `checkpoints_*/` | ~2.5 GB       | ~1.6–1.8 GB `tar.zst` in 30–60 s  |
-|                  |               | ~1.7–1.9 GB `tar.gz`  in 3–4 min  |
-|                  |               | ~1.5–1.7 GB `tar.xz`  in 15+ min  |
+| File             | CSV (float64) | Parquet (float32 + zstd) |
+| ---------------- | ------------- | ------------------------ |
+| `year_log_*.csv` | ~5 GB         | ~0.5–1.0 GB              |
+| `training_log_*.csv` | ~30 MB    | ~5–10 MB                 |
+| `checkpoints_*/` | ~2.5 GB       | ~0.5–1.5 GB tar.xz       |
 
 A 4-seed sweep drops from ~22 GB on disk to ~3–5 GB; a 16-cell
 thesis-experiments sweep stays well under one disk's worth of headroom.
-The default `tar.zst` codec gets you the disk savings in tens of
-seconds rather than minutes per seed, which adds up to multi-hour
-wall-clock savings on a full sweep.

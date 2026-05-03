@@ -133,7 +133,7 @@ echo "[bootstrap] Using sweep spec: ${SPEC_TO_RUN}"
 # compression need (pyarrow in particular is the silent failure that strands
 # multi-GB CSVs / checkpoint dirs uncompressed). Probe for the critical
 # imports and install requirements.txt if any are absent.
-_NEEDED_PY_MODS=(numpy pandas pyarrow yaml torch gymnasium zstandard)
+_NEEDED_PY_MODS=(numpy pandas pyarrow yaml torch gymnasium)
 # Keep this list aligned with requirements.txt / pyproject.toml. It only
 # needs to cover modules whose absence would silently degrade a run
 # (e.g. pyarrow for the end-of-run lossless log compression). Other deps

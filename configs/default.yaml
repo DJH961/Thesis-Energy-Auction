@@ -3,7 +3,7 @@
 
 # Run version banner — printed at the top of training output. Bump in
 # lockstep with pyproject.toml `version`.
-version: "8.6.5"
+version: "8.6.4"
 
 simulation:
   n_years: 12
@@ -477,8 +477,7 @@ logging:
   # already small.
   #   logs       : convert training_log_*.csv / year_log_*.csv to zstd
   #                parquet (5–10× smaller); delete the source CSV.
-  #   checkpoints: bundle checkpoints_*/ into a single tar archive
-  #                (codec controlled by checkpoints_codec below); delete
+  #   checkpoints: bundle checkpoints_*/ into a single tar.xz; delete
   #                the source dir.
   # Round-trip is lossless modulo the float64→float32 / int64→int32
   # downcast in the parquet writer.
@@ -487,13 +486,6 @@ logging:
     checkpoints: true
     delete_csv: true
     delete_checkpoint_dir: true
-    # Checkpoint archive codec. 'auto' picks zstd when the optional
-    # 'zstandard' package is importable (fast, good ratio on dense
-    # float weights) and falls back to stdlib gzip otherwise. 'xz'
-    # is retained for cold-archival use (best ratio, much slower).
-    # All three codecs are read back transparently — old .tar.xz
-    # archives keep working without migration.
-    checkpoints_codec: "auto"
   results_dir: "results/"
   checkpoint_pruning:
     enabled: true
