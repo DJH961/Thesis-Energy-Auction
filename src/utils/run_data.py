@@ -96,6 +96,7 @@ __all__ = [
     "compress_checkpoints",
     "decompress_checkpoints",
     "checkpoint_archive_suffixes",
+    "resolve_checkpoint_codec",
 ]
 
 _log = logging.getLogger(__name__)
@@ -740,11 +741,16 @@ def _zstandard_available() -> bool:
     return True
 
 
-def _resolve_codec(codec: str) -> str:
+def resolve_checkpoint_codec(codec: str) -> str:
     """Resolve ``codec='auto'`` to ``'zst'`` or ``'gz'`` based on availability.
 
-    Explicit ``'zst'`` raises a clear error if ``zstandard`` is missing.
-    ``'gz'`` and ``'xz'`` always work via the Python stdlib.
+    Public so external callers (e.g. ``scripts/compress_results.py``)
+    can print the codec they will actually use without re-implementing
+    the same fallback rule.
+
+    * ``'auto'`` → ``'zst'`` if ``zstandard`` is importable, else ``'gz'``.
+    * Explicit ``'zst'`` raises ``RuntimeError`` if ``zstandard`` is missing.
+    * ``'gz'`` and ``'xz'`` always work via the Python stdlib.
     """
     c = (codec or "auto").lower()
     if c == "auto":
@@ -761,6 +767,10 @@ def _resolve_codec(codec: str) -> str:
             f"{sorted(_CKPT_CODEC_SUFFIX)} or 'auto'."
         )
     return c
+
+
+# Internal alias kept for in-module call sites.
+_resolve_codec = resolve_checkpoint_codec
 
 
 def _sniff_ckpt_codec(archive_path: str) -> str | None:
@@ -868,6 +878,13 @@ def compress_checkpoints(
         if resolved == "zst":
             import zstandard
 
+            # ``threads=-1`` tells libzstd to use all available CPU
+            # cores for the compression workers (the default is 0,
+            # i.e. single-threaded). zstd's worker pool is the main
+            # reason this codec is ~30× faster than xz on the same
+            # input — leaving it enabled unconditionally is the right
+            # default for a checkpoint dir that's only ever a few
+            # hundred MB to a few GB.
             cctx = zstandard.ZstdCompressor(level=int(level), threads=-1)
             with open(tmp_archive, "wb") as raw, cctx.stream_writer(raw) as zw:
                 with tarfile.open(fileobj=zw, mode="w|") as tar:
@@ -957,34 +974,33 @@ def decompress_checkpoints(
             f"Expected one of {_CKPT_ARCHIVE_SUFFIXES}."
         )
 
-    def _open_tar():
+    from contextlib import ExitStack
+
+    # ExitStack ties the lifetime of every helper file/stream to the
+    # tar reader so a stray exception doesn't leak file handles.
+    # zstd archives need an explicit raw-file + stream_reader pair
+    # underneath the tarfile; gz / xz are handled natively by tarfile.
+    with ExitStack() as stack:
         if codec == "zst":
             import zstandard
 
-            raw = open(archive_path, "rb")
-            try:
-                dctx = zstandard.ZstdDecompressor()
-                reader = dctx.stream_reader(raw)
-                # tarfile in stream mode (``r|``) reads sequentially, which
-                # matches zstd's stream_reader (no seek required).
-                tar = tarfile.open(fileobj=reader, mode="r|")
-            except Exception:
-                raw.close()
-                raise
-            # Track the underlying file so the caller can close it after
-            # extraction completes.
-            tar._zst_raw = raw  # type: ignore[attr-defined]
-            tar._zst_reader = reader  # type: ignore[attr-defined]
-            return tar
-        if codec == "gz":
-            return tarfile.open(archive_path, mode="r:gz")
-        return tarfile.open(archive_path, mode="r:xz")
+            raw = stack.enter_context(open(archive_path, "rb"))
+            dctx = zstandard.ZstdDecompressor()
+            reader = stack.enter_context(dctx.stream_reader(raw))
+            # Stream mode (``r|``) reads sequentially — the only mode
+            # compatible with zstd's stream_reader, which is not
+            # seekable.
+            tar = stack.enter_context(
+                tarfile.open(fileobj=reader, mode="r|")
+            )
+        elif codec == "gz":
+            tar = stack.enter_context(tarfile.open(archive_path, mode="r:gz"))
+        else:  # xz
+            tar = stack.enter_context(tarfile.open(archive_path, mode="r:xz"))
 
-    tar = _open_tar()
-    try:
-        # Streaming tarfiles (``r|`` mode used for zstd) iterate members
-        # once; eagerly extract while we read so we capture both the top
-        # name and the contents in a single pass.
+        # Streaming tarfiles (``r|`` mode used for zstd) iterate
+        # members once; eagerly extract while we read so we capture
+        # both the top name and the contents in a single pass.
         top: str | None = None
         for member in tar:
             if top is None:
@@ -992,14 +1008,6 @@ def decompress_checkpoints(
             tar.extract(member, out_dir, **extract_kwargs)
         if top is None:
             return None
-    finally:
-        tar.close()
-        raw = getattr(tar, "_zst_raw", None)
-        if raw is not None:
-            try:
-                raw.close()
-            except Exception:
-                pass
 
     if delete_archive:
         os.remove(archive_path)

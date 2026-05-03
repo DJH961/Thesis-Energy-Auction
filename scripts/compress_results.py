@@ -47,6 +47,7 @@ from src.utils.run_data import (  # noqa: E402
     checkpoint_archive_suffixes,
     compress_checkpoints,
     compress_logs,
+    resolve_checkpoint_codec,
 )
 
 LOG_PREFIXES = ("training_log_", "year_log_", "ql_training_log_")
@@ -210,9 +211,7 @@ def main() -> int:
     # be used; ``compress_checkpoints`` does the same resolution per
     # call, but printing it here makes the run log self-explanatory.
     try:
-        from src.utils.run_data import _resolve_codec  # noqa: WPS437
-
-        _resolved_codec = _resolve_codec(args.codec)
+        _resolved_codec = resolve_checkpoint_codec(args.codec)
     except Exception:
         _resolved_codec = args.codec
     print(f"  checkpoint codec        : {args.codec} → {_resolved_codec}")

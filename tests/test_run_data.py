@@ -686,37 +686,61 @@ def test_compress_checkpoints_auto_picks_zst_when_available(tmp_path):
     assert archive.endswith(".tar.zst"), archive
 
 
+class _ZstandardImportBlocker:
+    """Meta-path finder that raises ImportError for ``zstandard``.
+
+    Used by tests below to simulate hosts where the optional
+    ``zstandard`` dependency is not installed (e.g. minimal Azure ML
+    curated environments) so we can verify the auto-fallback path and
+    the explicit-codec hard-fail path both behave correctly.
+    """
+
+    def find_spec(self, name, path=None, target=None):  # noqa: D401
+        if name == "zstandard":
+            raise ImportError("blocked for test")
+        return None
+
+
+def _with_zstandard_blocked():
+    """Context manager that hides ``zstandard`` from imports.
+
+    Reloads ``src.utils.run_data`` inside the block so its
+    ``_zstandard_available`` cache is rebuilt against the patched
+    meta_path, and again on exit so the rest of the test session sees
+    the real environment.
+    """
+    import contextlib
+    import importlib
+    import sys
+
+    @contextlib.contextmanager
+    def _ctx():
+        import src.utils.run_data as rd
+
+        saved = sys.modules.pop("zstandard", None)
+        blocker = _ZstandardImportBlocker()
+        sys.meta_path.insert(0, blocker)
+        try:
+            importlib.reload(rd)
+            yield rd
+        finally:
+            sys.meta_path.remove(blocker)
+            if saved is not None:
+                sys.modules["zstandard"] = saved
+            importlib.reload(rd)
+
+    return _ctx()
+
+
 def test_compress_checkpoints_auto_falls_back_to_gz_without_zstandard(tmp_path):
     """When ``zstandard`` is missing, ``codec='auto'`` silently falls back
     to gzip — the stdlib codec — so a curated environment that never
     installs the optional dep still gets working compression.
     """
-    import importlib
-    import sys
-
-    import src.utils.run_data as rd
-
-    saved = sys.modules.pop("zstandard", None)
-    monkey = type(sys)("zstandard_blocker")  # placeholder
-
-    class _BlockZstandard:
-        def find_spec(self, name, path=None, target=None):
-            if name == "zstandard":
-                raise ImportError("blocked for test")
-            return None
-
-    blocker = _BlockZstandard()
-    sys.meta_path.insert(0, blocker)
-    try:
-        importlib.reload(rd)
+    with _with_zstandard_blocked() as rd:
         d = _make_ckpt_dir(tmp_path, "checkpoints_fallback_s1", {"a.pt": b"x"})
         archive = rd.compress_checkpoints(d, codec="auto")
         assert archive.endswith(".tar.gz"), archive
-    finally:
-        sys.meta_path.remove(blocker)
-        if saved is not None:
-            sys.modules["zstandard"] = saved
-        importlib.reload(rd)
 
 
 def test_compress_checkpoints_zst_raises_when_zstandard_missing(tmp_path):
@@ -724,31 +748,10 @@ def test_compress_checkpoints_zst_raises_when_zstandard_missing(tmp_path):
     when ``zstandard`` is not importable — silent fallback would mask a
     misconfigured pinned-codec deployment.
     """
-    import importlib
-    import sys
-
-    import src.utils.run_data as rd
-
-    saved = sys.modules.pop("zstandard", None)
-
-    class _BlockZstandard:
-        def find_spec(self, name, path=None, target=None):
-            if name == "zstandard":
-                raise ImportError("blocked for test")
-            return None
-
-    blocker = _BlockZstandard()
-    sys.meta_path.insert(0, blocker)
-    try:
-        importlib.reload(rd)
+    with _with_zstandard_blocked() as rd:
         d = _make_ckpt_dir(tmp_path, "checkpoints_strict_s1", {"a.pt": b"x"})
         with pytest.raises(RuntimeError, match="zstandard"):
             rd.compress_checkpoints(d, codec="zst")
-    finally:
-        sys.meta_path.remove(blocker)
-        if saved is not None:
-            sys.modules["zstandard"] = saved
-        importlib.reload(rd)
 
 
 def test_decompress_checkpoints_unrecognised_suffix_raises(tmp_path):
