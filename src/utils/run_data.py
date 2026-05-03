@@ -97,6 +97,9 @@ __all__ = [
     "decompress_checkpoints",
     "checkpoint_archive_suffixes",
     "resolve_checkpoint_codec",
+    "default_ep_columns",
+    "default_yr_columns",
+    "default_analysis_columns",
 ]
 
 _log = logging.getLogger(__name__)
@@ -342,6 +345,212 @@ def _build_parquet(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Canonical analysis-column projection
+# ---------------------------------------------------------------------------
+#
+# The year_log is the dominant memory cost in sweep-loading notebooks: each
+# run holds n_episodes × n_years rows × ~270–414 columns. A 16-cell sweep
+# loaded in full pegs ~30 GB even after float32 downcast. Almost no notebook
+# cell actually reads more than a few dozen of those columns; the rest is
+# diagnostic detail produced by the trainer for offline forensics.
+#
+# These helpers return the canonical superset of columns the analysis
+# notebooks consume. Passed through ``columns=`` to :func:`load_run_csv`,
+# they push the filter into the parquet reader so unused columns are never
+# decompressed — typical reduction is 5–10× on the year_log.
+#
+# Unknown column names are silently dropped by ``load_run_csv``, so it is
+# safe to ask for a superset across runs whose schemas have diverged.
+
+# Per-episode (training_log) scalar columns referenced by the analysis
+# notebooks. Add new entries here, not in individual notebooks.
+_EP_SCALAR_COLUMNS: tuple[str, ...] = (
+    "episode",
+    "clearing_price_last",
+    "cap_last",
+    "entropy_coef",
+    "shaping_weight",
+    "epsilon",
+    "ep_mean_clearing_price",
+    "ep_default_count",
+    "quality_score",
+    "Q_compliance",
+    "Q_price_realism",
+    "Q_saved_carbon",
+    "Q_cost_eff",
+    "Q_volatility",
+    "secondary_volume",
+    "secondary_avg_price",
+    "secondary_match_rate",
+    "secondary_price",
+    "price_start",
+    "price_peak",
+    "price_std",
+    "warn_priceFloor",
+    "warn_priceCeil",
+    "warn_noInvest",
+    "warn_debtSpiral",
+    "warn_overBank",
+    "warn_auctFail",
+    "year0_tnac",
+    "yearT_tnac",
+    "ep_total_unsold",
+    "ep_auction_failures",
+    "ep_total_defaults",
+)
+
+# Per-agent prefixes in the training_log: column name is f"{prefix}_A{i}".
+_EP_AGENT_PREFIXES: tuple[str, ...] = (
+    "reward",
+    "reward_base",
+    "reward_shaping",
+    "green_frac",
+    "delta_green",
+    "penalty",
+    "shortfall",
+    "bid_price",
+    "sec_buy_vol",
+    "sec_sell_vol",
+    "sec_buy_years",
+    "sec_sell_years",
+    "avg_sec_qty",
+    "avg_bid_mult",
+    "avg_bid_coverage",
+    "sec_buy_intent_share",
+    "sec_sell_intent_share",
+    "inv_onshore_share",
+    "inv_offshore_share",
+    "inv_solar_share",
+    "udbc_U_total",
+    "udbc_D_total",
+    "udbc_M_total",
+    "udbc_B_total",
+    "udbc_C_total",
+    "ep_start_bank",
+    "mean_alloc",
+    "invest_cost",
+    "total_mac_reduction",
+    "esg_vs_penalty_ratio",
+    "compliance_gate",
+    "peak_loan_outstanding",
+    "peak_carry_forward",
+    "final_treasury_reserve",
+    "actor_loss",
+    "critic_loss",
+)
+
+# Per-(episode, year) (year_log) scalar columns referenced by the analysis
+# notebooks.
+_YR_SCALAR_COLUMNS: tuple[str, ...] = (
+    "episode",
+    "year",
+    "cap",
+    "auction_volume",
+    "tnac",
+    "clearing_price",
+    "secondary_price",
+    "msr_reserve",
+    "msr_total_cancelled",
+    "msr_withhold_this_year",
+    "msr_release_this_year",
+    "inflation_rate",
+    "inflation_factor",
+    "auction_total_demand",
+    "auction_unsold",
+    "auction_hhi",
+    "auction_max_agent_share",
+    "auction_failed",
+    "auction_defaults",
+    "auction_defaulted_volume",
+    "effective_reserve_price",
+    "secondary_n_buyers_intent",
+    "secondary_n_sellers_intent",
+    "secondary_n_buyers_executed",
+    "secondary_n_sellers_executed",
+    "fundamental_anchor",
+)
+
+# Per-agent prefixes in the year_log: column name is f"{prefix}_A{i}".
+_YR_AGENT_PREFIXES: tuple[str, ...] = (
+    "bank_start",
+    "bank_end",
+    "alloc",
+    "emissions",
+    "trade_qty",
+    "trade_cost",
+    "green_frac",
+    "delta_green",
+    "shortfall",
+    "penalty",
+    "reward",
+    "reward_base",
+    "reward_shaping",
+    "holdings",
+    "invest_cost",
+    "collateral_cost",
+    "bid_price",
+    "auction_cost",
+    "secondary_net",
+    "compliance_surplus",
+    "mac_reduction",
+    "mac_cost",
+    "sec_qty_action",
+    "sec_action_side",
+    "bid_qty_mult",
+    "estimate_need",
+    "bid_coverage",
+    "invest_frac_pre_clip",
+    "invest_frac_post_clip",
+    "available_budget",
+    "compliance_share_of_available",
+    "carry_forward_start",
+    "carry_forward_end",
+    "coverage_gap",
+    "effective_penalty_rate",
+    "treasury_reserve",
+    "treasury_drawn",
+    "loan_outstanding",
+)
+
+
+def _expand_with_agents(
+    scalars: Sequence[str], prefixes: Sequence[str], n_max_agents: int
+) -> list[str]:
+    out = list(scalars)
+    for i in range(1, n_max_agents + 1):
+        out.extend(f"{p}_A{i}" for p in prefixes)
+    # Preserve order, drop duplicates.
+    return list(dict.fromkeys(out))
+
+
+def default_ep_columns(n_max_agents: int = 16) -> list[str]:
+    """Canonical training_log column projection for analysis notebooks.
+
+    Returns scalar episode-level columns plus ``<prefix>_A{i}`` for each
+    per-agent prefix and ``i in 1..n_max_agents``. ``n_max_agents`` is a
+    superset bound — the trainer logs only the agents that exist in the
+    config and ``load_run_csv`` silently drops unknown column names, so
+    asking for ``A1..A16`` works fine for an 8-agent run.
+    """
+    return _expand_with_agents(_EP_SCALAR_COLUMNS, _EP_AGENT_PREFIXES, n_max_agents)
+
+
+def default_yr_columns(n_max_agents: int = 16) -> list[str]:
+    """Canonical year_log column projection for analysis notebooks.
+
+    See :func:`default_ep_columns`. The year_log is the dominant memory
+    cost in full-sweep loads; the projection returned here typically cuts
+    in-RAM size by 5–10×.
+    """
+    return _expand_with_agents(_YR_SCALAR_COLUMNS, _YR_AGENT_PREFIXES, n_max_agents)
+
+
+def default_analysis_columns(n_max_agents: int = 16) -> tuple[list[str], list[str]]:
+    """Convenience: return ``(ep_columns, yr_columns)`` together."""
+    return default_ep_columns(n_max_agents), default_yr_columns(n_max_agents)
 
 
 def load_run_csv(

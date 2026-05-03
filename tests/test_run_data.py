@@ -13,6 +13,9 @@ import pytest
 from src.utils.run_data import (
     CacheEntry,
     cache_path_for,
+    default_analysis_columns,
+    default_ep_columns,
+    default_yr_columns,
     load_run,
     load_run_csv,
     rebuild_cache,
@@ -836,3 +839,76 @@ def test_run_data_module_imports_without_pyarrow(tmp_path):
         f"stdout={res.stdout!r} stderr={res.stderr!r}"
     )
     assert "imported" in res.stdout
+
+
+# ---------------------------------------------------------------------------
+# default_ep_columns / default_yr_columns — the analysis-projection helpers.
+# ---------------------------------------------------------------------------
+
+
+def test_default_columns_basic_membership():
+    ep = default_ep_columns()
+    yr = default_yr_columns()
+    # Episode-level scalars present in both training-log analyses.
+    assert "episode" in ep
+    assert "quality_score" in ep
+    assert "ep_mean_clearing_price" in ep
+    # Year-level scalars present in every sweep notebook.
+    assert "episode" in yr
+    assert "year" in yr
+    assert "clearing_price" in yr
+    assert "cap" in yr
+    assert "fundamental_anchor" in yr
+    # No duplicates — order-preserving uniqueness is the contract.
+    assert len(ep) == len(set(ep))
+    assert len(yr) == len(set(yr))
+
+
+def test_default_columns_per_agent_expansion():
+    yr = default_yr_columns(n_max_agents=8)
+    # Per-agent columns are produced for every prefix.
+    for i in range(1, 9):
+        assert f"reward_A{i}" in yr
+        assert f"bank_end_A{i}" in yr
+        assert f"emissions_A{i}" in yr
+    # n_max_agents bounds the expansion.
+    assert "reward_A9" not in yr
+    yr16 = default_yr_columns(n_max_agents=16)
+    assert "reward_A16" in yr16
+    assert "reward_A17" not in yr16
+
+
+def test_default_columns_projection_drops_unused(tmp_path):
+    # A year_log that mixes wanted, per-agent, and unused diagnostic columns.
+    df = pd.DataFrame(
+        {
+            "episode": [0, 0, 1, 1],
+            "year": [0, 1, 0, 1],
+            "clearing_price": [50.0, 51.0, 52.0, 53.0],
+            "reward_A1": [1.0, 2.0, 3.0, 4.0],
+            "reward_A8": [10.0, 20.0, 30.0, 40.0],
+            "obscure_diagnostic_col": [9, 9, 9, 9],
+            "another_unused": ["a", "b", "c", "d"],
+        }
+    )
+    csv = _write_csv(tmp_path, "year_log_proj_s1.csv", df)
+    out = load_run_csv(csv, columns=default_yr_columns(n_max_agents=8))
+    # Asked-for columns kept...
+    assert set(out.columns) >= {
+        "episode",
+        "year",
+        "clearing_price",
+        "reward_A1",
+        "reward_A8",
+    }
+    # ...and unwanted diagnostic columns are silently dropped.
+    assert "obscure_diagnostic_col" not in out.columns
+    assert "another_unused" not in out.columns
+    # Float64 was downcast to float32 by load_run_csv.
+    assert out["clearing_price"].dtype == np.float32
+
+
+def test_default_analysis_columns_returns_pair():
+    ep, yr = default_analysis_columns(8)
+    assert ep == default_ep_columns(8)
+    assert yr == default_yr_columns(8)
