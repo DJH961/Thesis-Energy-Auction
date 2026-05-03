@@ -5,6 +5,48 @@ Version numbers reflect the `version` field in `pyproject.toml`
 
 ---
 
+## [8.6.5]
+
+**Faster checkpoint compression: `tar.xz` → `tar.zst`** (with stdlib
+gzip fallback). On real runs, end-of-training checkpoint archiving
+drops from ~15 minutes per seed to ~30 seconds with essentially the
+same disk footprint (~1.7 GB per `checkpoints_*/`), saving multi-hour
+wall-clock on full sweeps.
+
+* `src/utils/run_data.py` — `compress_checkpoints(..., codec="auto",
+  level=None)` now writes `.tar.zst` (zstd, threaded) when the optional
+  `zstandard` package is importable, `.tar.gz` (stdlib, level=1) when
+  it is not, and `.tar.xz` (stdlib, preset=6) when explicitly requested
+  for cold-archival use. `decompress_checkpoints` sniffs the archive
+  suffix and dispatches to the right decoder, so all three codecs read
+  back transparently. New `checkpoint_archive_suffixes()` helper
+  exposes the recognised suffix list.
+* `configs/default.yaml` — new `logging.compress_on_finish.checkpoints_codec`
+  knob (default `"auto"`).
+* `scripts/{train,sweep,compress_results,evaluate}.py` — pass the codec
+  through; `compress_results.py` gained a `--codec` CLI flag, prints
+  the resolved codec in its run header, and its directory finder now
+  skips a `checkpoints_*/` dir when **any** of the three archive
+  variants already exists (so re-running the migration script on a
+  partially migrated tree is a clean no-op regardless of the codec
+  used previously).
+* `requirements.txt` + `pyproject.toml` + `bootstrap.sh` — `zstandard>=0.22.0`
+  added as a regular dependency; bootstrap self-heal probe extended to
+  install it when missing on Azure ML curated environments.
+* Tests — full roundtrip coverage for all three codecs, suffix sniff
+  on the reader, finder skip-on-existing-archive logic, auto fallback
+  to `gz` when `zstandard` is unavailable, and an explicit-`zst`
+  hard-fail when the dep is missing.
+* `docs/run_data_cache.md` — codec choice subsection, updated
+  disk-space sketch with realistic zst/gz/xz timings, explicit
+  back-compat note: existing `.tar.xz` archives keep working without
+  any migration step.
+
+**Migration:** none required. Old `.tar.xz` archives are read
+transparently by the updated reader and `scripts/evaluate.py`.
+
+---
+
 ## [8.6.4]
 
 **Lossless end-of-training compression + parquet log cache.** Logs and

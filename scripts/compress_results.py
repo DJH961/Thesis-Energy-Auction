@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pa
 
 from src.utils.run_data import (  # noqa: E402
     cache_path_for,
+    checkpoint_archive_suffixes,
     compress_checkpoints,
     compress_logs,
 )
@@ -57,7 +58,7 @@ LOG_PREFIXES = ("training_log_", "year_log_", "ql_training_log_")
 # observed throughput once each section starts producing data, so the ETA
 # converges away from these priors after a few items.
 _LOGS_BYTES_PER_SEC_PRIOR = 60 * 1024 * 1024     # ~60 MB/s CSV → parquet
-_CKPTS_BYTES_PER_SEC_PRIOR = 8 * 1024 * 1024     # ~8 MB/s dir → tar.xz
+_CKPTS_BYTES_PER_SEC_PRIOR = 50 * 1024 * 1024    # ~50 MB/s dir → tar.zst
 
 
 def _find_log_csvs(root: str) -> list[str]:
@@ -74,15 +75,19 @@ def _find_log_csvs(root: str) -> list[str]:
 
 def _find_checkpoint_dirs(root: str) -> list[str]:
     out: list[str] = []
+    suffixes = checkpoint_archive_suffixes()
     for dirpath, dirnames, _filenames in os.walk(root):
         for d in dirnames:
             if d.startswith("checkpoints"):
-                # Skip dirs that are already siblings of an existing archive
-                # (re-running compress_results should be a no-op).
+                # Skip dirs that are already siblings of an existing
+                # archive in any supported codec — re-running
+                # compress_results should be a no-op on already-archived
+                # runs regardless of which codec was used.
                 full = os.path.join(dirpath, d)
-                archive = full.rstrip(os.sep) + ".tar.xz"
-                if not os.path.exists(archive):
-                    out.append(full)
+                stem = full.rstrip(os.sep)
+                if any(os.path.exists(stem + s) for s in suffixes):
+                    continue
+                out.append(full)
     return sorted(out)
 
 
@@ -145,6 +150,18 @@ def main() -> int:
         action="store_true",
         help="Skip log compression.",
     )
+    parser.add_argument(
+        "--codec",
+        choices=("auto", "zst", "gz", "xz"),
+        default="auto",
+        help=(
+            "Checkpoint archive codec. 'auto' (default) picks zstd when "
+            "the 'zstandard' package is installed and falls back to "
+            "stdlib gzip otherwise. 'xz' is retained for cold-archival "
+            "use (best ratio, much slower). All three are read back "
+            "transparently by decompress_checkpoints."
+        ),
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(args.root):
@@ -189,12 +206,26 @@ def main() -> int:
         f"  checkpoint dirs to bundle: {len(ckpts)} "
         f"({_human(total_ckpt_input)})"
     )
+    # Resolve the codec once so the header reflects what will actually
+    # be used; ``compress_checkpoints`` does the same resolution per
+    # call, but printing it here makes the run log self-explanatory.
+    try:
+        from src.utils.run_data import _resolve_codec  # noqa: WPS437
+
+        _resolved_codec = _resolve_codec(args.codec)
+    except Exception:
+        _resolved_codec = args.codec
+    print(f"  checkpoint codec        : {args.codec} → {_resolved_codec}")
+
+    _ckpt_suffix_for_codec = {
+        "zst": ".tar.zst", "gz": ".tar.gz", "xz": ".tar.xz",
+    }.get(_resolved_codec, ".tar.zst")
 
     if args.dry_run:
         for p in csvs:
             print(f"  [LOG ] {p} → {cache_path_for(p)}")
         for d in ckpts:
-            print(f"  [CKPT] {d} → {d.rstrip(os.sep)}.tar.xz")
+            print(f"  [CKPT] {d} → {d.rstrip(os.sep)}{_ckpt_suffix_for_codec}")
         return 0
 
     # Upfront forward-looking ETA — based on size-weighted prior throughput
@@ -283,7 +314,7 @@ def main() -> int:
         try:
             size_before = ckpt_sizes[idx]
             archive = compress_checkpoints(
-                ckpt_dir, delete_dir=not args.keep_source
+                ckpt_dir, delete_dir=not args.keep_source, codec=args.codec
             )
         except Exception as e:
             print(f"  FAIL {ckpt_dir}: {e}", file=sys.stderr)
