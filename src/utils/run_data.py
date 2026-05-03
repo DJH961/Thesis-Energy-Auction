@@ -560,6 +560,8 @@ def load_run_csv(
     chunksize: int = _DEFAULT_CHUNKSIZE,
     compression: str = "zstd",
     rebuild: bool = False,
+    tail_episodes: int | None = None,
+    episode_column: str = "episode",
 ) -> pd.DataFrame | None:
     """Load one training-log / year-log CSV via a persistent parquet cache.
 
@@ -580,6 +582,17 @@ def load_run_csv(
         for these logs).
     rebuild
         Force rebuilding the parquet even if the cache key matches.
+    tail_episodes
+        If set, only rows with ``episode_column >= max(episode_column) -
+        tail_episodes + 1`` are returned. Implemented as a parquet
+        row-filter so only the relevant row groups are decompressed —
+        loading 16+ runs of a 100k-episode sweep otherwise blows out
+        notebook RAM. Use for analyses that only consume the converged
+        tail.
+    episode_column
+        Column name used by ``tail_episodes`` to identify episodes.
+        Defaults to ``"episode"`` (matches both the training_log and
+        year_log schemas).
 
     Returns
     -------
@@ -633,12 +646,13 @@ def load_run_csv(
                     compression=compression,
                 )
 
+    _, pq = _require_pyarrow()
+
     cols = list(columns) if columns is not None else None
     if cols is not None:
         # Filter to columns that actually exist; silently drop unknowns so
         # notebooks can ask for a superset across heterogeneous schemas
         # (e.g. older runs that pre-date a new diagnostic column).
-        _, pq = _require_pyarrow()
         available = set(pq.read_schema(parquet_path).names)
         cols = [c for c in cols if c in available]
         if not cols:
@@ -646,9 +660,41 @@ def load_run_csv(
             # empty frame rather than crashing pyarrow.
             return pd.DataFrame()
 
-    _, pq = _require_pyarrow()
-    table = pq.read_table(parquet_path, columns=cols)
-    return table.to_pandas()
+    # Tail-episode filter. We need the episode column even if the caller
+    # didn't ask for it, so we can compute the cutoff. After filtering we
+    # drop it again to keep the projection contract.
+    pq_filters = None
+    cutoff: int | None = None
+    drop_episode_after_filter = False
+    if tail_episodes is not None and tail_episodes > 0:
+        schema_names = set(pq.read_schema(parquet_path).names)
+        if episode_column not in schema_names:
+            # Tail filter requested but the file has no episode column —
+            # nothing to filter on. Return all rows rather than crashing.
+            _log.info(
+                "tail_episodes requested for %s but column %r not in schema; "
+                "ignoring filter",
+                csv_path, episode_column,
+            )
+        else:
+            ep_col_table = pq.read_table(parquet_path, columns=[episode_column])
+            ep_series = ep_col_table.column(episode_column)
+            if len(ep_series) == 0:
+                pass  # empty file — nothing to filter
+            else:
+                ep_max = ep_series.to_pandas().max()
+                if pd.notna(ep_max):
+                    cutoff = int(ep_max) - int(tail_episodes) + 1
+                    pq_filters = [(episode_column, ">=", cutoff)]
+                    if cols is not None and episode_column not in cols:
+                        cols = list(cols) + [episode_column]
+                        drop_episode_after_filter = True
+
+    table = pq.read_table(parquet_path, columns=cols, filters=pq_filters)
+    df = table.to_pandas()
+    if drop_episode_after_filter and episode_column in df.columns:
+        df = df.drop(columns=[episode_column])
+    return df
 
 
 def load_run(
@@ -659,18 +705,23 @@ def load_run(
     yr_columns: Sequence[str] | None = None,
     chunksize: int = _DEFAULT_CHUNKSIZE,
     rebuild: bool = False,
+    tail_episodes: int | None = None,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """Load the (training_log, year_log) pair for a single run.
 
     Convenience wrapper around :func:`load_run_csv` that mirrors the
     ``(ep_df, yr_df)`` tuple returned by the notebook helpers. Either path
     may be ``None`` to indicate that file is unavailable for this run.
+    ``tail_episodes`` is forwarded to both reads — see
+    :func:`load_run_csv`.
     """
     ep_df = load_run_csv(
-        training_log, columns=ep_columns, chunksize=chunksize, rebuild=rebuild
+        training_log, columns=ep_columns, chunksize=chunksize, rebuild=rebuild,
+        tail_episodes=tail_episodes,
     )
     yr_df = load_run_csv(
-        year_log, columns=yr_columns, chunksize=chunksize, rebuild=rebuild
+        year_log, columns=yr_columns, chunksize=chunksize, rebuild=rebuild,
+        tail_episodes=tail_episodes,
     )
     return ep_df, yr_df
 

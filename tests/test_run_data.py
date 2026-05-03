@@ -912,3 +912,93 @@ def test_default_analysis_columns_returns_pair():
     ep, yr = default_analysis_columns(8)
     assert ep == default_ep_columns(8)
     assert yr == default_yr_columns(8)
+
+
+# ---------------------------------------------------------------------------
+# tail_episodes — converged-tail row filter pushed into parquet.
+# ---------------------------------------------------------------------------
+
+
+def _write_year_log(tmp_path, n_episodes=100, n_years=12, name="year_log_tail_s1.csv"):
+    rows = []
+    for ep in range(n_episodes):
+        for yr in range(n_years):
+            rows.append({
+                "episode": ep,
+                "year": yr,
+                "cap": 1.0,
+                "clearing_price": 50.0 + ep * 0.1,
+                "reward_A1": float(ep),
+                "unused_diag": 999.0,
+            })
+    df = pd.DataFrame(rows)
+    return _write_csv(tmp_path, name, df), df
+
+
+def test_tail_episodes_filters_to_last_n(tmp_path):
+    csv, _ = _write_year_log(tmp_path, n_episodes=100, n_years=12)
+    full = load_run_csv(csv)
+    tail = load_run_csv(csv, tail_episodes=10)
+    assert len(full) == 100 * 12
+    assert len(tail) == 10 * 12
+    assert int(tail["episode"].min()) == 90
+    assert int(tail["episode"].max()) == 99
+
+
+def test_tail_episodes_combined_with_columns_drops_episode_when_unrequested(tmp_path):
+    # When the caller doesn't ask for the episode column, tail_episodes
+    # must not leak it into the result — the column is borrowed only for
+    # the row filter and must be removed afterwards.
+    csv, _ = _write_year_log(tmp_path, n_episodes=50, n_years=12)
+    out = load_run_csv(
+        csv, columns=["cap", "clearing_price"], tail_episodes=10
+    )
+    assert set(out.columns) == {"cap", "clearing_price"}
+    assert len(out) == 10 * 12
+
+
+def test_tail_episodes_keeps_episode_when_requested(tmp_path):
+    csv, _ = _write_year_log(tmp_path, n_episodes=50, n_years=12)
+    out = load_run_csv(
+        csv, columns=["episode", "cap"], tail_episodes=10
+    )
+    assert set(out.columns) == {"episode", "cap"}
+    assert int(out["episode"].min()) == 40
+
+
+def test_tail_episodes_larger_than_data_returns_all(tmp_path):
+    csv, _ = _write_year_log(tmp_path, n_episodes=20, n_years=12)
+    out = load_run_csv(csv, tail_episodes=10_000)
+    assert len(out) == 20 * 12
+
+
+def test_tail_episodes_zero_or_none_is_noop(tmp_path):
+    csv, _ = _write_year_log(tmp_path, n_episodes=20, n_years=12)
+    full = load_run_csv(csv)
+    assert len(load_run_csv(csv, tail_episodes=None)) == len(full)
+    assert len(load_run_csv(csv, tail_episodes=0)) == len(full)
+
+
+def test_tail_episodes_preserves_dtype_downcast(tmp_path):
+    csv, _ = _write_year_log(tmp_path, n_episodes=30, n_years=12)
+    out = load_run_csv(csv, tail_episodes=5)
+    assert out["cap"].dtype == np.float32
+    assert out["reward_A1"].dtype == np.float32
+
+
+def test_tail_episodes_missing_column_is_silent_passthrough(tmp_path, caplog):
+    # A schema with no 'episode' column (e.g. if a future log family lacks
+    # one). tail_episodes should log + return all rows rather than crash.
+    df = pd.DataFrame({"year": [0, 1, 2], "cap": [1.0, 2.0, 3.0]})
+    csv = _write_csv(tmp_path, "year_log_no_episode_s1.csv", df)
+    out = load_run_csv(csv, tail_episodes=5)
+    assert len(out) == 3
+
+
+def test_tail_episodes_on_empty_log(tmp_path):
+    df = pd.DataFrame({"episode": pd.Series(dtype="int64"),
+                       "year": pd.Series(dtype="int64"),
+                       "cap": pd.Series(dtype="float64")})
+    csv = _write_csv(tmp_path, "year_log_empty_s1.csv", df)
+    out = load_run_csv(csv, tail_episodes=10)
+    assert out.empty
