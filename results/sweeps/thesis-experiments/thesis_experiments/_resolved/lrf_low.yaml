@@ -1,0 +1,636 @@
+version: 8.6.4
+simulation:
+  n_years: 12
+  n_episodes: 120000
+  seeds:
+  - 1729
+  - 8191
+  - 6561
+  - 5041
+device: auto
+technologies:
+  names:
+  - coal
+  - gas
+  - onshore_wind
+  - offshore_wind
+  - solar
+  emission_factors:
+  - 0.82
+  - 0.49
+  - 0.011
+  - 0.012
+  - 0.048
+  capex:
+  - 3000
+  - 1150
+  - 1350
+  - 3250
+  - 750
+  capacity_factors:
+  - 0.65
+  - 0.6
+  - 0.35
+  - 0.47
+  - 0.17
+  deploy_delays:
+  - 0
+  - 0
+  - 4
+  - 7
+  - 2
+  operational_costs:
+  - 72.0
+  - 55.0
+  - 17.0
+  - 47.0
+  - 10.0
+  decommission_costs:
+  - 200
+  - 100
+  - 0
+  - 0
+  - 0
+  is_green:
+  - false
+  - false
+  - true
+  - true
+  - true
+  is_buildable:
+  - false
+  - false
+  - true
+  - true
+  - true
+ets:
+  cap_year_0_override: null
+  initial_bank_fraction: 0.5
+  cap_overhead_pct: 0.1
+  lrf_phase1: 0.043
+  lrf_phase2: 0.022
+  lrf_phase_switch: 2
+  msr:
+    enabled: true
+    tnac_upper_ratio: 0.68
+    tnac_mid_ratio: null
+    tnac_lower_ratio: null
+    withhold_rate: 0.24
+    release_frac: 0.0638297872
+    activation_year: 1
+    price_containment_absolute: 175
+    price_release_absolute: 212
+    price_release_enabled: false
+    emergency_release_frac: 0.064
+    min_auction_frac: 0.1
+  banking: true
+  reserve_price: 45.0
+  reserve_price_mode: static
+  reserve_discount: 0.8
+  reserve_initial: 50.0
+  unsold_to_msr: true
+  max_rollover_multiplier: 1.5
+  price_history_anchor: auction
+companies:
+  n_agents: 8
+  output_twh: 10.0
+  initial_mix:
+  - - 0.25
+    - 0.3
+    - 0.2
+    - 0.15
+    - 0.1
+  - - 0.25
+    - 0.3
+    - 0.2
+    - 0.15
+    - 0.1
+  - - 0.15
+    - 0.35
+    - 0.25
+    - 0.15
+    - 0.1
+  - - 0.15
+    - 0.35
+    - 0.25
+    - 0.15
+    - 0.1
+  - - 0.1
+    - 0.25
+    - 0.3
+    - 0.2
+    - 0.15
+  - - 0.1
+    - 0.25
+    - 0.3
+    - 0.2
+    - 0.15
+  - - 0.05
+    - 0.2
+    - 0.3
+    - 0.25
+    - 0.2
+  - - 0.05
+    - 0.2
+    - 0.3
+    - 0.25
+    - 0.2
+  reward_weights:
+  - - 1.0
+    - 0.0
+  - - 0.5
+    - 0.5
+  - - 1.0
+    - 0.0
+  - - 0.5
+    - 0.5
+  - - 1.0
+    - 0.0
+  - - 0.5
+    - 0.5
+  - - 1.0
+    - 0.0
+  - - 0.5
+    - 0.5
+  n_bot_agents: 0
+  bot_initial_mix:
+  - - 0.4
+    - 0.4
+    - 0.1
+    - 0.05
+    - 0.05
+  - - 0.4
+    - 0.4
+    - 0.1
+    - 0.05
+    - 0.05
+  - - 0.15
+    - 0.45
+    - 0.2
+    - 0.1
+    - 0.1
+  - - 0.15
+    - 0.45
+    - 0.2
+    - 0.1
+    - 0.1
+  - - 0.05
+    - 0.25
+    - 0.35
+    - 0.2
+    - 0.15
+  - - 0.05
+    - 0.25
+    - 0.35
+    - 0.2
+    - 0.15
+  - - 0.0
+    - 0.1
+    - 0.3
+    - 0.35
+    - 0.25
+  - - 0.0
+    - 0.1
+    - 0.3
+    - 0.35
+    - 0.25
+  bot_reward_weights:
+  - - 1.0
+    - 0.0
+  - - 0.5
+    - 0.5
+  - - 1.0
+    - 0.0
+  - - 0.5
+    - 0.5
+  - - 1.0
+    - 0.0
+  - - 0.5
+    - 0.5
+  - - 1.0
+    - 0.0
+  - - 0.5
+    - 0.5
+investment:
+  max_invest_frac: 0.2
+  convexity_alpha: 0.2
+  discount_rate: 0.05
+risk:
+  p_fail_min: 0.08
+  p_fail_max: 0.4
+  p_fail_alpha: 0.7
+  experience_discount: 0.1
+  experience_threshold: 2
+auction:
+  price_max: 250.0
+  price_min: 45.0
+  quantity_max: 3.0
+  bid_change_limit:
+    enabled: true
+    value: 75.0
+  qty_mult_low: 0.5
+  qty_mult_high: 2.0
+  max_agent_share: 1.0
+  pricing_rule: uniform
+  cancel_under_subscribed: false
+  lot_size: 0.0005
+  collateral:
+    enabled: true
+    collateral_rate: 0.15
+    hold_fraction: 0.02
+    collateral_fraction: 0.2
+    max_collateral_budget_share: 0.5
+    min_qty_floor_frac: 0.5
+  leverage_multiplier: 3.0
+  suspension_length: 0
+  budget_price_clip: true
+  budget_gate:
+    enabled: true
+    safety_mult: 1.2
+    notional_safety_mult: 5.0
+    protect_need_floor: true
+    inflation_aware_ma3: true
+    include_loan_headroom: false
+    treasury_fraction: 0.33
+    treasury_max_abs: 0.0
+    shock_aware_need_floor: false
+  carry_forward_defaults: true
+trading:
+  enabled: true
+  transaction_cost: 0.5
+  spread_tolerance: 0.12
+  sec_price_min: 45.0
+  sec_price_max_mult: 2.0
+secondary:
+  liquidity_pool:
+    enabled: false
+    floor_fraction_of_penalty: 0.25
+budget:
+  mode: revenue_based
+  debt_headrooms:
+  - 240.0
+  - 240.0
+  - 155.0
+  - 155.0
+  - 65.0
+  - 65.0
+  - -25.0
+  - -25.0
+  bot_debt_headrooms:
+  - 240.0
+  - 240.0
+  - 155.0
+  - 155.0
+  - 65.0
+  - 65.0
+  - -25.0
+  - -25.0
+  budget_ema_alpha: 0.3
+  annual_budgets:
+  - 880.0
+  - 880.0
+  - 800.0
+  - 800.0
+  - 820.0
+  - 820.0
+  - 780.0
+  - 780.0
+  bot_annual_budgets:
+  - 880.0
+  - 880.0
+  - 800.0
+  - 800.0
+  - 820.0
+  - 820.0
+  - 780.0
+  - 780.0
+  dynamic_budget_ceiling_multiplier: 2.5
+  overspend_penalty_coef: 0.5
+  contingency_zone: 0.1
+  contingency_penalty_coef: 0.05
+  hard_cap_fraction: 1.15
+  soft_zone_start: 1.0
+  tiered_penalty_coef: 2.0
+  investment_hard_gate: true
+  capex_throughputs:
+  - 130.0
+  - 130.0
+  - 130.0
+  - 130.0
+  - 160.0
+  - 160.0
+  - 120.0
+  - 120.0
+  bot_capex_throughputs:
+  - 130.0
+  - 130.0
+  - 130.0
+  - 130.0
+  - 160.0
+  - 160.0
+  - 120.0
+  - 120.0
+  capex_overspend_coef: 1.0
+  emergency_loan:
+    enabled: true
+    max_loan_fraction: 0.15
+    interest_rate: 0.08
+    repayment_years: 3
+    leverage_premium_coef: 0.25
+    leverage_premium_exp: 1.5
+    capex_squeeze_floor: 0.5
+    origination_sting_coef: 0.07
+  treasury_reserve:
+    enabled: true
+    retention_fraction: 0.6
+    cap_multiple: 1.5
+    decay_rate: 0.05
+    terminal_value_rate: 0.3
+  suspension_length: 1
+green_finance:
+  enabled: false
+  loan_budget_boost: 200.0
+  loan_interest_rate: 0.05
+  capex_throughput_boost: 80.0
+bots:
+  valuation_noise_std: 5.0
+  urgency_mult_low: 0.8
+  urgency_mult_high: 1.2
+  urgency_denominators:
+  - 1.3
+  - 1.7
+  - 1.3
+  - 1.7
+  - 1.3
+  - 1.7
+  - 1.3
+  - 1.7
+  max_compliance_share: 0.7
+  enhanced_noise:
+    enabled: true
+    valuation_noise_std: 15.0
+    urgency_mult_low: 0.6
+    urgency_mult_high: 1.5
+    budget_stress_prob: 0.15
+    budget_stress_qty_mult: 0.65
+  fade_schedule:
+    enabled: false
+    schedule:
+    - - 0
+      - 8
+    - - 30000
+      - 6
+    - - 60000
+      - 4
+    - - 80000
+      - 2
+penalty:
+  rate: 138.75
+  inflation_rate: 0.02
+  inflation_random_std: 0.015
+  carry_forward: true
+  carry_forward_cap: 0.0
+price:
+  initial_expected: 70.0
+  banking_premium_mult: 1.4
+  burnin_std: 10.0
+  ar1_persistence: 0.85
+  volatility_std: 0.15
+mac:
+  enabled: true
+  coal_to_gas_cost: 48.0
+  max_switch_frac: 0.2
+electricity:
+  enabled: true
+  base_price: 55.0
+  carbon_passthrough: 0.9
+reward:
+  normalizer_alpha: 0.02
+  gae_min_std: 0.15
+  opportunity_cost_rate: 0.0
+  clip_min: -10.0
+  clip_max: 10.0
+  shaping_beta: 7.0
+  shaping_gamma: 1.0
+  shaping_decay_episode: 0
+  shaping_decay_frac: 0.1
+  shaping_weight_floor: 0.0
+  terminal_bank_value: true
+  terminal_queue_value: true
+  terminal_payoff_years: 5
+  treasury_terminal_value: true
+  anchor_normalize_cost_only: true
+  budget_norm_anchor: dynamic
+  budget_norm_budget_0: 1000.0
+  opportunity_cost_shaping:
+    enabled: true
+    scale: 1.0
+  coverage_gap_shaping:
+    enabled: true
+    scale: 0.5
+  banking_signal:
+    enabled: true
+    w_banking: 0.3
+    w_imputed: 1.0
+    imputed_cap_factor: 5.0
+    initial_bank_cost_factor: 0.8
+  sec_proxy:
+    enabled: true
+    ema_alpha: 0.3
+    cap_mult: 1.5
+  compliance_gate_blend_threshold: 0.9
+  compliance_gate_blend_width: 0.3
+esg:
+  enabled: true
+  scale: 0.5
+  stock_weight: 1.0
+  flow_weight: 1.5
+  speed_coef: 0.3
+  speed_coef_late: 0.3
+opponent_modeling:
+  enabled: true
+opponent_obs:
+  mode: lagged
+  lag_years: 1
+  queue_noise_sigma: 0.15
+  dims_per_opponent: 7
+agent_cycling:
+  enabled: false
+  soft: true
+  soft_lr_scale: 0.3
+ppo:
+  hidden_size: 256
+  lr: 0.0002
+  gamma: 0.99
+  gae_lambda: 0.97
+  clip_eps: 0.15
+  entropy_coef: 0.08
+  entropy_coef_final: 0.015
+  entropy_decay_start: -1
+  entropy_decay_window: -1
+  entropy_decay_frac: 0.7
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  n_epochs: 3
+  mini_batch_size: 64
+  episodes_per_update: 32
+  long_run_episode_threshold: 20000
+  short_run_overrides:
+    lr: 0.0002
+    entropy_coef_final: 0.03
+    episodes_per_update: 16
+  normalize_advantages: true
+  log_std_min: -3.0
+  log_std_max: 0.0
+  centralized_critic: true
+  split_invest_head: true
+  happo: true
+  happo_dynamic_order: true
+  happo_order_metric: advantage
+  happo_perf_ema_alpha: 0.1
+  critic_compliance_features: true
+  critic_lr: 0.0005
+  critic_hidden_size: 512
+  critic_warmup_episodes: 0
+  lr_decay: cosine
+  lr_min: 1.0e-05
+  critic_lr_decay: cosine
+  critic_lr_min: 5.0e-05
+  target_kl: 0.015
+  dual_clip_c: 3.0
+  log_ratio_clip: 10.0
+  kl_anchor_beta: 0.0
+  kl_anchor_decay_episodes: 0
+  critic_extra_epochs: 6
+  critic_huber: true
+  critic_huber_delta: 4.0
+  clip_value: true
+  normalize_returns: false
+curriculum:
+  enabled: false
+  start_years: 4
+  ramp_episodes: 3000
+uncertainty:
+  enabled: true
+  sigma_demand: 0.07
+  corr_rho: 0.4
+construction_jitter:
+  enabled: true
+  poisson_lambdas:
+  - 1.0
+  - 1.0
+  - 2.0
+  - 3.0
+  - 1.5
+  p_cancel_per_tech:
+  - 0.0
+  - 0.0
+  - 0.01
+  - 0.006
+  - 0.015
+  p_cancel: 0.01
+  recovery_rate: 0.4
+  cf_sigma:
+  - 0.0
+  - 0.0
+  - 0.08
+  - 0.08
+  - 0.05
+warm_start:
+  enabled: true
+  burnin_enabled: true
+  n_burnin_years: 4
+  burnin_price_seed_mean: 70.0
+  burnin_price_seed_std: 10.0
+  n_burnin_prices: 2
+  bank_seed_min: 0.15
+  bank_seed_max: 0.35
+  queue_mu_onshore: 1.5
+  queue_mu_offshore: 0.5
+  queue_mu_solar: 2.0
+  msr_initial_reserve_frac: 0.23
+logging:
+  log_interval: 100
+  save_interval: 500
+  csv_flush_interval: 1000
+  snapshot_interval: 2500
+  snapshot_keep_recent: 1
+  snapshot_delete_on_finish: true
+  compress_on_finish:
+    logs: true
+    checkpoints: true
+    delete_csv: true
+    delete_checkpoint_dir: true
+  results_dir: results/sweeps/thesis_experiments/lrf_low
+  checkpoint_pruning:
+    enabled: true
+    online: true
+    n_keep_milestones: 20
+    n_keep_recent: 5
+pretrain:
+  enabled: false
+  episodes: 0
+  epochs: 0
+  lr: 0.001
+diagnostics:
+  market_broken_window: 200
+  market_broken_bid_threshold: 0.99
+  floor_bid_threshold: 1.02
+  zero_qty_threshold: 0.01
+  stuck_boost_window: 250
+  stuck_boost_coef: 0.04
+  esg_over_penalty_warn_window: 50
+hpp:
+  enabled: true
+  pool_size: 10
+  save_interval: 0
+  swap_prob: 0.2
+  warmup_episodes: 0
+  seed_heuristic: false
+  seed_count: 2
+exploration:
+  mode: anchored
+  epsilon_start: 0.25
+  epsilon_final: 0.02
+  epsilon_decay_episodes: 0
+  epsilon_decay_frac: 0.45
+  anchor_boost: 1.14
+  auction_anchors: null
+  secondary_anchors: null
+  anchor_snap:
+    enabled: false
+    prob_per_episode: 0.02
+cap_curriculum:
+  enabled: false
+  cap_start: 1.3
+  cap_end: 1.0
+  decay_frac: 0.3
+budget_curriculum:
+  enabled: false
+  budget_start: 1.5
+  budget_end: 1.0
+  decay_frac: 0.3
+phantom_bidder:
+  enabled: false
+  qty_frac_lo: 0.15
+  qty_frac_hi: 0.35
+  price_lognormal_sigma: 0.35
+  price_fundamental_frac: 0.6
+  price_min_above_reserve: 2.0
+  price_max_frac_penalty: 0.65
+  price_min_below_reserve_buffer: 5.0
+urgency_scalars:
+  enabled: true
+  lognormal_sigma: 0.3
+tabula_rasa:
+  enabled: false
+  epsilon_start: 0.3
+  epsilon_final: 0.1
+  epsilon_decay_frac: 0.9
+  entropy_coef: 0.08
+  entropy_decay_start_frac: 0.0
+  entropy_decay_window_frac: 0.95
+  critic_warmup_frac: 0.03
+  shaping_decay_frac: 0.6
+  hpp_warmup_frac: 0.25
+  exploration_mode: uniform
