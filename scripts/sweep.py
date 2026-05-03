@@ -234,7 +234,7 @@ def _run_job(
 
     os.makedirs(results_dir, exist_ok=True)
     log_path = _job_log_path(results_dir, variant_name, seed)
-    with open(log_path, "w", buffering=1) as log_f:
+    with open(log_path, "w", encoding="utf-8", buffering=1) as log_f:
         log_f.write(
             f"# {variant_name} s={seed}  cmd: {' '.join(cmd)}\n"
             f"# threads={threads}  started={time.strftime('%Y-%m-%dT%H:%M:%S')}\n"

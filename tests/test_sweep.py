@@ -366,7 +366,7 @@ class TestPostJobCompression:
         from scripts.sweep import _compress_job_artifacts
 
         cfg_path, results_dir, ck = self._setup_artifacts(tmp_path)
-        log_f = open(results_dir / "run_v_s7.log", "w")
+        log_f = open(results_dir / "run_v_s7.log", "w", encoding="utf-8")
         try:
             _compress_job_artifacts(
                 config_path=str(cfg_path),
