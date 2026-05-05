@@ -5,37 +5,6 @@ Version numbers reflect the `version` field in `pyproject.toml`
 
 ---
 
-## [8.6.6]
-
-**Memory-frugal `Data Science Analysis.ipynb` — streaming pre-compute**
-
-Importing 16+ runs into a single `runs` dict with full `ep_df` + `yr_df`
-DataFrames was OOMing on real machines around the 12th run. The notebook
-now uses a registry-only discovery pass (paths + configs, no
-DataFrames) followed by a single streaming pre-compute that holds **one
-run at a time** in memory, distilling each into small persistent
-artefacts (`conv_starts`, `feat_df`, `clearing_per_year_df`, `pay_df`,
-`udbc_df`, `out_df`, `headline_traces_default`, `headline_tail_means`,
-…). Every downstream §C/§S/§R/§6 cell reads from those artefacts
-instead of `run['ep_df']` / `run['yr_df']`.
-
-* New top-of-notebook knobs in §3:
-  * `EXPERIMENT_FILTER` — fnmatch globs for sweeps/variants and a
-    seed/`max_runs` cap, so the user can subset which experiments
-    participate without editing `SWEEP_SPECS`.
-  * `PRECOMPUTE_TAIL_EPISODES` — optional integer cap that pushes a
-    parquet row-filter on the `episode` column at load time, bounding
-    per-run RAM further on multi-100k-episode sweeps.
-* `load_run_data(key, …)` and `iter_run_data(filter_keys, …)` helpers
-  expose the same lazy/streaming pattern for ad-hoc per-run analysis
-  outside the pre-built artefacts.
-* Peak RAM is now **one run's DataFrames** regardless of the total
-  number of experiments imported; re-running the pre-compute cell
-  with a different `EXPERIMENT_FILTER` swaps datasets without ever
-  holding two in RAM simultaneously.
-
----
-
 ## [8.6.5]
 
 **Faster checkpoint compression: `tar.xz` → `tar.zst`** (with stdlib
