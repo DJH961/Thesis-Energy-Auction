@@ -2300,6 +2300,79 @@ instead of `value / 1000`. Two new keys: `compliance_norm`, `capital_norm`.
 
 Historical note:
 - Several v7.11 defaults above were intentionally rolled back in `v7.12.0` based on approval scope.
+- v7.11 was the version label that landed on `main`; the intermediate
+  iterations behind it are reconstructed in `v7.10.0` and `v7.9.0` below.
+
+---
+
+## v7.10.0
+
+**Scarcity-First Market Calibration + Exploration Retune + Pay-As-Bid Auction Mode**
+
+Mid-cycle pass between the v7.9 reward simplification and the final v7.11
+pure-MARL flip. Focused on tightening the market itself once the reward
+surface had been cleaned up.
+
+### Market structure and defaults (`configs/default.yaml`)
+- Structural scarcity introduced from year 0:
+  - `ets.cap_overhead_pct`: `+0.02 -> -0.10`
+- Price floor raised near the MAC anchor:
+  - `auction.reserve_price`: `30.0 -> 45.0`
+  - `auction.price_min`: `30.0 -> 45.0`
+  - `secondary.sec_price_min`: `30.0 -> 45.0`
+- Auction quantity multiplier range tightened:
+  - `auction.qty_mult_low`: `0.3 -> 0.85`
+  - `auction.qty_mult_high`: `2.0 -> 1.5`
+- Unsold auction volume rerouted into the MSR path:
+  - `ets.unsold_to_msr`: `false -> true`
+- Carry-forward tolerance tightened:
+  - `penalty.carry_forward_cap`: `1.0 -> 0.5`
+- Initial bank seed increased to keep year-0 compliance feasible under the
+  new scarcity profile:
+  - `stochastic.bank_seed_min/max`: `0.05/0.15 -> 0.15/0.35`
+  - `ets.initial_bank_fraction`: `0.10 -> 0.25`
+
+### Exploration schedule retune
+- `tabular.epsilon_start`: `0.50 -> 0.30`
+- `tabular.epsilon_decay_frac`: `0.50 -> 0.80`
+- `tabular.critic_warmup_frac`: `0.10 -> 0.03`
+- `tabular.shaping_decay_frac`: `0.33 -> 0.60`
+- `reward.shaping_weight_floor`: `0.00 -> 0.10`
+
+### Auction mechanism extension (`src/auction/market_clearing_ets.py`)
+- Configurable pricing mode added: `auction.pricing_rule: uniform | pay_as_bid`.
+- Default kept on `uniform`; `pay_as_bid` exposed for comparative
+  market-design experiments.
+
+---
+
+## v7.9.0
+
+**Reward Simplification + Hard-Constraint Migration**
+
+First half of the work that ultimately shipped under the v7.11 label. The
+reward function was stripped down to a small set of clearly interpretable
+channels, and soft budget/capex penalties were retired in favour of hard
+mechanical gating.
+
+### Reward and training behavior (`src/environment/ets_environment.py`)
+- Reward normalization moved to a fixed global scale (`REWARD_SCALE=1000`)
+  instead of per-agent budget divisors.
+- Baseline-cost subtraction removed from reward.
+- Shaping channels removed from the active reward path:
+  - green bonus
+  - efficiency bonus
+- Soft budget/capex penalties removed from the reward path; the same
+  constraints are now enforced via hard mechanical gating/clipping.
+- Terminal valuation changes:
+  - bank value switched from diminishing `log1p` form to linear value
+  - terminal queue value removed from reward path
+- Reward channel diagnostics reduced to the active core channels
+  (`cost_norm`, `penalty_norm`, `esg_signal`, `base_reward`).
+- Diagnostic score clamp fix: `S_financial` bounded to `[0, 1]`.
+
+These changes set up the cleaner gradient surface that v7.10 then exploited
+to retune market parameters and exploration.
 
 ---
 
