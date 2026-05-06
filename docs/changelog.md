@@ -3033,3 +3033,113 @@ This was the first stable version of `ets_marl_happo_current`, consolidating the
 - **Construction risk**: investment failure probability, Poisson delay jitter, project cancellation risk, capacity-factor noise.
 - **Training infrastructure**: pre-training routine (commit `6310d7d`), market-collapse warnings (commit `3bfc11e`), Historical Policy Pool (HPP).
 - Uncertainty (demand and emission shocks) reactivated (commit `3e8bb27`).
+
+---
+
+## v4.1
+
+*Commits: `b05ccb6` — "Rename ETS folder to ets_marl_happo and remove duplicate test project", `a2686ca` — "Simplify main layout: legacy PPO, legacy test, and current HAPPO folders"*
+
+Cleanup release that bridges the pure-PPO lineage and the HAPPO-style line that
+begins at v5.0.
+
+- Duplicate `ets_marl test/` project removed; `ets_marl ppo/` renamed to
+  `ets_marl_happo`.
+- Repository reorganised into three clearly separated branches of work:
+  `legacy_ppo/`, `legacy_test/`, and `ets_marl_happo_current/`. Current code
+  proceeds from `ets_marl_happo_current`.
+- First standalone HAPPO notebook (`ets_marl_colab_HAPPO.ipynb`) added
+  alongside the legacy PPO notebook.
+
+---
+
+## v4.0
+
+*Commit: `0e63254` — "8 Agents + Behavioral update"*
+
+First "full-shape" market: 8 learning agents, behavioural archetypes, and the
+training-stability tooling that the rest of the project still relies on.
+
+- **8 learning agents** with differentiated cost / ESG reward weights (the seed
+  of the four-archetype split that v5.0 formalises).
+- **Penalty mechanics overhaul**: stronger non-compliance penalty, broken-window
+  threshold, and shortfall tracking in the year log (`b5cafcd`, `1376eff`).
+- **Pre-training routine**: heuristic warm-start of the actor and critic before
+  PPO updates kick in, with retention fixes so the warm-start is not wiped on
+  the first gradient step (`6310d7d`, `6ade9a0`).
+- **Market-collapse warning system**: training log now flags degenerate
+  clearing-price regimes and emits explicit warnings in the console
+  (`3bfc11e`, `cc02baf`, `d7ee641`).
+- Console / CSV logging tidied up; `.gitignore` covers result artefacts
+  (`f1eb189`, `053cc4d`).
+
+---
+
+## v3.1
+
+*Commits: `0b96dfe` — "Behavior update", `8ca8313` — "New learning methodology",
+`a37f989` — "More complex randomness and secondary market", `a7a9db6`*
+
+- Secondary trading round added after each primary auction so agents can
+  rebalance allowances between themselves.
+- Episode-level demand shocks and per-agent emission noise wired into the
+  rollout.
+- Reworked PPO learning loop with separate handling for auction and secondary
+  decisions ("new learning methodology").
+- Small selling-side incentive fix to keep banked allowances liquid.
+
+---
+
+## v3.0
+
+*Commit: `7957ae8` — "Massive update for complex energy mix"*
+
+First multi-technology version of the simulator.
+
+- `Company` extended with a richer technology mix: distinct emission factors,
+  CAPEX, OPEX, and dispatch logic per fuel.
+- `ETSEnvironment` reworked around the new tech model: cap, MSR, and
+  clearing logic generalised; reserve price introduced.
+- `configs/default.yaml` rewritten end-to-end; legacy single-fuel parameters
+  retired.
+- Naming cleanup across configs and modules (`cab3e8a`).
+
+---
+
+## v2.1
+
+*Folder: `ets_marl test/`*
+
+A parallel "test" project sat alongside the pure-PPO build for several weeks,
+used to prototype auction-mechanic and reward variants without disturbing the
+v2.0 baseline. Both projects coexisted in the repository until the layout
+cleanup at v4.1 / v5.0, after which the test project was removed.
+
+---
+
+## v2.0
+
+*Commit: `99383bc` — "marl with ppo"*
+
+First end-to-end MARL build of the EU-ETS auction simulator — the "pure PPO"
+baseline.
+
+- New `ets_marl ppo/` project folder with config-driven entry points
+  (`scripts/train.py`, `scripts/evaluate.py`).
+- `configs/default.yaml` plus `baseline_2024` and `low_price_2020` scenario
+  overlays.
+- Bare `Company` + `ETSEnvironment` + `ActorCritic` (`PPOAgent`) trio, learning
+  compliance bidding under a single uniform-price auction.
+- First `tests/test_environment.py` smoke tests; `requirements.txt` and
+  `pyproject.toml` packaging in place.
+- Initial `README.md` and `docs/design.md` describing the auction and reward
+  layout.
+
+---
+
+## v1.0
+
+*Commits: `f591a50` — "Initial commit", `a150972` — "Add files via upload"*
+
+Repository scaffold. Bare project skeleton and a placeholder training script;
+no learning loop yet. Useful only as the starting point of the timeline.
