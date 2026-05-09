@@ -1,17 +1,5 @@
 # Changelog
 
-All notable changes to the ETS-MARL simulator (`ets_marl_happo_current`).
-The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
-the project follows semantic-ish versioning tied to `pyproject.toml`,
-and entries focus on what each release means for the simulation —
-the market, the agents, the reward, the training loop — not on
-documentation or notebook bookkeeping.
-
-The pre-rewrite, exhaustive history (including documentation/notebook
-churn) is preserved in [`changelog_archive.md`](changelog_archive.md).
-
----
-
 ## 8.6.5 — Faster checkpoint archiving
 
 End-of-training checkpoint compression switches from `tar.xz` to
