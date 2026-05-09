@@ -20,6 +20,7 @@ episodes. Master-thesis project.
 | Every config knob, grouped by subsystem | `docs/config_dictionary.md` |
 | Every column in `training_log_*.csv` / `year_log_*.csv` | `docs/data_dictionary.md` |
 | Action-space layout, bounds, derivation | `docs/action_space.md` |
+| Observation-space layout, dims, normalisation | `docs/observation_space.md` |
 | Reward formula (cost buckets, ESG, terminal payoffs) | `docs/reward_function.md`, `docs/esg_reward_design.md` |
 | Research questions and which notebook addresses each | `docs/research_questions.md` |
 | Methodology for the data-science chapter | `docs/data_science_analysis.md` |
