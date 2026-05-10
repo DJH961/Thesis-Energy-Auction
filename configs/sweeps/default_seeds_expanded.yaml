@@ -1,0 +1,21 @@
+# =============================================================================
+# Default vs lower-start-cap sweep — split seed sets
+# =============================================================================
+# Runs two variants with non-overlapping per-variant seed lists:
+#   - lower_start_cap: existing seeds only (1729, 8191, 6561)
+#   - default: new uncommon 3-digit seeds only (317, 431, 569, 683, 947)
+#
+# Run with:
+#     python scripts/sweep.py --spec configs/sweeps/default_seeds_expanded.yaml
+# =============================================================================
+
+base_config: configs/default.yaml
+output_dir: results
+
+
+parallel_workers: 8
+threads_per_worker: null
+
+variants:
+  - name: default
+    seeds: [317, 431, 683, 947]
