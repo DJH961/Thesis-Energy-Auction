@@ -254,7 +254,7 @@ Year-level scalars surfaced from the `auction_stats` sub-dict in
 | `emission_shock_A{i}`, `cf_shock_A{i}` | Realised demand and capacity-factor shocks this year. |
 | `cancellation_A{i}` | # construction projects cancelled this year. |
 | `auction_cost_A{i}`, `secondary_net_A{i}` | Cost-bucket breakdown (M€). |
-| `compliance_surplus_A{i}` | (alloc + bank + buy) − (emiss + cf), Mt. |
+| `compliance_surplus_A{i}` | Pre-compliance diagnostic surplus, `bank_start + alloc + trade_qty − emissions` (Mt). Use `shortfall_A{i}` for final compliance because carry-forward debt is settled there. |
 | `bank_end_A{i}` | Bank holdings at end of year (Mt). |
 | `mac_reduction_A{i}`, `mac_cost_A{i}` | MAC fuel-switching abated tonnes / cost (Mt, M€). |
 | `terminal_bank_value_A{i}` | Year-T-only: discounted terminal value of unused bank (M€). |
