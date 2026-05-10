@@ -1,0 +1,30 @@
+# =============================================================================
+# High-inflation cell — fill-in sweep for the two seeds not run originally
+# =============================================================================
+# The thesis_experiments.yaml sweep ran the high_inf variant on a single
+# seed (1729) so it could be paired against default/s1729. This sweep adds
+# the other two seeds from the main thesis seed pool (8191, 6561) so the
+# high-inflation cell has the same 3-seed coverage as every other variant.
+#
+# Run with:
+#     python scripts/sweep.py --spec configs/sweeps/high_inf_extra_seeds.yaml
+# =============================================================================
+
+base_config: configs/default.yaml
+output_dir: results/sweeps/thesis_experiments
+
+# Seeds intentionally omitted from the original thesis_experiments high_inf
+# cell. 8191 = M_13 Mersenne prime; 6561 = 3^8.
+seeds: [8191, 6561]
+
+parallel_workers: 2
+threads_per_worker: null
+
+variants:
+  # High inflation drift + high variance — same overrides as variant 6 in
+  # thesis_experiments.yaml so results land in the same sweep directory and
+  # are directly comparable to the seed-1729 run.
+  - name: high_inf
+    overrides:
+      penalty.inflation_rate: 0.040
+      penalty.inflation_random_std: 0.02
