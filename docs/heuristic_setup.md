@@ -1,206 +1,368 @@
-# Heuristic Bot — Configuration & Setup
+# Heuristic Bot — Behavioural Reference
 
-Reference for the rule-based **heuristic bot** participants (`B1…B8`). The
-environment, auction, secondary market, budget, MSR, ESG reward, etc. are
-documented in `design.md`, `config_dictionary.md`, `action_space.md` and
-`reward_function.md` — **this doc only covers what is different from a
-HAPPO learning agent**. If a knob is not mentioned here, the bot inherits
-the same environment-side behaviour as a learning agent.
+This document describes **how the rule-based bot policy acts**. The
+environment, action space, observation space, auction mechanics, MSR,
+penalties, budget machinery, and reward channels are documented in
+`design.md`, `action_space.md`, `observation_space.md`,
+`reward_function.md`, and `config_dictionary.md`; nothing in those
+references is repeated here. A reader who already knows the environment
+should be able to use this file alone to reproduce or report on a
+bots-only baseline.
 
-> Bots are off by default (`companies.n_bot_agents: 0`). They are intended
-> for ablation, calibration and opponent-diversity runs. The mirror config
-> arrays (`bot_*`) are kept synchronised even when bots are inactive.
+The behaviour is implemented in `src/agents/heuristic_policy.py` and
+dispatched by the environment in
+`src/environment/ets_environment.py::_generate_bot_auction_actions /
+_generate_bot_secondary_actions`. The bot has no policy network, no
+critic, no learning step, and no exploration noise; it is a
+deterministic function of the public market state, the agent's own
+finances, two persistent per-episode random scalars (§5), and an
+optional budget-stress flag.
+
+The text below is purely descriptive — it states what the rules do, not
+whether they are realistic, well-calibrated, or competitive with the
+learning agents.
 
 ---
 
-## 1. What stays the same
+## 1. Inputs the heuristic reads
 
-Bots are full `Company` instances and live in the same simulation loop as
-learning agents. They share:
+At each call the bot is passed (or reads from its `Company`):
 
-- the same action space (6 Phase-1 dims, 2 Phase-2 dims), same bounds,
-  same lot/budget/collateral/MSR/penalty machinery;
-- the same observation construction (the `Company` builds the obs even
-  though the bot never reads it);
-- the same revenue passthrough, treasury reserve, emergency loan,
-  carry-forward, ESG reward channels;
-- the same default reward weight pattern `[1.0, 0.0]` (pure financial) /
-  `[0.5, 0.5]` (balanced ESG) alternating across the 8 archetype slots.
+- **Market state**: 3-year moving average of clearing price `price_ma3`,
+  the dynamic reserve price, the inflation factor for the current year,
+  the MSR-adjusted auction volume, and the current annual cap.
+- **Own finances**: bank, allocation (Phase-2 only), operating cash
+  (`annual_budget − budget_spent_this_year`), treasury balance,
+  outstanding emergency loan, last year's collateral load, capex
+  already spent this year, carry-forward debt.
+- **Own physical state**: weighted emission factor, generation mix,
+  `output_mwh`, per-tech `emission_factors`, `compute_estimate_need()`.
+- **Fixed config**: `mac.coal_to_gas_cost`, `penalty.rate +
+  inflation`, `auction.{price_min, price_max, qty_mult_low,
+  qty_mult_high}`, `trading.{sec_price_min, sec_price_max_mult}`,
+  `investment.{max_invest_frac, discount_rate}`, the technology arrays,
+  `reward.terminal_payoff_years`.
+- **Per-bot persistent scalars** (drawn once per episode, §5):
+  `valuation_noise`, `urgency_multiplier`, `urgency_denom`.
 
-The bot does **not** have a policy, value net, GAE buffer, BC loss, HPP
-snapshot, or any gradient flow — it is invoked synchronously by the
-environment at bid time and returns a deterministic action conditioned on
-two per-episode random scalars.
+The bot does not read other agents' bids, other agents' holdings, or
+any private regulator state.
 
-## 2. Indexing & wiring
+## 2. Auction phase — `auction_action`
 
-- Bot indices are `n_agents … n_agents + n_bot_agents − 1`. Learning
-  agents come first; bots are appended.
-- The environment auto-extends the per-agent config arrays with the
-  `bot_*` mirrors before constructing `Company` objects, so every
-  per-agent knob (`initial_mix`, `reward_weights`, `annual_budgets`,
-  `debt_headrooms`, `capex_throughputs`) has a bot counterpart of the
-  same shape.
-- Market calibration (cap, emissions, MSR thresholds) is recomputed each
-  episode against `n_agents + active_bots`, so bot fade-out shrinks the
-  cap accordingly. See `market_calibration.py`.
-- Bot actions are produced inside `step_auction` / `step_secondary` via
-  `_generate_bot_auction_actions` and `_generate_bot_secondary_actions`,
-  which call `src/agents/heuristic_policy.py`. The external `step()`
-  interface receives only learning-agent actions.
+The auction action is `[bid_price, qty_mult, invest_frac, logit_onshore,
+logit_offshore, logit_solar]`, all in physical space. Each component is
+computed independently.
 
-## 3. Archetype defaults (`companies.bot_*`)
+### 2.1 Market anchor and urgency
 
-| Slot | `bot_initial_mix` (coal/gas/onshore/offshore/solar) | Archetype     | `bot_reward_weights` |
-|------|------------------------------------------------------|---------------|----------------------|
-| B1   | 0.40 / 0.40 / 0.10 / 0.05 / 0.05                     | coal-heavy    | [1.0, 0.0] financial |
-| B2   | 0.40 / 0.40 / 0.10 / 0.05 / 0.05                     | coal-heavy    | [0.5, 0.5] balanced  |
-| B3   | 0.15 / 0.45 / 0.20 / 0.10 / 0.10                     | gas-dominant  | [1.0, 0.0]           |
-| B4   | 0.15 / 0.45 / 0.20 / 0.10 / 0.10                     | gas-dominant  | [0.5, 0.5]           |
-| B5   | 0.05 / 0.25 / 0.35 / 0.20 / 0.15                     | transitioner  | [1.0, 0.0]           |
-| B6   | 0.05 / 0.25 / 0.35 / 0.20 / 0.15                     | transitioner  | [0.5, 0.5]           |
-| B7   | 0.00 / 0.10 / 0.30 / 0.35 / 0.25                     | green-leader  | [1.0, 0.0]           |
-| B8   | 0.00 / 0.10 / 0.30 / 0.35 / 0.25                     | green-leader  | [0.5, 0.5]           |
+The bot first forms two scalars used everywhere downstream:
 
-`bot_annual_budgets`, `bot_debt_headrooms`, `bot_capex_throughputs`
-mirror the learning-agent arrays element-by-element (`[880, 880, 800,
-800, 820, 820, 780, 780]` etc.). Each pair B(2k−1)/B(2k) is identical at
-the resource level — the only differentiator is the reward weight, which
-the heuristic reads to switch its investment branch.
+- `anchor = max(mac.coal_to_gas_cost, price_ma3) + valuation_noise`.
+  This is the bot's reference for "what the market is worth right now"
+  — the MAC of coal-to-gas switching is treated as a floor, and the
+  moving average of clearing prices is the upper reference. The
+  per-episode `valuation_noise` (Gaussian) shifts this reference
+  uniformly across all decisions for that bot in that episode.
+- `coverage_ratio = bank / annual_need`.
+- `urgency_raw = max(0, 1 − coverage_ratio / urgency_denom)`. Lower
+  bank or higher denom → urgency near 0; bank far below need → urgency
+  near 1.
+- A **supply-scarcity bump** is added when MSR-adjusted auction volume
+  is below 80 % of the annual cap: `+ max(0, 1 − supply_ratio) × 0.3`.
+- The result is multiplied by the per-episode `urgency_multiplier` and
+  clipped to `[0, 1]`.
 
-**Green vs. financial split is inferred from `w_green > 0.25`**, not from
-index parity, so re-ordering `bot_reward_weights` re-tags the bots
-correctly.
+### 2.2 Bid price — dual willingness-to-pay ceiling
 
-## 4. Behavioural model (`heuristic_policy.py`)
+The bid price is the minimum of two ceilings, then floored at the
+reserve.
 
-### 4.1 Auction action `[bid_price, qty_mult, invest_frac, logits×3]`
+1. **Economic ceiling** (what the bot is willing to pay):
+   `wtp_economic = anchor + urgency × (penalty_rate − anchor)`, then
+   capped at `penalty_rate − 1`. At urgency 0 the bot bids at the
+   anchor; at urgency 1 it bids just under the inflation-adjusted
+   penalty rate. The relationship is linear in urgency.
 
-- **Market anchor**: `max(mac.coal_to_gas_cost, price_ma3) +
-  valuation_noise`. `price_ma3` is the env's 3-yr MA of clearing.
-- **Urgency**: `1 − coverage_ratio / urgency_denom`, clipped to `[0, 1]`,
-  scaled by the bot's persistent `urgency_multiplier`. Boosted by up to
-  `0.3 × (1 − supply_ratio)` when MSR-adjusted auction volume is below
-  80 % of the year's cap (supply-scarcity awareness).
-- **Bid price — dual WTP ceiling**:
-  - *Economic ceiling*: `anchor + urgency × (penalty_rate − anchor)`,
-    capped strictly below the inflation-adjusted penalty rate. No
-    `price_ma3` feedback term — that was removed to prevent a runaway
-    MA3 loop.
-  - *Budget ceiling*: `max_compliance_share × available_cash /
-    target_qty`. `available_cash = operating_cash + treasury_fraction ×
-    treasury` (mirrors the env-side joint budget gate; loan headroom is
-    excluded, treasury is meant to absorb spikes not size routine bids).
-  - Result: `max(min(economic, budget), reserve + 1)` then clipped to
-    `[auction.price_min, auction.price_max]`.
-- **Quantity multiplier**: `qty_mult = clip((need + 0.1 × need × urgency)
-  / need, qty_mult_low, qty_mult_high)`. `need` includes carry-forward
-  debt. The 10 % extra is a safety buffer that scales with urgency.
-- **Investment fraction (NPV-gated)**:
-  - Pick the buildable tech maximising `(remaining_years − deploy_delay
-    + terminal_horizon) × capacity_factor / capex`.
-  - Compute avoided-carbon NPV with the **annuity discount factor**
-    `(1 − (1+r)⁻ⁿ) / r`, `r = investment.discount_rate` (5 %).
-  - Branch:
-    - **Green** (`w_green > 0.25`): `invest_frac ≈ 0.07 × min(NPV/cost,
-      2)/2 + 0.02`, floor 2 %.
-    - **Financial**: only invest if `NPV/cost > 1`, otherwise hold a
-      0.5 % floor.
-  - Clip down to `capex_throughput` headroom and then to
-    *post-compliance budget headroom* (cash minus expected compliance
-    cost at the MAC anchor minus a 5 % safety reserve). This is the
-    "compliance-priority" clip — coal-heavy bots invest less under stress.
-  - **EMA smoothing**: `invest_frac ← 0.5 × invest_frac + 0.5 ×
-    prev_invest_frac` to avoid on/off oscillation year-to-year.
-- **Loan awareness**: when `loan_outstanding / annual_budget > 0.05`,
-  `qty_mult` is scaled down up to −20 % and `invest_frac` up to −50 %
-  proportional to loan pressure.
-- **Tech logits**: hard one-hot on the winning tech (`+1`, `−1`, `−1`),
-  i.e. the bot never mixes — it commits to one renewable per year.
+2. **Budget ceiling** (what the bot can afford to pay per tonne):
+   `wtp_budget = max_compliance_share × available_cash / qty_target`,
+   with `available_cash = operating_cash + treasury_fraction ×
+   treasury` (treasury fraction taken from `auction.budget_gate`;
+   emergency loan headroom is excluded). `qty_target` is computed in
+   §2.3 below.
 
-### 4.2 Secondary action `[sec_price, sec_qty]`
+3. **Final**: `bid_price = max(min(wtp_economic, wtp_budget), reserve
+   + 1)`, then clipped to `[auction.price_min, auction.price_max]`.
 
-- **Target bank trajectory**: `target_bank = need × min(remaining_years
-  − 1, 2) × 0.3` (≈ a ~0.6-year buffer mid-episode, ramping to 0 at the
-  end). Trade target is half the gap to `target_bank`.
-- **Final-year aggression**: in the last 2 years, if currently short,
-  the trade target is bumped to cover the shortfall (capped at
-  `quantity_max`).
-- **Compliance safeguard**: while `_carry_forward > 0.01`, the bot is
-  forbidden from selling (`trade_target` clipped at 0).
-- **Spend caps**: max share of remaining budget allowed for a buy is
-  `0.9` if in carry-forward debt, `0.6` if just short, else `0.3`.
-- **Loan awareness**: outstanding loan scales buy size down up to −40 %.
-- **Price**: `anchor + price_frac × (penalty_rate − anchor)` with
-  `price_frac = urgency + 0.2 × severity` for buys, and a tighter
-  `max(0.10, urgency) + 0.15 × severity` for sells. Clipped to
-  `[trading.sec_price_min, sec_price_max_mult × penalty_rate]`, with a
-  hard `1.8 × penalty_rate` cap before clip.
+The binding ceiling (`"economic"` or `"budget"`) is recorded on the
+`Company` for diagnostics.
 
-### 4.3 What is **not** modelled
+### 2.3 Quantity multiplier
 
-- No banking-premium or expected-future-price term beyond the
-  fundamentals anchor (the env handles banking incentives via the
-  reward function).
-- No strategic withholding, collusion, or learned response to peer
-  behaviour — bots react only to public market state and their own
-  finances.
-- No exploration noise, action noise, or epsilon-greedy on top of the
-  rules; all randomness is the two persistent scalars in §5.1 and the
-  optional `enhanced_noise` qty-stress draw.
+```
+qty_target = annual_need × (1 + 0.1 × urgency)
+qty_mult   = clip(qty_target / annual_need,
+                  auction.qty_mult_low, auction.qty_mult_high)
+```
 
-## 5. `bots:` config block
+`annual_need` already includes carry-forward debt, so a bot starting
+the year short asks for the full deficit plus a small urgency buffer.
+The 10 % multiplier is a fixed safety margin; it does not scale with
+the cap, the year, or the agent's mix.
 
-| Key                          | Purpose                                                                                                                         |
-|------------------------------|---------------------------------------------------------------------------------------------------------------------------------|
-| `valuation_noise_std`        | Per-episode Gaussian on the **anchor** for each bot. Persistent within an episode, redrawn at `reset()`. Default **5 EUR/t**.   |
-| `urgency_mult_low/high`      | Per-episode `Uniform(low, high)` scalar multiplying the bot's urgency term. Default **[0.8, 1.2]**.                             |
-| `urgency_denominators`       | Per-slot list of denominators in `urgency = 1 − coverage / denom`. Lower → more aggressive. Default `[1.3, 1.7] × 4`.            |
-| `max_compliance_share`       | Fraction of `available_cash` the heuristic is willing to commit to compliance in a single auction. Default **0.70**.            |
+### 2.4 Investment fraction
 
-### 5.1 `bots.enhanced_noise` — opponent diversity boost
+The bot picks **one** buildable technology per year and computes an
+investment fraction against it.
 
-Inflates the persistent noise draws and adds a budget-stress event so
-the bot population isn't lock-step. Defaults:
+**Technology choice.** Among onshore, offshore, solar, pick the tech
+maximising the effective payoff metric
 
-| Key                       | Default | Effect                                                                            |
-|---------------------------|---------|-----------------------------------------------------------------------------------|
-| `enabled`                 | `true`  | If on, overrides the four base noise knobs.                                       |
-| `valuation_noise_std`     | `15.0`  | Wider anchor noise.                                                               |
-| `urgency_mult_low/high`   | `0.6 / 1.5` | Wider urgency dispersion.                                                     |
-| `budget_stress_prob`      | `0.15`  | Per-episode, per-bot Bernoulli. Stressed bots' `qty_mult` is cut at bid time.     |
-| `budget_stress_qty_mult`  | `0.65`  | Multiplier applied to `qty_mult` (then re-clipped to `[qty_mult_low, high]`).     |
+```
+score(t) = (remaining_years − deploy_delays[t] + terminal_payoff_years)
+           × capacity_factors[t] / capex[t].
+```
 
-### 5.2 `bots.fade_schedule` — episode-based retirement
+Techs whose `(remaining_years − deploy_delays[t] + terminal_horizon)`
+is non-positive are skipped. The chosen tech is encoded as a hard
+one-hot in the three logit slots (`+1` for the winner, `−1` for the
+others); the bot never mixes investment across technologies in a
+single year.
 
-Turns bots off in stages as training progresses. Disabled by default.
+**Reference NPV.** At a test fraction `frac_test` (0.07 if the bot is
+green-tagged, 0.03 otherwise — see §6), the bot estimates avoided
+emissions over the project's effective horizon and discounts them as an
+annuity at `investment.discount_rate`:
 
-| Key        | Default                                          | Effect                                                                  |
-|------------|--------------------------------------------------|-------------------------------------------------------------------------|
-| `enabled`  | `false`                                          | Master switch.                                                          |
-| `schedule` | `[[0, 8], [30000, 6], [60000, 4], [80000, 2]]`   | `[episode_threshold, active_bot_count]` step function (non-decreasing in threshold). |
+```
+ef_saved          = max(0, weighted_emission_factor − ef[best_tech])
+effective_horizon = max(0, remaining_years − deploy_delays[best_tech]
+                          + terminal_payoff_years)
+annual_reduction  = frac_test × output_mwh × ef_saved / 1e6     [Mt]
+annuity_factor    = (1 − (1+r)^−effective_horizon) / r          (or
+                    effective_horizon if r = 0)
+avoided_NPV       = annual_reduction × price_ma3 × annuity_factor
+invest_cost       = compute_investment_cost(best_tech, frac_test, year)
+npv_ratio         = avoided_NPV / invest_cost
+```
 
-When a bot is "faded", it submits a no-op action (`bid_price=price_min,
-qty=0, invest=0`, zero secondary action) but its `Company` slot remains
-allocated. Market calibration is **rerun** at episode start whenever the
-active bot count changes so cap, MSR thresholds and emissions targets
-re-scale to the smaller participant pool.
+**Branch on tag.** The npv_ratio drives `invest_frac` differently for
+the two tags:
 
-## 6. Determinism & RNG
+- **Green-tagged** bots invest proportionally to the NPV ratio with a
+  floor:
+  `invest_frac = clip(frac_test × min(npv_ratio, 2)/2 + 0.02, 0.02,
+  investment.max_invest_frac)`.
+- **Financial-tagged** bots only invest when `npv_ratio > 1` and use a
+  lower floor:
+  `invest_frac = clip(frac_test × min(npv_ratio, 2)/2, 0.005,
+  max_invest_frac)` if `npv_ratio > 1`, else `0.005`.
 
-- Bot persistent noise draws (valuation noise, urgency multiplier,
-  budget-stress mask) come from `self._bot_rng`, an independent RNG
-  stream so changes elsewhere don't shift bot behaviour for a fixed
-  seed.
-- Given the two episode-start scalars and the optional stress flag, the
-  heuristic is fully deterministic — same env state → same action.
+**Capex throughput clip.** If the estimated invest cost exceeds
+remaining capex throughput for the year, `invest_frac` is scaled down
+linearly so the cost matches the remaining throughput.
 
-## 7. Files at a glance
+**Compliance-priority clip.** After the throughput clip, the bot
+computes a "post-compliance" budget headroom
 
-| File                                          | Role                                                          |
-|-----------------------------------------------|---------------------------------------------------------------|
-| `src/agents/heuristic_policy.py`              | `auction_action`, `secondary_action` (the rules above).       |
-| `src/environment/ets_environment.py`          | Persistent-noise draw, fade resolution, bot-action dispatch.  |
-| `src/environment/market_calibration.py`       | Re-scales cap / MSR when active bot count changes.            |
-| `configs/default.yaml` (`bots:`, `bot_*`)     | All knobs documented above.                                   |
-| `src/utils/preflight.py`                      | Validates `bot_*` array lengths against `n_bot_agents`.       |
+```
+expected_settlement = max(reserve, mac.coal_to_gas_cost)
+expected_compliance = qty_mult × annual_need × expected_settlement
+safety_reserve      = 0.05 × annual_budget
+post_compliance     = max(0, available_cash − expected_compliance
+                                              − safety_reserve)
+```
+
+and re-clips `invest_frac` so the implied capex is at most
+`post_compliance`. This is the rule that makes cash-tight bots invest
+less without explicit coordination.
+
+**Loan and EMA smoothing.** If outstanding emergency loan / annual
+budget > 0.05, `invest_frac` is multiplied by `(1 − 0.5 ×
+loan_pressure)` (loan_pressure clipped at 1). Finally an EMA against
+the previous year's value:
+`invest_frac ← 0.5 × invest_frac + 0.5 × prev_invest_frac`, then
+clipped to `[0, max_invest_frac]`. The previous value is stored on the
+`Company`.
+
+### 2.5 Loan-aware quantity reduction
+
+After §2.3, if outstanding loan / annual budget > 0.05, `qty_mult` is
+multiplied by `(1 − min(0.20, 0.3 × loan_pressure))` — i.e. up to a
+20 % cut in compliance buying while a loan is outstanding.
+
+### 2.6 Optional budget-stress event
+
+When `bots.enhanced_noise.enabled` is on, each bot draws a Bernoulli
+"stressed" flag at episode start. Stressed bots have their final
+`qty_mult` multiplied by `budget_stress_qty_mult` (default 0.65) and
+re-clipped. Nothing else about the bot's behaviour changes.
+
+## 3. Secondary market phase — `secondary_action`
+
+The secondary action is `[sec_price, sec_qty]` with `sec_qty > 0`
+meaning buy, `< 0` meaning sell.
+
+### 3.1 Trade direction and size
+
+The bot targets a **forward-looking bank buffer** that linearly
+shrinks to zero in the last year:
+
+```
+target_bank      = annual_need × min(remaining_years − 1, 2) × 0.3
+current_position = bank + allocation − annual_need
+trade_target     = 0.5 × (target_bank − current_position)
+```
+
+i.e. each year the bot closes half the gap to a buffer of ~0.6 ×
+`annual_need` (clamped above by 2 years).
+
+Two overrides:
+
+- **Final-years aggression.** When `remaining_years ≤ 2` and
+  `current_position < 0`, `trade_target` is bumped up to
+  `min(1.5 × |current_position|, quantity_max)` so the last two years
+  prioritise covering compliance.
+- **No selling under carry-forward debt.** If `carry_forward > 0.01`,
+  `trade_target` is clipped at 0 — the bot will only buy, never sell.
+
+### 3.2 Buy-side budget cap
+
+If `trade_target > 0`, the bot caps the buy size by remaining budget:
+
+```
+spend_frac = 0.9 if carry_forward > 0.01     # aggressive recovery
+           = 0.6 if current_position < 0     # plain shortfall
+           = 0.3 otherwise                   # routine top-up
+max_spend  = spend_frac × (annual_budget − budget_spent_this_year)
+trade_target = min(trade_target, max_spend / max(clearing_price, 1))
+```
+
+Outstanding loans further scale the buy size down by up to 40 %
+(`× (1 − 0.4 × loan_pressure)`).
+
+### 3.3 Price
+
+The price uses the same anchor logic as the auction, but with the
+**current clearing price** in place of `price_ma3`:
+
+```
+anchor   = max(mac.coal_to_gas_cost, clearing_price) + valuation_noise
+coverage = (bank + allocation) / annual_need
+urgency  = (1 − coverage / urgency_denom) × urgency_multiplier, clipped
+severity = |trade_target| / max(annual_need, 0.1)
+```
+
+For **buys**:
+`price_frac = urgency + 0.2 × min(severity, 1)`, and
+`sec_price = anchor + price_frac × (penalty_rate − anchor)`.
+
+For **sells**:
+`price_frac = max(0.10, urgency) + 0.15 × min(severity, 1)`.
+This gives surplus holders a small spread above the anchor that
+widens with severity.
+
+For zero trade: `sec_price = clearing_price`, `sec_qty = 0`.
+
+After computation, the price is capped at `1.8 × penalty_rate` and
+clipped to `[trading.sec_price_min, trading.sec_price_max_mult ×
+penalty_rate]`; `sec_qty` is clipped to `±auction.quantity_max`.
+
+## 4. Reaction to other state
+
+The bot **does not** look at peer bids, peer holdings, recent reward
+realisations, or the cap trajectory beyond what enters via
+`price_ma3`, `auction_volume`, `cap_t`, and the dynamic reserve. It
+**does** react to:
+
+- inflation (via the inflation-adjusted penalty rate used as the WTP
+  cap),
+- supply scarcity (via the auction_volume / cap_t ratio bump in §2.1),
+- its own collateral load and outstanding loan,
+- carry-forward debt (no-sell rule + aggressive buy-spend fraction),
+- the year index (via `remaining_years` in target-bank, NPV horizon,
+  and final-year aggression).
+
+## 5. Per-episode randomness
+
+Three scalars are drawn at every `reset()` from the environment's
+dedicated `_bot_rng` stream, fixed for the rest of the episode:
+
+| Scalar                      | Distribution                                | Where it enters                             |
+|-----------------------------|---------------------------------------------|---------------------------------------------|
+| `valuation_noise[b]`        | `Normal(0, valuation_noise_std)` (EUR/t)    | Additive to the anchor in §2.1 and §3.3.    |
+| `urgency_multiplier[b]`     | `Uniform(urgency_mult_low, urgency_mult_high)` | Multiplies urgency before clipping.      |
+| `budget_stressed[b]` (opt.) | `Bernoulli(budget_stress_prob)`             | Cuts auction `qty_mult` (§2.6).             |
+
+`urgency_denom` is fixed per slot via `bots.urgency_denominators` (not
+random). Under `enhanced_noise`, the std and the multiplier bounds are
+widened (default `15 EUR/t`, `[0.6, 1.5]`) and the stress event is
+enabled. Conditional on these scalars and the public state, the bot is
+deterministic.
+
+## 6. The green / financial tag
+
+The investment branch in §2.4 is selected by **`w_green > 0.25`**,
+read from the agent's reward weights. This is inferred from
+`bot_reward_weights` (or `reward_weights` for a learning agent the
+heuristic is being used to seed) rather than from the agent index, so
+re-ordering the weight list re-tags the bots consistently.
+
+The tag affects only:
+
+- the test fraction `frac_test` used to size avoided-emissions NPV
+  (0.07 green, 0.03 financial), and
+- the gating of `invest_frac` against `npv_ratio` (green: proportional
+  + floor; financial: hard `npv_ratio > 1` gate).
+
+Auction price, qty multiplier, secondary direction, and secondary
+pricing do **not** depend on the tag.
+
+## 7. Properties relevant for a bots-only baseline
+
+The following are direct consequences of the rules above; they are
+useful when reporting a bots-only run but are not by themselves
+endorsements of realism.
+
+- **Price formation is anchored to fundamentals.** Bids and secondary
+  quotes are linear interpolations between
+  `max(mac_cost, price_ma3 | clearing)` and the inflation-adjusted
+  penalty rate, with the interpolation coefficient set by an
+  urgency/severity statistic. There is no learned drift, no banking-
+  premium term beyond the buffer in §3.1, and the penalty rate is a
+  strict (minus-1) cap on willingness-to-pay.
+- **Quantity is need-driven, not price-elastic.** `qty_mult` is a
+  function of `annual_need` and urgency only; the bot does not reduce
+  quantity in response to a high `wtp_economic` (the joint budget gate
+  on the env side may still do so).
+- **Investment is gated by NPV and cash.** Both tags route through the
+  same NPV computation, the same capex-throughput clip, and the same
+  post-compliance budget headroom clip. Under cash stress the
+  compliance-priority clip dominates and `invest_frac` collapses
+  toward zero regardless of NPV. Year-to-year smoothing damps
+  oscillation.
+- **One technology per year.** Tech logits are a hard one-hot on the
+  argmax of `(effective_years × capacity_factor / capex)`. Diversified
+  build-out across techs only emerges over multiple years.
+- **Final-year compliance bias.** In the last 2 years the bot will buy
+  to cover any shortfall up to `quantity_max`; under carry-forward
+  debt it cannot sell. Combined, these produce a structural late-
+  episode net demand from any bot entering year 11 short.
+- **Loan and stress are dampeners only.** Outstanding loans
+  monotonically reduce buy quantity, invest fraction, and secondary
+  buy volume; the budget-stress event monotonically reduces auction
+  `qty_mult`. None of these mechanisms can flip the trade direction
+  or increase aggressiveness.
+- **No peer modelling.** Bots do not condition on each other. Any
+  "coordination" observed in a bots-only run is the joint product of
+  shared market state (`price_ma3`, reserve, supply ratio, penalty)
+  and the per-bot persistent scalars.
+
+## 8. Implementation pointers
+
+| File                                          | Contents                                                                 |
+|-----------------------------------------------|--------------------------------------------------------------------------|
+| `src/agents/heuristic_policy.py`              | `auction_action`, `secondary_action` — all rules in §§2–3.                |
+| `src/environment/ets_environment.py`          | Per-episode scalar draw, fade resolution, dispatch into the policy.       |
+| `configs/default.yaml` (`bots:` block)        | The four noise/urgency knobs, `enhanced_noise`, `fade_schedule`.          |
+| `docs/config_dictionary.md`                   | One-line reference for each knob mentioned above.                         |
